@@ -1,0 +1,6 @@
+biorealistic-v1-model
+bmtk
+GLIF_network
+*.ipynb*
+billeh_model_utils/__pycache__
+general_utils/__pycache__
