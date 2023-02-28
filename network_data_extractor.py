@@ -1,3 +1,4 @@
+import json
 import os
 import pickle as pkl
 
@@ -41,6 +42,8 @@ target_node_ids = np.array(
 syn_weights = np.array(edges_h5_file["edges"]["v1_to_v1"]["0"]["syn_weight"])
 edges_df = pd.read_csv(
     "GLIF_network/network/v1_v1_edge_types.csv", delimiter=" ")
+synaptic_models_path = os.path.join(
+    'biorealistic-v1-model', 'tiny_shinya', 'components', 'synaptic_models')
 
 for idx, (edge_type_id, edge_model, edge_delay) in edges_df[
     ["edge_type_id", "model_template", "delay"]
@@ -51,11 +54,15 @@ for idx, (edge_type_id, edge_model, edge_delay) in edges_df[
         "target": target_node_ids[mask],
         "params": {
             "model": edge_model,
-            #    'receptor_type':edge_receptor_type,
             "delay": edge_delay,
             "weight": syn_weights[mask],
         },
     }
+    # open json file with edge parameters
+    dynamic_params_json = edges_df["dynamics_params"].loc[idx]
+    with open(os.path.join(synaptic_models_path, dynamic_params_json)) as f:
+        synaptic_model_dict = json.load(f)
+    new_pop_dict["params"]["receptor_type"] = synaptic_model_dict["receptor_type"]
     new_network["edges"].append(new_pop_dict)
 
 with open(os.path.join(data_dir, "new_network_dat.pkl"), "wb") as file:
