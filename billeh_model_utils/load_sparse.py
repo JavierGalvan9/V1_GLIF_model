@@ -1,9 +1,11 @@
 import os
+import pickle as pkl
+
+import h5py
 import numpy as np
 import pandas as pd
-import h5py
-import pickle as pkl
 from numba import njit
+
 
 @njit
 def sort_indices(indices, weights, delays):
@@ -157,7 +159,8 @@ def load_network(path='GLIF_network/network_dat.pkl',
         sel[take_inds] = True 
         
     #elif n_neurons == -1:
-    #    sel = np.full(n_nodes, True)     
+    #    sel = np.full(n_nodes, True)  
+
 
     n_nodes = np.sum(sel) # number of nodes selected
     tf_id_to_bmtk_id = tf_id_to_bmtk_id[sel]  # tf idx '0' corresponds to 'tf_id_to_bmtk_id[0]' bmtk idx
