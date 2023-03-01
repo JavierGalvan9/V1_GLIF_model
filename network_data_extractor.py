@@ -17,7 +17,7 @@ v1_node_type_ids = np.array(nodes_h5_file["nodes"]["v1"]["node_type_id"])
 nodes_df = pd.read_csv(os.path.join(
     data_dir, "v1_node_types.csv"), delimiter=" ")
 cell_models_path = os.path.join(
-    'biorealistic-v1-model', 'tiny_shinya', 'components', 'cell_models')
+    'biorealistic-v1-model', 'tiny', 'components', 'cell_models')
 for node_type_id in nodes_df["node_type_id"]:
     mask = v1_node_type_ids == node_type_id
     new_pop_dict = {"ids": v1_node_ids[mask].astype(np.uint32)}
@@ -43,7 +43,7 @@ syn_weights = np.array(edges_h5_file["edges"]["v1_to_v1"]["0"]["syn_weight"])
 edges_df = pd.read_csv(
     "GLIF_network/network/v1_v1_edge_types.csv", delimiter=" ")
 synaptic_models_path = os.path.join(
-    'biorealistic-v1-model', 'tiny_shinya', 'components', 'synaptic_models')
+    'biorealistic-v1-model', 'tiny', 'components', 'synaptic_models')
 
 for idx, (edge_type_id, edge_model, edge_delay) in edges_df[
     ["edge_type_id", "model_template", "delay"]
