@@ -162,7 +162,7 @@ def load_network(
             else:
                 v[i] = node_type["params"][k]
 
-    # each node has 79 different inputs with different tau_syn each
+    # each node has at most 10 different inputs with different tau_syn each
     dense_shape = (max_n_receptors * n_nodes, n_nodes)
     # dense_shape = (np.sum(tau_syns), n_nodes)
     indices = np.zeros((n_edges, 2), dtype=np.int64)
@@ -431,7 +431,9 @@ def load_billeh(
     input_population = inputs[0]
     # contains the single background node that projects to all V1 neurons
     bkg = inputs[1]
-    max_n_receptors = int(network["synapses"]["dense_shape"][0]/network["synapses"]["dense_shape"][1])
+    max_n_receptors = int(
+        network["synapses"]["dense_shape"][0] / network["synapses"]["dense_shape"][1]
+    )
     bkg_weights = np.zeros((network["n_nodes"] * max_n_receptors,), np.float32)
     bkg_weights[bkg["indices"][:, 0]] = bkg["weights"]
     if n_input != 17400:

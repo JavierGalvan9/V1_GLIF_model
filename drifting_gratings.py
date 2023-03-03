@@ -162,10 +162,6 @@ def main(_):
     ### MODEL INPUT ###
     lgn_firing_rates_filename = f"orientation_{str(flags.gratings_orientation)}&TF_{str(float(flags.gratings_frequency))}&SF_0.04&reverse_{str(flags.reverse)}&init_screen_dur_1.0&visual_flow_dur_1.0&end_screen_dur_1.0&min_value_-1&max_value_1&contrast_0.8&dt_0.001&height_120&width_240&init_gray_screen_False&end_gray_screen_False.lzma"
 
-    # print list of files in input folder
-    print(lgn_firing_rates_filename)
-    print(os.listdir(os.path.join(flags.data_dir, "input", "Drifting_gratings")))
-
     with open(
         os.path.join(
             flags.data_dir, "input", "Drifting_gratings", lgn_firing_rates_filename

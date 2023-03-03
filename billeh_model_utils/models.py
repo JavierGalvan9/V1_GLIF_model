@@ -142,6 +142,7 @@ class SparseLayer(tf.keras.layers.Layer):
         self._indices = indices
         self._weights = weights
         self._dense_shape = dense_shape
+        print(int(2**31 / weights.shape[0]))
         # self._max_batch = int(2**31 / weights.shape[0]) #int(2**40 / weights.shape[0]) #int(2**31 / weights.shape[0])
         self._max_batch = int(2**40 / weights.shape[0])
         self._dtype = dtype
