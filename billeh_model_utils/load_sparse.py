@@ -128,6 +128,7 @@ def load_network(
 
     # Save in a dictionary the properties of each of the 111 node types
     n_node_types = len(d["nodes"])
+    max_n_receptors = 10
     node_params = dict(
         V_th=np.zeros(n_node_types, np.float32),
         g=np.zeros(n_node_types, np.float32),
@@ -135,14 +136,16 @@ def load_network(
         k=np.zeros((n_node_types, 2), np.float32),
         C_m=np.zeros(n_node_types, np.float32),
         V_reset=np.zeros(n_node_types, np.float32),
-        tau_syn=np.zeros((n_node_types, 10), np.float32),
+        tau_syn=np.zeros(
+            (n_node_types, max_n_receptors), np.float32
+        ),  # 10 is the maximum number of different synaptic types a neuron has
         t_ref=np.zeros(n_node_types, np.float32),
         asc_amps=np.zeros((n_node_types, 2), np.float32),
     )
 
     # give every selected node of a given node type an index according to tf ids
     node_type_ids = np.zeros(n_nodes, np.int64)
-    tau_syn_list = np.zeros(n_nodes, dtype=np.int32)
+    tau_syns = np.zeros(n_nodes, dtype=np.int32)
     for i, node_type in enumerate(d["nodes"]):
         # get ALL the nodes of the given node type
         tf_ids = bmtk_id_to_tf_id[np.array(node_type["ids"])]
@@ -154,14 +157,14 @@ def load_network(
         for k, v in node_params.items():
             # save in a dict the information of the nodes
             if k == "tau_syn":
-                tau_syn_list[np.array(node_type["ids"])] = len(node_type["params"][k])
+                tau_syns[np.array(node_type["ids"])] = len(node_type["params"][k])
                 v[i, : len(node_type["params"][k])] = node_type["params"][k]
             else:
                 v[i] = node_type["params"][k]
 
     # each node has 79 different inputs with different tau_syn each
-    # dense_shape = (10 * n_nodes, n_nodes)
-    dense_shape = (np.sum(tau_syn_list), n_nodes)
+    dense_shape = (max_n_receptors * n_nodes, n_nodes)
+    # dense_shape = (np.sum(tau_syns), n_nodes)
     indices = np.zeros((n_edges, 2), dtype=np.int64)
     weights = np.zeros(n_edges, np.float32)
     delays = np.zeros(n_edges, np.float32)
@@ -181,13 +184,13 @@ def load_network(
         # all the edges of a given type have the same delay
         delays_tf = edge["params"]["delay"]
         n_new_edge = np.sum(edge_exists)
-        # indices[current_edge : current_edge + n_new_edge] = np.array(
-        #             [target_tf_ids * 10 + r, source_tf_ids]
-        #         ).T
-        n_receptors = tau_syn_list[np.array(edge["target"])][edge_exists]
         indices[current_edge : current_edge + n_new_edge] = np.array(
-            [target_tf_ids * n_receptors + r, source_tf_ids]
+            [target_tf_ids * max_n_receptors + r, source_tf_ids]
         ).T
+        # n_receptors = tau_syns[np.array(edge["target"])][edge_exists]
+        # indices[current_edge : current_edge + n_new_edge] = np.array(
+        #     [target_tf_ids * n_receptors + r, source_tf_ids]
+        # ).T
 
         # we multiply by 4 and add r to identify the receptor_type easily:
         # if target id is divisible by 4 the receptor_type is 0,
@@ -206,7 +209,7 @@ def load_network(
         n_edges=n_edges,
         node_params=node_params,
         node_type_ids=node_type_ids,
-        tau_syn_list=tau_syn_list,
+        tau_syns=tau_syns,
         synapses=dict(
             indices=indices, weights=weights, delays=delays, dense_shape=dense_shape
         ),
@@ -223,7 +226,7 @@ def load_input(
     duration=3000,
     dt=1,
     bmtk_id_to_tf_id=None,
-    tau_syn_list=None,
+    tau_syns=None,
 ):
     with open(path, "rb") as f:
         # d contains two populations (LGN and background inputs), each of them with two elements:
@@ -234,6 +237,7 @@ def load_input(
         # The second population (background) is only formed by the source index 0 (single background node)
         # and projects to all V1 neurons with 21 different edges types and weights
 
+    max_n_receptors = tau_syns.max()
     input_populations = []
     for idx, input_population in enumerate(d):
         post_indices = []
@@ -260,10 +264,11 @@ def load_input(
                 weights_tf = weights_tf[edge_exists]
                 delays_tf = delays_tf[edge_exists]
 
-                if tau_syn_list is not None:
-                    n_receptors = tau_syn_list[np.array(edge["target"])][edge_exists]
-                    new_target_tf_id = target_tf_id * n_receptors + r
+                # if tau_syns is not None:
+                #     n_receptors = tau_syns[np.array(edge["target"])][edge_exists]
+                #     new_target_tf_id = target_tf_id * n_receptors + r
 
+            new_target_tf_id = target_tf_id * max_n_receptors + r
             # we multiply by 4 the indices and add r to identify the receptor_type easily:
             # if target id is divisible by 4 the receptor_type is 0,
             # if it is rest is 1 by dividing by 4 then its receptor type is 1, and so on...
@@ -394,7 +399,7 @@ def load_billeh(
         dt=1,
         path=os.path.join(data_dir, "network/input_dat.pkl"),
         bmtk_id_to_tf_id=network["bmtk_id_to_tf_id"],
-        tau_syn_list=network["tau_syn_list"],
+        tau_syns=network["tau_syns"],
     )
     df = pd.read_csv(os.path.join(data_dir, "network/v1_node_types.csv"), delimiter=" ")
 
@@ -426,9 +431,8 @@ def load_billeh(
     input_population = inputs[0]
     # contains the single background node that projects to all V1 neurons
     bkg = inputs[1]
-    bkg_weights = np.zeros(
-        (network["n_nodes"] * network["synapses"]["dense_shape"][0],), np.float32
-    )
+    max_n_receptors = int(network["synapses"]["dense_shape"][0]/network["synapses"]["dense_shape"][1])
+    bkg_weights = np.zeros((network["n_nodes"] * max_n_receptors,), np.float32)
     bkg_weights[bkg["indices"][:, 0]] = bkg["weights"]
     if n_input != 17400:
         input_population = reduce_input_population(input_population, n_input, seed=seed)

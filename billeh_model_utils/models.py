@@ -143,9 +143,7 @@ class SparseLayer(tf.keras.layers.Layer):
         self._weights = weights
         self._dense_shape = dense_shape
         # self._max_batch = int(2**31 / weights.shape[0]) #int(2**40 / weights.shape[0]) #int(2**31 / weights.shape[0])
-        self._max_batch = int(
-            2**40 / weights.shape[0]
-        )  # int(2**40 / weights.shape[0])
+        self._max_batch = int(2**40 / weights.shape[0])
         self._dtype = dtype
         self._bkg_weights = bkg_weights
         self._lr_scale = lr_scale
@@ -281,6 +279,11 @@ class BillehColumn(tf.keras.layers.Layer):
         )  # _params['asc_amps'] has shape (111, 2)
 
         self._node_type_ids = network["node_type_ids"]
+        self._n_tau_syns = network["tau_syns"]
+        self._max_n_receptors = int(
+            network["synapses"]["dense_shape"][0]
+            / network["synapses"]["dense_shape"][1]
+        )
         self._dt = dt
         self._recurrent_dampening = recurrent_dampening_factor
         self._pseudo_gauss = pseudo_gauss
@@ -291,10 +294,10 @@ class BillehColumn(tf.keras.layers.Layer):
 
         self._hard_reset = hard_reset
 
-        n_receptors = network["node_params"]["tau_syn"].shape[
-            1
-        ]  # we have 10 receptors for each neuron
-        self._n_receptors = n_receptors
+        # n_receptors = network["node_params"]["tau_syn"].shape[
+        #     1
+        # ]
+        # self._n_receptors = n_receptors
         self._n_neurons = network["n_nodes"]
         self._dampening_factor = tf.cast(dampening_factor, self._compute_dtype)
         self._gauss_std = tf.cast(gauss_std, self._compute_dtype)
@@ -304,8 +307,19 @@ class BillehColumn(tf.keras.layers.Layer):
         )  # determine the membrane time decay constant
         self._decay = np.exp(-dt / tau)
         self._current_factor = 1 / self._params["C_m"] * (1 - self._decay) * tau
-        self._syn_decay = np.exp(-dt / np.array(self._params["tau_syn"]))
-        self._psc_initial = np.e / np.array(self._params["tau_syn"])
+        # replace with nan values where the denominator is 0 for the following arrays
+        self._syn_decay = np.where(
+            np.array(self._params["tau_syn"]) == 0,
+            np.nan,
+            np.exp(-dt / np.array(self._params["tau_syn"])),
+        )
+        self._psc_initial = np.where(
+            np.array(self._params["tau_syn"]) == 0,
+            np.nan,
+            np.e / np.array(self._params["tau_syn"]),
+        )
+        # self._syn_decay = np.exp(-dt / np.array(self._params["tau_syn"]))
+        # self._psc_initial = np.e / np.array(self._params["tau_syn"])
 
         # synapses: target_ids, source_ids, weights, delays
         # this are the axonal delays
@@ -319,8 +333,8 @@ class BillehColumn(tf.keras.layers.Layer):
             self._n_neurons,  # r
             self._n_neurons,  # asc 1
             self._n_neurons,  # asc 2
-            n_receptors * self._n_neurons,  # psc rise
-            n_receptors * self._n_neurons,  # psc
+            self._n_neurons * self._max_n_receptors,  # psc rise
+            self._n_neurons * self._max_n_receptors,  # psc
         )
 
         def _f(_v, trainable=False):
@@ -366,7 +380,7 @@ class BillehColumn(tf.keras.layers.Layer):
         )
         weights = (
             weights
-            / voltage_scale[self._node_type_ids[indices[:, 0] // self._n_receptors]]
+            / voltage_scale[self._node_type_ids[indices[:, 0] // self._max_n_receptors]]
         )  # scale down the weights
 
         delays = np.round(
@@ -385,13 +399,17 @@ class BillehColumn(tf.keras.layers.Layer):
         input_weights = (
             input_weights
             / voltage_scale[
-                self._node_type_ids[input_indices[:, 0] // self._n_receptors]
+                self._node_type_ids[input_indices[:, 0] // self._max_n_receptors]
             ]
         )
         print(f"> Input synapses {len(input_indices)}")
 
+        # input_dense_shape = (
+        #     self._n_receptors * self._n_neurons,
+        #     input_population["n_inputs"],
+        # )
         input_dense_shape = (
-            self._n_receptors * self._n_neurons,
+            self._max_n_receptors * self._n_neurons,
             input_population["n_inputs"],
         )
 
@@ -419,7 +437,7 @@ class BillehColumn(tf.keras.layers.Layer):
         self.input_indices = tf.Variable(input_indices, trainable=False)
         self.input_dense_shape = input_dense_shape
         bkg_weights = bkg_weights / np.repeat(
-            voltage_scale[self._node_type_ids], self._n_receptors
+            voltage_scale[self._node_type_ids], self._max_n_receptors
         )
         self.bkg_weights = tf.Variable(
             bkg_weights * 10.0, name="rest_of_brain_weights", trainable=train_input
@@ -453,8 +471,10 @@ class BillehColumn(tf.keras.layers.Layer):
         r0 = tf.zeros((batch_size, self._n_neurons), dtype)
         asc_10 = tf.zeros((batch_size, self._n_neurons), dtype)
         asc_20 = tf.zeros((batch_size, self._n_neurons), dtype)
-        psc_rise0 = tf.zeros((batch_size, self._n_neurons * self._n_receptors), dtype)
-        psc0 = tf.zeros((batch_size, self._n_neurons * self._n_receptors), dtype)
+        psc_rise0 = tf.zeros(
+            (batch_size, self._n_neurons * self._max_n_receptors), dtype
+        )
+        psc0 = tf.zeros((batch_size, self._n_neurons * self._max_n_receptors), dtype)
         return z0_buf, v0, r0, asc_10, asc_20, psc_rise0, psc0
 
     def _gather(self, prop):
@@ -471,12 +491,16 @@ class BillehColumn(tf.keras.layers.Layer):
             state_input = tf.zeros((4,))
         if constants is not None:
             if self._spike_gradient:
-                external_current = inputs[:, : self._n_neurons * self._n_receptors]
-                state_input = inputs[:, self._n_neurons * self._n_receptors :]
+                external_current = inputs[:, : self._n_neurons * self._max_n_receptors]
+                state_input = inputs[:, self._n_neurons * self._max_n_receptors :]
             else:
-                external_current = inputs[:, : self._n_neurons * self._n_receptors]
-                state_input = inputs[:, self._n_neurons * self._n_receptors :]
-                state_input = tf.reshape(state_input, (batch_size, self._n_neurons, 4))
+                external_current = inputs[:, : self._n_neurons * self._max_n_receptors]
+                state_input = inputs[:, self._n_neurons * self._max_n_receptors :]
+                state_input = tf.reshape(
+                    state_input, (batch_size, self._n_neurons, self._max_n_receptors)
+                )
+                # state_input = tf.reshape(state_input, (batch_size, self._n_neurons, 4))
+
         # external_current = inputs
         z_buf, v, r, asc_1, asc_2, psc_rise, psc = state
 
@@ -486,9 +510,9 @@ class BillehColumn(tf.keras.layers.Layer):
         prev_z = shaped_z_buf[:, 0]  # previous spikes with shape (50000)
 
         psc_rise = tf.reshape(
-            psc_rise, (batch_size, self._n_neurons, self._n_receptors)
+            psc_rise, (batch_size, self._n_neurons, self._max_n_receptors)
         )
-        psc = tf.reshape(psc, (batch_size, self._n_neurons, self._n_receptors))
+        psc = tf.reshape(psc, (batch_size, self._n_neurons, self._max_n_receptors))
 
         dampened_z_buf = z_buf * self._recurrent_dampening
         rec_z_buf = (
@@ -509,7 +533,7 @@ class BillehColumn(tf.keras.layers.Layer):
         rec_inputs = tf.cast(i_rec, self._compute_dtype)
         rec_inputs = tf.reshape(
             rec_inputs + external_current,
-            (batch_size, self._n_neurons, self._n_receptors),
+            (batch_size, self._n_neurons, self._max_n_receptors),
         )
         rec_inputs = rec_inputs * self._lr_scale
 
@@ -574,9 +598,11 @@ class BillehColumn(tf.keras.layers.Layer):
                     new_z = spike_function(v_sc, self._dampening_factor)
 
         new_z = tf.where(new_r > 0.0, tf.zeros_like(new_z), new_z)
-        new_psc = tf.reshape(new_psc, (batch_size, self._n_neurons * self._n_receptors))
+        new_psc = tf.reshape(
+            new_psc, (batch_size, self._n_neurons * self._max_n_receptors)
+        )
         new_psc_rise = tf.reshape(
-            new_psc_rise, (batch_size, self._n_neurons * self._n_receptors)
+            new_psc_rise, (batch_size, self._n_neurons * self._max_n_receptors)
         )
 
         # new_z = tf.cast(new_z, tf.float16)
@@ -587,7 +613,7 @@ class BillehColumn(tf.keras.layers.Layer):
         outputs = (
             new_z,
             new_v * self.voltage_scale + self.voltage_offset,
-            input_current + new_asc_1 + new_asc_2,
+            (input_current + new_asc_1 + new_asc_2) * self.voltage_scale,
         )
         new_state = (
             new_z_buf,
@@ -808,7 +834,7 @@ if __name__ == "__main__":
     n_input = 17400
     n_neurons = 1574
 
-    input_population, network, bkg, bkg_weights = load_sparse.load_billeh(
+    input_population, network, bkg, bkg_weights = load_sparse.cached_load_billeh(
         n_input,
         n_neurons,
         True,
@@ -842,7 +868,7 @@ if __name__ == "__main__":
         down_sample=50,
         add_metric=True,
         max_delay=5,
-        batch_size=None,
+        batch_size=1,
         pseudo_gauss=False,
         hard_reset=True,
     )

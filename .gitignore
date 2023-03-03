@@ -3,4 +3,5 @@ bmtk
 GLIF_network
 *.ipynb*
 billeh_model_utils/__pycache__
+billeh_model_utils/.cache
 general_utils/__pycache__
