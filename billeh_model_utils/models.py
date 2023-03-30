@@ -280,7 +280,7 @@ class BillehColumn(tf.keras.layers.Layer):
         )  # _params['asc_amps'] has shape (111, 2)
 
         self._node_type_ids = network["node_type_ids"]
-        self._n_tau_syns = network["tau_syns"]
+        # self._n_tau_syns = network["tau_syns"]
         self._max_n_receptors = int(
             network["synapses"]["dense_shape"][0]
             / network["synapses"]["dense_shape"][1]
@@ -361,7 +361,6 @@ class BillehColumn(tf.keras.layers.Layer):
         self.syn_decay = _f(self._syn_decay)
         self.psc_initial = _f(self._psc_initial)
         self.t_ref = _f(self._params["t_ref"])  # refractory time
-        # print(set(self._params['t_ref']))
         self.asc_amps = _f(self._params["asc_amps"], trainable=False)
         _k = self._params["k"]
         self.param_k, self.param_k_read = custom_val(_k, trainable=False)

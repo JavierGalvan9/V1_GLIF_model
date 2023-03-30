@@ -55,7 +55,8 @@ def load_network(
     #                              3.33087865e-34, 1.26318969e-03, 1.20919572e-01])}
 
     n_nodes = sum([len(a["ids"]) for a in d["nodes"]])  # 230924 total neurons
-    n_edges = sum([len(a["source"]) for a in d["edges"]])  # 70139111 total edges
+    n_edges = sum([len(a["source"])
+                  for a in d["edges"]])  # 70139111 total edges
     # max_delay = max([a['params']['delay'] for a in d['edges']])
 
     bmtk_id_to_tf_id = np.arange(n_nodes)
@@ -76,37 +77,40 @@ def load_network(
     # its a cylinder where the y variable is just the depth
     r = np.sqrt(x**2 + z**2)
 
-    # sel is a boolean array with True value in the indices of selected neurons
-    if  n_neurons is not None and n_neurons > 1000000:
+    # Select neurons to keep in the network
+    # Check if the number of neurons is not too large
+    if n_neurons is not None and n_neurons > 1000000:
         raise ValueError("There are only 230924 neurons in the network")
-    elif connected_selection:  # this condition takes the n_neurons closest neurons
-        sorted_ind = np.argsort(r)  # order according to radius distance
+    # this condition takes the n_neurons closest neurons to the origin
+    elif connected_selection:
+        sorted_ind = np.argsort(r)
         sel = np.zeros(n_nodes, np.bool_)
-        sel[sorted_ind[:n_neurons]] = True  # keep only the nearest n_neurons
+        sel[sorted_ind[:n_neurons]] = True
         print(f"> Maximum sample radius: {r[sorted_ind[n_neurons - 1]]:.2f}")
-    # this condition makes all the neurons to be within distance 400 micrometers from the origin (core)
+    # this condition takes the n_neurons closest neurons to the origin (core)
     elif core_only:
-        # 51,978 maximum value for n_neurons in this case
         sel = r < 400
         if n_neurons is not None and n_neurons > 51978:
             raise ValueError("There are only 51978 neurons in the core")
         elif n_neurons is not None and n_neurons > 0:
-            (inds,) = np.where(sel)  # indices where the condition is satisfied
+            (inds,) = np.where(sel)
             take_inds = rd.choice(inds, size=n_neurons, replace=False)
             sel[:] = False
             sel[take_inds] = True
+    # this condition samples neurons from the whole V1
     elif (
         n_neurons is not None and n_neurons > 0
-    ):  # this condition takes random neurons from all the V1
+    ):
         legit_neurons = np.arange(n_nodes)
         take_inds = rd.choice(legit_neurons, size=n_neurons, replace=False)
         sel = np.zeros(n_nodes, np.bool_)
         sel[take_inds] = True
+    # if no condition is met, all neurons are selected
+    else:
+        sel = np.ones(n_nodes, np.bool_)
 
-    # elif n_neurons == -1:
-    #    sel = np.full(n_nodes, True)
-
-    n_nodes = np.sum(sel)  # number of nodes selected
+    # Update the number of neurons
+    n_nodes = np.sum(sel)
     # tf idx '0' corresponds to 'tf_id_to_bmtk_id[0]' bmtk idx
     tf_id_to_bmtk_id = tf_id_to_bmtk_id[sel]
     bmtk_id_to_tf_id = np.zeros_like(bmtk_id_to_tf_id) - 1
@@ -149,6 +153,7 @@ def load_network(
 
     # give every selected node of a given node type an index according to tf ids
     node_type_ids = np.zeros(n_nodes, np.int64)
+    # number of synaptic types per neuron
     tau_syns = np.zeros(n_nodes, dtype=np.int32)
     for i, node_type in enumerate(d["nodes"]):
         # get ALL the nodes of the given node type
@@ -161,7 +166,8 @@ def load_network(
         for k, v in node_params.items():
             # save in a dict the information of the nodes
             if k == "tau_syn":
-                tau_syns[np.array(node_type["ids"])] = len(node_type["params"][k])
+                tau_syns[np.array(node_type["ids"])] = len(
+                    node_type["params"][k])
                 v[i, : len(node_type["params"][k])] = node_type["params"][k]
             else:
                 v[i] = node_type["params"][k]
@@ -175,7 +181,7 @@ def load_network(
 
     current_edge = 0
     for edge in edges:
-        # Identify the which of the 10 types of inputs we have
+        # Identify which of the 10 types of inputs we have
         r = edge["params"]["receptor_type"] - 1
         # r takes values within 0 - 9
         target_tf_ids = bmtk_id_to_tf_id[np.array(edge["target"])]
@@ -188,7 +194,10 @@ def load_network(
         # all the edges of a given type have the same delay
         delays_tf = edge["params"]["delay"]
         n_new_edge = np.sum(edge_exists)
-        indices[current_edge : current_edge + n_new_edge] = np.array(
+        # we multiply by max_n_receptors and add r to identify the receptor_type easily:
+        # if target id is divisible by max_n_receptors the receptor_type is 0,
+        # if it is rest is 1 by dividing by max_n_receptors then its receptor type is 1, and so on...
+        indices[current_edge: current_edge + n_new_edge] = np.array(
             [target_tf_ids * max_n_receptors + r, source_tf_ids]
         ).T
         # n_receptors = tau_syns[np.array(edge["target"])][edge_exists]
@@ -196,11 +205,8 @@ def load_network(
         #     [target_tf_ids * n_receptors + r, source_tf_ids]
         # ).T
 
-        # we multiply by 4 and add r to identify the receptor_type easily:
-        # if target id is divisible by 4 the receptor_type is 0,
-        # if it is rest is 1 by dividing by 4 then its receptor type is 1, and so on...
-        weights[current_edge : current_edge + n_new_edge] = weights_tf
-        delays[current_edge : current_edge + n_new_edge] = delays_tf
+        weights[current_edge: current_edge + n_new_edge] = weights_tf
+        delays[current_edge: current_edge + n_new_edge] = delays_tf
         current_edge += n_new_edge
     # sort indices by considering first all the targets of node 0, then all of node 1, ...
     indices, weights, delays = sort_indices(indices, weights, delays)
@@ -235,9 +241,8 @@ def load_input(
     with open(path, "rb") as f:
         # d contains two populations (LGN and background inputs), each of them with two elements:
         d = pkl.load(f)
-        # [0] a dict with 'ids' and 'spikes'
-        # [1] a list of edges types, each of them with their 'source', 'target' and 'params'
-        # The first population (LGN) has 86 different edges and the source ids go from 0 to 17399
+        # a list of edges types, each of them with their 'source', 'target' and 'params'
+        # The first population (LGN) has 402 different edges and the source ids go from 0 to 17399
         # The second population (background) is only formed by the source index 0 (single background node)
         # and projects to all V1 neurons with 21 different edges types and weights
 
@@ -267,7 +272,6 @@ def load_input(
                 source_tf_id = source_tf_id[edge_exists]
                 weights_tf = weights_tf[edge_exists]
                 delays_tf = delays_tf[edge_exists]
-
                 # if tau_syns is not None:
                 #     n_receptors = tau_syns[np.array(edge["target"])][edge_exists]
                 #     new_target_tf_id = target_tf_id * n_receptors + r
@@ -290,16 +294,18 @@ def load_input(
 
         if idx == 0:
             # we load the LGN nodes and their positions
-            lgn_nodes_h5_file = h5py.File("GLIF_network/network/lgn_nodes.h5", "r")
-            n_neurons = len(lgn_nodes_h5_file["nodes"]["lgn"]["node_id"])
+            lgn_nodes_h5_file = h5py.File(
+                "GLIF_network/network/lgn_nodes.h5", "r")
+            n_inputs = len(lgn_nodes_h5_file["nodes"]["lgn"]["node_id"])
         elif idx == 1:
             # we load the background nodes and their positions
-            bkg_nodes_h5_file = h5py.File("GLIF_network/network/bkg_nodes.h5", "r")
-            n_neurons = len(bkg_nodes_h5_file["nodes"]["bkg"]["node_id"])
+            bkg_nodes_h5_file = h5py.File(
+                "GLIF_network/network/bkg_nodes.h5", "r")
+            n_inputs = len(bkg_nodes_h5_file["nodes"]["bkg"]["node_id"])
 
         input_populations.append(
             dict(
-                n_inputs=n_neurons,
+                n_inputs=n_inputs,
                 indices=indices.astype(np.int64),
                 weights=weights,
                 delays=delays,
@@ -405,7 +411,8 @@ def load_billeh(
         bmtk_id_to_tf_id=network["bmtk_id_to_tf_id"],
         tau_syns=network["tau_syns"],
     )
-    df = pd.read_csv(os.path.join(data_dir, "network/v1_node_types.csv"), delimiter=" ")
+    df = pd.read_csv(os.path.join(
+        data_dir, "network/v1_node_types.csv"), delimiter=" ")
 
     ###### Select random l5e neurons #########
     l5e_types_indices = []
@@ -436,12 +443,14 @@ def load_billeh(
     # contains the single background node that projects to all V1 neurons
     bkg = inputs[1]
     max_n_receptors = int(
-        network["synapses"]["dense_shape"][0] / network["synapses"]["dense_shape"][1]
+        network["synapses"]["dense_shape"][0] /
+        network["synapses"]["dense_shape"][1]
     )
     bkg_weights = np.zeros((network["n_nodes"] * max_n_receptors,), np.float32)
     bkg_weights[bkg["indices"][:, 0]] = bkg["weights"]
     if n_input != 17400:
-        input_population = reduce_input_population(input_population, n_input, seed=seed)
+        input_population = reduce_input_population(
+            input_population, n_input, seed=seed)
     # return input_population, network, bkg_weights
     return input_population, network, bkg, bkg_weights
 
@@ -464,7 +473,8 @@ def cached_load_billeh(
     )
     flag_str += f"_out{n_output}_nper{neurons_per_output}"
     file_dir = os.path.split(__file__)[0]
-    cache_path = os.path.join(file_dir, f".cache/billeh_network_{flag_str}.pkl")
+    cache_path = os.path.join(
+        file_dir, f".cache/billeh_network_{flag_str}.pkl")
     # os.remove(cache_path)
     if os.path.exists(cache_path):
         try:

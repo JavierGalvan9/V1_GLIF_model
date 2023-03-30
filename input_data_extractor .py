@@ -9,8 +9,9 @@ import pandas as pd
 # Create a new_input_network.dat
 data_dir = "GLIF_network/network"
 new_input_network = []
-lgn_input_network = []
 
+# LGN input network
+lgn_input_network = []
 lgn_edges_h5_file = h5py.File('GLIF_network/network/lgn_v1_edges.h5', "r")
 edge_type_ids = np.array(
     lgn_edges_h5_file["edges"]["lgn_to_v1"]["edge_type_id"])
@@ -45,11 +46,10 @@ for idx, (edge_type_id, edge_model, edge_delay) in edges_df[
         synaptic_model_dict = json.load(f)
     new_pop_dict["params"]["receptor_type"] = synaptic_model_dict["receptor_type"]
     lgn_input_network.append(new_pop_dict)
-
 new_input_network.append(lgn_input_network)
 
+# BKG input network
 bkg_input_network = []
-
 bkg_edges_h5_file = h5py.File('GLIF_network/network/bkg_v1_edges.h5', "r")
 edge_type_ids = np.array(
     bkg_edges_h5_file["edges"]["bkg_to_v1"]["edge_type_id"])
@@ -83,9 +83,9 @@ for idx, (edge_type_id, edge_model, edge_delay) in edges_df[
     with open(os.path.join(synaptic_models_path, dynamic_params_json)) as f:
         synaptic_model_dict = json.load(f)
     new_pop_dict["params"]["receptor_type"] = synaptic_model_dict["receptor_type"]
-    lgn_input_network.append(new_pop_dict)
+    bkg_input_network.append(new_pop_dict)
 
-new_input_network.append(lgn_input_network)
+new_input_network.append(bkg_input_network)
 
 with open(os.path.join(data_dir, "new_input_dat.pkl"), "wb") as file:
     pkl.dump(new_input_network, file)

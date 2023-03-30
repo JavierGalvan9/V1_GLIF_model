@@ -1,3 +1,16 @@
+from plotting_utils import (
+    InputActivityFigure,
+    LaminarPlot,
+    LGN_sample_plot,
+    PopulationActivity,
+    RasterPlot,
+)
+import toolkit
+import other_billeh_utils
+import models
+import load_sparse
+from other_utils import memory_tracer, timer
+import file_management
 import json
 import os
 import sys
@@ -11,21 +24,8 @@ from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
 parentDir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(parentDir, "general_utils"))
-import file_management
-from other_utils import memory_tracer, timer
 
 sys.path.append(os.path.join(parentDir, "billeh_model_utils"))
-import load_sparse
-import models
-import other_billeh_utils
-import toolkit
-from plotting_utils import (
-    InputActivityFigure,
-    LaminarPlot,
-    LGN_sample_plot,
-    PopulationActivity,
-    RasterPlot,
-)
 
 # import callbacks
 # import data_sets
@@ -50,7 +50,8 @@ class PlotCallback(tf.keras.callbacks.Callback):
         self._test_example = next(test_iter)
         self._extractor_model = extractor_model
 
-        self.figure = plt.figure(figsize=toolkit.cm2inch((15 * scale, 11 * scale)))
+        self.figure = plt.figure(
+            figsize=toolkit.cm2inch((15 * scale, 11 * scale)))
         gs = self.figure.add_gridspec(5, 1)
         self.input_ax = self.figure.add_subplot(gs[0])
         self.activity_ax = self.figure.add_subplot(gs[1:-1])
@@ -86,7 +87,8 @@ class PlotCallback(tf.keras.callbacks.Callback):
         toolkit.apply_style(self.activity_ax, scale=self.scale)
 
         all_pred_np = tf.nn.softmax(
-            models.exp_convolve(all_prediction[self.batch_ind], axis=0, decay=0.8)
+            models.exp_convolve(
+                all_prediction[self.batch_ind], axis=0, decay=0.8)
         ).numpy()
         self.output_ax.plot(
             all_pred_np[:, 1], "r", alpha=0.7, lw=self.scale, label="Up"
@@ -178,9 +180,11 @@ def main(_):
     # then, if random number in 0-1 is lower that firing_rate in spike/ms, there is a
     # neuron spike at that ms
     # We remove the first 500 ms of lgn firing rates, which have shape (3000, 17400), to allow then reach the stationary
-    firing_rates = firing_rates[None, 500 : flags.seq_len + 500]  # (1,2500,17400)
+    firing_rates = firing_rates[None,
+                                500: flags.seq_len + 500]  # (1,2500,17400)
     # firing_rates = firing_rates[None, :]
 
+    # Build the network
     input_population, network, bkg, bkg_weights = load_fn(
         flags.n_input,
         flags.neurons,
@@ -192,97 +196,29 @@ def main(_):
         flags.neurons_per_output,
     )
 
-    # if flags.neurons > 51978:
-    #     n_core_neurons = 51978
-    #     _, core_network, _, _ = load_fn(
-    #         flags.n_input, n_core_neurons, True, flags.data_dir, flags.seed, flags.connected_selection, flags.n_output,
-    #         flags.neurons_per_output)
-    # core_mask = other_billeh_utils.isolate_core_neurons(network, data_dir=flags.data_dir)
-    # else:
-    #     n_core_neurons = flags.neurons
-    #     core_network = network
-    # core_mask = np.full(n_core_neurons, True)
-
-    # The following path is used to obtain all the currents targeting
-    # to 10 e23 neurons of each class. Still in development
-    full_selection_data_path = os.path.join(
-        path,
-        "Network_simulation_results",
-        "Input_current",
-        "e23_classification_base_keller.lzma",
+    # Create the model
+    model = models.create_model(
+        network,
+        input_population,
+        bkg_weights,
+        seq_len=flags.seq_len,
+        n_input=flags.n_input,
+        n_output=flags.n_output,
+        cue_duration=flags.recall_duration,
+        dtype=dtype,
+        input_weight_scale=input_weight_scale,
+        dampening_factor=flags.dampening_factor,
+        gauss_std=flags.gauss_std,
+        lr_scale=flags.lr_scale,
+        train_recurrent=flags.train_recurrent,
+        neuron_output=flags.neuron_output,
+        recurrent_dampening_factor=flags.recurrent_dampening_factor,
+        batch_size=flags.batch_size,
+        pseudo_gauss=flags.pseudo_gauss,
+        use_state_input=True,
+        return_state=True,
+        hard_reset=flags.hard_reset,
     )
-    if flags.output_currents and os.path.exists(full_selection_data_path):
-        model = models_output_currents.create_model(
-            network,
-            input_population,
-            bkg_weights,
-            full_selection_data_path,
-            seq_len=flags.seq_len,
-            n_input=flags.n_input,
-            n_output=flags.n_output,
-            cue_duration=flags.recall_duration,
-            dtype=dtype,
-            input_weight_scale=input_weight_scale,
-            dampening_factor=flags.dampening_factor,
-            gauss_std=flags.gauss_std,
-            lr_scale=flags.lr_scale,
-            train_recurrent=flags.train_recurrent,
-            neuron_output=flags.neuron_output,
-            recurrent_dampening_factor=flags.recurrent_dampening_factor,
-            batch_size=flags.batch_size,
-            pseudo_gauss=flags.pseudo_gauss,
-            use_state_input=True,
-            return_state=True,
-            hard_reset=flags.hard_reset,
-        )
-    elif flags.output_currents and not (os.path.exists(full_selection_data_path)):
-        full_selection_data_path = None
-        model = models_output_currents.create_model(
-            network,
-            input_population,
-            bkg_weights,
-            full_selection_data_path,
-            seq_len=flags.seq_len,
-            n_input=flags.n_input,
-            n_output=flags.n_output,
-            cue_duration=flags.recall_duration,
-            dtype=dtype,
-            input_weight_scale=input_weight_scale,
-            dampening_factor=flags.dampening_factor,
-            gauss_std=flags.gauss_std,
-            lr_scale=flags.lr_scale,
-            train_recurrent=flags.train_recurrent,
-            neuron_output=flags.neuron_output,
-            recurrent_dampening_factor=flags.recurrent_dampening_factor,
-            batch_size=flags.batch_size,
-            pseudo_gauss=flags.pseudo_gauss,
-            use_state_input=True,
-            return_state=True,
-            hard_reset=flags.hard_reset,
-        )
-    else:
-        model = models.create_model(
-            network,
-            input_population,
-            bkg_weights,
-            seq_len=flags.seq_len,
-            n_input=flags.n_input,
-            n_output=flags.n_output,
-            cue_duration=flags.recall_duration,
-            dtype=dtype,
-            input_weight_scale=input_weight_scale,
-            dampening_factor=flags.dampening_factor,
-            gauss_std=flags.gauss_std,
-            lr_scale=flags.lr_scale,
-            train_recurrent=flags.train_recurrent,
-            neuron_output=flags.neuron_output,
-            recurrent_dampening_factor=flags.recurrent_dampening_factor,
-            batch_size=flags.batch_size,
-            pseudo_gauss=flags.pseudo_gauss,
-            use_state_input=True,
-            return_state=True,
-            hard_reset=flags.hard_reset,
-        )
 
     model.build((flags.batch_size, flags.seq_len, flags.n_input))
 
@@ -305,7 +241,8 @@ def main(_):
     # Provides the opportunity to compute gradients wrt. membrane voltages at all time steps
     # Not important for general use
     zero_state = rsnn_layer.cell.zero_state(flags.batch_size)
-    dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
+    dummy_zeros = tf.zeros(
+        (flags.batch_size, flags.seq_len, flags.neurons), dtype)
     inputs = tf.zeros((flags.batch_size, flags.seq_len, flags.n_input), dtype)
     state = zero_state
 
