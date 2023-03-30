@@ -77,7 +77,9 @@ def load_network(
     r = np.sqrt(x**2 + z**2)
 
     # sel is a boolean array with True value in the indices of selected neurons
-    if connected_selection:  # this condition takes the n_neurons closest neurons
+    if  n_neurons is not None and n_neurons > 1000000:
+        raise ValueError("There are only 230924 neurons in the network")
+    elif connected_selection:  # this condition takes the n_neurons closest neurons
         sorted_ind = np.argsort(r)  # order according to radius distance
         sel = np.zeros(n_nodes, np.bool_)
         sel[sorted_ind[:n_neurons]] = True  # keep only the nearest n_neurons
@@ -86,7 +88,9 @@ def load_network(
     elif core_only:
         # 51,978 maximum value for n_neurons in this case
         sel = r < 400
-        if n_neurons is not None and n_neurons > 0:
+        if n_neurons is not None and n_neurons > 51978:
+            raise ValueError("There are only 51978 neurons in the core")
+        elif n_neurons is not None and n_neurons > 0:
             (inds,) = np.where(sel)  # indices where the condition is satisfied
             take_inds = rd.choice(inds, size=n_neurons, replace=False)
             sel[:] = False
