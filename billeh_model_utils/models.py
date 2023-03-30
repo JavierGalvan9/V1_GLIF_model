@@ -121,7 +121,8 @@ def exp_convolve(tensor, decay=0.8, reverse=False, initializer=None, axis=0):
     def scan_fun(_acc, _t):
         return _acc * decay + _t
 
-    filtered = tf.scan(scan_fun, tensor, reverse=reverse, initializer=initializer)
+    filtered = tf.scan(scan_fun, tensor, reverse=reverse,
+                       initializer=initializer)
 
     filtered = tf.transpose(filtered, perm)
     return filtered
@@ -142,29 +143,42 @@ class SparseLayer(tf.keras.layers.Layer):
         self._indices = indices
         self._weights = weights
         self._dense_shape = dense_shape
-        print(int(2**31 / weights.shape[0]))
-        # self._max_batch = int(2**31 / weights.shape[0]) #int(2**40 / weights.shape[0]) #int(2**31 / weights.shape[0])
-        self._max_batch = int(2**40 / weights.shape[0])
+        # Define a threshold that determines whether to compute the sparse
+        # matrix multiplication directly or split it into smaller batches.
+        # The value is calculated as the maximum number of rows that can be used
+        # in a sparse matrix multiplication operation without running into memory
+        # limitations on the device. The value 2**31 represents the maximum number
+        # of elements in a tensor that can be stored on most modern GPU devices, and
+        # weights.shape[0] is the number of rows in the sparse matrix.
+        self._max_batch = int(2**31 / weights.shape[0])
         self._dtype = dtype
         self._bkg_weights = bkg_weights
         self._lr_scale = lr_scale
 
     def call(self, inp):
         tf_shp = tf.unstack(tf.shape(inp))
-        shp = inp.shape.as_list()
+        shp = inp.shape.as_list()  # input shape at graph construction time
+        # replace any None values in the shape of inp with the actual values obtained
+        # from the input tensor at runtime (tf.shape(inp)).
+        # This is necessary because the SparseTensor multiplication operation requires
+        # a fully defined shape.
         for i, a in enumerate(shp):
             if a is None:
                 shp[i] = tf_shp[i]
 
         sparse_w_in = tf.sparse.SparseTensor(
             self._indices, self._weights, self._dense_shape
-        )
-        # print(sparse_w_in.shape) # (923696, 17400)
+        )  # (923696, 17400)
+        # (batch_size*sequence_length, input_dim)
         inp = tf.reshape(inp, (shp[0] * shp[1], shp[2]))
         # print(inp.shape) #(2500, 17400)
         # print(shp)#[1, 2500, 17400]
         # print(self._weights.shape) #(3506881,)
         # print(self._max_batch) #612
+        # By setting self._max_batch to this value, the code ensures that the input
+        # tensor is processed in smaller batches when its shape exceeds the maximum
+        # number of elements in a tensor.
+        # the sparse tensor multiplication can be directly performed
         if shp[0] * shp[1] < self._max_batch:
             input_current = tf.sparse.sparse_dense_matmul(
                 sparse_w_in, tf.cast(inp, tf.float32), adjoint_b=True
@@ -174,8 +188,9 @@ class SparseLayer(tf.keras.layers.Layer):
         else:
             _batch_size = shp[0] * shp[1]  # 2500
             _n_iter = tf.ones((), tf.int32)
-            # while _batch_size > self._max_batch:
-            for _i in tf.range(int(np.log(self._max_batch) * 2)):  # 12
+            while _batch_size > self._max_batch:
+                # This loop is used to determine the optimal batch size that is smaller than _max_batch.
+                # for _i in tf.range(int(np.log(self._max_batch) * 2)):  # 12
                 _sel = tf.greater(_batch_size, self._max_batch)  # True
                 _batch_size = tf.where(
                     _sel, tf.cast(_batch_size / 2, tf.int32), _batch_size
@@ -183,26 +198,48 @@ class SparseLayer(tf.keras.layers.Layer):
                 # _n_iter = tf.where(_sel, _n_iter + 1, _n_iter)
                 _n_iter = tf.where(
                     _sel, _n_iter * 2, _n_iter
-                )  # creo que esto es lo correcto
+                )
 
-            # _batch_size, _n_iter = 312, 4
-            results = tf.TensorArray(self._dtype, size=_n_iter)
+            # Initialize tensor array to store results
+            if _n_iter * _batch_size == tf.shape(inp)[0]:
+                results = tf.TensorArray(self._dtype, size=_n_iter)
+            else:
+                # if the division in mini batches does not cover the entire input, compute
+                # last smaller minibatch at the end
+                results = tf.TensorArray(self._dtype, size=_n_iter+1)
+
+            # Handle final part of input sequence if it does not fit into batches
+            if _n_iter * _batch_size < tf.shape(inp)[0]:
+                partial_input_current = tf.sparse.sparse_dense_matmul(
+                    sparse_w_in,
+                    tf.cast(inp[_n_iter * _batch_size:], tf.float32),
+                    adjoint_b=True,
+                )
+                partial_input_current = tf.cast(
+                    tf.transpose(partial_input_current), self._dtype)
+                # write _n_iter to the last position of the tensor array as a tensor
+                results = results.write(_n_iter, partial_input_current)
+
+            # Iterate over the input tensor in batches of size _batch_size
             for _i in tf.range(_n_iter):
                 partial_input_current = tf.sparse.sparse_dense_matmul(
                     sparse_w_in,
-                    tf.cast(inp[_i * _batch_size : (_i + 1) * _batch_size], tf.float32),
+                    tf.cast(inp[_i * _batch_size: (_i + 1)
+                            * _batch_size], tf.float32),
                     adjoint_b=True,
                 )
                 partial_input_current = tf.cast(
                     tf.transpose(partial_input_current), self._dtype
                 )
-                print(_i, partial_input_current.shape)
                 results = results.write(_i, partial_input_current)
-                _i += 1
+
             input_current = results.stack()
 
+        # Add background noise with 1-channel, 4kHz spike rate (with 1 kHz sampling rate)
+        bkg_spike_rate = 4
         rest_of_brain = tf.reduce_sum(
-            tf.cast(tf.random.uniform((shp[0], shp[1], 10)) < 0.1, self._compute_dtype),
+            tf.cast(tf.random.uniform(
+                (shp[0], shp[1], 10*bkg_spike_rate)) < 0.1, self._compute_dtype),
             -1,
         )
         noise_input = (
@@ -210,7 +247,8 @@ class SparseLayer(tf.keras.layers.Layer):
             * rest_of_brain[..., None]
             / 10.0
         )
-        input_current = tf.reshape(input_current, (shp[0], shp[1], -1)) + noise_input
+        input_current = tf.reshape(
+            input_current, (shp[0], shp[1], -1)) + noise_input
         return input_current
 
 
@@ -219,7 +257,8 @@ class SignedConstraint(tf.keras.constraints.Constraint):
         self._positive = positive
 
     def __call__(self, w):
-        sign_corrected_w = tf.where(self._positive, tf.nn.relu(w), -tf.nn.relu(-w))
+        sign_corrected_w = tf.where(
+            self._positive, tf.nn.relu(w), -tf.nn.relu(-w))
         return sign_corrected_w
 
 
@@ -229,7 +268,8 @@ class SparseSignedConstraint(tf.keras.constraints.Constraint):
         self._positive = positive
 
     def __call__(self, w):
-        sign_corrected_w = tf.where(self._positive, tf.nn.relu(w), -tf.nn.relu(-w))
+        sign_corrected_w = tf.where(
+            self._positive, tf.nn.relu(w), -tf.nn.relu(-w))
         return tf.where(self._mask, sign_corrected_w, tf.zeros_like(sign_corrected_w))
 
 
@@ -270,8 +310,10 @@ class BillehColumn(tf.keras.layers.Layer):
         # for the weights to be normalized when learning (weights are scaled similarly)
         voltage_scale = self._params["V_th"] - self._params["E_L"]
         voltage_offset = self._params["E_L"]
-        self._params["V_th"] = (self._params["V_th"] - voltage_offset) / voltage_scale
-        self._params["E_L"] = (self._params["E_L"] - voltage_offset) / voltage_scale
+        self._params["V_th"] = (self._params["V_th"] -
+                                voltage_offset) / voltage_scale
+        self._params["E_L"] = (self._params["E_L"] -
+                               voltage_offset) / voltage_scale
         self._params["V_reset"] = (
             self._params["V_reset"] - voltage_offset
         ) / voltage_scale
@@ -288,11 +330,8 @@ class BillehColumn(tf.keras.layers.Layer):
         self._dt = dt
         self._recurrent_dampening = recurrent_dampening_factor
         self._pseudo_gauss = pseudo_gauss
-
         self._lr_scale = lr_scale
-
         self._spike_gradient = spike_gradient
-
         self._hard_reset = hard_reset
 
         # n_receptors = network["node_params"]["tau_syn"].shape[
@@ -307,7 +346,8 @@ class BillehColumn(tf.keras.layers.Layer):
             self._params["C_m"] / self._params["g"]
         )  # determine the membrane time decay constant
         self._decay = np.exp(-dt / tau)
-        self._current_factor = 1 / self._params["C_m"] * (1 - self._decay) * tau
+        self._current_factor = 1 / \
+            self._params["C_m"] * (1 - self._decay) * tau
         # replace with nan values where the denominator is 0 for the following arrays
         self._syn_decay = np.where(
             np.array(self._params["tau_syn"]) == 0,
@@ -325,7 +365,8 @@ class BillehColumn(tf.keras.layers.Layer):
         # synapses: target_ids, source_ids, weights, delays
         # this are the axonal delays
         self.max_delay = int(
-            np.round(np.min([np.max(network["synapses"]["delays"]), max_delay]))
+            np.round(
+                np.min([np.max(network["synapses"]["delays"]), max_delay]))
         )
 
         self.state_size = (
@@ -363,6 +404,7 @@ class BillehColumn(tf.keras.layers.Layer):
         self.t_ref = _f(self._params["t_ref"])  # refractory time
         self.asc_amps = _f(self._params["asc_amps"], trainable=False)
         _k = self._params["k"]
+        # inverse sigmoid of the adaptation rate constant (1/ms)
         self.param_k, self.param_k_read = custom_val(_k, trainable=False)
         self.v_th = _f(self._params["V_th"])
         self.e_l = _f(self._params["E_L"])
@@ -399,7 +441,8 @@ class BillehColumn(tf.keras.layers.Layer):
         input_weights = (
             input_weights
             / voltage_scale[
-                self._node_type_ids[input_indices[:, 0] // self._max_n_receptors]
+                self._node_type_ids[input_indices[:, 0] //
+                                    self._max_n_receptors]
             ]
         )
         print(f"> Input synapses {len(input_indices)}")
@@ -422,6 +465,7 @@ class BillehColumn(tf.keras.layers.Layer):
         self.recurrent_weight_values = tf.Variable(
             weights * recurrent_weight_scale / lr_scale,
             name="sparse_recurrent_weights",
+            # to ensure that the weights always keep their sign
             constraint=SignedConstraint(self.recurrent_weight_positive),
             trainable=train_recurrent,
         )
@@ -459,7 +503,8 @@ class BillehColumn(tf.keras.layers.Layer):
         )
         input_current = tf.transpose(input_current)
 
-        input_current = tf.reshape(input_current, (shp[0], shp[1], 4 * self._n_neurons))
+        input_current = tf.reshape(
+            input_current, (shp[0], shp[1], 10 * self._n_neurons))
         return input_current
 
     def zero_state(self, batch_size, dtype=tf.float32):
@@ -467,14 +512,16 @@ class BillehColumn(tf.keras.layers.Layer):
         v0 = tf.ones((batch_size, self._n_neurons), dtype) * tf.cast(
             self.v_th * 0.0 + 1.0 * self.v_reset, dtype
         )
-        z0_buf = tf.zeros((batch_size, self._n_neurons * self.max_delay), dtype)
+        z0_buf = tf.zeros(
+            (batch_size, self._n_neurons * self.max_delay), dtype)
         r0 = tf.zeros((batch_size, self._n_neurons), dtype)
         asc_10 = tf.zeros((batch_size, self._n_neurons), dtype)
         asc_20 = tf.zeros((batch_size, self._n_neurons), dtype)
         psc_rise0 = tf.zeros(
             (batch_size, self._n_neurons * self._max_n_receptors), dtype
         )
-        psc0 = tf.zeros((batch_size, self._n_neurons * self._max_n_receptors), dtype)
+        psc0 = tf.zeros((batch_size, self._n_neurons *
+                        self._max_n_receptors), dtype)
         return z0_buf, v0, r0, asc_10, asc_20, psc_rise0, psc0
 
     def _gather(self, prop):
@@ -491,17 +538,21 @@ class BillehColumn(tf.keras.layers.Layer):
             state_input = tf.zeros((4,))
         if constants is not None:
             if self._spike_gradient:
-                external_current = inputs[:, : self._n_neurons * self._max_n_receptors]
-                state_input = inputs[:, self._n_neurons * self._max_n_receptors :]
+                external_current = inputs[:,
+                                          : self._n_neurons * self._max_n_receptors]
+                state_input = inputs[:, self._n_neurons *
+                                     self._max_n_receptors:]
             else:
-                external_current = inputs[:, : self._n_neurons * self._max_n_receptors]
-                state_input = inputs[:, self._n_neurons * self._max_n_receptors :]
+                external_current = inputs[:,
+                                          : self._n_neurons * self._max_n_receptors]
+                state_input = inputs[:, self._n_neurons *
+                                     self._max_n_receptors:]
                 state_input = tf.reshape(
-                    state_input, (batch_size, self._n_neurons, self._max_n_receptors)
+                    state_input, (batch_size, self._n_neurons,
+                                  self._max_n_receptors)
                 )
                 # state_input = tf.reshape(state_input, (batch_size, self._n_neurons, 4))
 
-        # external_current = inputs
         z_buf, v, r, asc_1, asc_2, psc_rise, psc = state
 
         shaped_z_buf = tf.reshape(
@@ -512,25 +563,26 @@ class BillehColumn(tf.keras.layers.Layer):
         psc_rise = tf.reshape(
             psc_rise, (batch_size, self._n_neurons, self._max_n_receptors)
         )
-        psc = tf.reshape(psc, (batch_size, self._n_neurons, self._max_n_receptors))
+        psc = tf.reshape(
+            psc, (batch_size, self._n_neurons, self._max_n_receptors))
 
-        dampened_z_buf = z_buf * self._recurrent_dampening
+        dampened_z_buf = z_buf * self._recurrent_dampening  # dampened version of z_buf
         rec_z_buf = (
             tf.stop_gradient(z_buf - dampened_z_buf) + dampened_z_buf
         )  # here we use tf.stop_gradient to prevent the term (z_buf - dampened_z_buf) to be trained
 
+        # Calculate the recurrent input current
         sparse_w_rec = tf.sparse.SparseTensor(
             self.recurrent_indices,
             self.recurrent_weight_values,
             self.recurrent_dense_shape,
         )
-
         i_rec = tf.sparse.sparse_dense_matmul(
             sparse_w_rec, tf.cast(rec_z_buf, tf.float32), adjoint_b=True
         )
         i_rec = tf.transpose(i_rec)
-
         rec_inputs = tf.cast(i_rec, self._compute_dtype)
+        # Add the external current to the recurrent current
         rec_inputs = tf.reshape(
             rec_inputs + external_current,
             (batch_size, self._n_neurons, self._max_n_receptors),
@@ -548,11 +600,13 @@ class BillehColumn(tf.keras.layers.Layer):
         new_r = tf.nn.relu(
             r + prev_z * self.t_ref - self._dt
         )  # =max(r + prev_z * self.t_ref - self._dt, 0)
-
+        # Calculate the ASC
         k = self.param_k_read()
         asc_amps = self.asc_amps
-        new_asc_1 = tf.exp(-self._dt * k[:, 0]) * asc_1 + prev_z * asc_amps[:, 0]
-        new_asc_2 = tf.exp(-self._dt * k[:, 1]) * asc_2 + prev_z * asc_amps[:, 1]
+        new_asc_1 = tf.exp(-self._dt * k[:, 0]) * \
+            asc_1 + prev_z * asc_amps[:, 0]
+        new_asc_2 = tf.exp(-self._dt * k[:, 1]) * \
+            asc_2 + prev_z * asc_amps[:, 1]
 
         if constants is not None and self._spike_gradient:
             input_current = tf.reduce_sum(psc, -1) + state_input
@@ -562,7 +616,7 @@ class BillehColumn(tf.keras.layers.Layer):
         decayed_v = self.decay * v
         gathered_g = self.param_g * self.e_l
         c1 = input_current + asc_1 + asc_2 + gathered_g
-
+        # Update the voltage according to the LIF equation and the refractory period
         if self._hard_reset:
             # Here we keep the voltage at the reset value during the refractory period
             new_v = tf.where(
@@ -590,7 +644,8 @@ class BillehColumn(tf.keras.layers.Layer):
                         v_sc, self._gauss_std, self._dampening_factor
                     )
                 else:
-                    new_z = spike_gauss(v_sc, self._gauss_std, self._dampening_factor)
+                    new_z = spike_gauss(
+                        v_sc, self._gauss_std, self._dampening_factor)
             else:
                 if self._compute_dtype == tf.float16:
                     new_z = spike_function_16(v_sc, self._dampening_factor)
@@ -604,15 +659,14 @@ class BillehColumn(tf.keras.layers.Layer):
         new_psc_rise = tf.reshape(
             new_psc_rise, (batch_size, self._n_neurons * self._max_n_receptors)
         )
-
-        # new_z = tf.cast(new_z, tf.float16)
-
+        # Add current spikes to the buffer
         new_shaped_z_buf = tf.concat((new_z[:, None], shaped_z_buf[:, :-1]), 1)
-        new_z_buf = tf.reshape(new_shaped_z_buf, (-1, self._n_neurons * self.max_delay))
+        new_z_buf = tf.reshape(
+            new_shaped_z_buf, (-1, self._n_neurons * self.max_delay))
 
         outputs = (
             new_z,
-            new_v * self.voltage_scale + self.voltage_offset,
+            new_v * self.voltage_scale + self.voltage_offset
             (input_current + new_asc_1 + new_asc_2) * self.voltage_scale,
         )
         new_state = (
@@ -629,8 +683,10 @@ class BillehColumn(tf.keras.layers.Layer):
 
 
 def huber_quantile_loss(u, tau, kappa):
-    branch_1 = tf.abs(tau - tf.cast(u <= 0, tf.float32)) / (2 * kappa) * tf.square(u)
-    branch_2 = tf.abs(tau - tf.cast(u <= 0, tf.float32)) * (tf.abs(u) - 0.5 * kappa)
+    branch_1 = tf.abs(tau - tf.cast(u <= 0, tf.float32)) / \
+        (2 * kappa) * tf.square(u)
+    branch_2 = tf.abs(tau - tf.cast(u <= 0, tf.float32)) * \
+        (tf.abs(u) - 0.5 * kappa)
     return tf.where(tf.abs(u) <= kappa, branch_1, branch_2)
 
 
@@ -676,7 +732,8 @@ class VoltageRegularization:
         v_pos = tf.square(tf.nn.relu(voltage_32 - 1.0))
         v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.0))
         voltage_loss = (
-            tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * self._voltage_cost
+            tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) *
+            self._voltage_cost
         )
         return voltage_loss
 
@@ -709,26 +766,29 @@ def create_model(
     hard_reset=True,
 ):
 
-    # Create the input of the model
+    # Create the input layer of the model
     x = tf.keras.layers.Input(
         shape=(
             seq_len,
             n_input,
         )
     )
+
     neurons = network["n_nodes"]
+    # Create an input layer for the initial state of the RNN
     state_input_holder = tf.keras.layers.Input(shape=(seq_len, neurons))
     state_input = tf.cast(
         tf.identity(state_input_holder), dtype
-    )  # tf.cast() changes the dtype
+    )  # casted version of state_input_holder
 
+    # If batch_size is not provided as an argument, it is automatically inferred from the
+    # first dimension of x using tf.shape().
     if batch_size is None:
-        batch_size = tf.shape(x)[
-            0
-        ]  # if batch_size is None just update after each seq_len
+        batch_size = tf.shape(x)[0]
     else:
         batch_size = batch_size
 
+    # Create the BillehColumn cell
     cell = BillehColumn(
         network,
         input_population,
@@ -745,18 +805,30 @@ def create_model(
         train_input=train_input,
         hard_reset=hard_reset,
     )
-
+    # initialize the RNN state to zero using the zero_state() method of the BillehColumn class.
     zero_state = cell.zero_state(batch_size, dtype)
     if use_state_input:
+        # The shape of each input tensor matches the shape of the corresponding
+        # tensor in the zero_state tuple, except for the batch dimension. The batch
+        # dimension is left unspecified, allowing the tensor to be fed variable-sized
+        # batches of data.
         initial_state_holder = tf.nest.map_structure(
             lambda _x: tf.keras.layers.Input(shape=_x.shape[1:]), zero_state
         )
-        rnn_initial_state = tf.nest.map_structure(tf.identity, initial_state_holder)
+        # The code then copies the input tensors into the rnn_initial_state variable
+        # using tf.nest.map_structure(). This creates a nested structure of tensors with
+        # the same shape as the original zero_state structure.
+        rnn_initial_state = tf.nest.map_structure(
+            tf.identity, initial_state_holder)
+        # In both cases, the code creates a constants tensor using tf.zeros_like() or
+        # tf.zeros(). This tensor is used to provide constant input to the RNN during
+        # computation. The shape of the constants tensor matches the batch_size.
         constants = tf.zeros_like(rnn_initial_state[0][:, 0], dtype)
     else:
         rnn_initial_state = zero_state
         constants = tf.zeros((batch_size,))
 
+    # Create the recurrent layer of the model
     rnn_inputs = SparseLayer(
         cell.input_indices,
         cell.input_weight_values,
@@ -767,13 +839,21 @@ def create_model(
         name="input_layer",
     )(x)
 
+    # Concatenate the input layer with the initial state of the RNN
     rnn_inputs = tf.cast(rnn_inputs, dtype)
     full_inputs = tf.concat((rnn_inputs, state_input), -1)
-
+    # Create the RNN layer of the model using the BillehColumn cell
+    # The RNN layer returns the output of the RNN layer and the final state of the RNN
+    # layer. The output of the RNN layer is a tensor of shape (batch_size, seq_len,
+    # neurons). The final state of the RNN layer is a tuple of tensors, each of shape
+    # (batch_size, neurons).
     rnn = tf.keras.layers.RNN(
         cell, return_sequences=True, return_state=return_state, name="rsnn"
     )
+    # Apply the rnn layer to the full_inputs tensor
     out = rnn(full_inputs, initial_state=rnn_initial_state, constants=constants)
+    # Check if the return_state argument is True or False and assign the output of the
+    # RNN layer to the hidden variable accordingly.
     if return_state:
         hidden = out[0]
         new_state = out[1:]
@@ -781,26 +861,46 @@ def create_model(
         hidden = out
     spikes = hidden[0]
     voltage = hidden[1]
+    # computes the mean of the spikes tensor along the second and third dimensions
+    # (which represent time and neurons),
     rate = tf.cast(tf.reduce_mean(spikes, (1, 2)), tf.float32)
 
+    # Create the output layer of the model
     if neuron_output:
+        # The output_spikes tensor is computed by taking a linear combination
+        # of the current spikes and the previous spikes, with the coefficients
+        # determined by the dampening_factor. This serves to reduce the volatility
+        # of the output spikes, making them more stable.
         output_spikes = 1 / dampening_factor * spikes + (
             1 - 1 / dampening_factor
         ) * tf.stop_gradient(spikes)
-        output = tf.gather(output_spikes, network["readout_neuron_ids"], axis=2)
+        # The output tensor is then computed by selecting the spikes from the
+        # output neurons and scaling them by a learned factor. The scale factor
+        # is computed using a softplus activation function applied to the output
+        # of a dense layer, and the threshold is computed by passing the output
+        # spikes through another dense layer.
+        output = tf.gather(
+            output_spikes, network["readout_neuron_ids"], axis=2)
         output = tf.reduce_mean(output, -1)
         scale = 1 + tf.nn.softplus(
             tf.keras.layers.Dense(1)(tf.zeros_like(output[:1, :1]))
         )
         thresh = tf.keras.layers.Dense(1)(tf.zeros_like(output))
         output = tf.stack([thresh[..., 0], output[..., -1]], -1) * scale
+    # If neuron_output is False, then the output tensor is simply the result of
+    # passing the spikes tensor through a dense layer with n_output units.
     else:
         output = tf.keras.layers.Dense(n_output, name="projection", trainable=True)(
             spikes
         )
-
+    # Finally, the output tensor is passed through a lambda layer which simply
+    # returns the tensor as is.
     output = tf.keras.layers.Lambda(lambda _a: _a, name="prediction")(output)
 
+    # If return_sequences is True, then the mean_output tensor is computed by
+    # averaging over sequences of length down_sample in the output tensor.
+    # Otherwise, mean_output is simply the mean of the last cue_duration time steps
+    # of the output tensor.
     if return_sequences:
         mean_output = tf.reshape(
             output, (-1, int(seq_len / down_sample), down_sample, n_output)
@@ -813,7 +913,8 @@ def create_model(
 
     if use_state_input:
         many_input_model = tf.keras.Model(
-            inputs=[x, state_input_holder, initial_state_holder], outputs=mean_output
+            inputs=[x, state_input_holder,
+                    initial_state_holder], outputs=mean_output
         )
     else:
         many_input_model = tf.keras.Model(
@@ -821,6 +922,7 @@ def create_model(
         )
 
     if add_metric:
+        # add the firing rate of the neurons as a metric to the model
         many_input_model.add_metric(rate, name="rate")
 
     return many_input_model
