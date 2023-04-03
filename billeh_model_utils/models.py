@@ -1,6 +1,11 @@
 import numpy as np
 import tensorflow as tf
 
+# Define a custom gradient for the spike function.
+# Diverse functions can be used to define the gradient.
+# Here we provide variations of this functions depending on
+# the gradient type and the precision of the input tensor.
+
 
 def gauss_pseudo(v_scaled, sigma, amplitude):
     return tf.math.exp(-tf.square(v_scaled) / tf.square(sigma)) * amplitude
@@ -15,14 +20,13 @@ def slayer_pseudo(v_scaled, sigma, amplitude):
 
 
 @tf.custom_gradient
-def spike_gauss_16(v_scaled, sigma, amplitude):
+def spike_gauss(v_scaled, sigma, amplitude):
     z_ = tf.greater(v_scaled, 0.0)
-    z_ = tf.cast(z_, tf.float16)
+    z_ = tf.cast(z_, tf.float32)
 
     def grad(dy):
         de_dz = dy
         dz_dv_scaled = gauss_pseudo(v_scaled, sigma, amplitude)
-
         de_dv_scaled = de_dz * dz_dv_scaled
 
         return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
@@ -31,13 +35,14 @@ def spike_gauss_16(v_scaled, sigma, amplitude):
 
 
 @tf.custom_gradient
-def spike_gauss(v_scaled, sigma, amplitude):
+def spike_gauss_16(v_scaled, sigma, amplitude):
     z_ = tf.greater(v_scaled, 0.0)
-    z_ = tf.cast(z_, tf.float32)
+    z_ = tf.cast(z_, tf.float16)
 
     def grad(dy):
         de_dz = dy
         dz_dv_scaled = gauss_pseudo(v_scaled, sigma, amplitude)
+
         de_dv_scaled = de_dz * dz_dv_scaled
 
         return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
@@ -143,6 +148,9 @@ class SparseLayer(tf.keras.layers.Layer):
         self._indices = indices
         self._weights = weights
         self._dense_shape = dense_shape
+        self._dtype = dtype
+        self._bkg_weights = bkg_weights
+        self._lr_scale = lr_scale
         # Define a threshold that determines whether to compute the sparse
         # matrix multiplication directly or split it into smaller batches.
         # The value is calculated as the maximum number of rows that can be used
@@ -151,9 +159,6 @@ class SparseLayer(tf.keras.layers.Layer):
         # of elements in a tensor that can be stored on most modern GPU devices, and
         # weights.shape[0] is the number of rows in the sparse matrix.
         self._max_batch = int(2**31 / weights.shape[0])
-        self._dtype = dtype
-        self._bkg_weights = bkg_weights
-        self._lr_scale = lr_scale
 
     def call(self, inp):
         tf_shp = tf.unstack(tf.shape(inp))
@@ -169,71 +174,81 @@ class SparseLayer(tf.keras.layers.Layer):
         sparse_w_in = tf.sparse.SparseTensor(
             self._indices, self._weights, self._dense_shape
         )  # (923696, 17400)
+        sparse_w_in = tf.cast(sparse_w_in, self._compute_dtype)
         # (batch_size*sequence_length, input_dim)
         inp = tf.reshape(inp, (shp[0] * shp[1], shp[2]))
+        inp = tf.cast(inp, self._compute_dtype)
         # print(inp.shape) #(2500, 17400)
-        # print(shp)#[1, 2500, 17400]
+        print(shp)  # [1, 2500, 17400]
         # print(self._weights.shape) #(3506881,)
-        # print(self._max_batch) #612
+        print(self._max_batch)  # 612
         # By setting self._max_batch to this value, the code ensures that the input
         # tensor is processed in smaller batches when its shape exceeds the maximum
         # number of elements in a tensor.
         # the sparse tensor multiplication can be directly performed
         if shp[0] * shp[1] < self._max_batch:
             input_current = tf.sparse.sparse_dense_matmul(
-                sparse_w_in, tf.cast(inp, tf.float32), adjoint_b=True
+                sparse_w_in,
+                inp,
+                adjoint_b=True
             )
             input_current = tf.transpose(input_current)
-            input_current = tf.cast(input_current, self._dtype)
+            input_current = tf.cast(input_current, self._compute_dtype)
         else:
-            _batch_size = shp[0] * shp[1]  # 2500
-            _n_iter = tf.ones((), tf.int32)
-            while _batch_size > self._max_batch:
-                # This loop is used to determine the optimal batch size that is smaller than _max_batch.
-                # for _i in tf.range(int(np.log(self._max_batch) * 2)):  # 12
-                _sel = tf.greater(_batch_size, self._max_batch)  # True
-                _batch_size = tf.where(
-                    _sel, tf.cast(_batch_size / 2, tf.int32), _batch_size
-                )
-                # _n_iter = tf.where(_sel, _n_iter + 1, _n_iter)
-                _n_iter = tf.where(
-                    _sel, _n_iter * 2, _n_iter
-                )
+            print('Chunking input tensor into smaller batches.')
+            print(self._compute_dtype)
+            # Get the input shape and number of features
+            input_shape = tf.shape(inp)
+            num_features = input_shape[-1]
 
-            # Initialize tensor array to store results
-            if _n_iter * _batch_size == tf.shape(inp)[0]:
-                results = tf.TensorArray(self._dtype, size=_n_iter)
-            else:
-                # if the division in mini batches does not cover the entire input, compute
-                # last smaller minibatch at the end
-                results = tf.TensorArray(self._dtype, size=_n_iter+1)
+            # Compute the number of chunks required
+            num_chunks = tf.cast(
+                tf.math.ceil(input_shape[0] / self._max_batch), tf.int32)
+            print(num_chunks)
+            # Determine the number of elements to pad
+            num_pad_elements = num_chunks * self._max_batch - input_shape[0]
+            print(num_pad_elements)
+            # Pad the input tensor with zeros to ensure that its size is a multiple of max_batch
+            padded_input = tf.pad(inp, [(0, num_pad_elements), (0, 0)])
+            print(inp.shape)
+            print(padded_input.shape)
+            # Initialize a tensor array to hold the partial results
+            result_array = tf.TensorArray(
+                dtype=self._compute_dtype, size=num_chunks)
 
-            # Handle final part of input sequence if it does not fit into batches
-            if _n_iter * _batch_size < tf.shape(inp)[0]:
+            # Split the input tensor into smaller chunks
+            for i in tf.range(num_chunks):
+                start_idx = i * self._max_batch
+                # end_idx = tf.minimum((i + 1) * self._max_batch, input_shape[0])
+                end_idx = (i + 1) * self._max_batch
+                # chunk = inp[start_idx:end_idx]
+                chunk = padded_input[start_idx:end_idx]
+                chunk = tf.cast(chunk, self._compute_dtype)
+                print(i)
+                print(chunk.shape)
+                print(self._max_batch)
+                # print dtype of sparse_w_in
+                print(sparse_w_in.dtype)
+                print(chunk.dtype)
+                # Perform sparse_dense_matmul on the chunk
                 partial_input_current = tf.sparse.sparse_dense_matmul(
                     sparse_w_in,
-                    tf.cast(inp[_n_iter * _batch_size:], tf.float32),
+                    chunk,
                     adjoint_b=True,
                 )
                 partial_input_current = tf.cast(
-                    tf.transpose(partial_input_current), self._dtype)
-                # write _n_iter to the last position of the tensor array as a tensor
-                results = results.write(_n_iter, partial_input_current)
-
-            # Iterate over the input tensor in batches of size _batch_size
-            for _i in tf.range(_n_iter):
-                partial_input_current = tf.sparse.sparse_dense_matmul(
-                    sparse_w_in,
-                    tf.cast(inp[_i * _batch_size: (_i + 1)
-                            * _batch_size], tf.float32),
-                    adjoint_b=True,
+                    tf.transpose(partial_input_current), self._compute_dtype
                 )
-                partial_input_current = tf.cast(
-                    tf.transpose(partial_input_current), self._dtype
-                )
-                results = results.write(_i, partial_input_current)
+                # chunk_result = tf.sparse.sparse_dense_matmul(chunk, sparse_w_in)
 
-            input_current = results.stack()
+                # Store the partial result in the tensor array
+                # print the shape of result_array and partial_input_current
+                print(partial_input_current.shape)
+                result_array = result_array.write(i, partial_input_current)
+
+            # Concatenate the partial results to get the final result
+            input_current = result_array.concat()[:-num_pad_elements, :]
+            print(input_current.shape)
 
         # Add background noise with 1-channel, 4kHz spike rate (with 1 kHz sampling rate)
         bkg_spike_rate = 4
@@ -348,15 +363,15 @@ class BillehColumn(tf.keras.layers.Layer):
         self._decay = np.exp(-dt / tau)
         self._current_factor = 1 / \
             self._params["C_m"] * (1 - self._decay) * tau
-        # replace with nan values where the denominator is 0 for the following arrays
+        # replace with 0 values where the denominator is 0 for the following arrays
         self._syn_decay = np.where(
             np.array(self._params["tau_syn"]) == 0,
-            np.nan,
+            0,
             np.exp(-dt / np.array(self._params["tau_syn"])),
         )
         self._psc_initial = np.where(
             np.array(self._params["tau_syn"]) == 0,
-            np.nan,
+            0,
             np.e / np.array(self._params["tau_syn"]),
         )
         # self._syn_decay = np.exp(-dt / np.array(self._params["tau_syn"]))
@@ -577,8 +592,14 @@ class BillehColumn(tf.keras.layers.Layer):
             self.recurrent_weight_values,
             self.recurrent_dense_shape,
         )
+        # i_rec = tf.sparse.sparse_dense_matmul(
+        #     sparse_w_rec, tf.cast(rec_z_buf, tf.float32), adjoint_b=True
+        # )
+        # print the dtype of rec_z_buf and sparse_w_rec
+        print(rec_z_buf.dtype)
+        print(sparse_w_rec.dtype)
         i_rec = tf.sparse.sparse_dense_matmul(
-            sparse_w_rec, tf.cast(rec_z_buf, tf.float32), adjoint_b=True
+            tf.cast(sparse_w_rec, self._compute_dtype), tf.cast(rec_z_buf, self._compute_dtype), adjoint_b=True
         )
         i_rec = tf.transpose(i_rec)
         rec_inputs = tf.cast(i_rec, self._compute_dtype)
@@ -631,26 +652,26 @@ class BillehColumn(tf.keras.layers.Layer):
 
         normalizer = self.v_th - self.e_l
         v_sc = (new_v - self.v_th) / normalizer
-        new_z = spike_slayer(
-            v_sc, 5.0, 0.6
-        )  # If v_sc is greater than 0 then there is a spike
 
-        if False:
-            if self._pseudo_gauss:
-                if self._compute_dtype == tf.bfloat16:
-                    new_z = spike_function_b16(v_sc, self._dampening_factor)
-                elif self._compute_dtype == tf.float16:
-                    new_z = spike_gauss_16(
-                        v_sc, self._gauss_std, self._dampening_factor
-                    )
-                else:
-                    new_z = spike_gauss(
-                        v_sc, self._gauss_std, self._dampening_factor)
+        if self._pseudo_gauss:
+            if self._compute_dtype == tf.bfloat16:
+                new_z = spike_function_b16(v_sc, self._dampening_factor)
+            elif self._compute_dtype == tf.float16:
+                new_z = spike_gauss_16(
+                    v_sc, self._gauss_std, self._dampening_factor
+                )
             else:
-                if self._compute_dtype == tf.float16:
-                    new_z = spike_function_16(v_sc, self._dampening_factor)
-                else:
-                    new_z = spike_function(v_sc, self._dampening_factor)
+                new_z = spike_gauss(
+                    v_sc, self._gauss_std, self._dampening_factor)
+        else:
+            if self._compute_dtype == tf.float16:
+                new_z = spike_function_16(v_sc, self._dampening_factor)
+            else:
+                new_z = spike_function(v_sc, self._dampening_factor)
+
+        # new_z = spike_slayer(
+        #     v_sc, 5.0, 0.6
+        # )  # If v_sc is greater than 0 then there is a spike
 
         new_z = tf.where(new_r > 0.0, tf.zeros_like(new_z), new_z)
         new_psc = tf.reshape(
@@ -666,7 +687,7 @@ class BillehColumn(tf.keras.layers.Layer):
 
         outputs = (
             new_z,
-            new_v * self.voltage_scale + self.voltage_offset
+            new_v * self.voltage_scale + self.voltage_offset,
             (input_current + new_asc_1 + new_asc_2) * self.voltage_scale,
         )
         new_state = (
@@ -787,7 +808,7 @@ def create_model(
         batch_size = tf.shape(x)[0]
     else:
         batch_size = batch_size
-
+    print('Creating the Billeh column')
     # Create the BillehColumn cell
     cell = BillehColumn(
         network,
@@ -805,6 +826,7 @@ def create_model(
         train_input=train_input,
         hard_reset=hard_reset,
     )
+    print("BillehColumn created")
     # initialize the RNN state to zero using the zero_state() method of the BillehColumn class.
     zero_state = cell.zero_state(batch_size, dtype)
     if use_state_input:
@@ -839,6 +861,8 @@ def create_model(
         name="input_layer",
     )(x)
 
+    print("Sparse layer created")
+
     # Concatenate the input layer with the initial state of the RNN
     rnn_inputs = tf.cast(rnn_inputs, dtype)
     full_inputs = tf.concat((rnn_inputs, state_input), -1)
@@ -850,8 +874,12 @@ def create_model(
     rnn = tf.keras.layers.RNN(
         cell, return_sequences=True, return_state=return_state, name="rsnn"
     )
+
+    print("RNN layer created")
+
     # Apply the rnn layer to the full_inputs tensor
     out = rnn(full_inputs, initial_state=rnn_initial_state, constants=constants)
+    print("RNN layer applied")
     # Check if the return_state argument is True or False and assign the output of the
     # RNN layer to the hidden variable accordingly.
     if return_state:
@@ -865,7 +893,7 @@ def create_model(
     # (which represent time and neurons),
     rate = tf.cast(tf.reduce_mean(spikes, (1, 2)), tf.float32)
 
-    # Create the output layer of the model
+    # The neuron output option selects only the output neurons from the spikes tensor
     if neuron_output:
         # The output_spikes tensor is computed by taking a linear combination
         # of the current spikes and the previous spikes, with the coefficients

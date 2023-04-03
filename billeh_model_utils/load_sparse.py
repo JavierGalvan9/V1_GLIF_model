@@ -30,7 +30,7 @@ def load_network(
         d = pkl.load(f)  # d is a dictionary with 'nodes' and 'edges' keys
 
     # This file contains the data related to each neuron class.
-    # The nodes key is a list of 111 entries (one per neuron class) with the following information:
+    # The nodes key is a list of 201 entries (one per neuron class) with the following information:
     #  'ids' (bmtk indices of the class neurons): array([173915, 174530, 175234, ..., 230780], dtype=uint32)
     #  'params': {'asc_init': [0.0, 0.0],
     #             'V_th': -34.78002413066345,
@@ -54,9 +54,9 @@ def load_network(
     #             'weight': array([2.05360475e-07, 1.18761259e-20, 1.04067864e-12, ...,
     #                              3.33087865e-34, 1.26318969e-03, 1.20919572e-01])}
 
-    n_nodes = sum([len(a["ids"]) for a in d["nodes"]])  # 230924 total neurons
+    n_nodes = sum([len(a["ids"]) for a in d["nodes"]])  # 296991 total neurons
     n_edges = sum([len(a["source"])
-                  for a in d["edges"]])  # 70139111 total edges
+                  for a in d["edges"]])  # 150655767 total edges
     # max_delay = max([a['params']['delay'] for a in d['edges']])
 
     bmtk_id_to_tf_id = np.arange(n_nodes)
@@ -75,12 +75,12 @@ def load_network(
     y = np.array(h5_file["nodes"]["v1"]["0"]["y"])
     z = np.array(h5_file["nodes"]["v1"]["0"]["z"])
     # its a cylinder where the y variable is just the depth
-    r = np.sqrt(x**2 + z**2)
+    r = np.sqrt(x**2 + z**2)  # the maximum radius is 845
 
     # Select neurons to keep in the network
     # Check if the number of neurons is not too large
-    if n_neurons is not None and n_neurons > 1000000:
-        raise ValueError("There are only 230924 neurons in the network")
+    if n_neurons is not None and n_neurons > 296991:
+        raise ValueError("There are only 296991 neurons in the network")
     # this condition takes the n_neurons closest neurons to the origin
     elif connected_selection:
         sorted_ind = np.argsort(r)
@@ -90,8 +90,9 @@ def load_network(
     # this condition takes the n_neurons closest neurons to the origin (core)
     elif core_only:
         sel = r < 400
-        if n_neurons is not None and n_neurons > 51978:
-            raise ValueError("There are only 51978 neurons in the core")
+        if n_neurons is not None and n_neurons > 66634:
+            raise ValueError(
+                "There are only 66634 neurons in the network core")
         elif n_neurons is not None and n_neurons > 0:
             (inds,) = np.where(sel)
             take_inds = rd.choice(inds, size=n_neurons, replace=False)
@@ -166,9 +167,9 @@ def load_network(
         for k, v in node_params.items():
             # save in a dict the information of the nodes
             if k == "tau_syn":
-                tau_syns[np.array(node_type["ids"])] = len(
-                    node_type["params"][k])
-                v[i, : len(node_type["params"][k])] = node_type["params"][k]
+                n_receptors = len(node_type["params"][k])
+                tau_syns[tf_ids] = n_receptors
+                v[i, : n_receptors] = node_type["params"][k]
             else:
                 v[i] = node_type["params"][k]
 
@@ -513,7 +514,7 @@ def cached_load_billeh(
 if __name__ == "__main__":
     load_billeh(
         n_input=17400,
-        n_neurons=1574,
+        n_neurons=10000,  # 1574,
         core_only=True,
         data_dir="GLIF_network",
         seed=3000,

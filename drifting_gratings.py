@@ -1,19 +1,7 @@
-from plotting_utils import (
-    InputActivityFigure,
-    LaminarPlot,
-    LGN_sample_plot,
-    PopulationActivity,
-    RasterPlot,
-)
-import toolkit
-import other_billeh_utils
-import models
-import load_sparse
-from other_utils import memory_tracer, timer
-import file_management
+
+
 import json
 import os
-import sys
 from time import time
 
 import absl
@@ -22,12 +10,10 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
-parentDir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(parentDir, "general_utils"))
-
-sys.path.append(os.path.join(parentDir, "billeh_model_utils"))
-
-# import callbacks
+from general_utils import file_management
+from general_utils.other_utils import memory_tracer, timer
+from billeh_model_utils import load_sparse, models, other_billeh_utils, toolkit
+from billeh_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
 # import data_sets
 
 
@@ -143,7 +129,12 @@ def main(_):
             tf.config.experimental.set_memory_growth(dev, True)
     except:
         # Invalid device or cannot modify virtual devices once initialized.
+        print("Invalid device or cannot modify virtual devices once initialized.")
         pass
+
+    for gpu in physical_devices:
+        print("GPU:", gpu.name)
+        print("Memory capacity:", gpu.memory_limit)
 
     # Can be used to try half precision training
     if flags.float16:
