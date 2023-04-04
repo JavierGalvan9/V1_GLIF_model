@@ -1,6 +1,12 @@
 biorealistic-v1-model
 bmtk
 GLIF_network
+GLIF_network/input/Full_field_flash
+GLIF_network/tiny_network
+GLIF_network/input_dat.pkl
+GLIF_network/network_dat.pkl
+GLIF_network/garrett_firing_rates.pkl
+GLIF_network/network
 *.ipynb*
 billeh_model_utils/__pycache__
 billeh_model_utils/.cache
@@ -8,3 +14,6 @@ general_utils/__pycache__
 Simulation_results
 Error
 Out
+requirements.txt
+requirements.yml
+drifting_gratings.sh
