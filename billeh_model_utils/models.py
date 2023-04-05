@@ -159,6 +159,7 @@ class SparseLayer(tf.keras.layers.Layer):
         # of elements in a tensor that can be stored on most modern GPU devices, and
         # weights.shape[0] is the number of rows in the sparse matrix.
         self._max_batch = int(2**31 / weights.shape[0])
+        print('The maximum batch size is: ', self._max_batch)
 
     def call(self, inp):
         tf_shp = tf.unstack(tf.shape(inp))
@@ -178,10 +179,6 @@ class SparseLayer(tf.keras.layers.Layer):
         # (batch_size*sequence_length, input_dim)
         inp = tf.reshape(inp, (shp[0] * shp[1], shp[2]))
         inp = tf.cast(inp, self._compute_dtype)
-        # print(inp.shape) #(2500, 17400)
-        print(shp)  # [1, 2500, 17400]
-        # print(self._weights.shape) #(3506881,)
-        print(self._max_batch)  # 612
         # By setting self._max_batch to this value, the code ensures that the input
         # tensor is processed in smaller batches when its shape exceeds the maximum
         # number of elements in a tensor.
@@ -196,40 +193,34 @@ class SparseLayer(tf.keras.layers.Layer):
             input_current = tf.cast(input_current, self._compute_dtype)
         else:
             print('Chunking input tensor into smaller batches.')
-            print(self._compute_dtype)
             # Get the input shape and number of features
             input_shape = tf.shape(inp)
             num_features = input_shape[-1]
-
             # Compute the number of chunks required
             num_chunks = tf.cast(
                 tf.math.ceil(input_shape[0] / self._max_batch), tf.int32)
-            print(num_chunks)
+            print('The number of chunks is: ', num_chunks)
             # Determine the number of elements to pad
             num_pad_elements = num_chunks * self._max_batch - input_shape[0]
-            print(num_pad_elements)
             # Pad the input tensor with zeros to ensure that its size is a multiple of max_batch
             padded_input = tf.pad(inp, [(0, num_pad_elements), (0, 0)])
-            print(inp.shape)
-            print(padded_input.shape)
             # Initialize a tensor array to hold the partial results
             result_array = tf.TensorArray(
                 dtype=self._compute_dtype, size=num_chunks)
-
             # Split the input tensor into smaller chunks
             for i in tf.range(num_chunks):
+                print('Processing chunk: ', i, ' of ', num_chunks, '.')
+                # print the memory consumption at this point
+                if tf.config.list_physical_devices('GPU'):
+                    # Returns a dict in the form {'current': <current mem usage>,
+                    #                             'peak': <peak mem usage>}
+                    mem = tf.config.experimental.get_memory_info('GPU:0')
+                    print('Memory consumption: ', mem)
+
                 start_idx = i * self._max_batch
-                # end_idx = tf.minimum((i + 1) * self._max_batch, input_shape[0])
                 end_idx = (i + 1) * self._max_batch
-                # chunk = inp[start_idx:end_idx]
                 chunk = padded_input[start_idx:end_idx]
                 chunk = tf.cast(chunk, self._compute_dtype)
-                print(i)
-                print(chunk.shape)
-                print(self._max_batch)
-                # print dtype of sparse_w_in
-                print(sparse_w_in.dtype)
-                print(chunk.dtype)
                 # Perform sparse_dense_matmul on the chunk
                 partial_input_current = tf.sparse.sparse_dense_matmul(
                     sparse_w_in,
@@ -239,11 +230,8 @@ class SparseLayer(tf.keras.layers.Layer):
                 partial_input_current = tf.cast(
                     tf.transpose(partial_input_current), self._compute_dtype
                 )
-                # chunk_result = tf.sparse.sparse_dense_matmul(chunk, sparse_w_in)
-
                 # Store the partial result in the tensor array
                 # print the shape of result_array and partial_input_current
-                print(partial_input_current.shape)
                 result_array = result_array.write(i, partial_input_current)
 
             # Concatenate the partial results to get the final result

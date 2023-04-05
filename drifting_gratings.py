@@ -132,10 +132,6 @@ def main(_):
         print("Invalid device or cannot modify virtual devices once initialized.")
         pass
 
-    for gpu in physical_devices:
-        print("GPU:", gpu.name)
-        print("Memory capacity:", gpu.memory_limit)
-
     # Can be used to try half precision training
     if flags.float16:
         policy = mixed_precision.Policy("mixed_float16")
