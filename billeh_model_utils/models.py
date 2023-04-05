@@ -212,10 +212,11 @@ class SparseLayer(tf.keras.layers.Layer):
                 print('Processing chunk: ', i, ' of ', num_chunks, '.')
                 # print the memory consumption at this point
                 if tf.config.list_physical_devices('GPU'):
-                    # Returns a dict in the form {'current': <current mem usage>,
-                    #                             'peak': <peak mem usage>}
-                    mem = tf.config.experimental.get_memory_info('GPU:0')
-                    print('Memory consumption: ', mem)
+                    config = tf.compat.v1.ConfigProto()
+                    config.gpu_options.allow_growth = True
+                    with tf.compat.v1.Session(config=config) as sess:
+                        stats = tf.contrib.memory_stats.BytesInUse()
+                        print(sess.run(stats))
 
                 start_idx = i * self._max_batch
                 end_idx = (i + 1) * self._max_batch
