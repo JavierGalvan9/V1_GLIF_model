@@ -1,5 +1,6 @@
 import numpy as np
 import tensorflow as tf
+import psutil
 
 # Define a custom gradient for the spike function.
 # Diverse functions can be used to define the gradient.
@@ -145,112 +146,115 @@ class SparseLayer(tf.keras.layers.Layer):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self._indices = indices
-        self._weights = weights
-        self._dense_shape = dense_shape
+        # self._indices = indices
+        # self._weights = weights
+        # self._dense_shape = dense_shape
         self._dtype = dtype
         self._bkg_weights = bkg_weights
         self._lr_scale = lr_scale
+        self._sparse_w_in = tf.sparse.SparseTensor(
+            self._indices, tf.cast(
+                self._weights, self._dtype), self._dense_shape
+        )
+
         # Define a threshold that determines whether to compute the sparse
         # matrix multiplication directly or split it into smaller batches.
         # The value is calculated as the maximum number of rows that can be used
         # in a sparse matrix multiplication operation without running into memory
-        # limitations on the device. The value 2**31 represents the maximum number
+        # limitations on the device. The value 2**32 represents 4GB the maximum number
         # of elements in a tensor that can be stored on most modern GPU devices, and
         # weights.shape[0] is the number of rows in the sparse matrix.
         self._max_batch = int(2**31 / weights.shape[0])
         print('The maximum batch size is: ', self._max_batch)
 
     def call(self, inp):
-        tf_shp = tf.unstack(tf.shape(inp))
-        shp = inp.shape.as_list()  # input shape at graph construction time
         # replace any None values in the shape of inp with the actual values obtained
         # from the input tensor at runtime (tf.shape(inp)).
         # This is necessary because the SparseTensor multiplication operation requires
         # a fully defined shape.
-        for i, a in enumerate(shp):
-            if a is None:
-                shp[i] = tf_shp[i]
+        inp_shape = inp.get_shape().as_list()
+        shp = [dim if dim is not None else tf.shape(
+            inp)[i] for i, dim in enumerate(inp_shape)]
 
-        sparse_w_in = tf.sparse.SparseTensor(
-            self._indices, self._weights, self._dense_shape
-        )  # (923696, 17400)
-        sparse_w_in = tf.cast(sparse_w_in, self._compute_dtype)
+        # cast the weights to dtype
+        # self._weights = tf.cast(self._weights, self._dtype)
+        # sparse_w_in = tf.sparse.SparseTensor(
+        #     self._indices, self._weights, self._dense_shape
+        # )  # (923696, 17400)
+        inp = tf.cast(inp, self._compute_dtype)
         # (batch_size*sequence_length, input_dim)
         inp = tf.reshape(inp, (shp[0] * shp[1], shp[2]))
-        inp = tf.cast(inp, self._compute_dtype)
         # By setting self._max_batch to this value, the code ensures that the input
         # tensor is processed in smaller batches when its shape exceeds the maximum
         # number of elements in a tensor.
         # the sparse tensor multiplication can be directly performed
         if shp[0] * shp[1] < self._max_batch:
             input_current = tf.sparse.sparse_dense_matmul(
-                sparse_w_in,
+                self._sparse_w_in,
                 inp,
                 adjoint_b=True
             )
             input_current = tf.transpose(input_current)
-            input_current = tf.cast(input_current, self._compute_dtype)
         else:
-            print('Chunking input tensor into smaller batches.')
-            # Get the input shape and number of features
-            input_shape = tf.shape(inp)
-            num_features = input_shape[-1]
-            # Compute the number of chunks required
-            num_chunks = tf.cast(
-                tf.math.ceil(input_shape[0] / self._max_batch), tf.int32)
-            print('The number of chunks is: ', num_chunks)
-            # Determine the number of elements to pad
-            num_pad_elements = num_chunks * self._max_batch - input_shape[0]
-            # Pad the input tensor with zeros to ensure that its size is a multiple of max_batch
+            tf.print('Chunking input tensor into smaller batches.')
+            num_chunks = tf.cast(tf.math.ceil(
+                tf.shape(inp)[0] / self._max_batch), tf.int32)
+            num_pad_elements = num_chunks * self._max_batch - tf.shape(inp)[0]
             padded_input = tf.pad(inp, [(0, num_pad_elements), (0, 0)])
             # Initialize a tensor array to hold the partial results
             result_array = tf.TensorArray(
                 dtype=self._compute_dtype, size=num_chunks)
-            # Split the input tensor into smaller chunks
             for i in tf.range(num_chunks):
-                print('Processing chunk: ', i, ' of ', num_chunks, '.')
+                tf.print('Processing chunk:', i, 'of', num_chunks, '.')
+                # if tf.config.list_physical_devices('GPU'):
+                #     config = tf.compat.v1.ConfigProto()
+                #     config.gpu_options.allow_growth = True
+                #     with tf.compat.v1.Session(config=config) as sess:
+                #         stats = tf.contrib.memory_stats.BytesInUse()
+                #         print(sess.run(stats))
                 # print the memory consumption at this point
-                if tf.config.list_physical_devices('GPU'):
-                    config = tf.compat.v1.ConfigProto()
-                    config.gpu_options.allow_growth = True
-                    with tf.compat.v1.Session(config=config) as sess:
-                        stats = tf.contrib.memory_stats.BytesInUse()
-                        print(sess.run(stats))
+                process = psutil.Process()
+                mem = process.memory_info().rss / (1024**3)  # in GB
+                tf.print("Memory consumption in GB:", mem)
 
                 start_idx = i * self._max_batch
                 end_idx = (i + 1) * self._max_batch
                 chunk = padded_input[start_idx:end_idx]
                 chunk = tf.cast(chunk, self._compute_dtype)
-                # Perform sparse_dense_matmul on the chunk
                 partial_input_current = tf.sparse.sparse_dense_matmul(
-                    sparse_w_in,
-                    chunk,
-                    adjoint_b=True,
-                )
-                partial_input_current = tf.cast(
-                    tf.transpose(partial_input_current), self._compute_dtype
-                )
+                    self._sparse_w_in, chunk, adjoint_b=True)
+                partial_input_current = tf.transpose(partial_input_current)
                 # Store the partial result in the tensor array
                 # print the shape of result_array and partial_input_current
                 result_array = result_array.write(i, partial_input_current)
 
             # Concatenate the partial results to get the final result
             input_current = result_array.concat()[:-num_pad_elements, :]
-            print(input_current.shape)
+
+        input_current = tf.cast(input_current, self._compute_dtype)
 
         # Add background noise with 1-channel, 4kHz spike rate (with 1 kHz sampling rate)
-        bkg_spike_rate = 4
-        rest_of_brain = tf.reduce_sum(
-            tf.cast(tf.random.uniform(
-                (shp[0], shp[1], 10*bkg_spike_rate)) < 0.1, self._compute_dtype),
-            -1,
-        )
+        # bkg_spike_rate = 4
+        # rest_of_brain = tf.reduce_sum(
+        #     tf.cast(tf.random.uniform(
+        #         (shp[0], shp[1], 10*bkg_spike_rate)) < 0.1, self._compute_dtype),
+        #     -1,
+        # )
+
+        #  noise_input = (
+        #     tf.cast(self._bkg_weights[None, None], self._compute_dtype)
+        #     * rest_of_brain[..., None]
+        #     / 10.0
+        # )
+
+        # Add background noise with 1-channel, 4kHz spike rate without random sampling
+        rest_of_brain = tf.ones(
+            (shp[0], shp[1]), dtype=self._compute_dtype) * bkg_spike_rate
         noise_input = (
             tf.cast(self._bkg_weights[None, None], self._compute_dtype)
             * rest_of_brain[..., None]
-            / 10.0
         )
+
         input_current = tf.reshape(
             input_current, (shp[0], shp[1], -1)) + noise_input
         return input_current
@@ -584,9 +588,6 @@ class BillehColumn(tf.keras.layers.Layer):
         # i_rec = tf.sparse.sparse_dense_matmul(
         #     sparse_w_rec, tf.cast(rec_z_buf, tf.float32), adjoint_b=True
         # )
-        # print the dtype of rec_z_buf and sparse_w_rec
-        print(rec_z_buf.dtype)
-        print(sparse_w_rec.dtype)
         i_rec = tf.sparse.sparse_dense_matmul(
             tf.cast(sparse_w_rec, self._compute_dtype), tf.cast(rec_z_buf, self._compute_dtype), adjoint_b=True
         )
@@ -860,6 +861,10 @@ def create_model(
     # layer. The output of the RNN layer is a tensor of shape (batch_size, seq_len,
     # neurons). The final state of the RNN layer is a tuple of tensors, each of shape
     # (batch_size, neurons).
+    process = psutil.Process()
+    mem = process.memory_info().rss / (1024 * 1024)  # in MB
+    tf.print("Memory consumption:", mem)
+
     rnn = tf.keras.layers.RNN(
         cell, return_sequences=True, return_state=return_state, name="rsnn"
     )
@@ -868,6 +873,9 @@ def create_model(
 
     # Apply the rnn layer to the full_inputs tensor
     out = rnn(full_inputs, initial_state=rnn_initial_state, constants=constants)
+    process = psutil.Process()
+    mem = process.memory_info().rss / (1024 * 1024)  # in MB
+    tf.print("Memory consumption:", mem)
     print("RNN layer applied")
     # Check if the return_state argument is True or False and assign the output of the
     # RNN layer to the hidden variable accordingly.

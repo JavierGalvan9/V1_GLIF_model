@@ -256,7 +256,7 @@ def main(_):
     #                                                 save_core_only=True, compress_data=True,
     #                                                 dtype=np.float16)
     for trial in range(0, flags.n_simulations):
-        print("{trial}:new trial".format(trial=trial))
+        print('Simulation {}/{}'.format(trial, flags.n_simulations))
         inputs = (
             np.random.uniform(size=inputs.shape, low=0.0, high=1.0)
             < firing_rates * 0.001
@@ -264,7 +264,10 @@ def main(_):
         t_init_sim = time()
         out = extractor_model((inputs, dummy_zeros, state))
         time_per_sim += time() - t_init_sim
+        # print the time spend in the trial
+        print('Time spent in trial: {}'.format(time() - t_init_sim))
 
+        print('Saving data...')
         t_init_save = time()
         if flags.output_currents:
             z, v, input_current, recurrent_current, bottom_up_current = out[0][0]
@@ -288,8 +291,11 @@ def main(_):
         # SimulationData(simulation_data, trial)
         SimulationDataHDF5(simulation_data, trial)
         time_per_save += time() - t_init_save
+        print('Time spent saving trial: {}'.format(time() - t_init_save))
 
         state = out[0][1:]
+
+    print("Making plots...")
 
     # Save the simulation metadata
     time_per_sim /= flags.n_simulations
@@ -333,6 +339,8 @@ def main(_):
         data_dir=flags.data_dir,
     )
     Population_activity(z, plot_core_only=True, bin_size=10)
+
+    print('Done!')
 
     ### TRAINING ###
 
