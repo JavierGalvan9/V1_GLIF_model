@@ -16,8 +16,8 @@ def pseudo_derivative(v_scaled, dampening_factor):
     return dampening_factor * tf.maximum(1 - tf.abs(v_scaled), 0)
 
 
-def slayer_pseudo(v_scaled, sigma, amplitude):
-    return tf.math.exp(-sigma * tf.abs(v_scaled)) * amplitude
+# def slayer_pseudo(v_scaled, sigma, amplitude):
+#     return tf.math.exp(-sigma * tf.abs(v_scaled)) * amplitude
 
 
 @tf.custom_gradient
@@ -51,20 +51,20 @@ def spike_gauss_16(v_scaled, sigma, amplitude):
     return tf.identity(z_, name="spike_gauss"), grad
 
 
-@tf.custom_gradient
-def spike_slayer(v_scaled, sigma, amplitude):
-    z_ = tf.greater(v_scaled, 0.0)
-    z_ = tf.cast(z_, tf.float32)
+# @tf.custom_gradient
+# def spike_slayer(v_scaled, sigma, amplitude):
+#     z_ = tf.greater(v_scaled, 0.0)
+#     z_ = tf.cast(z_, tf.float32)
 
-    def grad(dy):
-        de_dz = dy
-        dz_dv_scaled = slayer_pseudo(v_scaled, sigma, amplitude)
+#     def grad(dy):
+#         de_dz = dy
+#         dz_dv_scaled = slayer_pseudo(v_scaled, sigma, amplitude)
 
-        de_dv_scaled = de_dz * dz_dv_scaled
+#         de_dv_scaled = de_dz * dz_dv_scaled
 
-        return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
+#         return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
 
-    return tf.identity(z_, name="spike_slayer"), grad
+#     return tf.identity(z_, name="spike_slayer"), grad
 
 
 @tf.custom_gradient
@@ -153,8 +153,7 @@ class SparseLayer(tf.keras.layers.Layer):
         self._bkg_weights = bkg_weights
         self._lr_scale = lr_scale
         self._sparse_w_in = tf.sparse.SparseTensor(
-            self._indices, tf.cast(
-                self._weights, self._dtype), self._dense_shape
+            indices, tf.cast(weights, self._dtype), dense_shape
         )
 
         # Define a threshold that determines whether to compute the sparse
@@ -206,12 +205,8 @@ class SparseLayer(tf.keras.layers.Layer):
                 dtype=self._compute_dtype, size=num_chunks)
             for i in tf.range(num_chunks):
                 tf.print('Processing chunk:', i, 'of', num_chunks, '.')
-                # if tf.config.list_physical_devices('GPU'):
-                #     config = tf.compat.v1.ConfigProto()
-                #     config.gpu_options.allow_growth = True
-                #     with tf.compat.v1.Session(config=config) as sess:
-                #         stats = tf.contrib.memory_stats.BytesInUse()
-                #         print(sess.run(stats))
+                if tf.config.list_physical_devices('GPU'):
+                    print(tf.config.experimental.get_memory_usage('GPU:0'))
                 # print the memory consumption at this point
                 process = psutil.Process()
                 mem = process.memory_info().rss / (1024**3)  # in GB
@@ -229,9 +224,9 @@ class SparseLayer(tf.keras.layers.Layer):
                 result_array = result_array.write(i, partial_input_current)
 
             # Concatenate the partial results to get the final result
-            input_current = result_array.concat()[:-num_pad_elements, :]
+            result_array = result_array.concat()[:-num_pad_elements, :]
 
-        input_current = tf.cast(input_current, self._compute_dtype)
+        input_current = tf.cast(result_array, self._compute_dtype)
 
         # Add background noise with 1-channel, 4kHz spike rate (with 1 kHz sampling rate)
         # bkg_spike_rate = 4
@@ -240,16 +235,22 @@ class SparseLayer(tf.keras.layers.Layer):
         #         (shp[0], shp[1], 10*bkg_spike_rate)) < 0.1, self._compute_dtype),
         #     -1,
         # )
-
-        #  noise_input = (
+        # noise_input = (
         #     tf.cast(self._bkg_weights[None, None], self._compute_dtype)
         #     * rest_of_brain[..., None]
         #     / 10.0
         # )
 
         # Add background noise with 1-channel, 4kHz spike rate without random sampling
-        rest_of_brain = tf.ones(
-            (shp[0], shp[1]), dtype=self._compute_dtype) * bkg_spike_rate
+        # rest_of_brain = tf.ones(
+        #     shape=(shp[0], shp[1]), dtype=self._compute_dtype)
+        # rest_of_brain = tf.multiply(rest_of_brain, bkg_spike_rate)
+        bkg_spike_rate = 4
+        rest_of_brain = tf.reduce_sum(
+            tf.cast(tf.random.uniform(
+                (shp[0], shp[1], bkg_spike_rate)) < 1, self._compute_dtype),
+            -1,
+        )
         noise_input = (
             tf.cast(self._bkg_weights[None, None], self._compute_dtype)
             * rest_of_brain[..., None]
@@ -492,7 +493,7 @@ class BillehColumn(tf.keras.layers.Layer):
             voltage_scale[self._node_type_ids], self._max_n_receptors
         )
         self.bkg_weights = tf.Variable(
-            bkg_weights * 10.0, name="rest_of_brain_weights", trainable=train_input
+            bkg_weights, name="rest_of_brain_weights", trainable=train_input
         )
 
     def compute_input_current(self, inp):

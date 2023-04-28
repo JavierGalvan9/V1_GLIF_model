@@ -126,6 +126,7 @@ def main(_):
     physical_devices = tf.config.list_physical_devices("GPU")
     try:
         for dev in physical_devices:
+            print(dev)
             tf.config.experimental.set_memory_growth(dev, True)
     except:
         # Invalid device or cannot modify virtual devices once initialized.

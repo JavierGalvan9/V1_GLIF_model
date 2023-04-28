@@ -155,7 +155,7 @@ def load_network(
     # give every selected node of a given node type an index according to tf ids
     node_type_ids = np.zeros(n_nodes, np.int64)
     # number of synaptic types per neuron
-    tau_syns = np.zeros(n_nodes, dtype=np.int32)
+    # tau_syns = np.zeros(n_nodes, dtype=np.int32)
     for i, node_type in enumerate(d["nodes"]):
         # get ALL the nodes of the given node type
         tf_ids = bmtk_id_to_tf_id[np.array(node_type["ids"])]
@@ -168,7 +168,7 @@ def load_network(
             # save in a dict the information of the nodes
             if k == "tau_syn":
                 n_receptors = len(node_type["params"][k])
-                tau_syns[tf_ids] = n_receptors
+                # tau_syns[tf_ids] = n_receptors
                 v[i, : n_receptors] = node_type["params"][k]
             else:
                 v[i] = node_type["params"][k]
@@ -220,7 +220,7 @@ def load_network(
         n_edges=n_edges,
         node_params=node_params,
         node_type_ids=node_type_ids,
-        tau_syns=tau_syns,
+        # tau_syns=tau_syns,
         synapses=dict(
             indices=indices, weights=weights, delays=delays, dense_shape=dense_shape
         ),
@@ -230,14 +230,14 @@ def load_network(
     return network
 
 
-# Here we load the 17400 neurons that act as input in the model
+# Here we load the input from the LGN units and the background noise
 def load_input(
     path="GLIF_network/network/input_dat.pkl",
     start=0,
     duration=3000,
     dt=1,
     bmtk_id_to_tf_id=None,
-    tau_syns=None,
+    max_n_receptors=None
 ):
     with open(path, "rb") as f:
         # d contains two populations (LGN and background inputs), each of them with two elements:
@@ -247,7 +247,6 @@ def load_input(
         # The second population (background) is only formed by the source index 0 (single background node)
         # and projects to all V1 neurons with 21 different edges types and weights
 
-    max_n_receptors = tau_syns.max()
     input_populations = []
     for idx, input_population in enumerate(d):
         post_indices = []
@@ -404,13 +403,17 @@ def load_billeh(
         seed=seed,
         connected_selection=connected_selection,
     )
+    max_n_receptors = int(
+        network["synapses"]["dense_shape"][0]
+        / network["synapses"]["dense_shape"][1]
+    )
     inputs = load_input(
         start=1000,
         duration=1000,
         dt=1,
         path=os.path.join(data_dir, "network/input_dat.pkl"),
         bmtk_id_to_tf_id=network["bmtk_id_to_tf_id"],
-        tau_syns=network["tau_syns"],
+        max_n_receptors=max_n_receptors
     )
     df = pd.read_csv(os.path.join(
         data_dir, "network/v1_node_types.csv"), delimiter=" ")
