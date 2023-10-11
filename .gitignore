@@ -1,10 +1,15 @@
 biorealistic-v1-model
 bmtk
-GLIF_network
 GLIF_network/input/Full_field_flash
+GLIF_network/input/Drifting_gratings
 GLIF_network/tiny_network
+GLIF_network/network_old
 GLIF_network/input_dat.pkl
 GLIF_network/network_dat.pkl
+GLIF_network/network_dat0.pkl
+GLIF_network/lgn_input_dat.pkl
+GLIF_network/bkg_input_dat.pkl
+GLIF_network/input_dat0.pkl
 GLIF_network/garrett_firing_rates.pkl
 GLIF_network/network
 *.ipynb*
@@ -17,3 +22,5 @@ Out
 requirements.txt
 requirements.yml
 drifting_gratings.sh
+input_data_extractor.py
+network_data_extractor.py
