@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib import patches
-from . import other_billeh_utils, toolkit
+from . import other_v1_utils, toolkit
 
 
 class InputActivityFigure:
@@ -280,7 +280,7 @@ class LaminarPlot:
         if plot_core_only:
             if self.n_neurons > 66634:
                 self.n_neurons = 66634
-            self.core_mask = other_billeh_utils.isolate_core_neurons(
+            self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, data_dir=self.data_dir
             )
         else:
@@ -306,11 +306,8 @@ class LaminarPlot:
             true_pop_names.append(node_type_id_to_pop_name[nid])
 
         # Select population names of neurons in the present network (core)
-        true_pop_names = np.array(true_pop_names)[network["tf_id_to_bmtk_id"]][
-            self.core_mask
-        ]
-        true_node_type_ids = node_type_ids[network["tf_id_to_bmtk_id"]
-                                           ][self.core_mask]
+        true_pop_names = np.array(true_pop_names)[network["tf_id_to_bmtk_id"]][self.core_mask]
+        true_node_type_ids = node_type_ids[network["tf_id_to_bmtk_id"]][self.core_mask]
 
         # Now order the pop_names according to their layer and type
         pop_orders = dict(
@@ -398,9 +395,8 @@ class LaminarPlot:
         #                                                       ] = other_id, readout_id
         ###########################
 
-        self.neuron_id_to_y = (
-            self.n_neurons - neuron_id_to_y
-        )  # plot the L1 top and L6 bottom
+        # plot the L1 top and L6 bottom
+        self.neuron_id_to_y = self.n_neurons - neuron_id_to_y  
 
     def __call__(self, ax, spikes):
         scale = self.scale
@@ -422,7 +418,7 @@ class LaminarPlot:
             if i % 2 != 0:
                 continue
             rect = patches.Rectangle(
-                (0, self.n_neurons - y - h), spikes.shape[1], h, color="gray", alpha=0.1
+                (0, self.n_neurons - y - h), seq_len, h, color="gray", alpha=0.1
             )
             ax.add_patch(rect)
 
@@ -471,9 +467,8 @@ class LaminarPlot:
         ###########################
         ax.plot([-1, -1], [-1, -1], ".", color="pink",
                 ms=6, alpha=0.9, label="Htr3a")
-        ax.plot(
-            [-1, -1], [-1, -1], ".", color="darkviolet", ms=6, alpha=0.9, label="Vip"
-        )
+        ax.plot([-1, -1], [-1, -1], ".", color="darkviolet", 
+                ms=6, alpha=0.9, label="Vip")
         ax.plot([-1, -1], [-1, -1], ".", color="g",
                 ms=6, alpha=0.9, label="Sst")
         ax.plot([-1, -1], [-1, -1], ".", color="b",
@@ -643,7 +638,7 @@ class PopulationActivity:
         if plot_core_only:
             if self.n_neurons > 66634:
                 self.n_neurons = 66634
-            self.core_mask = other_billeh_utils.isolate_core_neurons(
+            self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, data_dir=self.data_dir
             )
         else:

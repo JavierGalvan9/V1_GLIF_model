@@ -41,6 +41,20 @@ syn_weights = np.array(edges_h5_file["edges"]["v1_to_v1"]["0"]["syn_weight"])
 edges_df = pd.read_csv("GLIF_network/network/v1_v1_edge_types.csv", delimiter=" ")
 synaptic_models_path = os.path.join(data_dir, "components", "synaptic_models")
 
+path=os.path.join(data_dir, 'basis_function_weights.csv')
+basis_function_weights = pd.read_csv(path, index_col=0)
+for dyn_params in edges_df['dynamics_params'].unique():
+    try:
+        with open(os.path.join(synaptic_models_path, dyn_params)) as f:
+            synaptic_model_dict = json.load(f)
+        synaptic_type = dyn_params.split('.')[0]
+        synaptic_model_dict['tau_syn_weights'] = basis_function_weights.loc[synaptic_type].values.tolist()
+        # save the results in a new file
+        with open(os.path.join(synaptic_models_path, dyn_params), 'w') as f:
+            json.dump(synaptic_model_dict, f)
+    except:
+        pass
+
 for idx, (edge_type_id, edge_model, edge_delay) in edges_df[
     ["edge_type_id", "model_template", "delay"]
 ].iterrows():
@@ -58,8 +72,13 @@ for idx, (edge_type_id, edge_model, edge_delay) in edges_df[
     dynamic_params_json = edges_df["dynamics_params"].loc[idx]
     with open(os.path.join(synaptic_models_path, dynamic_params_json)) as f:
         synaptic_model_dict = json.load(f)
+
+    # get the name of the synaptic model by splitting the dynamic_params_json by the .json 
+    # and taking the first element
+    new_pop_dict["params"]["synaptic_model"] = dynamic_params_json.split(".")[0]
     new_pop_dict["params"]["receptor_type"] = synaptic_model_dict["receptor_type"]
+    new_pop_dict["params"]["tau_syn_weights"] = synaptic_model_dict["tau_syn_weights"]
     new_network["edges"].append(new_pop_dict)
 
-with open(os.path.join(data_dir, "new_network_dat.pkl"), "wb") as file:
+with open(os.path.join(data_dir, "network_dat.pkl"), "wb") as file:
     pkl.dump(new_network, file)

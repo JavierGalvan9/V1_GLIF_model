@@ -12,8 +12,8 @@ from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
 from general_utils import file_management
 from general_utils.other_utils import memory_tracer, timer
-from billeh_model_utils import load_sparse, models, other_billeh_utils, toolkit
-from billeh_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
+from v1_model_utils import load_sparse, models, other_v1_utils, toolkit
+from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
 # import data_sets
 
 
@@ -109,16 +109,30 @@ class PlotCallback(tf.keras.callbacks.Callback):
 # @memory_tracer
 def main(_):
     flags = absl.app.flags.FLAGS
+
     np.random.seed(flags.seed)
     tf.random.set_seed(flags.seed)
 
+    # Save the configuration of the model
+    # simulation_results_path = f'{flags.save_dir}/V1_{V1_neurons}_LM_{LM_neurons}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_interarea_weight_distribution_{flags.interarea_weight_distribution}'
+    simulation_results_path = f'{flags.save_dir}/V1_{flags.neurons}'
+    for name, value in flags.flag_values_dict().items():
+        if value != flags[name].default and name not in ['save_dir', 'v', 'verbosity', 'n_simulations', 'caching', 'neurons', 'gratings_orientation', 'gratings_frequency']:
+            simulation_results_path += f'_{name}_{value}'
+    simulation_results_path = os.path.join(simulation_results_path, f'orien_{flags.gratings_orientation}_freq_{flags.gratings_frequency}')
+    print('Simulation results path: ', simulation_results_path)
+
+    os.makedirs(simulation_results_path, exist_ok=True)
+    with open(os.path.join(simulation_results_path, 'flags_config.json'), 'w') as fp:
+        json.dump(flags.flag_values_dict(), fp)
+
     # flags.data_dir = os.path.join(os.path.dirname(os.getcwd()), flags.data_dir)
     # Create directory to save the simulation results
-    path = os.path.join(
-        flags.save_dir,
-        f"orien_{str(flags.gratings_orientation)}_freq_{str(flags.gratings_frequency)}_reverse_{str(flags.reverse)}_rec_{flags.neurons}",
-    )
-    os.makedirs(path, exist_ok=True)
+    # path = os.path.join(
+    #     flags.save_dir,
+    #     f"orien_{str(flags.gratings_orientation)}_freq_{str(flags.gratings_frequency)}_reverse_{str(flags.reverse)}_rec_{flags.neurons}",
+    # )
+    # os.makedirs(path, exist_ok=True)
     # with open(os.path.join(path,'flags_config.json'), 'w') as fp:
     #     json.dump(flags.flag_values_dict(), fp)
 
@@ -133,6 +147,8 @@ def main(_):
         print("Invalid device or cannot modify virtual devices once initialized.")
         pass
 
+    print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+
     # Can be used to try half precision training
     if flags.float16:
         policy = mixed_precision.Policy("mixed_float16")
@@ -141,54 +157,60 @@ def main(_):
     else:
         dtype = tf.float32
 
-    # Load data of Billeh et al. (2020) and select appropriate number of neurons and inputs
+    # Load model data and select appropriate number of neurons and inputs
     if flags.caching:
-        load_fn = load_sparse.cached_load_billeh
+        load_fn = load_sparse.cached_load_v1
     else:
-        load_fn = load_sparse.load_billeh
+        load_fn = load_sparse.load_v1
+
+    # load_fn = load_sparse.load_v1
+
+    # Build the network
+    # input_population, network, bkg, bkg_weights = load_fn(flags, flags.neurons)
+    network, lgn_input, bkg_input = load_fn(flags, flags.neurons)
+
+    print('Hell yeahhhhhhhhh!')
 
     input_weight_scale = 1.0
 
     ### MODEL INPUT ###
     lgn_firing_rates_filename = f"orientation_{str(flags.gratings_orientation)}&TF_{str(float(flags.gratings_frequency))}&SF_0.04&reverse_{str(flags.reverse)}&init_screen_dur_1.0&visual_flow_dur_1.0&end_screen_dur_1.0&min_value_-1&max_value_1&contrast_0.8&dt_0.001&height_120&width_240&init_gray_screen_False&end_gray_screen_False.lzma"
-
-    with open(
-        os.path.join(
-            flags.data_dir, "input", "Drifting_gratings", lgn_firing_rates_filename
-        ),
-        "rb",
-    ) as f:
+    with open(os.path.join(flags.data_dir, "input", "Drifting_gratings", lgn_firing_rates_filename), "rb") as f:
         firing_rates = file_management.load_lzma(f)
-
-    # lgn_firing_rates_filename = 'drifting_grating_firing_rates_2_0.pkl'
-    # with open(os.path.join(flags.data_dir,'input',lgn_firing_rates_filename), 'rb') as f:
-    #     firing_rates = pkl.load(f)
 
     # firing_rates are the probability of spikes/seconds so we convert that to spike/ms
     # then, if random number in 0-1 is lower that firing_rate in spike/ms, there is a
     # neuron spike at that ms
-    # We remove the first 500 ms of lgn firing rates, which have shape (3000, 17400), to allow then reach the stationary
-    firing_rates = firing_rates[None,
-                                500: flags.seq_len + 500]  # (1,2500,17400)
+    firing_rates = firing_rates[None, 500: flags.seq_len + 500]  # (1,2500,17400)
     # firing_rates = firing_rates[None, :]
 
-    # Build the network
-    input_population, network, bkg, bkg_weights = load_fn(
-        flags.n_input,
-        flags.neurons,
-        flags.core_only,
-        flags.data_dir,
-        flags.seed,
-        flags.connected_selection,
-        flags.n_output,
-        flags.neurons_per_output,
-    )
-
-    # Create the model
+    # Build the model
+    # model = models.create_model(
+    #     network,
+    #     input_population,
+    #     bkg_weights,
+    #     seq_len=flags.seq_len,
+    #     n_input=flags.n_input,
+    #     n_output=flags.n_output,
+    #     cue_duration=flags.recall_duration,
+    #     dtype=dtype,
+    #     input_weight_scale=input_weight_scale,
+    #     dampening_factor=flags.dampening_factor,
+    #     gauss_std=flags.gauss_std,
+    #     lr_scale=flags.lr_scale,
+    #     train_recurrent=flags.train_recurrent,
+    #     neuron_output=flags.neuron_output,
+    #     recurrent_dampening_factor=flags.recurrent_dampening_factor,
+    #     batch_size=flags.batch_size,
+    #     pseudo_gauss=flags.pseudo_gauss,
+    #     use_state_input=True,
+    #     return_state=True,
+    #     hard_reset=flags.hard_reset,
+    # )
     model = models.create_model(
         network,
-        input_population,
-        bkg_weights,
+        lgn_input,
+        bkg_input,
         seq_len=flags.seq_len,
         n_input=flags.n_input,
         n_output=flags.n_output,
@@ -249,19 +271,30 @@ def main(_):
         save_dtype = np.float16
     else:
         save_dtype = np.float32
-    data_path = os.path.join(path, "Data")
-    SimulationDataHDF5 = other_billeh_utils.SaveSimDataHDF5(
+    data_path = os.path.join(simulation_results_path, "Data")
+    SimulationDataHDF5 = other_v1_utils.SaveSimDataHDF5(
         flags, keys, data_path, network, save_core_only=True, dtype=save_dtype
     )
-    # SimulationData = other_billeh_utils.SaveSimData(flags, keys, data_path, network,
+    # SimulationData = other_v1_utils.SaveSimData(flags, keys, data_path, network,
     #                                                 save_core_only=True, compress_data=True,
     #                                                 dtype=np.float16)
     for trial in range(0, flags.n_simulations):
         print('Simulation {}/{}'.format(trial, flags.n_simulations))
-        inputs = (
-            np.random.uniform(size=inputs.shape, low=0.0, high=1.0)
-            < firing_rates * 0.001
-        ).astype(np.uint8)
+        # inputs = (
+        #     np.random.uniform(size=inputs.shape, low=0.0, high=1.0)
+        #     < firing_rates * 0.001
+        # ).astype(np.uint8)
+
+
+        import pickle as pkl
+        pkl_path = os.path.join(flags.data_dir, "input", 'spikes.pkl')
+        # read the pkl_path
+        with open(pkl_path, 'rb') as f:
+            inputs = pkl.load(f)
+
+
+
+        print('Inputs shape', inputs.shape)
         t_init_sim = time()
         out = extractor_model((inputs, dummy_zeros, state))
         time_per_sim += time() - t_init_sim
@@ -301,14 +334,16 @@ def main(_):
     # Save the simulation metadata
     time_per_sim /= flags.n_simulations
     time_per_save /= flags.n_simulations
-    metadata_path = os.path.join(path, "Simulation stats")
+    metadata_path = os.path.join(simulation_results_path, "Simulation stats")
     with open(metadata_path, "w") as out_file:
         out_file.write(f"Consumed time per simulation: {time_per_sim}\n")
         out_file.write(f"Consumed time saving: {time_per_save}\n")
+    
     # Make the plots
     raster_filename = "Raster_plot.png"
-    image_path = os.path.join(path, "Images general")
+    image_path = os.path.join(simulation_results_path, "Images general")
     os.makedirs(image_path, exist_ok=True)
+
     # Scatter plot the responses of both the core neurons of V1 and the LGN units
     graph = InputActivityFigure(
         network,
@@ -322,6 +357,7 @@ def main(_):
         plot_core_only=False,
     )
     graph(inputs, z)
+
     # Plot LGN units firing rates
     LGN_units = LGN_sample_plot(
         firing_rates,
@@ -332,6 +368,7 @@ def main(_):
         n_samples=2,
     )
     LGN_units()
+
     # Plot the mean firing rate of the population of neurons
     Population_activity = PopulationActivity(
         n_neurons=flags.neurons,
@@ -466,12 +503,8 @@ if __name__ == "__main__":
 
     absl.app.flags.DEFINE_integer("n_epochs", 20, "")
     absl.app.flags.DEFINE_integer("batch_size", 16, "")
-    absl.app.flags.DEFINE_integer(
-        "neurons", 1574, ""
-    )  # 230,924 to take all neurons, 51,978 to take only core neurons
-    absl.app.flags.DEFINE_integer(
-        "n_input", 17400, ""
-    )  # number of LGN filters in visual space (input population)
+    absl.app.flags.DEFINE_integer("neurons", 1574, "") #296991
+    absl.app.flags.DEFINE_integer("n_input", 17400, "")  
     absl.app.flags.DEFINE_integer("seq_len", 2500, "")
     absl.app.flags.DEFINE_integer("n_cues", 3, "")
     absl.app.flags.DEFINE_integer("recall_duration", 40, "")
