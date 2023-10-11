@@ -136,7 +136,7 @@ def exp_convolve(tensor, decay=0.8, reverse=False, initializer=None, axis=0):
 
 class BackgroundNoiseLayer(tf.keras.layers.Layer):
     def __init__(self, indices, weights, dense_shape, tau_syn_weights, 
-                 lr_scale=1., bkg_firing_rate=4, n_bkg_units=100, 
+                 lr_scale=1., bkg_firing_rate=250, n_bkg_units=100, 
                  dtype=tf.float32, **kwargs):
         super().__init__(**kwargs)
         self._dtype = dtype
