@@ -13,6 +13,8 @@ GLIF_network/bkg_input_dat.pkl
 GLIF_network/input_dat0.pkl
 GLIF_network/garrett_firing_rates.pkl
 GLIF_network/network
+GLIF_network/syn_id_to_syn_weights_dict.pkl
+GLIF_network/synaptic_models_to_syn_id_dict.pkl
 *.ipynb*
 v1_model_utils/__pycache__
 v1_model_utils/.cache

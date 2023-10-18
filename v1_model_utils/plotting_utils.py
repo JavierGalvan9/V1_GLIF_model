@@ -87,7 +87,7 @@ class InputActivityFigure:
             self.tightened = True
 
         self.figure.savefig(
-            os.path.join(self.images_dir, self.filename), dpi=300, transparent=True
+            os.path.join(self.images_dir, self.filename), dpi=300, transparent=False
         )
 
         return self.figure
@@ -160,7 +160,7 @@ class InputActivityFigureWithoutStimulus:
             self.tightened = True
 
         self.figure.savefig(
-            os.path.join(self.images_dir, self.filename), dpi=300, transparent=True
+            os.path.join(self.images_dir, self.filename), dpi=300, transparent=False
         )
 
         return self.figure

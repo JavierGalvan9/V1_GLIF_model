@@ -105,36 +105,24 @@ class PlotCallback(tf.keras.callbacks.Callback):
             )
 
 
-# @timer
-# @memory_tracer
 def main(_):
     flags = absl.app.flags.FLAGS
-
     np.random.seed(flags.seed)
     tf.random.set_seed(flags.seed)
 
-    # Save the configuration of the model
-    # simulation_results_path = f'{flags.save_dir}/V1_{V1_neurons}_LM_{LM_neurons}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_interarea_weight_distribution_{flags.interarea_weight_distribution}'
+    ### Create a path to save the model results based on the flags configuration
     simulation_results_path = f'{flags.save_dir}/V1_{flags.neurons}'
     for name, value in flags.flag_values_dict().items():
         if value != flags[name].default and name not in ['save_dir', 'v', 'verbosity', 'n_simulations', 'caching', 'neurons', 'gratings_orientation', 'gratings_frequency']:
             simulation_results_path += f'_{name}_{value}'
+    
     simulation_results_path = os.path.join(simulation_results_path, f'orien_{flags.gratings_orientation}_freq_{flags.gratings_frequency}')
+    os.makedirs(simulation_results_path, exist_ok=True)
     print('Simulation results path: ', simulation_results_path)
 
-    os.makedirs(simulation_results_path, exist_ok=True)
+    # Save the flags configuration in a JSON file
     with open(os.path.join(simulation_results_path, 'flags_config.json'), 'w') as fp:
         json.dump(flags.flag_values_dict(), fp)
-
-    # flags.data_dir = os.path.join(os.path.dirname(os.getcwd()), flags.data_dir)
-    # Create directory to save the simulation results
-    # path = os.path.join(
-    #     flags.save_dir,
-    #     f"orien_{str(flags.gratings_orientation)}_freq_{str(flags.gratings_frequency)}_reverse_{str(flags.reverse)}_rec_{flags.neurons}",
-    # )
-    # os.makedirs(path, exist_ok=True)
-    # with open(os.path.join(path,'flags_config.json'), 'w') as fp:
-    #     json.dump(flags.flag_values_dict(), fp)
 
     # Allow for memory growth (also to observe memory consumption)
     physical_devices = tf.config.list_physical_devices("GPU")
@@ -157,56 +145,25 @@ def main(_):
     else:
         dtype = tf.float32
 
-    # Load model data and select appropriate number of neurons and inputs
-    if flags.caching:
-        load_fn = load_sparse.cached_load_v1
-    else:
-        load_fn = load_sparse.load_v1
+    ### Load or create the network configuration
+    # if flags.caching:
+    #     load_fn = load_sparse.cached_load_v1
+    # else:
+    #     load_fn = load_sparse.load_v1
 
-    # load_fn = load_sparse.load_v1
-
-    # Build the network
-    # input_population, network, bkg, bkg_weights = load_fn(flags, flags.neurons)
+    load_fn = load_sparse.load_v1
     network, lgn_input, bkg_input = load_fn(flags, flags.neurons)
 
-    print('Hell yeahhhhhhhhh!')
-
-    input_weight_scale = 1.0
-
     ### MODEL INPUT ###
-    lgn_firing_rates_filename = f"orientation_{str(flags.gratings_orientation)}&TF_{str(float(flags.gratings_frequency))}&SF_0.04&reverse_{str(flags.reverse)}&init_screen_dur_1.0&visual_flow_dur_1.0&end_screen_dur_1.0&min_value_-1&max_value_1&contrast_0.8&dt_0.001&height_120&width_240&init_gray_screen_False&end_gray_screen_False.lzma"
+    lgn_firing_rates_filename = f"orientation_{str(flags.gratings_orientation)}&TF_{str(float(flags.gratings_frequency))}&SF_0.04&reverse_{str(flags.reverse)}&init_screen_dur_0.5&visual_flow_dur_2.5&end_screen_dur_0.0&min_value_-1&max_value_1&contrast_0.8&dt_0.001&height_80&width_120&init_gray_screen_True&end_gray_screen_False.lzma"
     with open(os.path.join(flags.data_dir, "input", "Drifting_gratings", lgn_firing_rates_filename), "rb") as f:
         firing_rates = file_management.load_lzma(f)
 
-    # firing_rates are the probability of spikes/seconds so we convert that to spike/ms
-    # then, if random number in 0-1 is lower that firing_rate in spike/ms, there is a
-    # neuron spike at that ms
-    firing_rates = firing_rates[None, 500: flags.seq_len + 500]  # (1,2500,17400)
-    # firing_rates = firing_rates[None, :]
+    # firing_rates are the probability of spikes/seconds so we generate the spikes at each timestep (1 ms)
+    # firing_rates = firing_rates[None, 500: flags.seq_len + 500]  # (1,2500,17400)
+    firing_rates = firing_rates[None, :]
 
-    # Build the model
-    # model = models.create_model(
-    #     network,
-    #     input_population,
-    #     bkg_weights,
-    #     seq_len=flags.seq_len,
-    #     n_input=flags.n_input,
-    #     n_output=flags.n_output,
-    #     cue_duration=flags.recall_duration,
-    #     dtype=dtype,
-    #     input_weight_scale=input_weight_scale,
-    #     dampening_factor=flags.dampening_factor,
-    #     gauss_std=flags.gauss_std,
-    #     lr_scale=flags.lr_scale,
-    #     train_recurrent=flags.train_recurrent,
-    #     neuron_output=flags.neuron_output,
-    #     recurrent_dampening_factor=flags.recurrent_dampening_factor,
-    #     batch_size=flags.batch_size,
-    #     pseudo_gauss=flags.pseudo_gauss,
-    #     use_state_input=True,
-    #     return_state=True,
-    #     hard_reset=flags.hard_reset,
-    # )
+    ### Build the model
     model = models.create_model(
         network,
         lgn_input,
@@ -216,7 +173,7 @@ def main(_):
         n_output=flags.n_output,
         cue_duration=flags.recall_duration,
         dtype=dtype,
-        input_weight_scale=input_weight_scale,
+        input_weight_scale=flags.input_weight_scale,
         dampening_factor=flags.dampening_factor,
         gauss_std=flags.gauss_std,
         lr_scale=flags.lr_scale,
@@ -499,6 +456,7 @@ if __name__ == "__main__":
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_float("gauss_std", 0.3, "")
     absl.app.flags.DEFINE_float("lr_scale", 1.0, "")
+    absl.app.flags.DEFINE_float('input_weight_scale', 1.0, "")
     absl.app.flags.DEFINE_float("input_f0", 0.2, "")
 
     absl.app.flags.DEFINE_integer("n_epochs", 20, "")
