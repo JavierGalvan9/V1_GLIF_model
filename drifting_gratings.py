@@ -164,6 +164,7 @@ def main(_):
     firing_rates = firing_rates[None, :]
 
     ### Build the model
+    t0 = time()
     model = models.create_model(
         network,
         lgn_input,
@@ -188,6 +189,8 @@ def main(_):
     )
 
     model.build((flags.batch_size, flags.seq_len, flags.n_input))
+
+    print('Model building', time()-t0)
 
     # Extract outputs of intermediate keras layers to get access to
     # spikes and membrane voltages of the model
@@ -232,24 +235,19 @@ def main(_):
     SimulationDataHDF5 = other_v1_utils.SaveSimDataHDF5(
         flags, keys, data_path, network, save_core_only=True, dtype=save_dtype
     )
-    # SimulationData = other_v1_utils.SaveSimData(flags, keys, data_path, network,
-    #                                                 save_core_only=True, compress_data=True,
-    #                                                 dtype=np.float16)
+
     for trial in range(0, flags.n_simulations):
         print('Simulation {}/{}'.format(trial, flags.n_simulations))
-        # inputs = (
-        #     np.random.uniform(size=inputs.shape, low=0.0, high=1.0)
-        #     < firing_rates * 0.001
-        # ).astype(np.uint8)
+        inputs = (
+            np.random.uniform(size=inputs.shape, low=0.0, high=1.0)
+            < firing_rates * 0.001
+        ).astype(np.uint8)
 
-
-        import pickle as pkl
-        pkl_path = os.path.join(flags.data_dir, "input", 'spikes.pkl')
-        # read the pkl_path
-        with open(pkl_path, 'rb') as f:
-            inputs = pkl.load(f)
-
-
+        # import pickle as pkl
+        # pkl_path = os.path.join(flags.data_dir, "input", 'spikes.pkl')
+        # # read the pkl_path
+        # with open(pkl_path, 'rb') as f:
+        #     inputs = pkl.load(f)
 
         print('Inputs shape', inputs.shape)
         t_init_sim = time()
