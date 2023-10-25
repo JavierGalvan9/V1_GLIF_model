@@ -8,7 +8,12 @@ import absl
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.mixed_precision import experimental as mixed_precision
+# from tensorflow.keras.mixed_precision import experimental as mixed_precision
+from packaging import version
+# check the version of tensorflow, and do the right thing.
+# if tf.__version__ < "2.4.0": # does not work wor 2.10.1.
+if version.parse(tf.__version__) < version.parse("2.4.0"):
+    from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
 from general_utils import file_management
 from general_utils.other_utils import memory_tracer, timer
@@ -139,8 +144,13 @@ def main(_):
 
     # Can be used to try half precision training
     if flags.float16:
-        policy = mixed_precision.Policy("mixed_float16")
-        mixed_precision.set_policy(policy)
+        # policy = mixed_precision.Policy("mixed_float16")
+        # mixed_precision.set_policy(policy)
+        if tf.__version__ < "2.4.0":
+            policy = mixed_precision.Policy("mixed_float16")
+            mixed_precision.set_policy(policy)
+        else:
+            tf.keras.mixed_precision.set_global_policy("mixed_float16")
         dtype = tf.float16
     else:
         dtype = tf.float32
