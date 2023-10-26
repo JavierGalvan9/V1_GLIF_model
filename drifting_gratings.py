@@ -3,7 +3,10 @@
 import json
 import os
 from time import time
+# measure time for library loading...
+start_time = time()
 
+import pickle as pkl
 import absl
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,7 +14,6 @@ import tensorflow as tf
 # from tensorflow.keras.mixed_precision import experimental as mixed_precision
 from packaging import version
 # check the version of tensorflow, and do the right thing.
-# if tf.__version__ < "2.4.0": # does not work wor 2.10.1.
 if version.parse(tf.__version__) < version.parse("2.4.0"):
     from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
@@ -294,56 +296,57 @@ def main(_):
 
         state = out[0][1:]
 
-    print("Making plots...")
 
-    # Save the simulation metadata
-    time_per_sim /= flags.n_simulations
-    time_per_save /= flags.n_simulations
-    metadata_path = os.path.join(simulation_results_path, "Simulation stats")
-    with open(metadata_path, "w") as out_file:
-        out_file.write(f"Consumed time per simulation: {time_per_sim}\n")
-        out_file.write(f"Consumed time saving: {time_per_save}\n")
+    # print("Making plots...")
+
+    # # Save the simulation metadata
+    # time_per_sim /= flags.n_simulations
+    # time_per_save /= flags.n_simulations
+    # metadata_path = os.path.join(simulation_results_path, "Simulation stats")
+    # with open(metadata_path, "w") as out_file:
+    #     out_file.write(f"Consumed time per simulation: {time_per_sim}\n")
+    #     out_file.write(f"Consumed time saving: {time_per_save}\n")
     
-    # Make the plots
-    raster_filename = "Raster_plot.png"
-    image_path = os.path.join(simulation_results_path, "Images general")
-    os.makedirs(image_path, exist_ok=True)
+    # # Make the plots
+    # raster_filename = "Raster_plot.png"
+    # image_path = os.path.join(simulation_results_path, "Images general")
+    # os.makedirs(image_path, exist_ok=True)
 
-    # Scatter plot the responses of both the core neurons of V1 and the LGN units
-    graph = InputActivityFigure(
-        network,
-        flags.data_dir,
-        image_path,
-        filename=raster_filename,
-        frequency=flags.gratings_frequency,
-        stimuli_init_time=500,
-        stimuli_end_time=1500,
-        reverse=flags.reverse,
-        plot_core_only=False,
-    )
-    graph(inputs, z)
+    # # Scatter plot the responses of both the core neurons of V1 and the LGN units
+    # graph = InputActivityFigure(
+    #     network,
+    #     flags.data_dir,
+    #     image_path,
+    #     filename=raster_filename,
+    #     frequency=flags.gratings_frequency,
+    #     stimuli_init_time=500,
+    #     stimuli_end_time=1500,
+    #     reverse=flags.reverse,
+    #     plot_core_only=False,
+    # )
+    # graph(inputs, z)
 
-    # Plot LGN units firing rates
-    LGN_units = LGN_sample_plot(
-        firing_rates,
-        inputs,
-        stimuli_init_time=500,
-        stimuli_end_time=1500,
-        images_dir=image_path,
-        n_samples=2,
-    )
-    LGN_units()
+    # # Plot LGN units firing rates
+    # LGN_units = LGN_sample_plot(
+    #     firing_rates,
+    #     inputs,
+    #     stimuli_init_time=500,
+    #     stimuli_end_time=1500,
+    #     images_dir=image_path,
+    #     n_samples=2,
+    # )
+    # LGN_units()
 
-    # Plot the mean firing rate of the population of neurons
-    Population_activity = PopulationActivity(
-        n_neurons=flags.neurons,
-        network=network,
-        image_path=image_path,
-        data_dir=flags.data_dir,
-    )
-    Population_activity(z, plot_core_only=True, bin_size=10)
+    # # Plot the mean firing rate of the population of neurons
+    # Population_activity = PopulationActivity(
+    #     n_neurons=flags.neurons,
+    #     network=network,
+    #     image_path=image_path,
+    #     data_dir=flags.data_dir,
+    # )
+    # Population_activity(z, plot_core_only=True, bin_size=10)
 
-    print('Done!')
+    # print('Done!')
 
     ### TRAINING ###
 
@@ -358,7 +361,99 @@ def main(_):
     # x_rand = rate_rd.uniform(size=flags.neurons)
     # target_firing_rates = np.sort(
     #     np.interp(x_rand, percentiles, sorted_firing_rates))
+    
+    # here is a special one for drifting gratings
+    with open(os.path.join(flags.data_dir, 'np_gratings_firing_rates.pkl'), 'rb') as f:
+        firing_rates = pkl.load(f)
 
+    # TODO: move this function definition to an appropriate place...
+    def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
+        sorted_firing_rates = np.sort(firing_rates)
+        percentiles = (np.arange(firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
+        rate_rd = np.random.RandomState(seed=rnd_seed)
+        x_rand = rate_rd.uniform(size=n_neurons)
+        target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
+        return target_firing_rates
+
+    for key, value in firing_rates.items():
+        # identify tne ids that are included in value["ids"]
+        neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
+        firing_rates[key]['neuron_ids'] = neuron_ids
+        type_n_neurons = len(neuron_ids)
+        firing_rates[key]['sorted_target_rates'] = sample_firing_rates(
+            value["rates"], type_n_neurons, flags.seed)
+    target_firing_rates = firing_rates
+    
+    rate_distribution_regularizer = models.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost)
+
+    zero_state = rsnn_layer.cell.zero_state(flags.batch_size)
+    state_variables = tf.nest.map_structure(lambda a: tf.Variable(
+        a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
+    ), zero_state)
+
+    train_loss = tf.keras.metrics.Mean()
+    val_loss = tf.keras.metrics.Mean()
+    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
+    val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
+    train_firing_rate = tf.keras.metrics.Mean()
+    val_firing_rate = tf.keras.metrics.Mean()
+
+    train_rate_loss = tf.keras.metrics.Mean()
+    val_rate_loss = tf.keras.metrics.Mean()
+    train_voltage_loss = tf.keras.metrics.Mean()
+    val_voltage_loss = tf.keras.metrics.Mean()
+
+    def reset_train_metrics():
+        train_loss.reset_states(), train_accuracy.reset_states(), train_firing_rate.reset_states()
+        train_rate_loss.reset_states(), train_voltage_loss.reset_states()
+
+    def reset_validation_metrics():
+        val_loss.reset_states(), val_accuracy.reset_states(), val_firing_rate.reset_states()
+        val_rate_loss.reset_states(), val_voltage_loss.reset_states()
+        
+
+    def roll_out(_x, _y, _w):
+        _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
+        # stt = time.time()
+        dummy_zeros = tf.zeros(
+            (flags.batch_size, flags.seq_len, flags.neurons), dtype)
+        _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
+        # print('roll out time: ', time.time() - stt)
+        _z, _v, _asc = _out[0]
+        voltage_32 = (tf.cast(_v, tf.float32) - rsnn_layer.cell.voltage_offset) / rsnn_layer.cell.voltage_scale
+        v_pos = tf.square(tf.nn.relu(voltage_32 - 1.))
+        v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.))
+        voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * flags.voltage_cost
+        rate_loss = rate_distribution_regularizer(_z)
+        # classification loss is turned off for now.
+        # classification_loss = compute_loss_gratings(_y, _z)
+        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss)
+        # _loss = classification_loss + rate_loss + voltage_loss
+        # _loss = rate_loss + voltage_loss
+        _loss = rate_loss
+        return _out, _p, _loss, _aux
+    
+
+    def train_step(_x, _y, _w):
+        # make it non-persistent once debugging is done
+        with tf.GradientTape(persistent=True) as tape:
+            _out, _p, _loss, _aux = roll_out(_x, _y, _w)
+
+        _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
+        with tf.control_dependencies([_op]):
+            _op = train_loss.update_state(_loss)
+        _rate = tf.reduce_mean(_out[0][0])
+        with tf.control_dependencies([_op]):
+            _op = train_firing_rate.update_state(_rate)
+        with tf.control_dependencies([_op]):
+            _op = train_rate_loss.update_state(_aux['rate_loss'])
+        with tf.control_dependencies([_op]):
+            _op = train_voltage_loss.update_state(_aux['voltage_loss'])
+
+        grad = tape.gradient(_loss, model.trainable_variables)
+        for g, v in zip(grad, model.trainable_variables):
+            with tf.control_dependencies([_op]):
+                _op = optimizer.apply_gradients([(g, v)])
     # # ---
     # # Training disrupts the firing properties of the model
     # # To counteract, two types of regularizations are used
@@ -367,22 +462,62 @@ def main(_):
     # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(
     #     target_firing_rates, flags.rate_cost)
     # # 2) Voltage regularization penalizes membrane voltages that are below resting potential or above threshold
-    # voltage_regularizer = models.VoltageRegularization(
-    #     rsnn_layer.cell, flags.voltage_cost)
+    voltage_regularizer = models.VoltageRegularization(
+        rsnn_layer.cell, flags.voltage_cost)
 
-    # rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
+    rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
     # voltage_loss = voltage_regularizer(rsnn_layer.output[1])
-    # model.add_loss(rate_loss)
-    # model.add_loss(voltage_loss)
-    # model.add_metric(rate_loss, name='rate_loss')
-    # model.add_metric(voltage_loss, name='voltage_loss')
+    voltage_loss = voltage_regularizer(rsnn_layer.output[2]) # perhaps 2?
+    model.add_loss(rate_loss)
+    model.add_loss(voltage_loss)
+    model.add_metric(rate_loss, name='rate_loss')
+    model.add_metric(voltage_loss, name='voltage_loss')
+
+    def calculate_delta_angle(stim_angle, tuning_angle):
+        # angle unit is degrees.
+        # this function calculates the difference between stim_angle and tuning_angle,
+        # but it is fine to have the opposite direction.
+        # so, delta angle is always between -90 and 90.
+        # they are both vector, so dimension matche is needed.
+        # stim_angle is a length of batch size
+        # tuning_angle is a length of n_neurons
+
+        # delta_angle = stim_angle - tuning_angle
+        delta_angle = tf.expand_dims(stim_angle, axis=1) - tuning_angle
+        delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
+        delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
+        # # do it twice to make sure
+        delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
+        delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
+        return delta_angle
 
     # def compute_loss(_target, _pred):
-    #     return loss_object(_target, _pred) / global_batch_size
+        # return loss_object(_target, _pred) / global_batch_size
+    def compute_loss_gratings(_y, _z):
+        delta_angle = calculate_delta_angle(_y, network["tuning_angles"])
+        # sum spikes in _z, and multiply with delta_angle.
+        sum_angle = tf.reduce_mean(_z, axis=[1]) * delta_angle
+        # make a huber loss for this.
+        # angle_loss = tf.keras.losses.Huber(delta=1, reduction=tf.keras.losses.Reduction.SUM)(sum_angle, tf.zeros_like(sum_angle))
+        angle_loss = tf.reduce_mean(tf.abs(sum_angle))
+        return angle_loss
 
     # # Adaptive learning rates
-    # optimizer = tf.keras.optimizers.Adam(flags.learning_rate)
+    optimizer = tf.keras.optimizers.Adam(flags.learning_rate)
     # model.compile(optimizer, compute_loss, metrics=['accuracy'])
+    model.compile(optimizer, compute_loss_gratings, metrics=['mse'])
+    
+    # loop to train model...
+    for i in range(10):
+        # input should be tf tensors, so let's make y and w.
+        # y is the stim_angle which is 0 in this case
+        # w is the duration of the stimulus which is 3000 in this case.
+        y = tf.constant([0], dtype=tf.float32)
+        w = tf.constant([3000], dtype=tf.float32)
+        train_step(inputs, y, w)  # (input, stim_angle, duration?)
+        print(f"step: {i}, loss: {train_loss.result()}")
+        
+        
 
     # # Restore weights from a checkpoint if desired
     # if flags.restore_from != '':
@@ -500,5 +635,11 @@ if __name__ == "__main__":
     absl.app.flags.DEFINE_boolean("visualize_test", False, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
     absl.app.flags.DEFINE_boolean("hard_reset", True, "")
+    # absl.app.flags.DEFINE_boolean("hard_reset", False, "")
 
+    print(f"--- Library loading took {time() - start_time} seconds ---")
+    # measure the run time for the main part
+    print(f"--- Main part started ---")
+    start_time = time()
     absl.app.run(main)
+    print(f"--- Main part run in {time() - start_time} seconds ---")
