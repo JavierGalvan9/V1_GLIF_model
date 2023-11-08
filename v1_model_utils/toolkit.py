@@ -61,3 +61,71 @@ def get_random_identifier(prefix='', length=4):
     sim_name = prefix + random_identifier
     return sim_name
 
+# def split_1(_s):
+#      l = []
+#      cc = ''
+#      for i in range(len(_s)):
+#          if _s[i] != ',':
+#              cc += _s[i]
+#          else:
+#              if cc.count('[') > 0 and cc.count(']') == 0:
+#                  cc += _s[i]
+#              else:
+#                  l.append(cc)
+#                  cc = ''
+#      if cc != '':
+#          l.append(cc)
+#      return l
+
+
+# def split_2(_s):
+#     l = []
+#     if _s.count('[') == 0:
+#         return [_s]
+#     else:
+#         sub = _s[_s.index('[') + 1:_s.index(']')]
+#         base = _s[:_s.index('[')]
+#         kk = sub.split(',')
+#         for tt in kk:
+#             if tt.count('-') > 0:
+#                 num_a = tt[:tt.index('-')]
+#                 num_b = tt[tt.index('-') + 1:]
+#                 digit_len = len(num_a)
+#                 assert len(num_a) == len(num_b)
+#                 l.extend([base + str(a).zfill(digit_len) for a in range(int(tt[:tt.index('-')]), int(tt[tt.index('-') + 1:]) + 1)])
+#             else:
+#                 l.append(base + tt)
+#     return l
+
+# def expand_slurm_nodes(_s):
+#     l = []
+#     l1 = split_1(_s)
+#     for a in l1:
+#         l.extend(split_2(a))
+#     return l
+
+
+# def get_tf_config_from_nodelist(node_list, port=12778):
+#     cluster = [a + ':' + str(port) for a in node_list]
+#     tf_config = dict(cluster=cluster, task=dict(type='worker', index=os.environ.get('SLURM_PROCID', 0)))
+#     return json.dumps(tf_config, indent=4)
+
+
+# def set_tf_config_from_slurm(port=12778):
+#     if 'SLURM_JOB_NODELIST' not in os.environ.keys():
+#         return 1, 0
+#     # print(f'using slurm job nodelist {os.environ["SLURM_JOB_NODELIST"]}')
+#     node_list = expand_slurm_nodes(os.environ['SLURM_JOB_NODELIST'])
+#     node_list = [a + 'i.juwels' for a in node_list if a.startswith('jwb')]
+#     cluster = dict(worker=[a + ':' + str(port) for a in node_list])
+#     task_id = int(os.environ['SLURM_PROCID'])
+#     new_tf_config = dict(cluster=cluster, task=dict(type='worker', index=task_id))
+#     tf_config_str = os.environ.get('TF_CONFIG', '')
+#     if tf_config_str == '':
+#         tf_config = dict()
+#     else:
+#         tf_config = json.loads(tf_config_str)
+#     for k, v in new_tf_config.items():
+#         tf_config[k] = v
+#     os.environ['TF_CONFIG'] = json.dumps(tf_config, indent=4)
+#     return len(node_list), task_id

@@ -20,6 +20,12 @@ from general_utils.other_utils import memory_tracer, timer
 from v1_model_utils import load_sparse, models, other_v1_utils, toolkit
 from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
 # import data_sets
+import stim_dataset
+
+from memory_profiler import profile
+from pympler.asizeof import asizeof, asized
+
+import sys
 
 
 class PlotCallback(tf.keras.callbacks.Callback):
@@ -110,10 +116,15 @@ class PlotCallback(tf.keras.callbacks.Callback):
             )
 
 
+
+@profile
 def main(_):
+    # Enable TensorFlow Profiler
+    tf.profiler.experimental.start('log_dir') 
     flags = absl.app.flags.FLAGS
     np.random.seed(flags.seed)
     tf.random.set_seed(flags.seed)
+    per_replica_batch_size = flags.batch_size
 
     ### Create a path to save the model results based on the flags configuration
     simulation_results_path = f'{flags.save_dir}/V1_{flags.neurons}'
@@ -124,6 +135,9 @@ def main(_):
     simulation_results_path = os.path.join(simulation_results_path, f'orien_{flags.gratings_orientation}_freq_{flags.gratings_frequency}')
     os.makedirs(simulation_results_path, exist_ok=True)
     print('Simulation results path: ', simulation_results_path)
+
+    # Enable TensorFlow Profiler
+    # tf.profiler.experimental.start(simulation_results_path) 
 
     # Save the flags configuration in a JSON file
     with open(os.path.join(simulation_results_path, 'flags_config.json'), 'w') as fp:
@@ -141,6 +155,7 @@ def main(_):
         pass
 
     print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+    # print(tf.config.list_physical_devices())
 
     # Can be used to try half precision training
     if flags.float16:
@@ -156,30 +171,37 @@ def main(_):
         dtype = tf.float32
 
     ### Load or create the network configuration
-    # if flags.caching:
-    #     load_fn = load_sparse.cached_load_v1
-    # else:
-    #     load_fn = load_sparse.load_v1
+    t0 = time()
+    if flags.caching:
+        load_fn = load_sparse.cached_load_v1
+    else:
+        load_fn = load_sparse.load_v1
 
-    load_fn = load_sparse.load_v1
     network, lgn_input, bkg_input = load_fn(flags, flags.neurons)
+    print(f"Model data loading, {time()-t0:.2f} seconds")
 
     ### MODEL INPUT ###
-    lgn_firing_rates_filename = f"orientation_{str(flags.gratings_orientation)}&TF_{str(float(flags.gratings_frequency))}&SF_0.04&reverse_{str(flags.reverse)}&init_screen_dur_0.5&visual_flow_dur_2.5&end_screen_dur_0.0&min_value_-1&max_value_1&contrast_0.8&dt_0.001&height_80&width_120&init_gray_screen_True&end_gray_screen_False.lzma"
-    with open(os.path.join(flags.data_dir, "input", "Drifting_gratings", lgn_firing_rates_filename), "rb") as f:
-        firing_rates = file_management.load_lzma(f)
+    # lgn_firing_rates_filename = f"orientation_{str(flags.gratings_orientation)}&TF_{str(float(flags.gratings_frequency))}&SF_0.04&reverse_{str(flags.reverse)}&init_screen_dur_0.5&visual_flow_dur_2.5&end_screen_dur_0.0&min_value_-1&max_value_1&contrast_0.8&dt_0.001&height_80&width_120&init_gray_screen_True&end_gray_screen_False.lzma"
+    # with open(os.path.join(flags.data_dir, "input", "Drifting_gratings", lgn_firing_rates_filename), "rb") as f:
+    #     firing_rates = file_management.load_lzma(f)
 
-    # firing_rates are the probability of spikes/seconds so we generate the spikes at each timestep (1 ms)
-    # firing_rates = firing_rates[None, 500: flags.seq_len + 500]  # (1,2500,17400)
-    firing_rates = firing_rates[None, :]
+    # # firing_rates are the probability of spikes/seconds so we generate the spikes at each timestep (1 ms)
+    # # firing_rates = firing_rates[None, 500: flags.seq_len + 500]  # (1,2500,17400)
+    # firing_rates = firing_rates[None, :]
 
     ### Build the model
+    if flags.neurons > 66634:
+        model_seq_len = 100
+    else:
+        model_seq_len = 600
+
     t0 = time()
     model = models.create_model(
         network,
         lgn_input,
         bkg_input,
-        seq_len=flags.seq_len,
+        # seq_len=flags.seq_len,
+        seq_len=model_seq_len,
         n_input=flags.n_input,
         n_output=flags.n_output,
         cue_duration=flags.recall_duration,
@@ -198,33 +220,55 @@ def main(_):
         hard_reset=flags.hard_reset,
     )
 
-    model.build((flags.batch_size, flags.seq_len, flags.n_input))
+    del lgn_input, bkg_input
 
-    print('Model building', time()-t0)
+    # model.build((flags.batch_size, flags.seq_len, flags.n_input))
+    model.build((flags.batch_size, model_seq_len, flags.n_input))
+    print(f"Model built in {time()-t0:.2f} seconds")
 
     # Extract outputs of intermediate keras layers to get access to
     # spikes and membrane voltages of the model
     rsnn_layer = model.get_layer("rsnn")
     prediction_layer = model.get_layer("prediction")
+    # These "dummy" zeros are injected to the models membrane voltage
+    # Provides the opportunity to compute gradients wrt. membrane voltages at all time steps
+    # Not important for general use
+    zero_state = rsnn_layer.cell.zero_state(flags.batch_size, dtype=dtype)
+    # dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
+    dummy_zeros = tf.zeros((flags.batch_size, model_seq_len, flags.neurons), dtype)
+
+    # state_variables = tf.nest.map_structure(lambda a: tf.Variable(
+    #     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ), zero_state)
 
     extractor_model = tf.keras.Model(
         inputs=model.inputs,
         outputs=[rsnn_layer.output, model.output[0], prediction_layer.output],
     )
+    extractor_model.evaluate = True
+    n_gpus_per_worker = 1
+    _steps_per_epoch = flags.steps_per_epoch
+
+    checkpoint = tf.train.Checkpoint(model=extractor_model)
+    if flags.restore_from != '':
+        checkpoint.restore(flags.restore_from)
+        print(f'Model parameters restored from {flags.restore_from}')
+
+    # define stimulus here. Ideally, I want to run 8 directions, and 10 repetitions.
+    data_set = stim_dataset.generate_drifting_grating_tuning(regular=True, seq_len=3000, pre_delay=500, post_delay=0).batch(per_replica_batch_size)
+    data_it = iter(data_set)
+
+    split_num = flags.seq_len // model_seq_len
+    if flags.seq_len % model_seq_len != 0:
+        raise ValueError(f"seq_len {flags.seq_len} is not divisible by model_seq_len {model_seq_len}")
 
     # Loss used for training (evidence accumulation is a classification task)
-    loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=False, reduction=tf.keras.losses.Reduction.SUM
-    )
-
-    # These "dummy" zeros are injected to the models membrane voltage
-    # Provides the opportunity to compute gradients wrt. membrane voltages at all time steps
-    # Not important for general use
-    zero_state = rsnn_layer.cell.zero_state(flags.batch_size)
-    dummy_zeros = tf.zeros(
-        (flags.batch_size, flags.seq_len, flags.neurons), dtype)
-    inputs = tf.zeros((flags.batch_size, flags.seq_len, flags.n_input), dtype)
-    state = zero_state
+    # loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+    #     from_logits=False, reduction=tf.keras.losses.Reduction.SUM
+    # )
+    
+    # inputs = tf.zeros((flags.batch_size, flags.seq_len, flags.n_input), dtype)
+    # state = zero_state
+    initial_state = zero_state
 
     time_per_sim = 0
     time_per_save = 0
@@ -232,8 +276,6 @@ def main(_):
         "z",
         "v",
         "input_current",
-        # "recurrent_current",
-        # "bottom_up_current",
         "z_lgn",
     ]
     # Select the dtype of the data saved
@@ -246,12 +288,14 @@ def main(_):
         flags, keys, data_path, network, save_core_only=True, dtype=save_dtype
     )
 
-    for trial in range(0, flags.n_simulations):
-        print('Simulation {}/{}'.format(trial, flags.n_simulations))
-        inputs = (
-            np.random.uniform(size=inputs.shape, low=0.0, high=1.0)
-            < firing_rates * 0.001
-        ).astype(np.uint8)
+    trial_num = -1
+    for i in range(1): #range(8):
+    # for trial in range(0, flags.n_simulations):
+        # print('Simulation {}/{}'.format(trial, flags.n_simulations))
+        # inputs = (
+        #     np.random.uniform(size=inputs.shape, low=0.0, high=1.0)
+        #     < firing_rates * 0.001
+        # ).astype(np.uint8)
 
         # import pickle as pkl
         # pkl_path = os.path.join(flags.data_dir, "input", 'spikes.pkl')
@@ -259,40 +303,68 @@ def main(_):
         # with open(pkl_path, 'rb') as f:
         #     inputs = pkl.load(f)
 
-        print('Inputs shape', inputs.shape)
+        t0 = time()
+        x, y, _, _ = next(data_it)
+        # print(f"Network size: {asizeof(x.numpy())/1024/1024} MB, {x.shape}")
+        # print(f"Network size: {asizeof(y.numpy())/1024/1024} MB")
+        # print(f"Network size: {asizeof(data_it)/1024/1024} MB")
+        angle = int(y[0][0])
+        if angle == 0:
+            trial_num += 1
+        savename = f'angle{angle}_trial{trial_num}'
+        print(f"***** Time: {time() - t0:.2f} s, lgn run {i}")
+
+        # print('Inputs shape', inputs.shape)
         t_init_sim = time()
-        out = extractor_model((inputs, dummy_zeros, state))
+        out = extractor_model((x[:, :model_seq_len, :], dummy_zeros, initial_state))
+        state = out[0][1:]
+        # out = extractor_model((inputs, dummy_zeros, state))
+        spike_output_all = [out[0][0][0]]
+        # save the output to a file for now, batch = 1
+        for i in range(1, split_num):
+            # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), out[1:])
+            # state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
+            print('\n Running split {}/{} ...'.format(i, split_num))
+            out = extractor_model((x[:, i*model_seq_len:(i+1)*model_seq_len, :], dummy_zeros, state))
+            spike_output_all.append(out[0][0][0])
+            state = out[0][1:]
+
+        # concateneate the output
+        spike_output_concat = tf.concat(spike_output_all, axis=1)
+
         time_per_sim += time() - t_init_sim
         # print the time spend in the trial
-        print('Time spent in trial: {}'.format(time() - t_init_sim))
+        print('Time spent in trial: {:.2f}'.format(time() - t_init_sim))
 
         print('Saving data...')
         t_init_save = time()
-        if flags.output_currents:
-            z, v, input_current, recurrent_current, bottom_up_current = out[0][0]
-            simulation_data = {
-                "z": z,
-                "v": v,
-                "input_current": input_current,
-                "recurrent_current": recurrent_current,
-                "bottom_up_current": bottom_up_current,
-                "z_lgn": inputs,
-            }
-        else:
-            z, v, input_current = out[0][0]
-            simulation_data = {
-                "z": z,
-                "v": v,
-                "input_current": input_current,
-                "z_lgn": inputs,
-            }
+        # if flags.output_currents:
+        #     z, v, input_current, recurrent_current, bottom_up_current = out[0][0]
+        #     simulation_data = {
+        #         "z": z,
+        #         "v": v,
+        #         "input_current": input_current,
+        #         "recurrent_current": recurrent_current,
+        #         "bottom_up_current": bottom_up_current,
+        #         "z_lgn": x,
+        #         # "z_lgn": inputs,
+        #     }
+        # else:
+        #     z, v, input_current = out[0][0]
+        #     simulation_data = {
+        #         "z": z,
+        #         "v": v,
+        #         "input_current": input_current,
+        #         "z_lgn": x,
+        #         # "z_lgn": inputs,
+        #     }
 
-        # SimulationData(simulation_data, trial)
-        SimulationDataHDF5(simulation_data, trial)
+        # # SimulationData(simulation_data, trial)
+        # SimulationDataHDF5(simulation_data, trial)
         time_per_save += time() - t_init_save
-        print('Time spent saving trial: {}'.format(time() - t_init_save))
+        print('Time spent saving trial: {:.2f}'.format(time() - t_init_save))
 
-        state = out[0][1:]
+        # state = out[0][1:]
 
     print("Making plots...")
 
@@ -310,38 +382,42 @@ def main(_):
     os.makedirs(image_path, exist_ok=True)
 
     # Scatter plot the responses of both the core neurons of V1 and the LGN units
-    graph = InputActivityFigure(
-        network,
-        flags.data_dir,
-        image_path,
-        filename=raster_filename,
-        frequency=flags.gratings_frequency,
-        stimuli_init_time=500,
-        stimuli_end_time=1500,
-        reverse=flags.reverse,
-        plot_core_only=False,
-    )
-    graph(inputs, z)
+    # graph = InputActivityFigure(
+    #     network,
+    #     flags.data_dir,
+    #     image_path,
+    #     filename=raster_filename,
+    #     frequency=flags.gratings_frequency,
+    #     stimuli_init_time=500,
+    #     stimuli_end_time=1500,
+    #     reverse=flags.reverse,
+    #     plot_core_only=True,
+    # )
+    # # # graph(inputs, z)
+    # # print(x.numpy().shape, spike_output_concat.numpy().shape)
+    # graph(x.numpy(), spike_output_concat)
 
     # Plot LGN units firing rates
-    LGN_units = LGN_sample_plot(
-        firing_rates,
-        inputs,
-        stimuli_init_time=500,
-        stimuli_end_time=1500,
-        images_dir=image_path,
-        n_samples=2,
-    )
-    LGN_units()
+    # LGN_units = LGN_sample_plot(
+    #     firing_rates,
+    #     inputs,
+    #     stimuli_init_time=500,
+    #     stimuli_end_time=1500,
+    #     images_dir=image_path,
+    #     n_samples=2,
+    # )
+    # LGN_units()
 
     # Plot the mean firing rate of the population of neurons
-    Population_activity = PopulationActivity(
-        n_neurons=flags.neurons,
-        network=network,
-        image_path=image_path,
-        data_dir=flags.data_dir,
-    )
-    Population_activity(z, plot_core_only=True, bin_size=10)
+    # Population_activity = PopulationActivity(
+    #     n_neurons=flags.neurons,
+    #     network=network,
+    #     image_path=image_path,
+    #     data_dir=flags.data_dir,
+    # )
+    # Population_activity(z, plot_core_only=True, bin_size=10)
+
+    tf.profiler.experimental.stop()
 
     print('Done!')
 
@@ -349,96 +425,94 @@ def main(_):
 
     # Load a typical distribution of firing rates to which the model is regularized to
     # during training
-    # with open(os.path.joiNo don(flags.data_dir, 'garrett_firing_rates.pkl'), 'rb') as f:
-    #     firing_rates = pkl.load(f)
-    # sorted_firing_rates = np.sort(firing_rates)
-    # percentiles = (np.arange(
-    #     firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
-    # rate_rd = np.random.RandomState(seed=3000)
-    # x_rand = rate_rd.uniform(size=flags.neurons)
-    # target_firing_rates = np.sort(
-    #     np.interp(x_rand, percentiles, sorted_firing_rates))
+    with open(os.path.join(flags.data_dir, 'garrett_firing_rates.pkl'), 'rb') as f:
+        firing_rates = pkl.load(f)
+    sorted_firing_rates = np.sort(firing_rates)
+    percentiles = (np.arange(firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
+    rate_rd = np.random.RandomState(seed=3000)
+    x_rand = rate_rd.uniform(size=flags.neurons)
+    target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
 
-    # # ---
-    # # Training disrupts the firing properties of the model
-    # # To counteract, two types of regularizations are used
-    # # 1) Firing rate regularization keeps the distribution of the firing rates close
-    # # to the previously loaded distribution of firing rates
-    # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(
-    #     target_firing_rates, flags.rate_cost)
-    # # 2) Voltage regularization penalizes membrane voltages that are below resting potential or above threshold
-    # voltage_regularizer = models.VoltageRegularization(
-    #     rsnn_layer.cell, flags.voltage_cost)
+    # ---
+    # Training disrupts the firing properties of the model
+    # To counteract, two types of regularizations are used
+    # 1) Firing rate regularization keeps the distribution of the firing rates close
+    # to the previously loaded distribution of firing rates
+    rate_distribution_regularizer = models.SpikeRateDistributionRegularization(
+        target_firing_rates, flags.rate_cost)
+    # 2) Voltage regularization penalizes membrane voltages that are below resting potential or above threshold
+    voltage_regularizer = models.VoltageRegularization(
+        rsnn_layer.cell, flags.voltage_cost)
 
-    # rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
-    # voltage_loss = voltage_regularizer(rsnn_layer.output[1])
-    # model.add_loss(rate_loss)
-    # model.add_loss(voltage_loss)
-    # model.add_metric(rate_loss, name='rate_loss')
-    # model.add_metric(voltage_loss, name='voltage_loss')
+    rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
+    voltage_loss = voltage_regularizer(rsnn_layer.output[1])
+    model.add_loss(rate_loss)
+    model.add_loss(voltage_loss)
+    model.add_metric(rate_loss, name='rate_loss')
+    model.add_metric(voltage_loss, name='voltage_loss')
 
-    # def compute_loss(_target, _pred):
-    #     return loss_object(_target, _pred) / global_batch_size
+    def compute_loss(_target, _pred):
+        return loss_object(_target, _pred) / global_batch_size
 
-    # # Adaptive learning rates
-    # optimizer = tf.keras.optimizers.Adam(flags.learning_rate)
-    # model.compile(optimizer, compute_loss, metrics=['accuracy'])
+    # Adaptive learning rates
+    optimizer = tf.keras.optimizers.Adam(flags.learning_rate)
+    model.compile(optimizer, compute_loss, metrics=['accuracy'])
 
-    # # Restore weights from a checkpoint if desired
-    # if flags.restore_from != '':
-    #     model.load_weights(flags.restore_from)
-    #     print(f'> Model successfully restored from {flags.restore_from}')
+    # Restore weights from a checkpoint if desired
+    if flags.restore_from != '':
+        model.load_weights(flags.restore_from)
+        print(f'> Model successfully restored from {flags.restore_from}')
 
-    # def get_dataset_fn(_n, _n_cues):
-    #     def _f(_):
-    #         _data_set = data_sets.create_evidence_accumulation(
-    #             batch_size=global_batch_size, n_input=flags.n_input, seq_len=flags.seq_len,
-    #             recall_duration=flags.recall_duration, examples_in_epoch=_n, n_cues=_n_cues,
-    #             hard_only=flags.hard_only, t_cue=flags.cue_duration, t_interval=flags.interval_duration,
-    #             input_f0=flags.input_f0
-    #         ).repeat().map(_expand)
-    #         return _data_set
-    #     return _f
+    def get_dataset_fn(_n, _n_cues):
+        def _f(_):
+            _data_set = data_sets.create_evidence_accumulation(
+                batch_size=global_batch_size, n_input=flags.n_input, seq_len=flags.seq_len,
+                recall_duration=flags.recall_duration, examples_in_epoch=_n, n_cues=_n_cues,
+                hard_only=flags.hard_only, t_cue=flags.cue_duration, t_interval=flags.interval_duration,
+                input_f0=flags.input_f0
+            ).repeat().map(_expand)
+            return _data_set
+        return _f
 
-    # test_data_set = get_dataset_fn(
-    #     flags.validation_examples, flags.n_cues)(None)
+    test_data_set = get_dataset_fn(
+        flags.validation_examples, flags.n_cues)(None)
 
-    # # Bookkeeping of simulations
-    # sim_name = toolkit.get_random_identifier('b_')
-    # results_dir = os.path.join(
-    #     flags.results_dir, 'drifting_gratings_simulation')
-    # print(f'> Results will be stored in {os.path.join(results_dir, sim_name)}')
-    # os.makedirs(results_dir, exist_ok=True)
+    # Bookkeeping of simulations
+    sim_name = toolkit.get_random_identifier('b_')
+    results_dir = os.path.join(
+        flags.results_dir, 'drifting_gratings_simulation')
+    print(f'> Results will be stored in {os.path.join(results_dir, sim_name)}')
+    os.makedirs(results_dir, exist_ok=True)
 
-    # cm = simmanager.SimManager(sim_name, results_dir, write_protect_dirs=False, tee_stdx_to='output.log')
+    cm = simmanager.SimManager(sim_name, results_dir, write_protect_dirs=False, tee_stdx_to='output.log')
 
-    # with cm:
-    #     # Save the settings with which the script was invoked
-    #     with open(os.path.join(cm.paths.data_path, 'flags.json'), 'w') as f:
-    #         json.dump(flags.flag_values_dict(), f, indent=4)
+    with cm:
+        # Save the settings with which the script was invoked
+        with open(os.path.join(cm.paths.data_path, 'flags.json'), 'w') as f:
+            json.dump(flags.flag_values_dict(), f, indent=4)
 
-    #     # Apply a learning curriculum using iteratively more cues up to the desired number
-    #     for n_cues in range(1, flags.n_cues + 1, 2):
-    #         train_data_set = get_dataset_fn(flags.examples_in_epoch, n_cues)(None)
+        # Apply a learning curriculum using iteratively more cues up to the desired number
+        for n_cues in range(1, flags.n_cues + 1, 2):
+            train_data_set = get_dataset_fn(flags.examples_in_epoch, n_cues)(None)
 
-    #         vis_data = test_data_set if flags.visualize_test else train_data_set
-    #         # Define callbacks that are used for visualizing network activity (see above),
-    #         # for stopping the training if the task is solved, and for saving the model
-    #         plot_callback = PlotCallback(vis_data, extractor_model, network, flags.data_dir,
-    #                                      path=cm.paths.results_path, prefix=f'cue_{n_cues}_')
-    #         fit_callbacks = [
-    #             plot_callback,
-    #             callbacks.StopAt('accuracy', .99),
-    #             tf.keras.callbacks.ModelCheckpoint(
-    #                 filepath=os.path.join(cm.paths.results_path, 'model'),
-    #                 monitor='val_accuracy', save_weights_only=True),
-    #             tf.keras.callbacks.TensorBoard(log_dir=cm.paths.results_path)
-    #         ]
+            vis_data = test_data_set if flags.visualize_test else train_data_set
+            # Define callbacks that are used for visualizing network activity (see above),
+            # for stopping the training if the task is solved, and for saving the model
+            plot_callback = PlotCallback(vis_data, extractor_model, network, flags.data_dir,
+                                         path=cm.paths.results_path, prefix=f'cue_{n_cues}_')
+            fit_callbacks = [
+                plot_callback,
+                callbacks.StopAt('accuracy', .99),
+                tf.keras.callbacks.ModelCheckpoint(
+                    filepath=os.path.join(cm.paths.results_path, 'model'),
+                    monitor='val_accuracy', save_weights_only=True),
+                tf.keras.callbacks.TensorBoard(log_dir=cm.paths.results_path)
+            ]
 
-    #         # Perform training
-    #         model.fit(train_data_set, steps_per_epoch=flags.examples_in_epoch, epochs=flags.n_epochs,
-    #                   validation_data=test_data_set, validation_steps=flags.validation_examples,
-    #                   callbacks=fit_callbacks)
+            # Perform training
+            model.fit(train_data_set, steps_per_epoch=flags.examples_in_epoch, epochs=flags.n_epochs,
+                      validation_data=test_data_set, validation_steps=flags.validation_examples,
+                      callbacks=fit_callbacks)
 
 
 if __name__ == "__main__":
@@ -477,6 +551,7 @@ if __name__ == "__main__":
     absl.app.flags.DEFINE_integer("cue_duration", 40, "")
     absl.app.flags.DEFINE_integer("interval_duration", 40, "")
     absl.app.flags.DEFINE_integer("examples_in_epoch", 32, "")
+    absl.app.flags.DEFINE_integer('steps_per_epoch', 781, '')
     absl.app.flags.DEFINE_integer("validation_examples", 16, "")
     absl.app.flags.DEFINE_integer("seed", 3000, "")
     absl.app.flags.DEFINE_integer("neurons_per_output", 16, "")
