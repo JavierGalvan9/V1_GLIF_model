@@ -8,31 +8,24 @@ import pandas as pd
 from numba import njit
 from time import time
 
-# @njit
-# def old_sort_indices(indices, weights, delays, tau_syn_weights_array, syn_ids):
-#     max_ind = np.max(indices) + 1
-#     # sort indices by considering first all the targets of node 0, then all of node 1, ...
-#     q = indices[:, 0] * max_ind + indices[:, 1]
-#     sorted_ind = np.argsort(q)
-    
-#     return (indices[sorted_ind], weights[sorted_ind], delays[sorted_ind], tau_syn_weights_array[sorted_ind, :], syn_ids[sorted_ind])
+from memory_profiler import profile
 
 def sort_indices(indices, *arrays):
     max_ind = np.max(indices) + 1
     q = indices[:, 0] * max_ind + indices[:, 1]
     sorted_ind = np.argsort(q)
-    sorted_arrays = [indices[sorted_ind], *map(lambda arr: arr[sorted_ind], arrays)]
-
+    sorted_arrays = list(map(lambda arr: arr[sorted_ind], [indices, *arrays]))
     return tuple(sorted_arrays)
 
-@njit
-def sort_input_indices(indices, weights, delays, tau_syn_weights_array):
-    max_ind = np.max(indices) + 1
-    # sort indices by considering first all the targets of node 0, then all of node 1, ...
-    q = indices[:, 0] * max_ind + indices[:, 1]
-    sorted_ind = np.argsort(q)
+
+# @njit
+# def sort_input_indices(indices, weights, delays, tau_syn_weights_array):
+#     max_ind = np.max(indices) + 1
+#     # sort indices by considering first all the targets of node 0, then all of node 1, ...
+#     q = indices[:, 0] * max_ind + indices[:, 1]
+#     sorted_ind = np.argsort(q)
     
-    return (indices[sorted_ind], weights[sorted_ind], delays[sorted_ind], tau_syn_weights_array[sorted_ind, :])
+#     return (indices[sorted_ind], weights[sorted_ind], delays[sorted_ind], tau_syn_weights_array[sorted_ind, :])
 
 
 def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1', 
@@ -76,11 +69,25 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
     edges_type_df = pd.read_csv(os.path.join(data_dir, edge_types_file), delimiter=" ")
     synaptic_models_path = os.path.join('GLIF_network', 'components', "synaptic_models")
     basis_function_weights_df = pd.read_csv('GLIF_network/synaptic_data/basis_function_weights.csv', index_col=0)
-
+    print(f'Saving basis function weights for {source}-{target}')
     # Map the synaptic model to a given id using a dictionary
-    path = os.path.join('GLIF_network/components', 'synaptic_models_to_syn_id_dict.pkl')
-    with open(path, "rb") as f:
-        synaptic_models_to_syn_id_dict = pkl.load(f)
+    path = os.path.join('GLIF_network', 'synaptic_models_to_syn_id_dict.pkl')
+    if not os.path.exists(path):
+        synaptic_models_to_syn_id_dict = dict()
+        syn_id_to_syn_weights_dict = dict()
+        for syn_id, file in enumerate(os.listdir(synaptic_models_path)):
+            if file.endswith(".json"):
+                synaptic_model = file.split('.')[0]
+                synaptic_models_to_syn_id_dict[synaptic_model] = syn_id
+                tau_syn_weights = basis_function_weights_df.loc[synaptic_model].values
+                syn_id_to_syn_weights_dict[syn_id] = tau_syn_weights
+        with open(path, "wb") as f:
+            pkl.dump(synaptic_models_to_syn_id_dict, f)
+        with open('GLIF_network/syn_id_to_syn_weights_dict.pkl', "wb") as f:
+            pkl.dump(syn_id_to_syn_weights_dict, f)
+    else:
+        with open(path, "rb") as f:
+            synaptic_models_to_syn_id_dict = pkl.load(f)
 
     with h5py.File(edges_h5_path, "r") as edges_h5_file:
         source_to_target = f"{source}_to_{target}"
@@ -131,7 +138,7 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
 
     return new_network_dat
 
-
+# @profile
 def load_network(
     path="GLIF_network/network_dat.pkl",
     h5_path="GLIF_network/network/v1_nodes.h5",
@@ -320,10 +327,7 @@ def load_network(
         current_edge += n_new_edge
     # sort indices by considering first all the targets of node 0, then all of node 1, ...
     # indices, weights, delays, tau_syn_weights_array, syn_ids = sort_indices(indices, weights, delays, tau_syn_weights_array, syn_ids)
-    from time import time
-    t0 = time()
     indices, weights, delays, syn_ids = sort_indices(indices, weights, delays, syn_ids)
-    print('>>> Sorting tracking: ', time()-t0)
 
     # # i want the weights array to be of the same shape as tau_syn_weights_array. make copies of the weights along a new axis to achieve this
     # weights = np.repeat(weights[:, np.newaxis], n_syn_basis, axis=1)    
@@ -365,6 +369,7 @@ def load_network(
 
 
 # Here we load the input from the LGN units and the background noise
+# @profile
 def load_input(
     lgn_path="GLIF_network/lgn_input_dat.pkl",
     bkg_path="GLIF_network/bkg_input_dat.pkl",
@@ -405,6 +410,7 @@ def load_input(
         pre_indices = []
         weights = []
         delays = []
+        syn_ids = []
         tau_syn_weights = []
 
         for edge in input_population:  # input_population[1]:
@@ -415,7 +421,8 @@ def load_input(
             source_tf_id = np.array(edge["source"])
             weights_tf = np.array(edge["params"]["weight"])
             delays_tf = np.zeros_like(weights_tf) + edge["params"]["delay"]
-            tau_syn_weights_tf = np.zeros((len(delays_tf), len(edge["params"]["tau_syn_weights"])), dtype=np.float32) + edge["params"]["tau_syn_weights"]
+            syn_id = np.zeros_like(weights_tf) + edge["params"]["syn_id"]
+            # tau_syn_weights_tf = np.zeros((len(delays_tf), len(edge["params"]["tau_syn_weights"])), dtype=np.float32) + edge["params"]["tau_syn_weights"]
 
             if bmtk_id_to_tf_id is not None:
                 # check if the given edges exist in our model
@@ -427,7 +434,8 @@ def load_input(
                 source_tf_id = source_tf_id[edge_exists]
                 weights_tf = weights_tf[edge_exists]
                 delays_tf = delays_tf[edge_exists]
-                tau_syn_weights_tf = tau_syn_weights_tf[edge_exists, :]
+                syn_id = syn_id[edge_exists]
+                # tau_syn_weights_tf = tau_syn_weights_tf[edge_exists, :]
 
                 # we multiply by 10 the indices and add r to identify the receptor_type easily:
                 # if target id is divisible by 10 the receptor_type is 0,
@@ -438,17 +446,20 @@ def load_input(
                 post_indices.extend(new_target_tf_id)
                 pre_indices.extend(source_tf_id)
                 weights.extend(weights_tf)
-                delays.append(delays_tf)
-                tau_syn_weights.append(tau_syn_weights_tf)
+                delays.extend(delays_tf)
+                syn_ids.extend(syn_id)
+
+                # tau_syn_weights.extend(tau_syn_weights_tf)
 
         # first column are the post indices and second column the pre indices
         indices = np.stack([post_indices, pre_indices], -1)
         weights = np.array(weights)
-        delays = np.concatenate(delays)
-        tau_syn_weights_array = np.concatenate(tau_syn_weights)
+        delays = np.array(delays) # np.concatenate(delays)
+        syn_ids = np.array(syn_ids, dtype=np.uint8)
+        # tau_syn_weights_array = np.concatenate(tau_syn_weights)
         # sort indices by considering first all the sources of target node 0, then all of node 1, ...
         # indices, weights, delays = sort_input_indices(indices, weights, delays)
-        indices, weights, delays, tau_syn_weights_array = sort_input_indices(indices, weights, delays, tau_syn_weights_array)
+        indices, weights, delays, syn_ids = sort_indices(indices, weights, delays, syn_ids)
 
         if idx == 0:
             # we load the LGN nodes and their positions
@@ -465,7 +476,8 @@ def load_input(
                 indices=indices.astype(np.int64),
                 weights=weights,
                 delays=delays,
-                tau_syn_weights_array=tau_syn_weights_array,
+                syn_ids=syn_ids,
+                # tau_syn_weights_array=tau_syn_weights_array,
             )
         )
 
@@ -526,9 +538,14 @@ def reduce_input_population(input_population, new_n_input, seed=3000):
         new_in_weights[i] = w
         new_in_delays[i] = delays_dict[t_ind]
 
-    new_in_ind, new_in_weights, new_in_delays = sort_input_indices(
+    # new_in_ind, new_in_weights, new_in_delays = sort_input_indices(
+    #     new_in_ind, new_in_weights, new_in_delays
+    # )
+
+    new_in_ind, new_in_weights, new_in_delays = sort_indices(
         new_in_ind, new_in_weights, new_in_delays
     )
+    
     new_input_population = dict(
         n_inputs=new_n_input,
         indices=new_in_ind,
@@ -539,7 +556,7 @@ def reduce_input_population(input_population, new_n_input, seed=3000):
 
     return new_input_population
 
-
+# @profile
 def load_v1(flags, n_neurons):
 
     # Initialize the network 

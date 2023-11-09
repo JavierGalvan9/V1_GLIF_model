@@ -4,8 +4,11 @@ import psutil
 import os 
 import pickle as pkl
 from time import time
+from memory_profiler import profile
+from pympler.asizeof import asizeof, asized
 
-print("TensorFlow version:", tf.__version__)
+
+# print("TensorFlow version:", tf.__version__) # 2.4.1
 
 # Define a custom gradient for the spike function.
 # Diverse functions can be used to define the gradient.
@@ -139,8 +142,8 @@ def exp_convolve(tensor, decay=0.8, reverse=False, initializer=None, axis=0):
 
 
 class BackgroundNoiseLayer(tf.keras.layers.Layer):
-    def __init__(self, indices, weights, dense_shape, tau_syn_weights, 
-                 batch_size, seq_len,
+    def __init__(self, indices, weights, dense_shape, # tau_syn_weights, 
+                 synaptic_weights, syn_ids, batch_size, seq_len,
                  lr_scale=1., bkg_firing_rate=250, n_bkg_units=100, 
                  dtype=tf.float32, **kwargs):
         super().__init__(**kwargs)
@@ -148,13 +151,37 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
         self._bkg_weights = weights
         self._bkg_indices = indices
         self._dense_shape = dense_shape
-        self._tau_syn_weights = tau_syn_weights
+        # self._tau_syn_weights = tau_syn_weights
         self._batch_size = batch_size
         self._seq_len = seq_len
-        self._n_syn_basis = self._tau_syn_weights.shape[1]
+        self._n_syn_basis = synaptic_weights.shape[1]
         self._lr_scale = lr_scale
         self._bkg_firing_rate = bkg_firing_rate
         self._n_bkg_units = n_bkg_units
+
+        self.bkg_input_weights_factors = synaptic_weights[syn_ids]
+
+    @tf.function
+    def calculate_bkg_i_in(self, inputs):
+        # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
+        i_in = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
+        for r_id in range(self._n_syn_basis):
+            weights_syn_receptors = self._bkg_weights * self.bkg_input_weights_factors[:, r_id]
+            sparse_w_in = tf.sparse.SparseTensor(
+                self._bkg_indices,
+                tf.cast(weights_syn_receptors, self._compute_dtype), 
+                self._dense_shape,
+            )
+            i_receptor = tf.sparse.sparse_dense_matmul(
+                                                        sparse_w_in,
+                                                        inputs,
+                                                        adjoint_b=True
+                                                    )
+            # Append i_receptor to the TensorArray
+            i_in = i_in.write(r_id, i_receptor)
+        # Stack the TensorArray into a single tensor
+        i_in = i_in.stack()
+        return i_in
 
     def call(self, inp): # inp only provides the shape
         t0 = time()   
@@ -164,27 +191,7 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
                 self._compute_dtype)
         rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * self._seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
         # Create a TensorArray to save the results for every receptor type
-        noise_input = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
-        # Iterate over the receptors
-        for r_id in range(self._n_syn_basis):
-            tf.print('BKG input receptor ', r_id)
-            # Weight the synaptic weights by the tau_syn_weights
-            weights_syn_receptors = self._bkg_weights * self._tau_syn_weights[:, r_id]
-            sparse_w_in = tf.sparse.SparseTensor(
-                self._bkg_indices, 
-                tf.cast(weights_syn_receptors, self._compute_dtype), 
-                self._dense_shape
-            )
-            # Calculate the current associated to this receptor
-            i_receptor = tf.sparse.sparse_dense_matmul(
-                                                        sparse_w_in, 
-                                                        rest_of_brain,
-                                                        adjoint_b=True
-                                                        )
-            # Store the receptor current
-            noise_input = noise_input.write(r_id, i_receptor)
-
-        noise_input = noise_input.stack()
+        noise_input = self.calculate_bkg_i_in(tf.cast(rest_of_brain, self._compute_dtype))
         noise_input = tf.transpose(noise_input) # New shape (3000, 66634, 5)
         # Reshape properly the input current
         noise_input = tf.reshape(noise_input, (self._batch_size, self._seq_len, -1)) # (1, 3000, 333170)
@@ -194,36 +201,48 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
 
 class SparseLayer(tf.keras.layers.Layer):
-    def __init__(
-        self,
-        indices,
-        weights,
-        dense_shape,
-        tau_syn_weights,
-        n_neurons,
-        lr_scale=1.0,
-        dtype=tf.float32,
-        **kwargs,
-    ):
+    def __init__(self, indices, weights, dense_shape, synaptic_weights, syn_ids, # tau_syn_weights,
+                 n_neurons, lr_scale=1.0, dtype=tf.float32, **kwargs,):
         super().__init__(**kwargs)
         self._dtype = dtype
         self._lr_scale = lr_scale
         self._indices = indices
         self._input_weights = weights
-        self._tau_syn_weights = tau_syn_weights
-        self._n_syn_basis = self._tau_syn_weights.shape[1] # 5
+        # self._tau_syn_weights = tau_syn_weights
+        self._n_syn_basis = synaptic_weights.shape[1] # 5
         self._dense_shape = dense_shape
         self._n_neurons = n_neurons
 
+        self.input_weights_factors = synaptic_weights[syn_ids]
+
         # Define a threshold that determines whether to compute the sparse
-        # matrix multiplication directly or split it into smaller batches.
-        # The value is calculated as the maximum number of rows that can be used
-        # in a sparse matrix multiplication operation without running into memory
-        # limitations on the device. The value 2**32 represents 4GB the maximum number
-        # of elements in a tensor that can be stored on most modern GPU devices, and
-        # weights.shape[0] is the number of rows in the sparse matrix.
-        self._max_batch = int(2**31 / weights.shape[0])
-        print('The maximum batch size is: ', self._max_batch)
+        # matrix multiplication directly or split it into smaller batches in a GPU.
+        # The value is calculated to ensure that output.shape[1] * nnz(a) > 2^31, 
+        # where output.shape[1] is the time_length, and nnz(a) is the number of non-zero elements in the sparse matrix.
+        nnz_sparse_matrix = self._indices.shape[0]
+        self._max_batch = int(2**31 / nnz_sparse_matrix)
+
+    @tf.function
+    def calculate_i_in(self, inputs):
+        # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
+        i_in = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
+        for r_id in range(self._n_syn_basis):
+            weights_syn_receptors = self._input_weights * self.input_weights_factors[:, r_id]
+            sparse_w_in = tf.sparse.SparseTensor(
+                self._indices,
+                tf.cast(weights_syn_receptors, self._compute_dtype), 
+                self._dense_shape,
+            )
+            i_receptor = tf.sparse.sparse_dense_matmul(
+                                                        sparse_w_in,
+                                                        inputs,
+                                                        adjoint_b=True
+                                                    )
+            # Append i_receptor to the TensorArray
+            i_in = i_in.write(r_id, i_receptor)
+        # Stack the TensorArray into a single tensor
+        i_in = i_in.stack()
+        return i_in
 
     def call(self, inp):
         t0 = time()
@@ -233,99 +252,54 @@ class SparseLayer(tf.keras.layers.Layer):
         # a fully defined shape.
         inp_shape = inp.get_shape().as_list()
         shp = [dim if dim is not None else tf.shape(inp)[i] for i, dim in enumerate(inp_shape)]
-        print('>>> Input layer')
-        print('inp_shape: ', inp_shape)
+        batch_size = shp[0] * shp[1]
+        print(f"The ratio of the current input batch size to the maximum batch size is {batch_size}/{self._max_batch}")
         inp = tf.cast(inp, self._compute_dtype)
         inp = tf.reshape(inp, (shp[0] * shp[1], shp[2])) # (batch_size*sequence_length, input_dim)
 
         if shp[0] * shp[1] < self._max_batch:
             # the sparse tensor multiplication can be directly performed
-            tf.print('Processing input tensor directly.')
-            input_current = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
-            for r_id in range(self._n_syn_basis):
-                tf.print('LGN input receptor ', r_id)
-                # Weight the synaptic weights by the tau_syn_weights
-                weights_syn_receptors = self._input_weights * self._tau_syn_weights[:, r_id]
-                sparse_w_in = tf.sparse.SparseTensor(
-                                                    self._indices, 
-                                                    tf.cast(weights_syn_receptors, self._compute_dtype), 
-                                                    self._dense_shape
-                                                    )
-                # Calculate the currents asociated to this receptor and write them
-                i_receptor = tf.sparse.sparse_dense_matmul(
-                                                            sparse_w_in, 
-                                                            inp, 
-                                                            adjoint_b=True
-                                                            )
-                input_current = input_current.write(r_id, i_receptor)
-
-            input_current = input_current.stack()
-            input_current = tf.transpose(input_current)
+            print('Processing input tensor directly.')
+            input_current = self.calculate_i_in(tf.cast(inp, self._compute_dtype)) # (5, 1000, 600)
+            input_current = tf.transpose(input_current) # (600, 1000, 5)
 
         else: 
-            tf.print('Chunking input tensor into smaller batches.')
             # Define the current batch size and calculate the number of chunks
             batch_size = tf.shape(inp)[0]
-            num_chunks = int(batch_size / self._max_batch) + 1
-            print('Num chunks', num_chunks)
-            print('Max batch size', self._max_batch)
-            print('Batch size', batch_size)
-            # Padd the input with 0's to ensure all chunks have the same size for the matrix multiplication
-            num_pad_elements = num_chunks * self._max_batch - tf.shape(inp)[0]
-            padded_input = tf.pad(inp, [(0, num_pad_elements), (0, 0)])
-            padded_input = tf.cast(padded_input, self._compute_dtype)
-            # Define a TensorArray to save the partical results for every receptor
-            input_current = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
-            for r_id in range(self._n_syn_basis):
-                tf.print('Input receptor ', r_id)
-                # Weight the synaptic weights by the tau_syn_weights
-                weights_syn_receptors = self._input_weights * self._tau_syn_weights[:, r_id]
-                sparse_w_in = tf.sparse.SparseTensor(
-                    self._indices, 
-                    tf.cast(weights_syn_receptors, self._compute_dtype), 
-                    self._dense_shape
-                )
-                # Initialize a tensor array to hold the partial results of every chunk
-                result_array = tf.TensorArray(dtype=self._compute_dtype, size=num_chunks)
-                # Iterate over the chunks
-                for i in tf.range(num_chunks):
-                    # tf.print('Receptor ', r_id, '- Processing chunk:', i, '/', num_chunks)
-                    # if tf.config.list_physical_devices('GPU'):
-                    #     print(tf.config.experimental.get_memory_usage('GPU:0'))
-                    # # print the memory consumption at this point
-                    # process = psutil.Process()
-                    # mem = process.memory_info().rss / (1024**3)  # in GB
-                    # tf.print("Memory consumption in GB:", mem)
+            if batch_size % self._max_batch == 0:
+                num_chunks = int(batch_size / self._max_batch)
+                num_pad_elements = 0
+            else: # add 1 chunk if the quotient is not an integer
+                num_chunks = int(batch_size / self._max_batch) + 1
+                # Padd the input with 0's to ensure all chunks have the same size for the matrix multiplication
+                num_pad_elements = num_chunks * self._max_batch - tf.shape(inp)[0]
+                inp = tf.pad(inp, [(0, num_pad_elements), (0, 0)])
 
-                    start_idx = int(i * self._max_batch)
-                    end_idx = int((i + 1) * self._max_batch)
-                    chunk = padded_input[start_idx:end_idx, :]
-                    chunk = tf.reshape(chunk, (self._max_batch, -1))
-                    # Calculate the input current associated with this chunk
-                    partial_input_current = tf.sparse.sparse_dense_matmul(
-                                                                sparse_w_in, 
-                                                                chunk, 
-                                                                adjoint_b=True
-                                                                )
+            print(f'Chunking input tensor into {num_chunks} batches.')
+            inp = tf.cast(inp, self._compute_dtype)
 
-                    # reshape partial_input_current # New shape: (self._max_batch, self._n_neurons )
-                    partial_input_current = tf.transpose(partial_input_current) 
-                    # Store the partial result in the tensor array                    
-                    result_array = result_array.write(i, partial_input_current)
+            # Initialize a tensor array to hold the partial results of every chunk
+            result_array = tf.TensorArray(dtype=self._compute_dtype, size=num_chunks)
+            # Iterate over the chunks
+            for i in tf.range(num_chunks):
+                start_idx = int(i * self._max_batch)
+                end_idx = int((i + 1) * self._max_batch)
+                chunk = inp[start_idx:end_idx, :]
+                chunk = tf.reshape(chunk, (self._max_batch, -1))
+                partial_input_current = self.calculate_i_in(tf.cast(chunk, self._compute_dtype))  # ( 5, 66634, 68)
+                # Store the partial result in the tensor array     
+                result_array = result_array.write(i, partial_input_current)
+            
+            # Concatenate the partial results to get the final result
+            result_array = result_array.stack() # ( 9, 5, 66634, 68)
+            result_array = tf.transpose(result_array, perm=[1, 2, 3, 0]) # New shape (5, 66634, 68, 9)
+            result_array = tf.reshape(result_array, (self._n_syn_basis, -1, num_chunks * self._max_batch)) # New shape (5, 66634, 612)
+            result_array = tf.transpose(result_array, perm=[2, 1, 0]) # New shape (612, 66634, 5)
+            
+            if num_pad_elements > 0: # Remove the padded 0's
+                result_array = result_array[:-num_pad_elements, :] # New shape (600, 66634, 5)
+            input_current = tf.cast(result_array, self._compute_dtype)
 
-                # Concatenate the partial results to get the final result
-                result_array = result_array.stack()
-                result_array = tf.reshape(result_array, (num_chunks * self._max_batch, -1))
-                # Remove the padded 0's
-                result_array = result_array[:-num_pad_elements, :] # New shape (3000, 66634)
-                # result_array = result_array.concat()[:-num_pad_elements, :]
-                result_array = tf.cast(result_array, self._compute_dtype)
-                # Store the input current for this receptor
-                input_current = input_current.write(r_id, result_array)
-
-            input_current = input_current.stack() # New shape (5, 3000, 66634)
-            input_current = tf.transpose(input_current, perm=[1, 2, 0]) # New shape (3000, 66634, 5)
-        
         # Reshape properly the input current
         input_current = tf.reshape(input_current, (shp[0], shp[1], -1)) # New shape (1, 3000, 333170)
         print('>>> Input sparse layer processing time: ', time()-t0)
@@ -363,8 +337,9 @@ class StiffRegularizer(tf.keras.regularizers.Regularizer):
     def __call__(self, x):
         return self._strength * tf.reduce_sum(tf.square(x - self._initial_value))
 
-
+# @profile
 class V1Column(tf.keras.layers.Layer):
+    # @profile
     def __init__(
         self,
         network,
@@ -464,7 +439,14 @@ class V1Column(tf.keras.layers.Layer):
         self.current_factor = _f(self._current_factor)
         self.voltage_scale = _f(voltage_scale)
         self.voltage_offset = _f(voltage_offset)
-        self.recurrent_weights = None
+        # self.recurrent_weights = None
+
+        # Find the synaptic basis representation for each neuron
+        path = os.path.join('GLIF_network', 'syn_id_to_syn_weights_dict.pkl')
+        with open(path, "rb") as f:
+            syn_id_to_syn_weights_dict = pkl.load(f)
+        synaptic_weights = np.array([syn_id_to_syn_weights_dict[i] for i in range(len(syn_id_to_syn_weights_dict))])
+        self.synaptic_weights = synaptic_weights
 
         ### Network recurrent connectivity ###
         indices, weights, dense_shape, syn_ids = (
@@ -474,27 +456,20 @@ class V1Column(tf.keras.layers.Layer):
             network["synapses"]["syn_ids"]
         )
         # Scale down the recurrent weights
-        weights = (
-            weights
-            / voltage_scale[self._node_type_ids[indices[:, 0]]]
-        ).astype(np.float32)
-        # Find the synaptic basis representation for each neuron
-        path = os.path.join('GLIF_network/components', 'syn_id_to_syn_weights_dict.pkl')
-        with open(path, "rb") as f:
-            syn_id_to_syn_weights_dict = pkl.load(f)
-        synaptic_weights = np.array([syn_id_to_syn_weights_dict[i] for i in range(len(syn_id_to_syn_weights_dict))])
-        self.weights_factors = synaptic_weights[syn_ids]
+        weights = (weights/voltage_scale[self._node_type_ids[indices[:, 0]]]).astype(np.float32)
+        
+        # recurrent_weights_factors = self.synaptic_weights[syn_ids] # syn_ids.shape = n_synapses, synaptic_weights.shape = (79, n_syn_basis=5), 
+        # recurrent_weights_factors.shape = (n_synapses, n_syn_basis=5)
 
         # Use the maximum delay to clip the synaptic delays
-        delays = np.round(
-            np.clip(network["synapses"]["delays"], dt, self.max_delay) / dt
-        ).astype(np.int32)
+        delays = np.round(np.clip(network["synapses"]["delays"], dt, self.max_delay)/dt).astype(np.int32)
         dense_shape = dense_shape[0], self.max_delay * dense_shape[1]
         # Notice that in dense_shape, the first column (presynaptic neuron) has size n_neurons
         # and the second column (postsynaptic neuron) has size max_delay*n_neurons
 
         # Introduce the delays in the postsynaptic neuron indices
         indices[:, 1] = indices[:, 1] + self._n_neurons * (delays - 1)
+
         # Define the Tensorflow variables
         self.recurrent_indices = tf.Variable(indices, trainable=False)
         self.recurrent_dense_shape = dense_shape
@@ -508,31 +483,44 @@ class V1Column(tf.keras.layers.Layer):
             # to ensure that the weights always keep their sign
             constraint=SignedConstraint(self.recurrent_weight_positive),
             trainable=train_recurrent,
-        )
+        ) # shape = (n_synapses,)
+
+        self.recurrent_weights_factors = synaptic_weights[syn_ids]
+
         # Generate weight tensors for every basis receptor type
-        self.recurrent_weight_values_mod = self.recurrent_weight_values[:, np.newaxis] * self.weights_factors
-        self.recurrent_weight_values_mod_list = tf.split(self.recurrent_weight_values_mod, self._n_syn_basis, axis=1)
-        self.recurrent_sparse_w_rec = []
-        for recurrent_weight in self.recurrent_weight_values_mod_list:
-            sparse_w_rec = tf.sparse.SparseTensor(
-                self.recurrent_indices,
-                recurrent_weight[:, 0],
-                self.recurrent_dense_shape,
-            )
-            self.recurrent_sparse_w_rec.append(tf.cast(sparse_w_rec, self._compute_dtype))
-        print('Recurrent weights shape:', self.recurrent_weight_values_mod.shape)
+        # recurrent_weight_values_mod = self.recurrent_weight_values[:, np.newaxis] * recurrent_weights_factors
+        # recurrent_weight_values_mod_list = tf.split(recurrent_weight_values_mod, self._n_syn_basis, axis=1) # list with one element per syn basis
+        # self.recurrent_sparse_w_rec = []
+        # for recurrent_weight in recurrent_weight_values_mod_list:
+        #     sparse_w_rec = tf.sparse.SparseTensor(
+        #         self.recurrent_indices,
+        #         recurrent_weight[:, 0],
+        #         self.recurrent_dense_shape,
+        #     )
+        #     self.recurrent_sparse_w_rec.append(tf.cast(sparse_w_rec, self._compute_dtype))
+        # print(f"Recurrent weights list size: {asizeof(self.recurrent_sparse_w_rec)/1024/1024} MB")
+        # print(f"Recurrent weights variable size: {asizeof(self.recurrent_weight_values.numpy())/1024/1024} MB")
+        # print(f"Recurrent weights array size: {asizeof(weights)/1024/1024} MB")
+        # print(f"Recurrent weights factors size: {asizeof(recurrent_weights_factors)/1024/1024} MB")
         print(f"> Recurrent synapses {len(indices)}")
+
+        del indices, weights, dense_shape, syn_ids
 
         ### LGN input connectivity ###
         self.lgn_input_dense_shape = (self._n_neurons, lgn_input["n_inputs"],)
+        input_indices, input_weights, input_syn_ids = (
+            lgn_input["indices"],
+            lgn_input["weights"],
+            lgn_input["syn_ids"]
+        )
 
-        input_indices = lgn_input["indices"]
-        self.input_indices = tf.Variable(input_indices, trainable=False)
-
-        self.input_tau_syn_weights = lgn_input["tau_syn_weights_array"]
-        input_weights = lgn_input["weights"].astype(np.float32)
+        # self.input_tau_syn_weights = lgn_input["tau_syn_weights_array"]
         # Scale down the input weights
-        input_weights = (input_weights/ voltage_scale[self._node_type_ids[input_indices[:, 0]]])
+        input_weights = (input_weights/ voltage_scale[self._node_type_ids[input_indices[:, 0]]]).astype(np.float32)
+        input_delays = np.round(np.clip(lgn_input["delays"], dt, self.max_delay)/dt).astype(np.int32)
+        # Introduce the delays in the postsynaptic neuron indices
+        # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
+        self.input_indices = tf.Variable(input_indices, trainable=False)
 
         # Define the Tensorflow variables
         self.input_weight_positive = tf.Variable(
@@ -543,39 +531,77 @@ class V1Column(tf.keras.layers.Layer):
             constraint=SignedConstraint(self.input_weight_positive),
             trainable=train_input,
         )
+        self.input_syn_ids = input_syn_ids
 
+        # input_weights_factors = synaptic_weights[input_syn_ids]
+        # input_weight_values_mod = self.input_weight_values[:, np.newaxis] * input_weights_factors
+        # input_weight_values_mod_list = tf.split(input_weight_values_mod, self._n_syn_basis, axis=1)
+        # self.input_sparse_w = []
+        # for input_weight in input_weight_values_mod_list:
+        #     sparse_w_in = tf.sparse.SparseTensor(
+        #         self.input_indices,
+        #         input_weight[:, 0],
+        #         self.lgn_input_dense_shape,
+        #     )
+        #     self.input_sparse_w.append(tf.cast(sparse_w_in, self._compute_dtype))
         print(f"> LGN input synapses {len(input_indices)}")
+        del input_indices, input_weights, input_syn_ids 
 
         ### BKG input connectivity ###
         self.bkg_input_dense_shape = (self._n_neurons, bkg_input["n_inputs"],)
+        bkg_input_indices, bkg_input_weights, bkg_input_syn_ids = (
+            bkg_input["indices"],
+            bkg_input["weights"],
+            bkg_input["syn_ids"]
+        )
 
-        bkg_input_indices = bkg_input["indices"]
+        # bkg_input_indices = bkg_input["indices"]
+        # self.bkg_input_tau_syn_weights = bkg_input["tau_syn_weights_array"]
+        bkg_input_weights = (bkg_input_weights/voltage_scale[self._node_type_ids[bkg_input_indices[:, 0]]]).astype(np.float32)
+        bkg_input_delays = np.round(np.clip(bkg_input["delays"], dt, self.max_delay)/dt).astype(np.int32)
+        # Introduce the delays in the postsynaptic neuron indices
+        # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
         self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False)
 
-        self.bkg_input_tau_syn_weights = bkg_input["tau_syn_weights_array"]
-        bkg_input_weights = bkg_input["weights"].astype(np.float32)
-        bkg_input_weights = (bkg_input_weights/voltage_scale[self._node_type_ids[bkg_input_indices[:, 0]]])
-        
         # Define Tensorflow variables
         self.bkg_input_weight_positive = tf.Variable(
             bkg_input_weights >= 0.0, name="bkg_input_weights_sign", trainable=False)
-
         self.bkg_input_weights = tf.Variable(
             bkg_input_weights * input_weight_scale / lr_scale, 
             name="rest_of_brain_weights", 
             constraint=SignedConstraint(self.bkg_input_weight_positive),
             trainable=train_input
         )
-        
+        self.bkg_input_syn_ids = bkg_input_syn_ids
+
+        # bkg_input_weights_factors = synaptic_weights[bkg_input_syn_ids]
+        # bkg_input_weight_values_mod = self.bkg_input_weights[:, np.newaxis]*bkg_input_weights_factors
+        # bkg_input_weight_values_mod_list = tf.split(bkg_input_weight_values_mod, self._n_syn_basis, axis=1)
+        # self.bkg_input_sparse_w = []
+        # for bkg_input_weight in bkg_input_weight_values_mod_list:
+        #     sparse_w_in = tf.sparse.SparseTensor(
+        #         self.bkg_input_indices,
+        #         bkg_input_weight[:, 0],
+        #         self.bkg_input_dense_shape,
+        #     )
+        #     self.bkg_input_sparse_w.append(tf.cast(sparse_w_in, self._compute_dtype))    
+
         print(f"> BKG input synapses {len(bkg_input_indices)}")
+        del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, synaptic_weights
 
     @tf.function
     def calculate_i_rec(self, rec_z_buf):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
         i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
         for r_id in range(self._n_syn_basis):
+            weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
+            sparse_w_rec = tf.sparse.SparseTensor(
+                self.recurrent_indices,
+                tf.cast(weights_syn_receptors, self._compute_dtype), 
+                self.recurrent_dense_shape,
+            )
             i_receptor = tf.sparse.sparse_dense_matmul(
-                                                        self.recurrent_sparse_w_rec[r_id],
+                                                        sparse_w_rec,
                                                         rec_z_buf,
                                                         adjoint_b=True
                                                     )
@@ -752,6 +778,33 @@ def huber_quantile_loss(u, tau, kappa):
         (tf.abs(u) - 0.5 * kappa)
     return tf.where(tf.abs(u) <= kappa, branch_1, branch_2)
 
+### To calculate the loss of firing rates between neuron types
+def compute_spike_rate_target_loss(_spikes, target_rates):
+    # TODO: define this function
+    # target_rates is a dictionary that contains all the cell types.
+    # I should iterate on them, and add the cost for each one at the end.
+    # spikes will have a shape of (batch_size, n_steps, n_neurons)
+    losses = []
+    for key, value in target_rates.items():
+        spikes_type = tf.gather(_spikes, value["neuron_ids"], axis=-1)
+        loss_type = compute_spike_rate_distribution_loss(spikes_type, value["sorted_target_rates"])
+        losses.append(tf.reduce_mean(loss_type))
+
+    return tf.reduce_sum(losses, axis=0)
+
+
+class SpikeRateDistributionTarget:
+    """ Instead of regularization, treat it as a target.
+        The main difference is that this class will calculate the loss
+        for each subtypes of the neurons."""
+    def __init__(self, target_rates, rate_cost=.5):
+        self._rate_cost = rate_cost
+        self._target_rates = target_rates
+
+    def __call__(self, spikes):
+        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates) * self._rate_cost
+        return reg_loss
+
 
 def compute_spike_rate_distribution_loss(_spikes, target_rate):
     _rate = tf.reduce_mean(_spikes, (0, 1))
@@ -826,6 +879,17 @@ class VoltageRegularization:
         return voltage_loss
 
 
+def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
+    sorted_firing_rates = np.sort(firing_rates)
+    percentiles = (np.arange(firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
+    rate_rd = np.random.RandomState(seed=rnd_seed)
+    x_rand = rate_rd.uniform(size=n_neurons)
+    target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
+    
+    return target_firing_rates
+
+
+# @profile
 def create_model(
     network,
     lgn_input,
@@ -888,7 +952,7 @@ def create_model(
         train_input=train_input,
         hard_reset=hard_reset,
     )
-    print(f"V1Column created in {time()-time0} seconds")
+    print(f"V1Column created in {time()-time0:.2f} seconds")
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.
     zero_state = cell.zero_state(batch_size, dtype)
@@ -916,7 +980,9 @@ def create_model(
         cell.input_indices,
         cell.input_weight_values,
         cell.lgn_input_dense_shape,
-        cell.input_tau_syn_weights,
+        cell.synaptic_weights,
+        cell.input_syn_ids,
+        # cell.input_tau_syn_weights,
         cell._n_neurons,
         lr_scale=lr_scale,
         dtype=dtype,
@@ -928,19 +994,15 @@ def create_model(
         cell.bkg_input_indices,
         cell.bkg_input_weights,
         cell.bkg_input_dense_shape,
-        cell.bkg_input_tau_syn_weights,
+        cell.synaptic_weights, 
+        cell.bkg_input_syn_ids,
+        # cell.bkg_input_tau_syn_weights,
         batch_size, 
         seq_len,
         lr_scale=lr_scale,
         dtype=dtype,
         name="noise_layer",
     )(x) # the input is provided just because in a Keras custom layer, the call method should accept input
-
-    print('Heyyy')
-    print(x.shape)
-    print(noise_inputs.shape)
-    print(rnn_inputs.shape)
-    print(state_input.shape)
 
     rnn_inputs = rnn_inputs + noise_inputs
 
@@ -955,10 +1017,6 @@ def create_model(
     # layer. The output of the RNN layer is a tensor of shape (batch_size, seq_len,
     # neurons). The final state of the RNN layer is a tuple of tensors, each of shape
     # (batch_size, neurons).
-    process = psutil.Process()
-    mem = process.memory_info().rss / (1024 * 1024)  # in MB
-    tf.print("Memory consumption:", mem)
-
     rnn = tf.keras.layers.RNN(
         cell, return_sequences=True, return_state=return_state, name="rsnn"
     )
@@ -966,11 +1024,12 @@ def create_model(
     print("RNN layer created")
 
     # Apply the rnn layer to the full_inputs tensor
+    t0 = time()
     out = rnn(full_inputs, initial_state=rnn_initial_state, constants=constants)
-    process = psutil.Process()
-    mem = process.memory_info().rss / (1024 * 1024)  # in MB
-    tf.print("Memory consumption:", mem)
-    print("RNN layer applied")
+    # process = psutil.Process()
+    # mem = process.memory_info().rss / (1024 * 1024)  # in MB
+    # tf.print("Memory consumption:", mem)
+    print('>>> Recurrent layer processing time: ', time()-t0)
     # Check if the return_state argument is True or False and assign the output of the
     # RNN layer to the hidden variable accordingly.
     if return_state:
@@ -1009,11 +1068,10 @@ def create_model(
     # If neuron_output is False, then the output tensor is simply the result of
     # passing the spikes tensor through a dense layer with n_output units.
     else:
-        output = tf.keras.layers.Dense(n_output, name="projection", trainable=True)(
-            spikes
-        )
-    # Finally, the output tensor is passed through a lambda layer which simply
-    # returns the tensor as it is.
+        output = tf.keras.layers.Dense(n_output, name="projection", trainable=False)(spikes)
+        # output = tf.keras.layers.Dense(n_output, name="projection", trainable=True)(spikes)
+        
+    # Finally, a prediction layer is created
     output = tf.keras.layers.Lambda(lambda _a: _a, name="prediction")(output)
 
     # If return_sequences is True, then the mean_output tensor is computed by
@@ -1035,10 +1093,15 @@ def create_model(
             inputs=[x, state_input_holder,
                     initial_state_holder], outputs=mean_output
         )
+        # many_input_model = tf.keras.Model(
+        #     inputs=[x, state_input_holder,initial_state_holder],
+        #     outputs=[])
     else:
         many_input_model = tf.keras.Model(
             inputs=[x, state_input_holder], outputs=mean_output
         )
+        # many_input_model = tf.keras.Model(
+        #     inputs=[x, state_input_holder])
 
     if add_metric:
         # add the firing rate of the neurons as a metric to the model
