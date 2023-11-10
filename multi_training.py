@@ -11,6 +11,7 @@ import datetime as dt
 import numpy as np
 import pickle as pkl
 import tensorflow as tf
+import re
 
 from packaging import version
 # check the version of tensorflow, and do the right thing.
@@ -130,14 +131,36 @@ def main(_):
         with open(os.path.join(flags.data_dir, 'np_gratings_firing_rates.pkl'), 'rb') as f:
             target_firing_rates = pkl.load(f)
 
-        for key, value in target_firing_rates.items():
+        cell_type_ids = np.zeros(flags.neurons, dtype=np.int32)
+        for i, (key, value) in enumerate(target_firing_rates.items()):
             # identify tne ids that are included in value["ids"]
             neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
             target_firing_rates[key]['neuron_ids'] = neuron_ids
             type_n_neurons = len(neuron_ids)
             target_firing_rates[key]['sorted_target_rates'] = models.sample_firing_rates(
                 value["rates"], type_n_neurons, flags.seed)
-            
+            # neuron_type_ids[key] = neuron_ids
+            cell_type_ids[neuron_ids] = i
+        
+        # make a new array for neurons that contains neuron type ids.
+        pre_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 0]]
+        post_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 1] % flags.neurons]
+        # division by neurons is needed to cancel the delay embedding.
+        
+        # assign connection type id to each unique pair of the sending and recieving ids.
+        connection_ids = np.zeros(network["synapses"]["indices"].shape[0], dtype=np.int32)
+        connection_ids = pre_cell_type_ids * 1000 + post_cell_type_ids
+        
+        # for each connection type, make a list of synapse indices.
+        connection_type_ids = np.unique(connection_ids)
+        connection_type_ids = connection_type_ids[connection_type_ids != 0]
+        connection_type_ids = np.sort(connection_type_ids)
+        connection_type_ids = connection_type_ids.tolist()
+        same_connection_type_indices = []
+        for i in connection_type_ids:
+            same_connection_type_indices.append(np.where(connection_ids == i)[0])
+        
+
         rate_distribution_regularizer = models.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost)
         # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
         # rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
@@ -194,7 +217,10 @@ def main(_):
             # make a huber loss for this.
             # angle_loss = tf.keras.losses.Huber(delta=1, reduction=tf.keras.losses.Reduction.SUM)(sum_angle, tf.zeros_like(sum_angle))
             angle_loss = tf.reduce_mean(tf.abs(sum_angle))
-            return angle_loss
+            
+            # it might be nice to add regularization of weights
+            rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+            return angle_loss + rec_weight_loss
         
         optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)    
 
@@ -238,15 +264,15 @@ def main(_):
         voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * flags.voltage_cost
         rate_loss = rate_distribution_regularizer(_z)
         # classification loss is turned off for now.
-        # classification_loss = compute_loss_gratings(_y, _z)
+        classification_loss = compute_loss_gratings(_y, _z)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss)
-        # _loss = classification_loss + rate_loss + voltage_loss
-        _loss = rate_loss
+        _loss = classification_loss + rate_loss + voltage_loss
+        # _loss = rate_loss
 
         return _out, _p, _loss, _aux
 
-    def train_step(_x, _y, _w):
+    def train_step(_x, _y, _w, grad_average_ind=None):
         with tf.GradientTape() as tape:
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
 
@@ -262,13 +288,29 @@ def main(_):
             _op = train_voltage_loss.update_state(_aux['voltage_loss'])
 
         grad = tape.gradient(_loss, model.trainable_variables)
+        
+            
         for g, v in zip(grad, model.trainable_variables):
             with tf.control_dependencies([_op]):
-                _op = optimizer.apply_gradients([(g, v)])
+                # if the trainable variable is recurrent connection, average the gradient
+                # for each cell type pair.
+                if grad_average_ind is not None:
+                    if v.name == "sparse_recurrent_weights:0":
+                        newg = tf.zeros_like(g)
+                        for inds in grad_average_ind:
+                            mean_frac_change = tf.reduce_mean(tf.gather(g, inds) / tf.gather(v, inds))
+                            mean_rel_change = tf.gather(v, inds) * mean_frac_change
+                            # newg[inds].assign(mean_rel_change)
+                            newg = tf.tensor_scatter_nd_update(newg, tf.expand_dims(inds, axis=1), mean_rel_change)
+                        _op = optimizer.apply_gradients([(newg, v)])
+                    else:
+                        _op = optimizer.apply_gradients([(g, v)])
+                else:
+                    _op = optimizer.apply_gradients([(g, v)])
 
     @tf.function
-    def distributed_train_step(_x, _y, _w):
-        strategy.run(train_step, args=(_x, _y, _w))
+    def distributed_train_step(_x, _y, _w, grad_average_ind=None):
+        strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
     def validation_step(_x, _y, _w):
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
@@ -366,7 +408,10 @@ def main(_):
         for step in range(flags.steps_per_epoch):
             step_t0 = time()
             x, y, _, w = next(it)
-            distributed_train_step(x, y, w)
+            if flags.average_grad_for_cell_type:
+                distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
+            else:
+                distributed_train_step(x, y, w)
 
             if step % 1 == 0:
                 print_str = f'  Step {step + 1:2d}/{flags.steps_per_epoch}: {time() - step_t0:.2f}s\n'
@@ -417,9 +462,15 @@ def main(_):
 
 if __name__ == '__main__':
     hostname = socket.gethostname()
-    if hostname.count('shinya') > 0:
-        _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow/GLIF_network'
-        _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow/results'
+    print("*" * 80)
+    print(hostname)
+    print("*" * 80)
+    # make a condition for different machines. The allen institute has
+    # cluster host name to be n??? where ??? is 3 digit number.
+    # let's make regex for that.
+    if hostname.count('alleninstitute') > 0 or re.search(r'n\d{3}', hostname) is not None:
+        _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
+        _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/results'
     else: 
         _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
         _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/results'
@@ -489,6 +540,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_boolean("hard_reset", True, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
+    absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", True, "")
 
     absl.app.run(main)
 
