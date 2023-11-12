@@ -3,7 +3,10 @@
 import json
 import os
 from time import time
+# measure time for library loading...
+start_time = time()
 
+import pickle as pkl
 import absl
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,7 +14,6 @@ import tensorflow as tf
 # from tensorflow.keras.mixed_precision import experimental as mixed_precision
 from packaging import version
 # check the version of tensorflow, and do the right thing.
-# if tf.__version__ < "2.4.0": # does not work wor 2.10.1.
 if version.parse(tf.__version__) < version.parse("2.4.0"):
     from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
@@ -364,7 +366,7 @@ def main(_):
         time_per_save += time() - t_init_save
         print('Time spent saving trial: {:.2f}'.format(time() - t_init_save))
 
-        # state = out[0][1:]
+        state = out[0][1:]
 
     print("Making plots...")
 
@@ -398,26 +400,24 @@ def main(_):
     # graph(x.numpy(), spike_output_concat)
 
     # Plot LGN units firing rates
-    # LGN_units = LGN_sample_plot(
-    #     firing_rates,
-    #     inputs,
-    #     stimuli_init_time=500,
-    #     stimuli_end_time=1500,
-    #     images_dir=image_path,
-    #     n_samples=2,
-    # )
-    # LGN_units()
+    LGN_units = LGN_sample_plot(
+        firing_rates,
+        inputs,
+        stimuli_init_time=500,
+        stimuli_end_time=1500,
+        images_dir=image_path,
+        n_samples=2,
+    )
+    LGN_units()
 
     # Plot the mean firing rate of the population of neurons
-    # Population_activity = PopulationActivity(
-    #     n_neurons=flags.neurons,
-    #     network=network,
-    #     image_path=image_path,
-    #     data_dir=flags.data_dir,
-    # )
-    # Population_activity(z, plot_core_only=True, bin_size=10)
-
-    tf.profiler.experimental.stop()
+    Population_activity = PopulationActivity(
+        n_neurons=flags.neurons,
+        network=network,
+        image_path=image_path,
+        data_dir=flags.data_dir,
+    )
+    Population_activity(z, plot_core_only=True, bin_size=10)
 
     print('Done!')
 
@@ -425,38 +425,40 @@ def main(_):
 
     # Load a typical distribution of firing rates to which the model is regularized to
     # during training
-    with open(os.path.join(flags.data_dir, 'garrett_firing_rates.pkl'), 'rb') as f:
-        firing_rates = pkl.load(f)
-    sorted_firing_rates = np.sort(firing_rates)
-    percentiles = (np.arange(firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
-    rate_rd = np.random.RandomState(seed=3000)
-    x_rand = rate_rd.uniform(size=flags.neurons)
-    target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
+    # with open(os.path.joiNo don(flags.data_dir, 'garrett_firing_rates.pkl'), 'rb') as f:
+    #     firing_rates = pkl.load(f)
+    # sorted_firing_rates = np.sort(firing_rates)
+    # percentiles = (np.arange(
+    #     firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
+    # rate_rd = np.random.RandomState(seed=3000)
+    # x_rand = rate_rd.uniform(size=flags.neurons)
+    # target_firing_rates = np.sort(
+    #     np.interp(x_rand, percentiles, sorted_firing_rates))
 
-    # ---
-    # Training disrupts the firing properties of the model
-    # To counteract, two types of regularizations are used
-    # 1) Firing rate regularization keeps the distribution of the firing rates close
-    # to the previously loaded distribution of firing rates
-    rate_distribution_regularizer = models.SpikeRateDistributionRegularization(
-        target_firing_rates, flags.rate_cost)
-    # 2) Voltage regularization penalizes membrane voltages that are below resting potential or above threshold
-    voltage_regularizer = models.VoltageRegularization(
-        rsnn_layer.cell, flags.voltage_cost)
+    # # ---
+    # # Training disrupts the firing properties of the model
+    # # To counteract, two types of regularizations are used
+    # # 1) Firing rate regularization keeps the distribution of the firing rates close
+    # # to the previously loaded distribution of firing rates
+    # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(
+    #     target_firing_rates, flags.rate_cost)
+    # # 2) Voltage regularization penalizes membrane voltages that are below resting potential or above threshold
+    # voltage_regularizer = models.VoltageRegularization(
+    #     rsnn_layer.cell, flags.voltage_cost)
 
-    rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
-    voltage_loss = voltage_regularizer(rsnn_layer.output[1])
-    model.add_loss(rate_loss)
-    model.add_loss(voltage_loss)
-    model.add_metric(rate_loss, name='rate_loss')
-    model.add_metric(voltage_loss, name='voltage_loss')
+    # rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
+    # voltage_loss = voltage_regularizer(rsnn_layer.output[1])
+    # model.add_loss(rate_loss)
+    # model.add_loss(voltage_loss)
+    # model.add_metric(rate_loss, name='rate_loss')
+    # model.add_metric(voltage_loss, name='voltage_loss')
 
-    def compute_loss(_target, _pred):
-        return loss_object(_target, _pred) / global_batch_size
+    # def compute_loss(_target, _pred):
+    #     return loss_object(_target, _pred) / global_batch_size
 
-    # Adaptive learning rates
-    optimizer = tf.keras.optimizers.Adam(flags.learning_rate)
-    model.compile(optimizer, compute_loss, metrics=['accuracy'])
+    # # Adaptive learning rates
+    # optimizer = tf.keras.optimizers.Adam(flags.learning_rate)
+    # model.compile(optimizer, compute_loss, metrics=['accuracy'])
 
     # Restore weights from a checkpoint if desired
     if flags.restore_from != '':
@@ -575,5 +577,11 @@ if __name__ == "__main__":
     absl.app.flags.DEFINE_boolean("visualize_test", False, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
     absl.app.flags.DEFINE_boolean("hard_reset", True, "")
+    # absl.app.flags.DEFINE_boolean("hard_reset", False, "")
 
+    print(f"--- Library loading took {time() - start_time} seconds ---")
+    # measure the run time for the main part
+    print(f"--- Main part started ---")
+    start_time = time()
     absl.app.run(main)
+    print(f"--- Main part run in {time() - start_time} seconds ---")
