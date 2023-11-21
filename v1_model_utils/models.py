@@ -835,6 +835,31 @@ class SpikeRateDistributionRegularization:
 
         return reg_loss
 
+def compute_spike_rate_target_loss(_spikes, target_rates):
+    # TODO: define this function
+    # target_rates is a dictionary that contains all the cell types.
+    # I should iterate on them, and add the cost for each one at the end.
+    # spikes will have a shape of (batch_size, n_steps, n_neurons)
+    losses = []
+    for key, value in target_rates.items():
+        spikes_type = tf.gather(_spikes, value["neuron_ids"], axis=-1)
+        loss_type = compute_spike_rate_distribution_loss(spikes_type, value["sorted_target_rates"])
+        losses.append(tf.reduce_mean(loss_type))
+    
+    return tf.reduce_sum(losses, axis=0)
+
+
+class SpikeRateDistributionTarget:
+    """ Instead of regularization, treat it as a target.
+        The main difference is that this class will calculate the loss
+        for each subtypes of the neurons."""
+    def __init__(self, target_rates, rate_cost=.5):
+        self._rate_cost = rate_cost
+        self._target_rates = target_rates
+    
+    def __call__(self, spikes):
+        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates) * self._rate_cost
+        return reg_loss
 
 class VoltageRegularization:
     def __init__(self, cell, voltage_cost=1e-5):
