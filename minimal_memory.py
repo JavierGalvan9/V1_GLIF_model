@@ -13,7 +13,7 @@ import stim_dataset
 
 class Fake():
     def __init__(self):
-        self.neurons = 33000
+        self.neurons = 5000
         self.batch_size = 1
         self.data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
         self.core_only = True
@@ -22,7 +22,7 @@ class Fake():
         self.n_output = 2
         self.neurons_per_output = 10
         self.n_input = 17400
-        self.seq_len = 128
+        self.seq_len = 600 
         self.delays = '10,10'
         self.voltage_cost = 1.0
         
@@ -73,7 +73,6 @@ dtype = tf.float32
 
 
 zero_state = rsnn_layer.cell.zero_state(flags.batch_size)
-   
 state_variables = tf.nest.map_structure(lambda a: tf.Variable(
     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
 ), zero_state)
@@ -82,6 +81,22 @@ state_variables = tf.nest.map_structure(lambda a: tf.Variable(
 def roll_out(_x, _y, _w):
     _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
     dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
+    # v1 = rsnn_layer.cell
+    v1 = extractor_model.get_layer('rsnn').cell
+    del v1.sparse_w_rec
+    # v1.prepare_sparse_weight(v1.recurrent_weight_values, v1.recurrent_weights_factors)
+    # let's be explicit. calculate the sparse tensor here.
+    # sparse_w_recs = []
+    # for r_id in range(v1._n_syn_basis):
+    #     w_syn_recep = v1.recurrent_weight_values * v1.recurrent_weights_factors[r_id]
+    #     sparse_w_rec = tf.sparse.SparseTensor(
+    #         v1.recurrent_indices,
+    #         tf.cast(w_syn_recep, v1._compute_dtype),
+    #         v1.recurrent_dense_shape
+    #     )
+    #     sparse_w_recs.append(sparse_w_rec)
+    
+    # # v1.prepare_sparse_weight()
     _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
     # print('roll out time: ', time.time() - stt)
 
@@ -108,8 +123,7 @@ def train_step(_x, _y, _w):
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
     tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)
-    # model.optimizer.apply_gradients(zip(_grads, model.trainable_variables))
-    return _out, _p, _loss, _aux
+    return _out, _p, _loss, _aux, _grads
 
 
 
@@ -128,6 +142,8 @@ x = tf.expand_dims(x, 0)
 
 # %% run the model
 out = train_step(x, y, w)
+print(out[-1]) # gradient
+print(out[-2]) # aux loss
 # out = roll_out(x, y, w)
 # %%
 

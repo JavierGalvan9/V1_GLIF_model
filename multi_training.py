@@ -28,7 +28,24 @@ import stim_dataset
 
 from time import time
 
+# tf.debugging.enable_check_numerics()
 
+
+print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
+print("--- CUDNN version: ", tf.sysconfig.get_build_info()["cudnn_version"])
+
+import ctypes.util
+# For CUDA Runtime API
+lib_path = ctypes.util.find_library('cudart')
+print("--- CUDA Library path: ", lib_path)
+
+debug = False
+def print_vram(check_point_num=0):
+    # print(f"GPU memory usage: {tf_ram:.3f} GB")
+    if debug:
+        tf_ram = tf.config.experimental.get_memory_usage('GPU:0') / 1e9
+        print(f"Checkpoint {check_point_num}: GPU memory usage: {tf_ram:.3f} GB")
+    return
 
 def main(_):
     # # Enable TensorFlow Profiler
@@ -72,7 +89,10 @@ def main(_):
     n_workers, n_gpus_per_worker = 1, 1
     # model is being run on multiple GPUs or CPUs, and the results are being reduced to a single CPU device. 
     # In this case, the reduce_to_device argument is set to "cpu:0", which means that the results are being reduced to the first CPU device.
-    strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.ReductionToOneDevice(reduce_to_device="cpu:0")) 
+    # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.ReductionToOneDevice(reduce_to_device="cpu:0")) 
+    # if gpu is available, use it, otherwise use cpu
+    device = "/gpu:0" if tf.config.list_physical_devices("GPU") else "/cpu:0"
+    strategy = tf.distribute.OneDeviceStrategy(device=device)
     task_name = 'drifting_gratings_firing_rates_distr'  
     per_replica_batch_size = flags.batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
@@ -115,6 +135,7 @@ def main(_):
             use_state_input=True,
             return_state=True,
         )
+        
 
         del lgn_input, bkg_input
 
@@ -298,7 +319,15 @@ def main(_):
                     if v.name == "sparse_recurrent_weights:0":
                         newg = tf.zeros_like(g)
                         for inds in grad_average_ind:
-                            mean_frac_change = tf.reduce_mean(tf.gather(g, inds) / tf.gather(v, inds))
+                            v_gathered = tf.gather(v, inds)
+                            g_gathered = tf.gather(g, inds)
+
+                            # Avoid division by zero and replace NaNs
+                            safe_divisor = tf.where(v_gathered != 0, v_gathered, tf.ones_like(v_gathered))
+                            mean_frac_change = tf.reduce_mean(g_gathered / safe_divisor)
+                            # mean_frac_change = tf.reduce_mean(tf.gather(g, inds) / tf.gather(v, inds))
+                            mean_frac_change = tf.where(tf.math.is_nan(mean_frac_change), tf.zeros_like(mean_frac_change), mean_frac_change)
+
                             mean_rel_change = tf.gather(v, inds) * mean_frac_change
                             # newg[inds].assign(mean_rel_change)
                             newg = tf.tensor_scatter_nd_update(newg, tf.expand_dims(inds, axis=1), mean_rel_change)
@@ -363,6 +392,7 @@ def main(_):
                 seq_len=flags.seq_len,
                 pre_delay=delays[0],
                 post_delay=delays[1],
+                n_input=flags.n_input,
             ).batch(
                     per_replica_batch_size)
                         
@@ -387,14 +417,35 @@ def main(_):
 
     def save_model():
         step_counter.assign_add(1)
-        p = manager.save()
-        print(f'Model saved in {p}')
+        try:
+            p = manager.save()
+            print(f'Model saved in {p}')
+        except:
+            print("Saving failed. Maybe next time?")
 
     with open(os.path.join(logdir, 'config.json'), 'w') as f:
         json.dump(flags.flag_values_dict(), f, indent=4)
 
     stop = False
     t0 = time()
+    
+    def safe_lgn_generation(lgn_iterator):
+        """ Generate LGN data sefely.
+        It looks that the LGN data generation fails randomly.
+        Enclose the generation in while loop and try clause to avoid failure.
+        If it fails, generate a new instance of LGN to avoid keep getting error.
+        """
+        while True:
+            try:
+                x, y, _, w = next(lgn_iterator)
+                break
+            except:
+                print("----- LGN input data generation failed. Renewing the LGN input generator...")
+                # resetting the lgn iterator
+                data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+                lgn_iterator = iter(data_set)
+                continue
+        return x, y, _, w, lgn_iterator
     
     for epoch in range(flags.n_epochs):
         if stop:
@@ -407,7 +458,10 @@ def main(_):
         distributed_reset_state()
         for step in range(flags.steps_per_epoch):
             step_t0 = time()
-            x, y, _, w = next(it)
+            # x, y, _, w = next(it)
+            # above line of code randomly prodeces an error.
+            # rewrite within try clause in while loop not to fail.
+            x, y, _, w, it = safe_lgn_generation(it)
             if flags.average_grad_for_cell_type:
                 distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
             else:
@@ -428,7 +482,7 @@ def main(_):
         distributed_reset_state()
         test_it = iter(test_data_set)
         for step in range(flags.val_steps):
-            x, y, _, w = next(test_it)
+            x, y, _, w, it = safe_lgn_generation(test_it)
             distributed_validation_step(x, y, w) 
 
         print_str = '  Validation: ' + compose_str(
