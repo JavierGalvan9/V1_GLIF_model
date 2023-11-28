@@ -295,6 +295,8 @@ def main(_):
 
     def train_step(_x, _y, _w, grad_average_ind=None):
         with tf.GradientTape() as tape:
+            v1 = extractor_model.get_layer('rsnn').cell
+            v1.sparse_w_rec = v1.prepare_sparse_weight()
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
@@ -342,6 +344,8 @@ def main(_):
         strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
     def validation_step(_x, _y, _w):
+        v1 = extractor_model.get_layer('rsnn').cell
+        v1.sparse_w_rec = v1.prepare_sparse_weight()
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
         _op = val_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
@@ -428,7 +432,7 @@ def main(_):
 
     stop = False
     t0 = time()
-    
+   
     def safe_lgn_generation(lgn_iterator):
         """ Generate LGN data sefely.
         It looks that the LGN data generation fails randomly.
@@ -447,6 +451,7 @@ def main(_):
                 continue
         return x, y, _, w, lgn_iterator
     
+    tf.profiler.experimental.start('logdir2')
     for epoch in range(flags.n_epochs):
         if stop:
             break
@@ -512,6 +517,7 @@ def main(_):
                 json.dump(result, f)
         reset_train_metrics()
         reset_validation_metrics()
+    tf.profiler.experimental.stop()
 
 
 if __name__ == '__main__':
