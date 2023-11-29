@@ -618,25 +618,37 @@ class V1Column(tf.keras.layers.Layer):
             # tf.print("preparing the sparse weight")
             # self.sparse_w_rec = self.prepare_sparse_weight()
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
-        i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
-        for r_id in range(self._n_syn_basis):
-            # weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
-            # weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[r_id]
-            # sparse_w_rec = tf.sparse.SparseTensor(
-            #     self.recurrent_indices,
-            #     tf.cast(weights_syn_receptors, self._compute_dtype), 
-            #     self.recurrent_dense_shape,
-            # )
-            i_receptor = tf.sparse.sparse_dense_matmul(
-                                                        # sparse_w_rec,
-                                                        self.sparse_w_rec[r_id],
-                                                        rec_z_buf,
-                                                        adjoint_b=True
-                                                    )
-            # Append i_receptor to the TensorArray
-            i_rec = i_rec.write(r_id, i_receptor)
-        # Stack the TensorArray into a single tensor
-        i_rec = i_rec.stack()
+        single = False
+        if single:
+            sparse_w_rec = tf.sparse.concat(axis=0, sp_inputs=self.sparse_w_rec)
+            i_rec = tf.sparse.sparse_dense_matmul(
+                                                    sparse_w_rec,
+                                                    rec_z_buf,
+                                                    adjoint_b=True
+                                                )
+            i_rec = tf.reshape(i_rec, (-1, self._n_syn_basis, self._n_neurons))
+            i_rec = tf.transpose(i_rec, perm=[1, 0, 2])
+
+        else:
+            i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
+            for r_id in range(self._n_syn_basis):
+                # weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
+                # weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[r_id]
+                # sparse_w_rec = tf.sparse.SparseTensor(
+                #     self.recurrent_indices,
+                #     tf.cast(weights_syn_receptors, self._compute_dtype), 
+                #     self.recurrent_dense_shape,
+                # )
+                i_receptor = tf.sparse.sparse_dense_matmul(
+                                                            # sparse_w_rec,
+                                                            self.sparse_w_rec[r_id],
+                                                            rec_z_buf,
+                                                            adjoint_b=True
+                                                        )
+                # Append i_receptor to the TensorArray
+                i_rec = i_rec.write(r_id, i_receptor)
+            # Stack the TensorArray into a single tensor
+            i_rec = i_rec.stack()
         return i_rec
     
     # @tf.function

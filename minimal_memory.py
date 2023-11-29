@@ -10,12 +10,12 @@ import stim_dataset
 from time import time
 
 
-tf.profiler.experimental.start('logdir2')
+# tf.profiler.experimental.start('logdir2')
 
 
 class Fake():
     def __init__(self):
-        self.neurons = 1000
+        self.neurons = 500
         self.batch_size = 1
         self.data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
         self.core_only = True
@@ -106,20 +106,21 @@ def roll_out(ex_model, _x, _y, _w):
     # _loss = classification_loss + rate_loss + voltage_loss
     _loss = voltage_loss
     # _loss = rate_loss
+    tf.print(f"Number of spikes: {tf.reduce_sum(_z):.2f}")
 
     return _out, _p, _loss, _aux
 
 @tf.function
 def train_step(ex_model, _x, _y, _w):
     with tf.GradientTape() as tape:
-        v1 = extractor_model.get_layer('rsnn').cell
+        v1 = ex_model.get_layer('rsnn').cell
         v1.sparse_w_rec = v1.prepare_sparse_weight()
         _out, _p, _loss, _aux = roll_out(ex_model, _x, _y, _w)
     tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)
     # print the gpu memory in GB use if gpu exists
     if tf.config.list_physical_devices('GPU'):
-        tf.print('GPU memory use: ', tf.config.experimental.get_memory_usage('GPU:0') / 1024 / 1024 / 1024)
+        tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
 
     return _out, _p, _loss, _aux, _grads
 
@@ -145,10 +146,10 @@ for i in range(2):
     print(out[-1]) # gradient
     print(out[-2]) # aux loss
     if tf.config.list_physical_devices('GPU'):
-        tf.print('GPU memory use: ', tf.config.experimental.get_memory_usage('GPU:0') / 1024 / 1024 / 1024)
+        tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
     tf.print(f"one step time: {time() - stime:.2f}")
     # print(sum(out[0][0][0])) # number of spikes
-tf.profiler.experimental.stop()
+# tf.profiler.experimental.stop()
 # out = roll_out(x, y, w)
 # %%
 

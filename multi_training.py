@@ -451,7 +451,7 @@ def main(_):
                 continue
         return x, y, _, w, lgn_iterator
     
-    tf.profiler.experimental.start('logdir2')
+    tf.profiler.experimental.start('logdir4')
     for epoch in range(flags.n_epochs):
         if stop:
             break
