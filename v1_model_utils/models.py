@@ -4,11 +4,35 @@ import psutil
 import os 
 import pickle as pkl
 from time import time
-from memory_profiler import profile
+# from memory_profiler import profile
 from pympler.asizeof import asizeof, asized
 
 
 # print("TensorFlow version:", tf.__version__) # 2.4.1
+import subprocess
+
+class GPUMemoryTracker:
+    def __init__(self):
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+                                stdout=subprocess.PIPE, encoding='utf-8') # MiB
+        self.previous_used = float(result.stdout.strip())
+    
+    def get_gpu_memory(self):
+        # Function to get the allocated, free and total memory of a GPU
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total', '--format=csv,nounits,noheader'],
+                                stdout=subprocess.PIPE, encoding='utf-8') # MiB
+        used, free, total = [float(x) for x in result.stdout.strip().split(',')]
+        
+        increase = used - self.previous_used
+        self.previous_used = used
+        
+        tf.print("---- GPU Memory ----")
+        tf.print(f"  Total: {round(total / 1024, 2)} GiB")
+        tf.print(f"  Available: {round(free / 1024, 2)} GiB")
+        tf.print(f"  Used: {round(used / 1024, 2)} GiB")
+        tf.print(f"  Increase: {round(increase / 1024, 2)} GiB")
+        tf.print('')
+
 
 # Define a custom gradient for the spike function.
 # Diverse functions can be used to define the gradient.
@@ -161,7 +185,7 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
         self.bkg_input_weights_factors = synaptic_weights[syn_ids]
 
-    @tf.function
+    # @tf.function
     def calculate_bkg_i_in(self, inputs):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
         i_in = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
@@ -195,7 +219,7 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
         noise_input = tf.transpose(noise_input) # New shape (3000, 66634, 5)
         # Reshape properly the input current
         noise_input = tf.reshape(noise_input, (self._batch_size, self._seq_len, -1)) # (1, 3000, 333170)
-        print('>>> BKG sparse layer processing time: ', time()-t0)
+        # print('>>> BKG sparse layer processing time: ', time()-t0)
 
         return noise_input
 
@@ -222,7 +246,9 @@ class SparseLayer(tf.keras.layers.Layer):
         nnz_sparse_matrix = self._indices.shape[0]
         self._max_batch = int(2**31 / nnz_sparse_matrix)
 
-    @tf.function
+
+    # @tf.function(input_signature=[tf.TensorSpec(shape=[None, None], dtype=tf.int16)])
+    # @tf.function
     def calculate_i_in(self, inputs):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
         i_in = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
@@ -235,7 +261,7 @@ class SparseLayer(tf.keras.layers.Layer):
             )
             i_receptor = tf.sparse.sparse_dense_matmul(
                                                         sparse_w_in,
-                                                        inputs,
+                                                        tf.cast(inputs, self._compute_dtype),
                                                         adjoint_b=True
                                                     )
             # Append i_receptor to the TensorArray
@@ -302,7 +328,7 @@ class SparseLayer(tf.keras.layers.Layer):
 
         # Reshape properly the input current
         input_current = tf.reshape(input_current, (shp[0], shp[1], -1)) # New shape (1, 3000, 333170)
-        print('>>> Input sparse layer processing time: ', time()-t0)
+        # print('>>> Input sparse layer processing time: ', time()-t0)
 
         return input_current
 
@@ -487,6 +513,8 @@ class V1Column(tf.keras.layers.Layer):
 
         self.recurrent_weights_factors = synaptic_weights[syn_ids]
 
+        print('Recurrent weights factors shape', self.recurrent_weights_factors.shape)
+
         # Generate weight tensors for every basis receptor type
         # recurrent_weight_values_mod = self.recurrent_weight_values[:, np.newaxis] * recurrent_weights_factors
         # recurrent_weight_values_mod_list = tf.split(recurrent_weight_values_mod, self._n_syn_basis, axis=1) # list with one element per syn basis
@@ -589,7 +617,7 @@ class V1Column(tf.keras.layers.Layer):
         print(f"> BKG input synapses {len(bkg_input_indices)}")
         del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, synaptic_weights
 
-    @tf.function
+    # @tf.function
     def calculate_i_rec(self, rec_z_buf):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
         i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
@@ -600,6 +628,7 @@ class V1Column(tf.keras.layers.Layer):
                 tf.cast(weights_syn_receptors, self._compute_dtype), 
                 self.recurrent_dense_shape,
             )
+
             i_receptor = tf.sparse.sparse_dense_matmul(
                                                         sparse_w_rec,
                                                         rec_z_buf,
@@ -611,13 +640,13 @@ class V1Column(tf.keras.layers.Layer):
         i_rec = i_rec.stack()
         return i_rec
 
-    @tf.function
+    # @tf.function
     def update_psc(self, psc, psc_rise, rec_inputs, syn_decay, psc_initial, dt):
         new_psc_rise = psc_rise * self.syn_decay + rec_inputs * self.psc_initial
         new_psc = psc * self.syn_decay + self._dt * self.syn_decay * psc_rise
         return new_psc, new_psc_rise
 
-    @tf.function
+    # @tf.function
     def update_asc(self, asc_1, asc_2, k, prev_z, asc_amps, dt):
         exp_dt_k_1 = tf.exp(-dt * k[:, 0])
         exp_dt_k_2 = tf.exp(-dt * k[:, 1])
@@ -625,7 +654,7 @@ class V1Column(tf.keras.layers.Layer):
         new_asc_2 = exp_dt_k_2 * asc_2 + prev_z * asc_amps[:, 1]
         return new_asc_1, new_asc_2
 
-    @tf.function
+    # @tf.function
     def zero_state(self, batch_size, dtype=tf.float32):
         # The neurons membrane voltage start the simulation at their reset value
         v0 = tf.ones((batch_size, self._n_neurons), dtype) * tf.cast(
@@ -642,11 +671,14 @@ class V1Column(tf.keras.layers.Layer):
                         self._n_syn_basis), dtype)
         return z0_buf, v0, r0, asc_10, asc_20, psc_rise0, psc0
 
-    @tf.function
+    # @tf.function
     def _gather(self, prop):
         return tf.gather(prop, self._node_type_ids)
 
     def call(self, inputs, state, constants=None):
+        # tf.print('------------- MODEL CALLING OUT --------------')
+        # tracker = GPUMemoryTracker()
+
         batch_size = inputs.shape[0]
         if batch_size is None:
             batch_size = tf.shape(inputs)[0]
@@ -976,6 +1008,7 @@ def create_model(
         constants = tf.zeros((batch_size,))
 
     # Create the LGN input layer of the model
+    # x = tf.cast(x, tf.int16)
     rnn_inputs = SparseLayer(
         cell.input_indices,
         cell.input_weight_values,
@@ -1029,7 +1062,7 @@ def create_model(
     # process = psutil.Process()
     # mem = process.memory_info().rss / (1024 * 1024)  # in MB
     # tf.print("Memory consumption:", mem)
-    print('>>> Recurrent layer processing time: ', time()-t0)
+    # print('>>> Recurrent layer processing time: ', time()-t0)
     # Check if the return_state argument is True or False and assign the output of the
     # RNN layer to the hidden variable accordingly.
     if return_state:

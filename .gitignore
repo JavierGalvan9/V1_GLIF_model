@@ -31,3 +31,4 @@ input_data_extractor.py
 network_data_extractor.py
 GLIF_network/input/firing_rates_mine.lzma
 __pycache__
+*.html

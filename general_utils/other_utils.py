@@ -20,6 +20,7 @@ from functools import reduce
 import time
 from datetime import datetime
 import tracemalloc
+import subprocess
 
 
 ##############################################################################################################################
@@ -226,3 +227,59 @@ def fig_saver(filename):
     while os.path.exists('{}{:d}.png'.format(filename, i)):
         i += 1
     plt.savefig('{}{:d}.png'.format(filename, i))
+
+
+##############################################################################################################################
+"""                                                   I. GPU and CPU memory profilers                                                        """
+##############################################################################################################################
+
+class GPUMemoryTracker:
+    def __init__(self):
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+                                stdout=subprocess.PIPE, encoding='utf-8') # MiB
+        self.previous_used = float(result.stdout.strip())
+    
+    def get_gpu_memory(self):
+        # Function to get the allocated, free and total memory of a GPU
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total', '--format=csv,nounits,noheader'],
+                                stdout=subprocess.PIPE, encoding='utf-8') # MiB
+        used, free, total = [float(x) for x in result.stdout.strip().split(',')]
+        
+        increase = used - self.previous_used
+        self.previous_used = used
+        
+        tf.print("---- GPU Memory ----")
+        tf.print(f"  Total: {round(total / 1024, 2)} GiB")
+        tf.print(f"  Available: {round(free / 1024, 2)} GiB")
+        tf.print(f"  Used: {round(used / 1024, 2)} GiB")
+        tf.print(f"  Increase: {round(increase / 1024, 2)} GiB")
+        tf.print('')
+
+
+def print_gpu_memory():
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if not physical_devices:
+        print("No GPU devices found.")
+        return
+
+    for i, gpu in enumerate(physical_devices):
+        # print(f"GPU {i}: {gpu.name}")
+        # Get the GPU name (takes on the form of '/device:GPU:0')
+        name = gpu.name
+        # Remove the '/device:' prefix and trailing GPU number to get the name
+        name = ':'.join(name.split(':')[-2:])
+
+        # Get GPU memory usage
+        try:
+            memory_details = tf.config.experimental.get_memory_usage(name) # this only gives the memory that Tf is currently using, not all the memory that it has allocated
+            # print gpu memory in GB
+            print("GPU memory:", memory_details/1024**3, " GB")
+        except:
+            print("Cannot get memory details for GPU", name)
+
+# def print_system_memory():
+#     svmem = psutil.virtual_memory()
+#     print(f"System Memory:")
+#     print(f"  Total: {svmem.total // (1024 ** 3)} GB")
+#     print(f"  Available: {svmem.available // (1024 ** 3)} GB")
+#     print(f"  Used: {svmem.used // (1024 ** 3)} GB")

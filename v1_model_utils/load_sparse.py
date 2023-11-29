@@ -496,65 +496,65 @@ def load_input(
     return input_populations
 
 
-def reduce_input_population(input_population, new_n_input, seed=3000):
-    rd = np.random.RandomState(seed=seed)
+# def reduce_input_population(input_population, new_n_input, seed=3000):
+#     rd = np.random.RandomState(seed=seed)
 
-    in_ind = input_population["indices"]
-    in_weights = input_population["weights"]
-    in_delays = input_population["delays"]
+#     in_ind = input_population["indices"]
+#     in_weights = input_population["weights"]
+#     in_delays = input_population["delays"]
 
-    # we take input_population['n_inputs'] neurons from a list of new_n_input with replace,
-    # which means that in the end there can be less than new_n_input neurons of the LGN,
-    # but they are randonmly selected
-    assignment = rd.choice(np.arange(new_n_input), size=input_population["n_inputs"], replace=True)
+#     # we take input_population['n_inputs'] neurons from a list of new_n_input with replace,
+#     # which means that in the end there can be less than new_n_input neurons of the LGN,
+#     # but they are randonmly selected
+#     assignment = rd.choice(np.arange(new_n_input), size=input_population["n_inputs"], replace=True)
 
-    weight_dict = dict()
-    delays_dict = dict()
-    # go through all the asignment selection made
-    for input_neuron in range(input_population["n_inputs"]):
-        assigned_neuron = assignment[input_neuron]
-        # consider that neurons connected to the input_neuron
-        sel = in_ind[:, 1] == input_neuron
-        # keep that neurons connected to the input_neuron
-        sel_post_inds = in_ind[sel, 0]
-        sel_weights = in_weights[sel]
-        sel_delays = in_delays[sel]
-        for post_ind, weight, delay in zip(sel_post_inds, sel_weights, sel_delays):
-            # tuple with the indices of the post model neuron and the pre LGN neuron
-            t_inds = post_ind, assigned_neuron
-            if t_inds not in weight_dict.keys():  # in case the key hasnt been already created
-                weight_dict[t_inds] = 0.0
-            # in case a LGN unit connection is repeated we consider that the weights are add up
-            weight_dict[t_inds] += weight
-            delays_dict[t_inds] = delay
+#     weight_dict = dict()
+#     delays_dict = dict()
+#     # go through all the asignment selection made
+#     for input_neuron in range(input_population["n_inputs"]):
+#         assigned_neuron = assignment[input_neuron]
+#         # consider that neurons connected to the input_neuron
+#         sel = in_ind[:, 1] == input_neuron
+#         # keep that neurons connected to the input_neuron
+#         sel_post_inds = in_ind[sel, 0]
+#         sel_weights = in_weights[sel]
+#         sel_delays = in_delays[sel]
+#         for post_ind, weight, delay in zip(sel_post_inds, sel_weights, sel_delays):
+#             # tuple with the indices of the post model neuron and the pre LGN neuron
+#             t_inds = post_ind, assigned_neuron
+#             if t_inds not in weight_dict.keys():  # in case the key hasnt been already created
+#                 weight_dict[t_inds] = 0.0
+#             # in case a LGN unit connection is repeated we consider that the weights are add up
+#             weight_dict[t_inds] += weight
+#             delays_dict[t_inds] = delay
 
-    n_synapses = len(weight_dict)
-    # we now save the synapses in arrays of indices and weights
-    new_in_ind = np.zeros((n_synapses, 2), np.int64)
-    new_in_weights = np.zeros(n_synapses)
-    new_in_delays = np.zeros(n_synapses)
-    for i, (t_ind, w) in enumerate(weight_dict.items()):
-        new_in_ind[i] = t_ind
-        new_in_weights[i] = w
-        new_in_delays[i] = delays_dict[t_ind]
+#     n_synapses = len(weight_dict)
+#     # we now save the synapses in arrays of indices and weights
+#     new_in_ind = np.zeros((n_synapses, 2), np.int64)
+#     new_in_weights = np.zeros(n_synapses)
+#     new_in_delays = np.zeros(n_synapses)
+#     for i, (t_ind, w) in enumerate(weight_dict.items()):
+#         new_in_ind[i] = t_ind
+#         new_in_weights[i] = w
+#         new_in_delays[i] = delays_dict[t_ind]
 
-    # new_in_ind, new_in_weights, new_in_delays = sort_input_indices(
-    #     new_in_ind, new_in_weights, new_in_delays
-    # )
+#     # new_in_ind, new_in_weights, new_in_delays = sort_input_indices(
+#     #     new_in_ind, new_in_weights, new_in_delays
+#     # )
 
-    new_in_ind, new_in_weights, new_in_delays = sort_indices(
-        new_in_ind, new_in_weights, new_in_delays
-    )
+#     new_in_ind, new_in_weights, new_in_delays = sort_indices(
+#         new_in_ind, new_in_weights, new_in_delays
+#     )
     
-    new_input_population = dict(
-        n_inputs=new_n_input,
-        indices=new_in_ind,
-        weights=new_in_weights,
-        delays=new_in_delays,
-        # spikes=None,
-    )
+#     new_input_population = dict(
+#         n_inputs=new_n_input,
+#         indices=new_in_ind,
+#         weights=new_in_weights,
+#         delays=new_in_delays,
+#         # spikes=None,
+#     )
 
-    return new_input_population
+#     return new_input_population
 
 # @profile
 def load_v1(flags, n_neurons):
