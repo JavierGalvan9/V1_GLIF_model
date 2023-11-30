@@ -563,6 +563,7 @@ def reduce_input_population(input_population, new_n_input, seed=3000):
 
     return new_input_population
 
+  
 # @profile
 def load_v1(flags, n_neurons):
 

@@ -27,29 +27,17 @@ from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_
 import stim_dataset
 
 from time import time
+import psutil
+# from memory_profiler import profile
 
 # tf.debugging.enable_check_numerics()
 
 
-print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
-print("--- CUDNN version: ", tf.sysconfig.get_build_info()["cudnn_version"])
 
-import ctypes.util
-# For CUDA Runtime API
-lib_path = ctypes.util.find_library('cudart')
-print("--- CUDA Library path: ", lib_path)
-
-debug = False
-def print_vram(check_point_num=0):
-    # print(f"GPU memory usage: {tf_ram:.3f} GB")
-    if debug:
-        tf_ram = tf.config.experimental.get_memory_usage('GPU:0') / 1e9
-        print(f"Checkpoint {check_point_num}: GPU memory usage: {tf_ram:.3f} GB")
-    return
+# @profile
 
 def main(_):
-    # # Enable TensorFlow Profiler
-    # tf.profiler.experimental.start('log_dir') 
+    # tracker = GPUMemoryTracker()
     flags = absl.app.flags.FLAGS
     np.random.seed(flags.seed)
     tf.random.set_seed(flags.seed)
@@ -65,7 +53,8 @@ def main(_):
     try:
         for dev in physical_devices:
             print(dev)
-            tf.config.experimental.set_memory_growth(dev, True)
+            tf.config.experimental.set_memory_growth(dev, True) 
+
     except:
         # Invalid device or cannot modify virtual devices once initialized.
         print("Invalid device or cannot modify virtual devices once initialized.")
@@ -86,14 +75,25 @@ def main(_):
         dtype = tf.float32
 
     
+    task_name = 'drifting_gratings_firing_rates_distr'  
+    sim_name = toolkit.get_random_identifier('b_')
+    logdir = os.path.join(results_dir, sim_name)
+    print(f'> Results for {task_name} will be stored in {logdir}')
+
+        # print('------------- MEMORY ANALYSIS 1 --------------')
+    # print_gpu_memory()
+    # print_system_memory()
+
+        
     n_workers, n_gpus_per_worker = 1, 1
     # model is being run on multiple GPUs or CPUs, and the results are being reduced to a single CPU device. 
     # In this case, the reduce_to_device argument is set to "cpu:0", which means that the results are being reduced to the first CPU device.
     # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.ReductionToOneDevice(reduce_to_device="cpu:0")) 
+    
     # if gpu is available, use it, otherwise use cpu
     device = "/gpu:0" if tf.config.list_physical_devices("GPU") else "/cpu:0"
     strategy = tf.distribute.OneDeviceStrategy(device=device)
-    task_name = 'drifting_gratings_firing_rates_distr'  
+
     per_replica_batch_size = flags.batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
     print(f'Global batch size: {global_batch_size}')
@@ -108,10 +108,12 @@ def main(_):
 
     network, lgn_input, bkg_input = load_fn(flags, flags.neurons)
     print(f"Model data loading, {time()-t0:.2f} seconds")
-
+  
     # Define the scope in which the model training will be executed
     with strategy.scope():
         t0 = time()
+        # # Enable TensorFlow Profiler
+        # tf.profiler.experimental.start(logdir=logdir, )
         model = models.create_model(
             network,
             lgn_input,
@@ -142,6 +144,14 @@ def main(_):
         model.build((flags.batch_size, flags.seq_len, flags.n_input))
         print(f"Model built in {time()-t0:.2f} seconds")
 
+        # tf.profiler.experimental.stop()
+
+        # print('------------- MODEL CONSTRUCTION --------------')
+        # tracker.get_gpu_memory()
+        # # Enable TensorFlow Profiler      
+
+        logdir2 = logdir+'_model'
+        
         # Extract outputs of intermediate keras layers to get access to
         # spikes and membrane voltages of the model
         rsnn_layer = model.get_layer("rsnn")
@@ -271,12 +281,21 @@ def main(_):
             val_loss.reset_states(), val_accuracy.reset_states(), val_firing_rate.reset_states()
             val_rate_loss.reset_states(), val_voltage_loss.reset_states()
 
+    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+
     def roll_out(_x, _y, _w):
         _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
-        stt = time()
+        # stt = time()
         dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
+
+        # print('------------- EXTRACTING MODEL --------------')
+        # tracker = GPUMemoryTracker()
+
+        # _x = tf.cast(_x, tf.int16)
+
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
-        # print('roll out time: ', time.time() - stt)
+        # tracker.get_gpu_memory()
+        # print('roll out time: ', time() - stt) # 1.23 seg
 
         _z, _v, _input_current = _out[0]
         voltage_32 = (tf.cast(_v, tf.float32) - rsnn_layer.cell.voltage_offset) / rsnn_layer.cell.voltage_scale
@@ -288,6 +307,7 @@ def main(_):
         classification_loss = compute_loss_gratings(_y, _z)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss)
+
         _loss = classification_loss + rate_loss + voltage_loss
         # _loss = rate_loss
 
@@ -296,6 +316,8 @@ def main(_):
     def train_step(_x, _y, _w, grad_average_ind=None):
         with tf.GradientTape() as tape:
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
+            #     grad = tape.gradient(_loss, model.trainable_variables)
+            # tape.reset()
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
@@ -309,8 +331,7 @@ def main(_):
             _op = train_voltage_loss.update_state(_aux['voltage_loss'])
 
         grad = tape.gradient(_loss, model.trainable_variables)
-        
-            
+             
         for g, v in zip(grad, model.trainable_variables):
             with tf.control_dependencies([_op]):
                 # if the trainable variable is recurrent connection, average the gradient
@@ -355,22 +376,17 @@ def main(_):
             _op = val_voltage_loss.update_state(_aux['voltage_loss'])
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
 
-    @tf.function
+    # @tf.function
     def distributed_validation_step(_x, _y, _w):
         strategy.run(validation_step, args=(_x, _y, _w))
 
     def reset_state():
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
 
-    @tf.function
+    # @tf.function
     def distributed_reset_state():
         strategy.run(reset_state)
-
-    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-    sim_name = toolkit.get_random_identifier('b_')
-    logdir = os.path.join(results_dir, sim_name)
-    print(f'> Results for {task_name} will be stored in {logdir}')
-
+    
     if flags.restore_from != '':
         with strategy.scope():
             # checkpoint.restore(tf.train.latest_checkpoint(flags.restore_from))
@@ -399,12 +415,12 @@ def main(_):
             return _data_set
         return _f
     
-    # We define the dataset generates function under the strategy scope for a randomly selected orientation
+    # We define the dataset generates function under the strategy scope for a randomly selected orientation       
     test_data_set = strategy.experimental_distribute_datasets_from_function(
         get_dataset_fn())
     train_data_set = strategy.experimental_distribute_datasets_from_function(
         get_dataset_fn())
-
+    
     ### Training
     step_counter = tf.Variable(0,trainable=False)
     manager = tf.train.CheckpointManager(
@@ -449,15 +465,19 @@ def main(_):
     
     for epoch in range(flags.n_epochs):
         if stop:
-            break
+            break 
 
         it = iter(train_data_set)
         date_str = dt.datetime.now().strftime('%d-%m-%Y %H:%M')
         print(f'Epoch {epoch + 1:2d}/{flags.n_epochs} @ {date_str}')
+        # tf.print(f'Epoch {epoch + 1:2d}/{flags.n_epochs} @ {date_str}')
+
         # quit()
         distributed_reset_state()
+                                #    options=tf.profiler.experimental.ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
         for step in range(flags.steps_per_epoch):
             step_t0 = time()
+
             # x, y, _, w = next(it)
             # above line of code randomly prodeces an error.
             # rewrite within try clause in while loop not to fail.
@@ -466,15 +486,27 @@ def main(_):
                 distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
             else:
                 distributed_train_step(x, y, w)
-
+            
+            print(f'LGN spikes calculation time: {time() - step_t0:.2f}s')
+            # tracker = GPUMemoryTracker()
+            # tf.print(f'------------- TRAINING STEP {step} --------------')
+            distributed_train_step(x, y, w)
+            # tracker.get_gpu_memory()
+            # tf.print(f'------------- TRAINING STEP DONE {step} --------------')
+            
             if step % 1 == 0:
                 print_str = f'  Step {step + 1:2d}/{flags.steps_per_epoch}: {time() - step_t0:.2f}s\n'
-                print_str += compose_str(train_loss.result(), train_accuracy.result(),
+                print_str += '    ' + compose_str(train_loss.result(), train_accuracy.result(),
                                             train_firing_rate.result(), train_rate_loss.result(), train_voltage_loss.result())
                 print(print_str, end='\n')
+                # tf.print(print_str, end='\n')
+
             if 0 < flags.max_time < (time() - t0) / 3600:
                 stop = True
                 break
+
+            # if step == 1:
+            #     tf.profiler.experimental.stop() 
 
         if stop:
             print(f'[ Maximum optimization time of {flags.max_time:.2f}h reached ]')
@@ -489,31 +521,11 @@ def main(_):
             val_loss.result(), val_accuracy.result(), val_firing_rate.result(),
             val_rate_loss.result(), val_voltage_loss.result())
         
-        print(print_str)
-        keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
-                'train_voltage_loss', 'val_accuracy', 'val_loss',
-                'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
-        values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, train_rate_loss,
-                                                train_voltage_loss, val_accuracy, val_loss, val_firing_rate,
-                                                val_rate_loss, val_voltage_loss]]
-        if stop:
-            result = dict(
-                train_loss=float(train_loss.result().numpy()),
-                train_accuracy=float(train_accuracy.result().numpy()),
-                test_loss=float(val_loss.result().numpy()),
-                test_accuracy=float(val_accuracy.result().numpy())
-            )
-        save_model()
-        with summary_writer.as_default():
-            for k, v in zip(keys, values):
-                tf.summary.scalar(k, v, step=epoch)
-        if stop:
-            with open(os.path.join(cm.paths.results_path, 'result.json'), 'w') as f:
-                json.dump(result, f)
-        reset_train_metrics()
-        reset_validation_metrics()
+        # reset_train_metrics()
+        # reset_validation_metrics()
+      
 
-
+ 
 if __name__ == '__main__':
     hostname = socket.gethostname()
     print("*" * 80)
@@ -562,7 +574,7 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_integer('port', 12778, '')
     absl.app.flags.DEFINE_integer("n_output", 2, "")
     absl.app.flags.DEFINE_integer('neurons_per_output', 30, '')
-    absl.app.flags.DEFINE_integer('steps_per_epoch', 10, '')# EA and garret dose not need this many but pure classification needs 781 = int(50000/64)
+    absl.app.flags.DEFINE_integer('steps_per_epoch', 1, '')# EA and garret dose not need this many but pure classification needs 781 = int(50000/64)
     absl.app.flags.DEFINE_integer('val_steps', 25, '')# EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
     # absl.app.flags.DEFINE_integer('max_delay', 5, '')
     # absl.app.flags.DEFINE_integer('n_plots', 1, '')
@@ -576,7 +588,7 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean('use_uniform_neuron_type', False, '')
     # absl.app.flags.DEFINE_boolean('use_only_one_type', False, '')
     # absl.app.flags.DEFINE_boolean('use_dale_law', True, '')
-    absl.app.flags.DEFINE_boolean('caching', False, '') # if one wants to use caching, remember to update the caching function
+    absl.app.flags.DEFINE_boolean('caching', True, '') # if one wants to use caching, remember to update the caching function
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     # absl.app.flags.DEFINE_boolean('train_input', True, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')

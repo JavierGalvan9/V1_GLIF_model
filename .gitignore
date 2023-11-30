@@ -34,3 +34,4 @@ __pycache__
 *.out
 logs/
 results/
+*.html
