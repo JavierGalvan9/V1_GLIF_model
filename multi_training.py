@@ -40,6 +40,16 @@ lib_path = ctypes.util.find_library('cudart')
 print("--- CUDA Library path: ", lib_path)
 
 debug = False
+
+def printgpu():
+    if tf.config.list_physical_devices('GPU'):
+        meminfo = tf.config.experimental.get_memory_info('GPU:0')
+        current = meminfo['current'] / 1e9
+        peak = meminfo['peak'] / 1e9
+        # tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
+        tf.print(f"GPU memory use: {current:.2f} GB, peak: {peak:.2f} GB")
+    return
+
 def print_vram(check_point_num=0):
     # print(f"GPU memory usage: {tf_ram:.3f} GB")
     if debug:
@@ -451,8 +461,9 @@ def main(_):
                 continue
         return x, y, _, w, lgn_iterator
     
-    tf.profiler.experimental.start('logdir4')
+    # tf.profiler.experimental.start('logdir4')
     for epoch in range(flags.n_epochs):
+        printgpu()
         if stop:
             break
 
@@ -517,7 +528,7 @@ def main(_):
                 json.dump(result, f)
         reset_train_metrics()
         reset_validation_metrics()
-    tf.profiler.experimental.stop()
+    # tf.profiler.experimental.stop()
 
 
 if __name__ == '__main__':

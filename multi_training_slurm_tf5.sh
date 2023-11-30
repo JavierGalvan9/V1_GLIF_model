@@ -4,7 +4,7 @@
 ###SBATCH --gpus-per-node=1
 #SBATCH --partition=braintv
 #SBATCH --mem=100G
-#SBATCH -t0:20:00
+#SBATCH -t36:00:00
 #SBATCH --qos=braintv
 ###SBATCH --output=gpu_run.out
 ###SBATCH --error=gpu_run.err
@@ -16,5 +16,5 @@
 # python custom_run_script.py
 XLA_FLAGS=--xla_gpu_cuda_data_dir=/home/shinya.ito/realistic-model/miniconda3/envs/tf5 \
 LD_LIBRARY_PATH=/home/shinya.ito/realistic-model/miniconda3/envs/tf5/lib \
-python -u multi_training.py --n_epochs 1 --steps_per_epoch 2 --val_steps 2 --neurons 10000 --noaverage_grad_for_cell_type
+python -u multi_training.py --n_epochs 20 --steps_per_epoch 100 --val_steps 2 --neurons 5000 --noaverage_grad_for_cell_type
 

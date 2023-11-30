@@ -15,7 +15,9 @@ from time import time
 
 class Fake():
     def __init__(self):
-        self.neurons = 500
+        # self.neurons = 65871  # 400 micron core
+        # self.neurons = 37052 # 300 micron core
+        self.neurons = 25000
         self.batch_size = 1
         self.data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
         self.core_only = True
@@ -24,7 +26,8 @@ class Fake():
         self.n_output = 2
         self.neurons_per_output = 10
         self.n_input = 17400
-        self.seq_len = 600 
+        # self.seq_len = 600 
+        self.seq_len = 50
         self.delays = '10,10'
         self.voltage_cost = 1.0
         
@@ -106,9 +109,20 @@ def roll_out(ex_model, _x, _y, _w):
     # _loss = classification_loss + rate_loss + voltage_loss
     _loss = voltage_loss
     # _loss = rate_loss
-    tf.print(f"Number of spikes: {tf.reduce_sum(_z):.2f}")
+    tf.print("Number of spikes: ", tf.reduce_sum(_z))
 
     return _out, _p, _loss, _aux
+
+def printgpu():
+    if tf.config.list_physical_devices('GPU'):
+        meminfo = tf.config.experimental.get_memory_info('GPU:0')
+        current = meminfo['current'] / 1e9
+        peak = meminfo['peak'] / 1e9
+        # tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
+        tf.print(f"GPU memory use: {current:.2f} GB, peak: {peak:.2f} GB")
+    return
+
+   
 
 @tf.function
 def train_step(ex_model, _x, _y, _w):
@@ -119,9 +133,7 @@ def train_step(ex_model, _x, _y, _w):
     tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)
     # print the gpu memory in GB use if gpu exists
-    if tf.config.list_physical_devices('GPU'):
-        tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
-
+    printgpu
     return _out, _p, _loss, _aux, _grads
 
 
@@ -145,8 +157,7 @@ for i in range(2):
     out = train_step(extractor_model, x, y, w)
     print(out[-1]) # gradient
     print(out[-2]) # aux loss
-    if tf.config.list_physical_devices('GPU'):
-        tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
+    printgpu()
     tf.print(f"one step time: {time() - stime:.2f}")
     # print(sum(out[0][0][0])) # number of spikes
 # tf.profiler.experimental.stop()
