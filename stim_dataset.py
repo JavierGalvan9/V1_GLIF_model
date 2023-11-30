@@ -59,11 +59,11 @@ def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True,
 def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8, 
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,
-                                     current_input=False, regular=False):
+                                     current_input=False, regular=False, n_input=17400):
     """ make a drifting gratings stimulus for FR and OSI tuning."""
     # mimc_lgn_std, mimc_lgn_mean = 0.02855, 0.02146
 
-    lgn = lgn_module.LGN(row_size=row_size, col_size=col_size)
+    lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input)
     # seq_len = pre_delay + duration + post_delay
     duration =  seq_len - pre_delay - post_delay
 
@@ -109,7 +109,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
     output_dtypes = (tf.float32, tf.float32, tf.float32, tf.float32)
     # output_dtypes = (tf.float32, tf.float32)
     # when using generator for dataset, it should not contain the batch dim
-    output_shapes = (tf.TensorShape((seq_len, 17400)), tf.TensorShape((1)), tf.TensorShape((1)), tf.TensorShape((1)))
+    output_shapes = (tf.TensorShape((seq_len, n_input)), tf.TensorShape((1)), tf.TensorShape((1)), tf.TensorShape((1)))
     # output_shapes = (tf.TensorShape((seq_len, 17400)), tf.TensorShape((1)))
     data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b, _c, _d:
                 (tf.cast(_a, tf.float32), tf.cast(_b, tf.float32), tf.cast(_c, tf.float32), tf.cast(_d, tf.float32)))

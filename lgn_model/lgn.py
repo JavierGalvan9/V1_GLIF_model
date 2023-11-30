@@ -117,7 +117,7 @@ def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_mo
 
 class LGN(object):
     # @profile
-    def __init__(self, row_size=80, col_size=120, lgn_data_path=None):
+    def __init__(self, row_size=80, col_size=120, lgn_data_path=None, n_input=None):
         filename = f'lgn_full_col_cells_{col_size}x{row_size}.csv'
         root_path = os.path.split(__file__)[0]
         root_path = os.path.join(root_path, 'data')
@@ -126,7 +126,15 @@ class LGN(object):
             d = pd.read_csv(lgn_data_path, delimiter=' ')
         else:
             print('Creating LGN units info')
-            d = create_lgn_units_info(filename=lgn_data_path)
+            # making the LGN file generation work in more generic environments
+            model_path = os.path.split(__file__)[0]
+            # go up one folder and add "GLIF_network" to the path
+            model_path = os.path.split(model_path)[0]
+            model_path = os.path.join(model_path, 'GLIF_network')
+            model_path = os.path.join(model_path, 'network')
+            lgn_node_path = os.path.join(model_path, 'lgn_nodes.h5')
+            lge_node_type_path = os.path.join(model_path, 'lgn_node_types.csv')
+            d = create_lgn_units_info(filename=lgn_data_path, csv_path=lge_node_type_path, h5_path=lgn_node_path)
         
         # if lgn_data_path is None:
         #     hostname = socket.gethostname()      
@@ -321,17 +329,36 @@ class LGN(object):
             gaussian_filter = tf.constant(gaussian_filter, dtype=tf.float32) # this is faster by assuming that gaussian_filter is unmutable
             gaussian_filters.append(gaussian_filter)
 
-        self.x = x
-        self.y = y
-        self.non_dominant_x = non_dominant_x
-        self.non_dominant_y = non_dominant_y
-        self.amplitude = amplitude
-        self.non_dom_amplitude = non_dom_amplitude
-        self.spontaneous_firing_rates = spontaneous_firing_rates
-        self.dom_temporal_kernels = dom_temporal_kernels
-        self.non_dom_temporal_kernels = non_dom_temporal_kernels
-        # self.kernels = kernels
-        self.gaussian_filters = gaussian_filters
+        if n_input is None:
+            self.x = x
+            self.y = y
+            self.non_dominant_x = non_dominant_x
+            self.non_dominant_y = non_dominant_y
+            self.amplitude = amplitude
+            self.non_dom_amplitude = non_dom_amplitude
+            self.spontaneous_firing_rates = spontaneous_firing_rates
+            self.dom_temporal_kernels = dom_temporal_kernels
+            self.non_dom_temporal_kernels = non_dom_temporal_kernels
+            # self.kernels = kernels
+            self.gaussian_filters = gaussian_filters
+        else:
+            self.x = x[:n_input]
+            self.y = y[:n_input]
+            self.non_dominant_x = non_dominant_x[:n_input]
+            self.non_dominant_y = non_dominant_y[:n_input]
+            self.amplitude = amplitude[:n_input]
+            self.non_dom_amplitude = non_dom_amplitude[:n_input]
+            self.spontaneous_firing_rates = spontaneous_firing_rates[:n_input]
+            self.dom_temporal_kernels = dom_temporal_kernels[:n_input, :]
+            self.non_dom_temporal_kernels = non_dom_temporal_kernels[:n_input, :]
+            # self.kernels = kernels
+            self.gaussian_filters = gaussian_filters
+            
+            # other properties that are defined above needs to be also truncated
+            self.spatial_sizes = self.spatial_sizes[:n_input]
+            self.model_id = self.model_id[:n_input]
+            self.is_composite = self.is_composite[:n_input]
+
 
     def spatial_response(self, movie):
         d_spatial = 1.

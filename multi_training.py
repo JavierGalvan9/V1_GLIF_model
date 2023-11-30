@@ -11,6 +11,7 @@ import datetime as dt
 import numpy as np
 import pickle as pkl
 import tensorflow as tf
+import re
 
 from packaging import version
 # check the version of tensorflow, and do the right thing.
@@ -29,9 +30,12 @@ from time import time
 import psutil
 # from memory_profiler import profile
 
+# tf.debugging.enable_check_numerics()
+
 
 
 # @profile
+
 def main(_):
     # tracker = GPUMemoryTracker()
     flags = absl.app.flags.FLAGS
@@ -85,13 +89,10 @@ def main(_):
     # model is being run on multiple GPUs or CPUs, and the results are being reduced to a single CPU device. 
     # In this case, the reduce_to_device argument is set to "cpu:0", which means that the results are being reduced to the first CPU device.
     # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.ReductionToOneDevice(reduce_to_device="cpu:0")) 
-
-    # I want a strategy where there is only one worker and one GPU.
-    # strategy = tf.distribute.MultiWorkerMirroredStrategy()
-    # strategy = tf.distribute.MirroredStrategy()
-
-    # strategy = tf.distribute.OneDeviceStrategy(device="/GPU:0")
-    strategy = tf.distribute.OneDeviceStrategy(device="/CPU:0")
+    
+    # if gpu is available, use it, otherwise use cpu
+    device = "/gpu:0" if tf.config.list_physical_devices("GPU") else "/cpu:0"
+    strategy = tf.distribute.OneDeviceStrategy(device=device)
 
     per_replica_batch_size = flags.batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
@@ -136,6 +137,7 @@ def main(_):
             use_state_input=True,
             return_state=True,
         )
+        
 
         del lgn_input, bkg_input
 
@@ -160,14 +162,36 @@ def main(_):
         with open(os.path.join(flags.data_dir, 'np_gratings_firing_rates.pkl'), 'rb') as f:
             target_firing_rates = pkl.load(f)
 
-        for key, value in target_firing_rates.items():
+        cell_type_ids = np.zeros(flags.neurons, dtype=np.int32)
+        for i, (key, value) in enumerate(target_firing_rates.items()):
             # identify tne ids that are included in value["ids"]
             neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
             target_firing_rates[key]['neuron_ids'] = neuron_ids
             type_n_neurons = len(neuron_ids)
             target_firing_rates[key]['sorted_target_rates'] = models.sample_firing_rates(
                 value["rates"], type_n_neurons, flags.seed)
-            
+            # neuron_type_ids[key] = neuron_ids
+            cell_type_ids[neuron_ids] = i
+        
+        # make a new array for neurons that contains neuron type ids.
+        pre_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 0]]
+        post_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 1] % flags.neurons]
+        # division by neurons is needed to cancel the delay embedding.
+        
+        # assign connection type id to each unique pair of the sending and recieving ids.
+        connection_ids = np.zeros(network["synapses"]["indices"].shape[0], dtype=np.int32)
+        connection_ids = pre_cell_type_ids * 1000 + post_cell_type_ids
+        
+        # for each connection type, make a list of synapse indices.
+        connection_type_ids = np.unique(connection_ids)
+        connection_type_ids = connection_type_ids[connection_type_ids != 0]
+        connection_type_ids = np.sort(connection_type_ids)
+        connection_type_ids = connection_type_ids.tolist()
+        same_connection_type_indices = []
+        for i in connection_type_ids:
+            same_connection_type_indices.append(np.where(connection_ids == i)[0])
+        
+
         rate_distribution_regularizer = models.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost)
         # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
         # rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
@@ -224,7 +248,10 @@ def main(_):
             # make a huber loss for this.
             # angle_loss = tf.keras.losses.Huber(delta=1, reduction=tf.keras.losses.Reduction.SUM)(sum_angle, tf.zeros_like(sum_angle))
             angle_loss = tf.reduce_mean(tf.abs(sum_angle))
-            return angle_loss
+            
+            # it might be nice to add regularization of weights
+            rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+            return angle_loss + rec_weight_loss
         
         optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)    
 
@@ -277,28 +304,20 @@ def main(_):
         voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * flags.voltage_cost
         rate_loss = rate_distribution_regularizer(_z)
         # classification loss is turned off for now.
-        # classification_loss = compute_loss_gratings(_y, _z)
+        classification_loss = compute_loss_gratings(_y, _z)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss)
-        # _loss = classification_loss + rate_loss + voltage_loss
-        _loss = rate_loss + voltage_loss
+
+        _loss = classification_loss + rate_loss + voltage_loss
+        # _loss = rate_loss
 
         return _out, _p, _loss, _aux
 
-    def train_step(_x, _y, _w):
-        # tf.print('------------- ROLLING OUT --------------')
-        # tracker = GPUMemoryTracker()
-        # with tf.GradientTape() as tape:
-        #     _out, _p, _loss, _aux = roll_out(_x, _y, _w)
-        #     grad = tape.gradient(_loss, model.trainable_variables)
-        #     # tape.reset()
-
-        _out, _p, _loss, _aux = roll_out(_x, _y, _w)
-        # tape.reset()
-        # _out, _p, _loss, _aux = roll_out(_x, _y, _w)
-        # tracker.get_gpu_memory()
-
-        # print('------------- UPDATING STATES --------------')
+    def train_step(_x, _y, _w, grad_average_ind=None):
+        with tf.GradientTape() as tape:
+            _out, _p, _loss, _aux = roll_out(_x, _y, _w)
+            #     grad = tape.gradient(_loss, model.trainable_variables)
+            # tape.reset()
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
@@ -311,26 +330,37 @@ def main(_):
         with tf.control_dependencies([_op]):
             _op = train_voltage_loss.update_state(_aux['voltage_loss'])
 
-        # tracker.get_gpu_memory()
+        grad = tape.gradient(_loss, model.trainable_variables)
+             
+        for g, v in zip(grad, model.trainable_variables):
+            with tf.control_dependencies([_op]):
+                # if the trainable variable is recurrent connection, average the gradient
+                # for each cell type pair.
+                if grad_average_ind is not None:
+                    if v.name == "sparse_recurrent_weights:0":
+                        newg = tf.zeros_like(g)
+                        for inds in grad_average_ind:
+                            v_gathered = tf.gather(v, inds)
+                            g_gathered = tf.gather(g, inds)
 
-        # tf.print('------------- GRADIENT --------------')
+                            # Avoid division by zero and replace NaNs
+                            safe_divisor = tf.where(v_gathered != 0, v_gathered, tf.ones_like(v_gathered))
+                            mean_frac_change = tf.reduce_mean(g_gathered / safe_divisor)
+                            # mean_frac_change = tf.reduce_mean(tf.gather(g, inds) / tf.gather(v, inds))
+                            mean_frac_change = tf.where(tf.math.is_nan(mean_frac_change), tf.zeros_like(mean_frac_change), mean_frac_change)
 
-        print(model.trainable_variables)
-        # print('gradient shape', grad)
-        # print(grad[0].shape)
+                            mean_rel_change = tf.gather(v, inds) * mean_frac_change
+                            # newg[inds].assign(mean_rel_change)
+                            newg = tf.tensor_scatter_nd_update(newg, tf.expand_dims(inds, axis=1), mean_rel_change)
+                        _op = optimizer.apply_gradients([(newg, v)])
+                    else:
+                        _op = optimizer.apply_gradients([(g, v)])
+                else:
+                    _op = optimizer.apply_gradients([(g, v)])
 
-        # for g, v in zip(grad, model.trainable_variables):
-        #     with tf.control_dependencies([_op]):
-        #         _op = optimizer.apply_gradients([(g, v)])
-
-        # tracker.get_gpu_memory()
-
-    # @tf.function
-    def distributed_train_step(_x, _y, _w):
-        # tracker = GPUMemoryTracker()
-        strategy.run(train_step, args=(_x, _y, _w))
-        # print('------------- DISTRIBUTED TRAINING STEP DONE --------------')
-        # tracker.get_gpu_memory()
+    @tf.function
+    def distributed_train_step(_x, _y, _w, grad_average_ind=None):
+        strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
     def validation_step(_x, _y, _w):
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
@@ -378,6 +408,7 @@ def main(_):
                 seq_len=flags.seq_len,
                 pre_delay=delays[0],
                 post_delay=delays[1],
+                n_input=flags.n_input,
             ).batch(
                     per_replica_batch_size)
                         
@@ -402,19 +433,36 @@ def main(_):
 
     def save_model():
         step_counter.assign_add(1)
-        p = manager.save()
-        print(f'Model saved in {p}')
+        try:
+            p = manager.save()
+            print(f'Model saved in {p}')
+        except:
+            print("Saving failed. Maybe next time?")
 
     with open(os.path.join(logdir, 'config.json'), 'w') as f:
         json.dump(flags.flag_values_dict(), f, indent=4)
 
     stop = False
     t0 = time()
-
-    # with tf.profiler.experimental.Profile(logdir):
-
-    # tf.profiler.experimental.start(logdir=logdir, )
-
+    
+    def safe_lgn_generation(lgn_iterator):
+        """ Generate LGN data sefely.
+        It looks that the LGN data generation fails randomly.
+        Enclose the generation in while loop and try clause to avoid failure.
+        If it fails, generate a new instance of LGN to avoid keep getting error.
+        """
+        while True:
+            try:
+                x, y, _, w = next(lgn_iterator)
+                break
+            except:
+                print("----- LGN input data generation failed. Renewing the LGN input generator...")
+                # resetting the lgn iterator
+                data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+                lgn_iterator = iter(data_set)
+                continue
+        return x, y, _, w, lgn_iterator
+    
     for epoch in range(flags.n_epochs):
         if stop:
             break 
@@ -429,12 +477,16 @@ def main(_):
                                 #    options=tf.profiler.experimental.ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
         for step in range(flags.steps_per_epoch):
             step_t0 = time()
-            # with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
-            # print('------------- LGN SIM --------------')
-            
-            x, y, _, w = next(it)
-            # tracker.get_gpu_memory()
 
+            # x, y, _, w = next(it)
+            # above line of code randomly prodeces an error.
+            # rewrite within try clause in while loop not to fail.
+            x, y, _, w, it = safe_lgn_generation(it)
+            if flags.average_grad_for_cell_type:
+                distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
+            else:
+                distributed_train_step(x, y, w)
+            
             print(f'LGN spikes calculation time: {time() - step_t0:.2f}s')
             # tracker = GPUMemoryTracker()
             # tf.print(f'------------- TRAINING STEP {step} --------------')
@@ -459,50 +511,32 @@ def main(_):
         if stop:
             print(f'[ Maximum optimization time of {flags.max_time:.2f}h reached ]')
 
-        # distributed_reset_state()
-        # test_it = iter(test_data_set)
-        # for step in range(flags.val_steps):
-        #     x, y, _, w = next(test_it)
-        #     distributed_validation_step(x, y, w) 
+        distributed_reset_state()
+        test_it = iter(test_data_set)
+        for step in range(flags.val_steps):
+            x, y, _, w, it = safe_lgn_generation(test_it)
+            distributed_validation_step(x, y, w) 
 
-        # print_str = '  Validation: ' + compose_str(
-        #     val_loss.result(), val_accuracy.result(), val_firing_rate.result(),
-        #     val_rate_loss.result(), val_voltage_loss.result())
-        # print(print_str)
-        # keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
-        #         'train_voltage_loss', 'val_accuracy', 'val_loss',
-        #         'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
-        # values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, train_rate_loss,
-        #                                         train_voltage_loss, val_accuracy, val_loss, val_firing_rate,
-        #                                         val_rate_loss, val_voltage_loss]]
-        # if stop:
-        #     result = dict(
-        #         train_loss=float(train_loss.result().numpy()),
-        #         train_accuracy=float(train_accuracy.result().numpy()),
-        #         test_loss=float(val_loss.result().numpy()),
-        #         test_accuracy=float(val_accuracy.result().numpy())
-        #     )
-
-        # with summary_writer.as_default():
-        #     for k, v in zip(keys, values):
-        #         tf.summary.scalar(k, v, step=epoch)
-        # if stop:
-        #     with open(os.path.join(cm.paths.results_path, 'result.json'), 'w') as f:
-        #         json.dump(result, f)
-
+        print_str = '  Validation: ' + compose_str(
+            val_loss.result(), val_accuracy.result(), val_firing_rate.result(),
+            val_rate_loss.result(), val_voltage_loss.result())
+        
         # reset_train_metrics()
         # reset_validation_metrics()
+      
 
-        
-
-    
-
-
+ 
 if __name__ == '__main__':
     hostname = socket.gethostname()
-    if hostname.count('shinya') > 0:
-        _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow/GLIF_network'
-        _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow/results'
+    print("*" * 80)
+    print(hostname)
+    print("*" * 80)
+    # make a condition for different machines. The allen institute has
+    # cluster host name to be n??? where ??? is 3 digit number.
+    # let's make regex for that.
+    if hostname.count('alleninstitute') > 0 or re.search(r'n\d{3}', hostname) is not None:
+        _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
+        _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/results'
     else: 
         _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
         _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/results'
@@ -572,6 +606,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_boolean("hard_reset", True, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
+    absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", True, "")
 
     absl.app.run(main)
 
