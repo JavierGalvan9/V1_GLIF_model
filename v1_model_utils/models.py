@@ -513,7 +513,8 @@ class V1Column(tf.keras.layers.Layer):
             trainable=train_recurrent,
         ) # shape = (n_synapses,)
 
-        # self.recurrent_weights_factors = synaptic_weights[syn_ids]
+        self.recurrent_weights_factors = synaptic_weights[syn_ids]
+        print('Recurrent weights factors shape', self.recurrent_weights_factors.shape)
         
         
         # self.recurrent_weights_factors = tf.Variable(
@@ -523,20 +524,19 @@ class V1Column(tf.keras.layers.Layer):
         #     trainable=False,
         # )
         
-        self.recurrent_weights_factors = []
-        for i in range(self._n_syn_basis):
-            self.recurrent_weights_factors.append(tf.Variable(
-                synaptic_weights[syn_ids, i],
-                name=f"recurrent_weights_factors_{i}",
-                dtype=self._compute_dtype,
-                trainable=False,
-            ))
+        # I thought this might be a good idea, but it may waste some GPU memory.
+        # self.recurrent_weights_factors = []
+        # for i in range(self._n_syn_basis):
+        #     self.recurrent_weights_factors.append(tf.Variable(
+        #         synaptic_weights[syn_ids, i],
+        #         name=f"recurrent_weights_factors_{i}",
+        #         dtype=self._compute_dtype,
+        #         trainable=False,
+        #     ))
 
         # self.prepare_sparse_weight(self.recurrent_weight_values, self.recurrent_weights_factors)
         self.sparse_w_rec = self.prepare_sparse_weight()
         # self.sparse_w_rec = []
-
-        print('Recurrent weights factors shape', self.recurrent_weights_factors.shape)
 
         # Generate weight tensors for every basis receptor type
         # recurrent_weight_values_mod = self.recurrent_weight_values[:, np.newaxis] * recurrent_weights_factors
@@ -556,6 +556,7 @@ class V1Column(tf.keras.layers.Layer):
         print(f"> Recurrent synapses {len(indices)}")
 
         del indices, weights, dense_shape, syn_ids
+
 
         ### LGN input connectivity ###
         self.lgn_input_dense_shape = (self._n_neurons, lgn_input["n_inputs"],)
@@ -646,6 +647,7 @@ class V1Column(tf.keras.layers.Layer):
             # tf.print("preparing the sparse weight")
             # self.sparse_w_rec = self.prepare_sparse_weight()
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
+        # TODO: This part need a bit of cleaning
         single = False
         if single:
             sparse_w_rec = tf.sparse.concat(axis=0, sp_inputs=self.sparse_w_rec)
@@ -690,27 +692,11 @@ class V1Column(tf.keras.layers.Layer):
                 tf.cast(weights_syn_receptors, self._compute_dtype), 
                 self.recurrent_dense_shape,
             )
-<<<<<<< HEAD
             sparse_w_rec_v.append(tf.cast(sparse_w_rec, self._compute_dtype))
         return sparse_w_rec_v
         
         
     @tf.function
-=======
-
-            i_receptor = tf.sparse.sparse_dense_matmul(
-                                                        sparse_w_rec,
-                                                        rec_z_buf,
-                                                        adjoint_b=True
-                                                    )
-            # Append i_receptor to the TensorArray
-            i_rec = i_rec.write(r_id, i_receptor)
-        # Stack the TensorArray into a single tensor
-        i_rec = i_rec.stack()
-        return i_rec
-
-    # @tf.function
->>>>>>> 560e1ba8d25ee903dd370c880909c71779333b88
     def update_psc(self, psc, psc_rise, rec_inputs, syn_decay, psc_initial, dt):
         new_psc_rise = psc_rise * self.syn_decay + rec_inputs * self.psc_initial
         new_psc = psc * self.syn_decay + self._dt * self.syn_decay * psc_rise
@@ -747,16 +733,14 @@ class V1Column(tf.keras.layers.Layer):
 
     # @tf.function
     def call(self, inputs, state, constants=None):
-<<<<<<< HEAD
+        # tf.print('------------- MODEL CALLING OUT --------------')
+        # tracker = GPUMemoryTracker()
+
         
         # if self.sparse_w_rec does not exist, make it
         # if not hasattr(self, 'sparse_w_rec'):
             # self.sparse_w_rec = self.prepare_sparse_weight()
             # tf.print("!!!!! Sparse weight prepared!!!")
-=======
-        # tf.print('------------- MODEL CALLING OUT --------------')
-        # tracker = GPUMemoryTracker()
->>>>>>> 560e1ba8d25ee903dd370c880909c71779333b88
 
         batch_size = inputs.shape[0]
         if batch_size is None:
