@@ -19,7 +19,7 @@ class Fake():
         # self.neurons = 37052 # 300 micron core
         self.neurons = 25000
         self.batch_size = 1
-        self.data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
+        self.data_dir = 'GLIF_network
         self.core_only = True
         self.seed = 3000
         self.connected_selection = True
@@ -35,11 +35,8 @@ class Fake():
         
 flags = Fake()
 
-# %%
 network, lgn_input, bkg_input = load_sparse.load_v1(flags, flags.neurons)
 
-
-# %%
 model = models.create_model(
     network,
     lgn_input,
@@ -67,7 +64,6 @@ del lgn_input, bkg_input
 
 model.build((flags.batch_size, flags.seq_len, flags.n_input))
 
-# %%
 rsnn_layer = model.get_layer("rsnn")
 prediction_layer = model.get_layer('prediction')
 extractor_model = tf.keras.Model(inputs=model.inputs,
@@ -78,6 +74,7 @@ dtype = tf.float32
 
 
 zero_state = rsnn_layer.cell.zero_state(flags.batch_size)
+
 state_variables = tf.nest.map_structure(lambda a: tf.Variable(
     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
 ), zero_state)
@@ -86,6 +83,7 @@ state_variables = tf.nest.map_structure(lambda a: tf.Variable(
 def roll_out(ex_model, _x, _y, _w):
     _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
     dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
+
     # v1 = rsnn_layer.cell
     v1 = ex_model.get_layer('rsnn').cell
     # v1.sparse_w_rec = v1.prepare_sparse_weight()
@@ -133,7 +131,7 @@ def train_step(ex_model, _x, _y, _w):
     tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)
     # print the gpu memory in GB use if gpu exists
-    printgpu
+    printgpu()
     return _out, _p, _loss, _aux, _grads
 
 
