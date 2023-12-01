@@ -59,6 +59,7 @@ def print_vram(check_point_num=0):
         print(f"Checkpoint {check_point_num}: GPU memory usage: {tf_ram:.3f} GB")
     return
 
+
 def main(_):
     # tracker = GPUMemoryTracker()
     flags = absl.app.flags.FLAGS
@@ -97,7 +98,6 @@ def main(_):
     else:
         dtype = tf.float32
 
-    
     task_name = 'drifting_gratings_firing_rates_distr'  
     sim_name = toolkit.get_random_identifier('b_')
     logdir = os.path.join(results_dir, sim_name)
@@ -107,7 +107,6 @@ def main(_):
     # print_gpu_memory()
     # print_system_memory()
 
-        
     n_workers, n_gpus_per_worker = 1, 1
     # model is being run on multiple GPUs or CPUs, and the results are being reduced to a single CPU device. 
     # In this case, the reduce_to_device argument is set to "cpu:0", which means that the results are being reduced to the first CPU device.
@@ -341,8 +340,6 @@ def main(_):
             v1 = extractor_model.get_layer('rsnn').cell
             v1.prepare_sparse_weight()
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
-            #     grad = tape.gradient(_loss, model.trainable_variables)
-            # tape.reset()
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
@@ -383,7 +380,7 @@ def main(_):
                 else:
                     _op = optimizer.apply_gradients([(g, v)])
 
-    @tf.function
+    # @tf.function
     def distributed_train_step(_x, _y, _w, grad_average_ind=None):
         strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
@@ -505,21 +502,26 @@ def main(_):
         distributed_reset_state()
                                 #    options=tf.profiler.experimental.ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
         for step in range(flags.steps_per_epoch):
+            print(f'---- Step {step}')
             step_t0 = time()
 
             # x, y, _, w = next(it)
             # above line of code randomly prodeces an error.
             # rewrite within try clause in while loop not to fail.
             x, y, _, w, it = safe_lgn_generation(it)
+            print(f'LGN spikes calculation time: {time() - step_t0:.2f}s')
+
+            t0 = time()
             if flags.average_grad_for_cell_type:
                 distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
             else:
                 distributed_train_step(x, y, w)
+            print(f'Step running time: {time() - t0:.2f}s')
             
-            print(f'LGN spikes calculation time: {time() - step_t0:.2f}s')
+            
             # tracker = GPUMemoryTracker()
             # tf.print(f'------------- TRAINING STEP {step} --------------')
-            distributed_train_step(x, y, w)
+            # distributed_train_step(x, y, w)
             # tracker.get_gpu_memory()
             # tf.print(f'------------- TRAINING STEP DONE {step} --------------')
             
@@ -540,15 +542,17 @@ def main(_):
         if stop:
             print(f'[ Maximum optimization time of {flags.max_time:.2f}h reached ]')
 
-        distributed_reset_state()
-        test_it = iter(test_data_set)
-        for step in range(flags.val_steps):
-            x, y, _, w, it = safe_lgn_generation(test_it)
-            distributed_validation_step(x, y, w) 
+        # distributed_reset_state()
+        # test_it = iter(test_data_set)
+        # for step in range(flags.val_steps):
+        #     x, y, _, w, it = safe_lgn_generation(test_it)
+        #     distributed_validation_step(x, y, w) 
 
-        print_str = '  Validation: ' + compose_str(
-            val_loss.result(), val_accuracy.result(), val_firing_rate.result(),
-            val_rate_loss.result(), val_voltage_loss.result())
+        # print_str = '  Validation: ' + compose_str(
+        #     val_loss.result(), val_accuracy.result(), val_firing_rate.result(),
+        #     val_rate_loss.result(), val_voltage_loss.result())
+
+        # print(print_str)
         
         print(print_str)
         keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
@@ -625,7 +629,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer("n_output", 2, "")
     absl.app.flags.DEFINE_integer('neurons_per_output', 30, '')
     absl.app.flags.DEFINE_integer('steps_per_epoch', 1, '')# EA and garret dose not need this many but pure classification needs 781 = int(50000/64)
-    absl.app.flags.DEFINE_integer('val_steps', 25, '')# EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
+    absl.app.flags.DEFINE_integer('val_steps', 1, '')# EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
     # absl.app.flags.DEFINE_integer('max_delay', 5, '')
     # absl.app.flags.DEFINE_integer('n_plots', 1, '')
 
@@ -656,7 +660,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_boolean("hard_reset", True, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
-    absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", True, "")
+    absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", False, "")
 
     absl.app.run(main)
 

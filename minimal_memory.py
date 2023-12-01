@@ -2,7 +2,7 @@
 # %%
 
 import tensorflow as tf
-
+from time import time
 
 from v1_model_utils import load_sparse, models, other_v1_utils, toolkit
 from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
@@ -10,8 +10,8 @@ import stim_dataset
 from time import time
 
 
-# tf.profiler.experimental.start('logdir2')
 
+# tf.profiler.experimental.start('logdir2')
 
 class Fake():
     def __init__(self):
@@ -36,7 +36,8 @@ class Fake():
         
 flags = Fake()
 
-network, lgn_input, bkg_input = load_sparse.load_v1(flags, flags.neurons)
+# network, lgn_input, bkg_input = load_sparse.load_v1(flags, flags.neurons)
+network, lgn_input, bkg_input = load_sparse.cached_load_v1(flags, flags.neurons)
 
 model = models.create_model(
     network,
@@ -112,6 +113,7 @@ def roll_out(ex_model, _x, _y, _w):
 
     return _out, _p, _loss, _aux
 
+
 def printgpu():
     if tf.config.list_physical_devices('GPU'):
         meminfo = tf.config.experimental.get_memory_info('GPU:0')
@@ -122,6 +124,7 @@ def printgpu():
     return
 
    
+optimizer = tf.keras.optimizers.Adam(0.01, epsilon=1e-11) 
 
 @tf.function
 def train_step(ex_model, _x, _y, _w):
@@ -132,10 +135,11 @@ def train_step(ex_model, _x, _y, _w):
         _out, _p, _loss, _aux = roll_out(ex_model, _x, _y, _w)
     tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)
+    for g, v in zip(_grads, model.trainable_variables):
+       _op = optimizer.apply_gradients([(g, v)])
     # print the gpu memory in GB use if gpu exists
     printgpu()
     return _out, _p, _loss, _aux, _grads
-
 
 
 # %%
@@ -146,13 +150,16 @@ data = stim_dataset.generate_drifting_grating_tuning(
     n_input=flags.n_input
 )
 
+t0 = time()
 for value in data.take(1):
     x, y, _, w = value
     break
 x = tf.expand_dims(x, 0)
+print(f'LGN spikes calculation time: {time() - t0:.2f}s')
 
 # %% run the model
-for i in range(2):
+
+for i in range(1):
     stime = time()
     out = train_step(extractor_model, x, y, w)
     print(out[-1]) # gradient
@@ -162,6 +169,7 @@ for i in range(2):
     tf.print(f"one step time: {time() - stime:.2f}")
     # print(sum(out[0][0][0])) # number of spikes
 # tf.profiler.experimental.stop()
+
 # out = roll_out(x, y, w)
 # %%
 
