@@ -511,15 +511,15 @@ def main(_):
             # above line of code randomly prodeces an error.
             # rewrite within try clause in while loop not to fail.
             x, y, _, w, it = safe_lgn_generation(it)
+            print(f'LGN spikes calculation time: {time() - step_t0:.2f}s')
             if flags.average_grad_for_cell_type:
                 distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
             else:
                 distributed_train_step(x, y, w)
             
-            print(f'LGN spikes calculation time: {time() - step_t0:.2f}s')
             # tracker = GPUMemoryTracker()
             # tf.print(f'------------- TRAINING STEP {step} --------------')
-            distributed_train_step(x, y, w)
+            # distributed_train_step(x, y, w)
             # tracker.get_gpu_memory()
             # tf.print(f'------------- TRAINING STEP DONE {step} --------------')
             
