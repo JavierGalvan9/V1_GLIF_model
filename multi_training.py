@@ -33,7 +33,33 @@ import psutil
 # tf.debugging.enable_check_numerics()
 
 
-# @profile
+print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
+print("--- CUDNN version: ", tf.sysconfig.get_build_info()["cudnn_version"])
+
+import ctypes.util
+# For CUDA Runtime API
+lib_path = ctypes.util.find_library('cudart')
+print("--- CUDA Library path: ", lib_path)
+
+debug = False
+
+def printgpu():
+    if tf.config.list_physical_devices('GPU'):
+        meminfo = tf.config.experimental.get_memory_info('GPU:0')
+        current = meminfo['current'] / 1e9
+        peak = meminfo['peak'] / 1e9
+        # tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
+        tf.print(f"GPU memory use: {current:.2f} GB, peak: {peak:.2f} GB")
+    return
+
+def print_vram(check_point_num=0):
+    # print(f"GPU memory usage: {tf_ram:.3f} GB")
+    if debug:
+        tf_ram = tf.config.experimental.get_memory_usage('GPU:0') / 1e9
+        print(f"Checkpoint {check_point_num}: GPU memory usage: {tf_ram:.3f} GB")
+    return
+
+
 def main(_):
     # tracker = GPUMemoryTracker()
     flags = absl.app.flags.FLAGS
@@ -311,6 +337,8 @@ def main(_):
 
     def train_step(_x, _y, _w, grad_average_ind=None):
         with tf.GradientTape() as tape:
+            v1 = extractor_model.get_layer('rsnn').cell
+            v1.prepare_sparse_weight()
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
@@ -357,6 +385,8 @@ def main(_):
         strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
     def validation_step(_x, _y, _w):
+        v1 = extractor_model.get_layer('rsnn').cell
+        v1.prepare_sparse_weight()
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
         _op = val_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
@@ -438,7 +468,7 @@ def main(_):
 
     stop = False
     t0 = time()
-    
+   
     def safe_lgn_generation(lgn_iterator):
         """ Generate LGN data sefely.
         It looks that the LGN data generation fails randomly.
@@ -457,7 +487,9 @@ def main(_):
                 continue
         return x, y, _, w, lgn_iterator
     
+    # tf.profiler.experimental.start('logdir4')
     for epoch in range(flags.n_epochs):
+        printgpu()
         if stop:
             break 
 
@@ -522,27 +554,30 @@ def main(_):
 
         # print(print_str)
         
-        # reset_train_metrics()
-        # reset_validation_metrics()
-
-        # keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
-        #         'train_voltage_loss', 'val_accuracy', 'val_loss',
-        #         'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
-        # values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, train_rate_loss,
-        #                                         train_voltage_loss, val_accuracy, val_loss, val_firing_rate,
-        #                                         val_rate_loss, val_voltage_loss]]
-        # if stop:
-        #     result = dict(
-        #         train_loss=float(train_loss.result().numpy()),
-        #         train_accuracy=float(train_accuracy.result().numpy()),
-        #         test_loss=float(val_loss.result().numpy()),
-        #         test_accuracy=float(val_accuracy.result().numpy())
-        #     )
-
-        # with summary_writer.as_default():
-        #     for k, v in zip(keys, values):
-        #         tf.summary.scalar(k, v, step=epoch)
-      
+        print(print_str)
+        keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
+                'train_voltage_loss', 'val_accuracy', 'val_loss',
+                'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
+        values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, train_rate_loss,
+                                                train_voltage_loss, val_accuracy, val_loss, val_firing_rate,
+                                                val_rate_loss, val_voltage_loss]]
+        if stop:
+            result = dict(
+                train_loss=float(train_loss.result().numpy()),
+                train_accuracy=float(train_accuracy.result().numpy()),
+                test_loss=float(val_loss.result().numpy()),
+                test_accuracy=float(val_accuracy.result().numpy())
+            )
+        save_model()
+        with summary_writer.as_default():
+            for k, v in zip(keys, values):
+                tf.summary.scalar(k, v, step=epoch)
+        if stop:
+            with open(os.path.join(cm.paths.results_path, 'result.json'), 'w') as f:
+                json.dump(result, f)
+        reset_train_metrics()
+        reset_validation_metrics()
+    # tf.profiler.experimental.stop()
 
  
 if __name__ == '__main__':

@@ -498,6 +498,8 @@ class V1Column(tf.keras.layers.Layer):
 
         # Define the Tensorflow variables
         self.recurrent_indices = tf.Variable(indices, trainable=False)
+        # convert it to tensor
+        # self.recurrent_indices = tf.convert_to_tensor(self.recurrent_indices, dtype=tf.int64)
         self.recurrent_dense_shape = dense_shape
         # Set the sign of the connections (exc or inh)
         self.recurrent_weight_positive = tf.Variable(
@@ -512,27 +514,15 @@ class V1Column(tf.keras.layers.Layer):
         ) # shape = (n_synapses,)
 
         self.recurrent_weights_factors = synaptic_weights[syn_ids]
-
         print('Recurrent weights factors shape', self.recurrent_weights_factors.shape)
+       
+        # self.sparse_w_rec = self.prepare_sparse_weight()
+        self.prepare_sparse_weight()
 
-        # Generate weight tensors for every basis receptor type
-        # recurrent_weight_values_mod = self.recurrent_weight_values[:, np.newaxis] * recurrent_weights_factors
-        # recurrent_weight_values_mod_list = tf.split(recurrent_weight_values_mod, self._n_syn_basis, axis=1) # list with one element per syn basis
-        # self.recurrent_sparse_w_rec = []
-        # for recurrent_weight in recurrent_weight_values_mod_list:
-        #     sparse_w_rec = tf.sparse.SparseTensor(
-        #         self.recurrent_indices,
-        #         recurrent_weight[:, 0],
-        #         self.recurrent_dense_shape,
-        #     )
-        #     self.recurrent_sparse_w_rec.append(tf.cast(sparse_w_rec, self._compute_dtype))
-        # print(f"Recurrent weights list size: {asizeof(self.recurrent_sparse_w_rec)/1024/1024} MB")
-        # print(f"Recurrent weights variable size: {asizeof(self.recurrent_weight_values.numpy())/1024/1024} MB")
-        # print(f"Recurrent weights array size: {asizeof(weights)/1024/1024} MB")
-        # print(f"Recurrent weights factors size: {asizeof(recurrent_weights_factors)/1024/1024} MB")
         print(f"> Recurrent synapses {len(indices)}")
 
         del indices, weights, dense_shape, syn_ids
+
 
         ### LGN input connectivity ###
         self.lgn_input_dense_shape = (self._n_neurons, lgn_input["n_inputs"],)
@@ -622,15 +612,8 @@ class V1Column(tf.keras.layers.Layer):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
         i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
         for r_id in range(self._n_syn_basis):
-            weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
-            sparse_w_rec = tf.sparse.SparseTensor(
-                self.recurrent_indices,
-                tf.cast(weights_syn_receptors, self._compute_dtype), 
-                self.recurrent_dense_shape,
-            )
-
             i_receptor = tf.sparse.sparse_dense_matmul(
-                                                        sparse_w_rec,
+                                                        self.sparse_w_rec[r_id],
                                                         rec_z_buf,
                                                         adjoint_b=True
                                                     )
@@ -639,8 +622,26 @@ class V1Column(tf.keras.layers.Layer):
         # Stack the TensorArray into a single tensor
         i_rec = i_rec.stack()
         return i_rec
-
+    
     # @tf.function
+    def prepare_sparse_weight(self, verbose=False):
+        sparse_w_rec_v = []
+        if verbose:
+            tf.print("preparing the sparse weight")
+        for r_id in range(self._n_syn_basis):
+            weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
+            sparse_w_rec = tf.sparse.SparseTensor(
+                self.recurrent_indices,
+                tf.cast(weights_syn_receptors, self._compute_dtype), 
+                self.recurrent_dense_shape,
+            )
+            sparse_w_rec_v.append(tf.cast(sparse_w_rec, self._compute_dtype))
+        self.sparse_w_rec = sparse_w_rec_v
+        # return sparse_w_rec_v
+        return
+        
+        
+    @tf.function
     def update_psc(self, psc, psc_rise, rec_inputs, syn_decay, psc_initial, dt):
         new_psc_rise = psc_rise * self.syn_decay + rec_inputs * self.psc_initial
         new_psc = psc * self.syn_decay + self._dt * self.syn_decay * psc_rise
@@ -675,9 +676,16 @@ class V1Column(tf.keras.layers.Layer):
     def _gather(self, prop):
         return tf.gather(prop, self._node_type_ids)
 
+    # @tf.function
     def call(self, inputs, state, constants=None):
         # tf.print('------------- MODEL CALLING OUT --------------')
         # tracker = GPUMemoryTracker()
+
+        
+        # if self.sparse_w_rec does not exist, make it
+        # if not hasattr(self, 'sparse_w_rec'):
+            # self.sparse_w_rec = self.prepare_sparse_weight()
+            # tf.print("!!!!! Sparse weight prepared!!!")
 
         batch_size = inputs.shape[0]
         if batch_size is None:
@@ -803,6 +811,7 @@ class V1Column(tf.keras.layers.Layer):
         return outputs, new_state
 
 
+# @tf.function
 def huber_quantile_loss(u, tau, kappa):
     branch_1 = tf.abs(tau - tf.cast(u <= 0, tf.float32)) / \
         (2 * kappa) * tf.square(u)
@@ -811,6 +820,7 @@ def huber_quantile_loss(u, tau, kappa):
     return tf.where(tf.abs(u) <= kappa, branch_1, branch_2)
 
 ### To calculate the loss of firing rates between neuron types
+# @tf.function
 def compute_spike_rate_target_loss(_spikes, target_rates):
     # TODO: define this function
     # target_rates is a dictionary that contains all the cell types.
@@ -867,31 +877,6 @@ class SpikeRateDistributionRegularization:
 
         return reg_loss
 
-def compute_spike_rate_target_loss(_spikes, target_rates):
-    # TODO: define this function
-    # target_rates is a dictionary that contains all the cell types.
-    # I should iterate on them, and add the cost for each one at the end.
-    # spikes will have a shape of (batch_size, n_steps, n_neurons)
-    losses = []
-    for key, value in target_rates.items():
-        spikes_type = tf.gather(_spikes, value["neuron_ids"], axis=-1)
-        loss_type = compute_spike_rate_distribution_loss(spikes_type, value["sorted_target_rates"])
-        losses.append(tf.reduce_mean(loss_type))
-    
-    return tf.reduce_sum(losses, axis=0)
-
-
-class SpikeRateDistributionTarget:
-    """ Instead of regularization, treat it as a target.
-        The main difference is that this class will calculate the loss
-        for each subtypes of the neurons."""
-    def __init__(self, target_rates, rate_cost=.5):
-        self._rate_cost = rate_cost
-        self._target_rates = target_rates
-    
-    def __call__(self, spikes):
-        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates) * self._rate_cost
-        return reg_loss
 
 class VoltageRegularization:
     def __init__(self, cell, voltage_cost=1e-5):

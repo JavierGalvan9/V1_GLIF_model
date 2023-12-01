@@ -7,11 +7,18 @@ from time import time
 from v1_model_utils import load_sparse, models, other_v1_utils, toolkit
 from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
 import stim_dataset
+from time import time
 
+
+
+# tf.profiler.experimental.start('logdir2')
 
 class Fake():
-    def __init__(self):        
-        self.neurons = 5000
+    def __init__(self):
+        # self.neurons = 65871  # 400 micron core
+        # self.neurons = 37052 # 300 micron core
+        self.neurons = 25000 # maximum working number so far
+        # self.neurons = 1000
         self.batch_size = 1
         self.data_dir = 'GLIF_network'
         self.core_only = True
@@ -21,6 +28,7 @@ class Fake():
         self.neurons_per_output = 10
         self.n_input = 17400
         self.seq_len = 600 
+        # self.seq_len = 50
         self.delays = '10,10'
         self.voltage_cost = 1.0
         
@@ -73,29 +81,18 @@ state_variables = tf.nest.map_structure(lambda a: tf.Variable(
     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
 ), zero_state)
 
-# @tf.function
-def roll_out(_x, _y, _w):
+@tf.function
+def roll_out(ex_model, _x, _y, _w):
     _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
     dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
 
     # v1 = rsnn_layer.cell
-    # v1 = extractor_model.get_layer('rsnn').cell
-    # del v1.sparse_w_rec
-    # v1.prepare_sparse_weight(v1.recurrent_weight_values, v1.recurrent_weights_factors)
-    # let's be explicit. calculate the sparse tensor here.
-    # sparse_w_recs = []
-    # for r_id in range(v1._n_syn_basis):
-    #     w_syn_recep = v1.recurrent_weight_values * v1.recurrent_weights_factors[r_id]
-    #     sparse_w_rec = tf.sparse.SparseTensor(
-    #         v1.recurrent_indices,
-    #         tf.cast(w_syn_recep, v1._compute_dtype),
-    #         v1.recurrent_dense_shape
-    #     )
-    #     sparse_w_recs.append(sparse_w_rec)
+    v1 = ex_model.get_layer('rsnn').cell
+    # v1.sparse_w_rec = v1.prepare_sparse_weight()
+    # v1.sparse_w_rec = []
     
     # # v1.prepare_sparse_weight()
-
-    _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
+    _out, _p, _ = ex_model((_x, dummy_zeros, _initial_state))
     # print('roll out time: ', time.time() - stt)
 
     _z, _v, _input_current = _out[0]
@@ -112,26 +109,37 @@ def roll_out(_x, _y, _w):
     # _loss = classification_loss + rate_loss + voltage_loss
     _loss = voltage_loss
     # _loss = rate_loss
+    tf.print("Number of spikes: ", tf.reduce_sum(_z))
 
     return _out, _p, _loss, _aux
 
-optimizer = tf.keras.optimizers.Adam(0.01, epsilon=1e-11)    
 
-# @tf.function
-def train_step(_x, _y, _w):
-    # _out, _p, _loss, _aux = roll_out(_x, _y, _w)
+def printgpu():
+    if tf.config.list_physical_devices('GPU'):
+        meminfo = tf.config.experimental.get_memory_info('GPU:0')
+        current = meminfo['current'] / 1e9
+        peak = meminfo['peak'] / 1e9
+        # tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
+        tf.print(f"GPU memory use: {current:.2f} GB, peak: {peak:.2f} GB")
+    return
 
+   
+optimizer = tf.keras.optimizers.Adam(0.01, epsilon=1e-11) 
+
+@tf.function
+def train_step(ex_model, _x, _y, _w):
     with tf.GradientTape() as tape:
-        _out, _p, _loss, _aux = roll_out(_x, _y, _w)
-    # tf.print("calculating gradient...")
+        v1 = ex_model.get_layer('rsnn').cell
+        # v1.sparse_w_rec = v1.prepare_sparse_weight()
+        v1.prepare_sparse_weight()
+        _out, _p, _loss, _aux = roll_out(ex_model, _x, _y, _w)
+    tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)
-
     for g, v in zip(_grads, model.trainable_variables):
-        _op = optimizer.apply_gradients([(g, v)])
-
-    return _out, _p, _loss, _aux
-
-
+       _op = optimizer.apply_gradients([(g, v)])
+    # print the gpu memory in GB use if gpu exists
+    printgpu()
+    return _out, _p, _loss, _aux, _grads
 
 
 # %%
@@ -150,12 +158,17 @@ x = tf.expand_dims(x, 0)
 print(f'LGN spikes calculation time: {time() - t0:.2f}s')
 
 # %% run the model
-step_t0 = time()
-out = train_step(x, y, w)
-print(f'Step running time: {time() - step_t0:.2f}s')
 
-print(out[-1]) # gradient
-print(out[-2]) # aux loss
+for i in range(1):
+    stime = time()
+    out = train_step(extractor_model, x, y, w)
+    print(out[-1]) # gradient
+    print(tf.reduce_sum(out[-1][0]))
+    print(out[-2]) # aux loss
+    printgpu()
+    tf.print(f"one step time: {time() - stime:.2f}")
+    # print(sum(out[0][0][0])) # number of spikes
+# tf.profiler.experimental.stop()
 
 # out = roll_out(x, y, w)
 # %%

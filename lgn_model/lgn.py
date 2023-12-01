@@ -13,8 +13,11 @@ import matplotlib.pyplot as plt
 from bmtk.simulator.filternet.lgnmodel.fitfuns import makeBasis_StimKernel
 from bmtk.simulator.filternet.lgnmodel.spatialfilter import GaussianSpatialFilter
 from bmtk.simulator.filternet.lgnmodel.temporalfilter import TemporalFilterCosineBump
-from bmtk.simulator.filternet.lgnmodel.util_fns import get_data_metrics_for_each_subclass, \
-    get_tcross_from_temporal_kernel
+from bmtk.simulator.filternet.lgnmodel.util_fns import get_tcross_from_temporal_kernel
+try:  # this is old version of bmtk
+    from bmtk.simulator.filternet.lgnmodel.util_fns import get_data_metrics_for_each_subclass
+except ImportError:  # new bmtk imports
+    from bmtk.simulator.filternet.lgnmodel.cellmetrics import get_data_metrics_for_each_subclass
 
 
 def create_temporal_filter(inp_dict):

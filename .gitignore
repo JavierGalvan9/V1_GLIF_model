@@ -16,7 +16,8 @@ GLIF_network/network
 GLIF_network/syn_id_to_syn_weights_dict.pkl
 GLIF_network/synaptic_models_to_syn_id_dict.pkl
 GLIF_network/results/
-log_dir
+log_dir*
+logdir*
 *.ipynb*
 v1_model_utils/__pycache__
 v1_model_utils/.cache
