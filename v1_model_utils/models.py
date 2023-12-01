@@ -629,8 +629,8 @@ class V1Column(tf.keras.layers.Layer):
         if verbose:
             tf.print("preparing the sparse weight")
         for r_id in range(self._n_syn_basis):
-            # weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
-            weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[r_id]
+            weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
+            # weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[r_id]
             sparse_w_rec = tf.sparse.SparseTensor(
                 self.recurrent_indices,
                 tf.cast(weights_syn_receptors, self._compute_dtype), 
