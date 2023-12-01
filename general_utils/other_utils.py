@@ -233,6 +233,8 @@ def fig_saver(filename):
 """                                                   I. GPU and CPU memory profilers                                                        """
 ##############################################################################################################################
 
+import tensorflow as tf
+
 class GPUMemoryTracker:
     def __init__(self):
         result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],

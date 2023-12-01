@@ -2,20 +2,18 @@
 # %%
 
 import tensorflow as tf
-
+from time import time
 
 from v1_model_utils import load_sparse, models, other_v1_utils, toolkit
 from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
 import stim_dataset
 
 
-
-
 class Fake():
     def __init__(self):        
-        self.neurons = 10000
+        self.neurons = 5000
         self.batch_size = 1
-        self.data_dir = 'GLIF_network
+        self.data_dir = 'GLIF_network'
         self.core_only = True
         self.seed = 3000
         self.connected_selection = True
@@ -30,7 +28,8 @@ class Fake():
         
 flags = Fake()
 
-network, lgn_input, bkg_input = load_sparse.load_v1(flags, flags.neurons)
+# network, lgn_input, bkg_input = load_sparse.load_v1(flags, flags.neurons)
+network, lgn_input, bkg_input = load_sparse.cached_load_v1(flags, flags.neurons)
 
 model = models.create_model(
     network,
@@ -74,14 +73,14 @@ state_variables = tf.nest.map_structure(lambda a: tf.Variable(
     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
 ), zero_state)
 
-@tf.function
+# @tf.function
 def roll_out(_x, _y, _w):
     _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
     dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
 
     # v1 = rsnn_layer.cell
-    v1 = extractor_model.get_layer('rsnn').cell
-    del v1.sparse_w_rec
+    # v1 = extractor_model.get_layer('rsnn').cell
+    # del v1.sparse_w_rec
     # v1.prepare_sparse_weight(v1.recurrent_weight_values, v1.recurrent_weights_factors)
     # let's be explicit. calculate the sparse tensor here.
     # sparse_w_recs = []
@@ -116,14 +115,20 @@ def roll_out(_x, _y, _w):
 
     return _out, _p, _loss, _aux
 
-@tf.function
+optimizer = tf.keras.optimizers.Adam(0.01, epsilon=1e-11)    
+
+# @tf.function
 def train_step(_x, _y, _w):
+    # _out, _p, _loss, _aux = roll_out(_x, _y, _w)
+
     with tf.GradientTape() as tape:
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
-    tf.print("calculating gradient...")
+    # tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)
 
-    # model.optimizer.apply_gradients(zip(_grads, model.trainable_variables))
+    for g, v in zip(_grads, model.trainable_variables):
+        _op = optimizer.apply_gradients([(g, v)])
+
     return _out, _p, _loss, _aux
 
 
@@ -137,13 +142,17 @@ data = stim_dataset.generate_drifting_grating_tuning(
     n_input=flags.n_input
 )
 
+t0 = time()
 for value in data.take(1):
     x, y, _, w = value
     break
 x = tf.expand_dims(x, 0)
+print(f'LGN spikes calculation time: {time() - t0:.2f}s')
 
 # %% run the model
+step_t0 = time()
 out = train_step(x, y, w)
+print(f'Step running time: {time() - step_t0:.2f}s')
 
 print(out[-1]) # gradient
 print(out[-2]) # aux loss
