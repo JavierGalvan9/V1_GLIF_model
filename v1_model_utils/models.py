@@ -513,20 +513,9 @@ class V1Column(tf.keras.layers.Layer):
             trainable=train_recurrent,
         ) # shape = (n_synapses,)
 
-        # self.recurrent_weights_factors = synaptic_weights[syn_ids]
-        # print('Recurrent weights factors shape', self.recurrent_weights_factors.shape)
+        self.recurrent_weights_factors = synaptic_weights[syn_ids]
+        print('Recurrent weights factors shape', self.recurrent_weights_factors.shape)
        
-        # If factors are implemented this way, it uses slightly more GPU memory, but 
-        # cuts 20% of the processing time compared to the above implementation.
-        self.recurrent_weights_factors = []
-        for i in range(self._n_syn_basis):
-            self.recurrent_weights_factors.append(tf.Variable(
-                synaptic_weights[syn_ids, i],
-                name=f"recurrent_weights_factors_{i}",
-                dtype=self._compute_dtype,
-                trainable=False,
-            ))
-
         # self.sparse_w_rec = self.prepare_sparse_weight()
         self.prepare_sparse_weight()
 

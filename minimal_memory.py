@@ -27,8 +27,8 @@ class Fake():
         self.n_output = 2
         self.neurons_per_output = 10
         self.n_input = 17400
-        # self.seq_len = 600 
-        self.seq_len = 50
+        self.seq_len = 600 
+        # self.seq_len = 50
         self.delays = '10,10'
         self.voltage_cost = 1.0
         
@@ -152,8 +152,8 @@ for value in data.take(1):
 x = tf.expand_dims(x, 0)
 
 # %% run the model
-stime = time()
 for i in range(2):
+    stime = time()
     out = train_step(extractor_model, x, y, w)
     print(out[-1]) # gradient
     print(tf.reduce_sum(out[-1][0]))
