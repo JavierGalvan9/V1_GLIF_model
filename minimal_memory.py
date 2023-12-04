@@ -1,5 +1,7 @@
 # minimal script that utilize memory of the network.
 # %%
+# import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 import tensorflow as tf
 
@@ -10,6 +12,7 @@ import stim_dataset
 from time import time
 
 
+
 # tf.profiler.experimental.start('logdir2')
 
 
@@ -17,8 +20,9 @@ class Fake():
     def __init__(self):
         # self.neurons = 65871  # 400 micron core
         # self.neurons = 37052 # 300 micron core
-        self.neurons = 25000 # maximum working number so far
-        # self.neurons = 1000
+        # self.neurons = 25000 # maximum working number so far
+        # self.neurons = 15000
+        self.neurons = 2000
         self.batch_size = 1
         self.data_dir = 'GLIF_network'
         self.core_only = True
@@ -80,7 +84,7 @@ state_variables = tf.nest.map_structure(lambda a: tf.Variable(
     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
 ), zero_state)
 
-@tf.function
+# @tf.function
 def roll_out(ex_model, _x, _y, _w):
     _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
     dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
@@ -156,6 +160,7 @@ for i in range(2):
     stime = time()
     out = train_step(extractor_model, x, y, w)
     print(out[-1]) # gradient
+    tf.debugging.check_numerics(out[-1], 'gradient is nan')
     print(tf.reduce_sum(out[-1][0]))
     print(out[-2]) # aux loss
     printgpu()

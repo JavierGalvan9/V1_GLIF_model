@@ -6,6 +6,7 @@ import pickle as pkl
 from time import time
 # from memory_profiler import profile
 from pympler.asizeof import asizeof, asized
+# from numba import njit
 
 
 # print("TensorFlow version:", tf.__version__) # 2.4.1
@@ -497,7 +498,11 @@ class V1Column(tf.keras.layers.Layer):
         indices[:, 1] = indices[:, 1] + self._n_neurons * (delays - 1)
 
         # Define the Tensorflow variables
-        self.recurrent_indices = tf.Variable(indices, trainable=False)
+        self.recurrent_indices = tf.Variable(indices, dtype=tf.int64, trainable=False)
+        # self.pre_ind_table = self.make_pre_ind_table(debug=True)
+        # self.pre_ind_table = self.make_pre_ind_table(indices, debug=False)
+        self.pre_ind_table = self.make_pre_ind_table_fast(indices)
+
         # convert it to tensor
         # self.recurrent_indices = tf.convert_to_tensor(self.recurrent_indices, dtype=tf.int64)
         self.recurrent_dense_shape = dense_shape
@@ -606,21 +611,233 @@ class V1Column(tf.keras.layers.Layer):
 
         print(f"> BKG input synapses {len(bkg_input_indices)}")
         del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, synaptic_weights
+    
+    def make_pre_ind_table_fast(self, indices):
+        pre_inds = indices[:, 1]
+        uni, counts = np.unique(pre_inds, return_counts=True)
+        max_elem = np.max(counts)
+        n_elem = self._n_neurons * self.max_delay
+        
+        def make_table(pre_inds, n_elem, max_elem):
+            # first, make a big array to allocate memory
+            arr = np.ones((n_elem, max_elem), dtype=np.int64) * -1
+            arr_inds = np.zeros(n_elem, dtype=np.int64)
+            for i in range(pre_inds.shape[0]):
+                arr[pre_inds[i], arr_inds[pre_inds[i]]] = i
+                arr_inds[pre_inds[i]] += 1
+            return arr
+        
+        table = make_table(pre_inds, n_elem, max_elem)
+        table = tf.cast(tf.stack(table, axis=0), tf.int64)
+        return table
 
+
+
+
+
+        
+    def make_pre_ind_table(self, indices, debug=False):
+        # pre_inds = self.recurrent_indices[:, 1]
+        pre_inds = indices[:, 1]
+        table = []
+        nelems = self._n_neurons * self.max_delay
+        for i in range(nelems):
+            # table.append(tf.where(pre_inds == i)[:, 0])
+            table.append(np.where(pre_inds == i)[0])
+
+        # determine the longest element (for padding)
+        max_elem = 0
+        for i in range(nelems):
+            if tf.shape(table[i])[0] > max_elem:
+                max_elem = tf.shape(table[i])[0]
+        
+        table2 = []
+        for i in range(nelems):
+            table2.append(tf.pad(table[i], [[0, max_elem - tf.shape(table[i])[0]]], constant_values=-1))
+            
+        if debug:
+            print("pre_ind_table created!")
+            print("longest element: ", max_elem)
+            print("table2: ", table2)
+            
+        return tf.stack(table2, axis=0)
+    
+    def get_new_inds_table(self, non_zero_cols):
+        pre_inds = self.recurrent_indices[:, 1]
+        post_inds = self.recurrent_indices[:, 0]
+        all_inds = tf.gather(self.pre_ind_table, non_zero_cols)
+        # tf.print("all_inds", tf.shape(all_inds), all_inds)
+        all_inds = tf.reshape(all_inds, [-1])
+        # tf.print("all_inds", tf.shape(all_inds), all_inds)
+        all_inds = tf.boolean_mask(all_inds, all_inds >= 0)
+        # tf.print("all_inds", tf.shape(all_inds), all_inds)
+        all_inds = tf.sort(all_inds)
+        # tf.print("all_inds", tf.shape(all_inds), all_inds)
+        inds = tf.cast(all_inds, tf.int64)
+        
+        remaining_pre = tf.gather(pre_inds, inds)
+        uniq_pre_inds, idx = tf.unique(remaining_pre, out_idx=tf.int64)
+
+        new_pre = tf.gather(idx, tf.argsort(inds))
+        new_post = tf.gather(post_inds, inds)
+        new_indices = tf.stack((new_post, new_pre), axis=1)
+        return new_indices, inds
+
+
+    def get_new_inds(self, non_zero_cols):
+        """ a function that prepares new sparse indices tensor.
+        This effectively does 'gather' operation for the sparse tensor."""
+        # tf.print(non_zero_cols)
+        pre_inds = self.recurrent_indices[:, 1]
+        # tf.print(pre_inds)
+        post_inds = self.recurrent_indices[:, 0]
+        # find where pre_inds is in non_zero_cols
+        nzc_ex = tf.expand_dims(non_zero_cols, 0)
+
+        # avoiding address overflow...
+        # nnz = tf.cast(tf.shape(non_zero_cols)[0], dtype=tf.int32)
+        # max_nnz = tf.cast(2**31 / tf.shape(pre_inds)[0], dtype=tf.int32)
+        mask = tf.reduce_any(tf.equal(tf.expand_dims(pre_inds, 1), nzc_ex), axis=1)
+        inds = tf.where(mask)[:, 0]
+        if tf.shape(inds)[0] == 0:
+            return tf.zeros((0, 2), dtype=tf.int64), inds
+
+        remaining_pre = tf.gather(pre_inds, inds)
+        uniq_pre_inds, idx = tf.unique(remaining_pre, out_idx=tf.int64)
+        # nnz = tf.cast(tf.shape(non_zero_cols)[0], dtype=tf.int64)
+
+        # if any indices are larger than nnz, alert.
+        # new_pre = tf.gather(idx, tf.argsort(inds))
+        new_pre = tf.gather(idx, tf.range(tf.size(inds)))
+        new_post = tf.gather(post_inds, inds)
+        new_indices = tf.stack((new_post, new_pre), axis=1)
+
+        return new_indices, inds
+
+
+    def get_new_inds_np(self, non_zero_cols):
+        """ above function, but cocisely written in numpy """
+        pre_inds = self.recurrent_indices_np[:, 1]
+        post_inds = self.recurrent_indices_np[:, 0]
+        
+        mask = np.isin(pre_inds, non_zero_cols.numpy())
+        inds = np.where(mask)[0]
+        remaining_pre = pre_inds[inds]
+        uniq_pre_inds, idx = np.unique(remaining_pre, return_inverse=True)
+        new_pre = tf.gather(idx, tf.range(tf.size(inds)))
+        new_post = tf.gather(post_inds, inds)
+        new_indices = tf.stack((new_post, new_pre), axis=1)
+        return new_indices, inds
+        
+
+
+    
     # @tf.function
     def calculate_i_rec(self, rec_z_buf):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
-        i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
-        for r_id in range(self._n_syn_basis):
-            i_receptor = tf.sparse.sparse_dense_matmul(
-                                                        self.sparse_w_rec[r_id],
-                                                        rec_z_buf,
-                                                        adjoint_b=True
-                                                    )
-            # Append i_receptor to the TensorArray
-            i_rec = i_rec.write(r_id, i_receptor)
-        # Stack the TensorArray into a single tensor
-        i_rec = i_rec.stack()
+        faster = True
+        # debug = True
+        debug = False
+        if faster:
+            # this faster method uses sparseness of the rec_z_buf.
+            # it identifies the non_zero rows of rec_z_buf and only computes the
+            # sparse matrix multiplication for those rows.
+            i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
+            # find the non-zero rows of rec_z_buf
+            # non_zero_cols = tf.where(tf.reduce_sum(rec_z_buf, axis=1) != 0)[:, 0]
+            non_zero_cols = tf.where(rec_z_buf)[:, 1]
+            nnz32 = tf.shape(non_zero_cols)[0]
+            nnz64 = tf.cast(nnz32, dtype=tf.int64)
+            # print out the percentage of non-zero rows
+            if debug:
+                tf.print("non_zero_cols: ", non_zero_cols)
+                tf.print("Shape of rec_z_buf:", tf.shape(rec_z_buf))
+                tf.print("Number of non-zero rows:", nnz64)
+                tf.print("Percentage of non-zero rows:", nnz32 / tf.shape(rec_z_buf)[1] * 100)
+            if tf.shape(non_zero_cols)[0] == 0:
+                i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)
+            else:
+                sliced_rec_z_buf = tf.gather(rec_z_buf, non_zero_cols, axis=1)
+                
+                # let's make sparse arrays for multiplication
+                # sliced_indices will be a version of indices that only contains the non-zero rows
+                # it is based on self.recurrent_indices.
+                # it reads self.recurrent_indices[:, 0] and pick up only elements contained
+                # in the non_zero_cols, and changes the indices accordingly.
+                new_indices, inds = self.get_new_inds_table(non_zero_cols)
+                # new_indices2, inds2 = self.get_new_inds(non_zero_cols)
+                # check shapes.
+                # tf.print("new_indices", tf.shape(new_indices))
+                # tf.print(new_indices)
+                # tf.print("new_indices2", tf.shape(new_indices2))
+                # tf.print(new_indices2)
+                # check if they are the same
+                # tf.print("inds", tf.shape(inds), inds)
+                # tf.print("inds2", tf.shape(inds2), inds2)
+                if tf.shape(inds)[0] == 0:
+                    i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)
+                else:
+                    picked_weights = tf.gather(self.recurrent_weight_values, inds)
+                    tf.debugging.check_numerics(picked_weights, "picked_weights is not numeric")
+                    
+                    for r_id in range(self._n_syn_basis):
+                        # safety check
+                        # if tf.reduce_any(new_indices[:, 0] >= self.recurrent_dense_shape[0]):
+                        #     tf.print("Bad shape of post new_indices")
+                        #     tf.print("new_indices", new_indices)
+                        #     tf.print("inds", inds)
+                        # if tf.reduce_any(new_indices[:, 1] >= nnz64):
+                        #     tf.print("Bad shape of pre new_indices")
+                        #     # print nnz64
+                        #     tf.print("nnz64", nnz64)
+                        #     # print max of the pre indices
+                        #     tf.print("max of the pre indices", tf.reduce_max(new_indices[:, 1]))
+                        #     tf.print("location of the max", tf.argmax(new_indices[:, 1]))
+                        #     tf.print("new_indices", new_indices)
+                        #     tf.print("inds", inds)
+
+                            
+                        weights_syn_receptors = picked_weights * tf.cast(tf.gather(self.recurrent_weights_factors[:, r_id], inds), dtype=self._compute_dtype)
+                        sliced_sparse = tf.sparse.SparseTensor(
+                            new_indices,
+                            weights_syn_receptors,
+                            [self.recurrent_dense_shape[0], nnz64]
+                        )
+                        # sliced_sparse_reord = tf.sparse.reorder(sliced_sparse)
+                        # slice the sparse matrix
+                        # sliced_sparse = tf.gather(self.sparse_w_rec[r_id], non_zero_cols)
+                        # gather does not work for sparse matrix, so we use slice
+                        # sliced_sparse = self.sparse_w_rec[r_id][non_zero_cols, :]
+                        # compute the sparse matrix multiplication
+                        # print shapes
+                        if debug:
+                            tf.print("sliced_sparse", tf.shape(sliced_sparse))
+                            tf.print("sliced_rec_z_buf", tf.shape(sliced_rec_z_buf))
+                        i_receptor = tf.sparse.sparse_dense_matmul(
+                                                                    # sliced_sparse_reord,
+                                                                    sliced_sparse,
+                                                                    sliced_rec_z_buf,
+                                                                    adjoint_b=True
+                                                                )
+                        tf.debugging.check_numerics(i_receptor, "i_receptor is not numeric")
+                        # Append i_receptor to the TensorArray
+                        i_rec = i_rec.write(r_id, i_receptor)
+                    # Stack the TensorArray into a single tensor
+                    i_rec = i_rec.stack()
+        else:
+            i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
+            for r_id in range(self._n_syn_basis):
+                i_receptor = tf.sparse.sparse_dense_matmul(
+                                                            self.sparse_w_rec[r_id],
+                                                            rec_z_buf,
+                                                            adjoint_b=True
+                                                        )
+                # Append i_receptor to the TensorArray
+                i_rec = i_rec.write(r_id, i_receptor)
+            # Stack the TensorArray into a single tensor
+            i_rec = i_rec.stack()
+            
+        tf.debugging.check_numerics(i_rec, "i_rec is not numeric")
         return i_rec
     
     # @tf.function
@@ -641,7 +858,7 @@ class V1Column(tf.keras.layers.Layer):
         return
         
         
-    @tf.function
+    # @tf.function
     def update_psc(self, psc, psc_rise, rec_inputs, syn_decay, psc_initial, dt):
         new_psc_rise = psc_rise * self.syn_decay + rec_inputs * self.psc_initial
         new_psc = psc * self.syn_decay + self._dt * self.syn_decay * psc_rise
