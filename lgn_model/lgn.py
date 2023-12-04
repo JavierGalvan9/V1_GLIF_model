@@ -138,27 +138,7 @@ class LGN(object):
             lgn_node_path = os.path.join(model_path, 'lgn_nodes.h5')
             lge_node_type_path = os.path.join(model_path, 'lgn_node_types.csv')
             d = create_lgn_units_info(filename=lgn_data_path, csv_path=lge_node_type_path, h5_path=lgn_node_path)
-        
-        # if lgn_data_path is None:
-        #     hostname = socket.gethostname()      
-        #     print(hostname)      
-        #     if hostname.count('nvcluster') > 0:
-        #         path = f'/home/ifgovh/tf_billeh_column/{lgn_data_path_name}'
-        #     elif hostname.count('juwels') > 0:
-        #         path = f'/p/project/structuretofunction/guozhang/glif_criticality/GLIF_network/{lgn_data_path_name}'
-        #     elif hostname.count('pCluster') > 0:
-        #         path = f'/home/guozhang/allen/LGN/LGN/{lgn_data_path_name}'
-        #     elif hostname.count('nid') > 0:
-        #         path = f'/users/bp000436/glif_criticality/GLIF_network/{lgn_data_path_name}'
-        #     elif hostname.count('shinya') > 0:
-        #         path = f'/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow/{lgn_data_path_name}'
-        #     else:
-        #         path = f'/home/jgalvan/Desktop/Neurocoding/Visual_stimulus/Utils/data/{lgn_data_path_name}'
-        #     d = pd.read_csv(path, delimiter=',')
-        # else:
-        #     filename = f'/home/jgalvan/Desktop/Neurocoding/Visual_stimulus/Utils/data/{lgn_data_path_name}'
-        #     d = create_lgn_units_info(filename=filename)
-        
+                
         spatial_sizes = d['spatial_size'].to_numpy()
         self.spatial_sizes = spatial_sizes
         model_id = d['model_id'].to_numpy()
