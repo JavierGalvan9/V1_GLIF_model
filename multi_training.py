@@ -478,6 +478,9 @@ def main(_):
         while True:
             try:
                 x, y, _, w = next(lgn_iterator)
+                sumx = tf.reduce_sum(x)
+                # print in order to finish spike generation here.
+                tf.print(f"sum of x: {sumx}")
                 break
             except:
                 print("----- LGN input data generation failed. Renewing the LGN input generator...")

@@ -3,7 +3,7 @@
 #SBATCH --gpus-per-node=a100:1
 ###SBATCH --gpus-per-node=1
 #SBATCH --partition=braintv
-#SBATCH --mem=100G
+#SBATCH --mem=150G
 #SBATCH -t0:20:00
 #SBATCH --qos=braintv
 ###SBATCH --output=gpu_run.out
@@ -17,3 +17,4 @@
 XLA_FLAGS=--xla_gpu_cuda_data_dir=/home/shinya.ito/realistic-model/miniconda3/envs/tf5 \
 LD_LIBRARY_PATH=/home/shinya.ito/realistic-model/miniconda3/envs/tf5/lib \
 python -u minimal_memory.py
+# scalene --reduced-profile minimal_memory.py

@@ -14,10 +14,11 @@ from time import time
 
 
 
-# tf.profiler.experimental.start('logdir2')
+# tf.profiler.experimental.start('logdir5')
 
 class Fake():
     def __init__(self):
+        # self.neurons = 65871  # 400 micron core
         # self.neurons = 65871  # 400 micron core
         # self.neurons = 37052 # 300 micron core
         # self.neurons = 25000 # maximum working number so far
@@ -147,23 +148,31 @@ def train_step(ex_model, _x, _y, _w):
 
 
 # %%
-data = stim_dataset.generate_drifting_grating_tuning(
-    seq_len=flags.seq_len,
-    pre_delay=10,
-    post_delay=10,
-    n_input=flags.n_input
-)
 
-t0 = time()
-for value in data.take(1):
-    x, y, _, w = value
-    break
-x = tf.expand_dims(x, 0)
-print(f'LGN spikes calculation time: {time() - t0:.2f}s')
+tf.function
+def get_lgn_data():
+    data = stim_dataset.generate_drifting_grating_tuning(
+        seq_len=flags.seq_len,
+        pre_delay=10,
+        post_delay=10,
+        n_input=flags.n_input
+    )
+
+    for value in data.take(1):
+        x, y, _, w = value
+        break
+    x = tf.expand_dims(x, 0)
+    return x, y, w
+
+for i in range(2):
+    t0 = time()
+    x, y, w = get_lgn_data()
+    tf.print("x: ", x)
+    tf.print(f'LGN spikes calculation time {i}: {time() - t0:.2f}s')
 
 # %% run the model
 
-for i in range(1):
+for i in range(2):
     stime = time()
     out = train_step(extractor_model, x, y, w)
     print(out[-1]) # gradient
