@@ -18,13 +18,13 @@ from time import time
 
 class Fake():
     def __init__(self):
-        # self.neurons = 65871  # 400 micron core
+        self.neurons = 65871  # 400 micron core
         # self.neurons = 296991  # everything
         # self.neurons = 65871  # 400 micron core
         # self.neurons = 37052 # 300 micron core
         # self.neurons = 25000 # maximum working number so far
         # self.neurons = 15000
-        self.neurons = 10000
+        # self.neurons = 10000
         # self.neurons = 2000
         self.batch_size = 1
         self.data_dir = 'GLIF_network'

@@ -498,7 +498,7 @@ class V1Column(tf.keras.layers.Layer):
         indices[:, 1] = indices[:, 1] + self._n_neurons * (delays - 1)
 
         # Define the Tensorflow variables
-        self.recurrent_indices = tf.Variable(indices, dtype=tf.int32, trainable=False)
+        self.recurrent_indices = tf.Variable(indices, dtype=tf.int64, trainable=False)
         self.pre_ind_table = self.make_pre_ind_table(indices)
 
         # convert it to tensor
@@ -651,7 +651,8 @@ class V1Column(tf.keras.layers.Layer):
             return arr
         
         table = make_table(pre_inds, n_elem, max_elem)
-        table = tf.convert_to_tensor(table, dtype=tf.int32)
+        # exit with int64 for faster processing on a GPU
+        table = tf.convert_to_tensor(table, dtype=tf.int64)
         # table = tf.cast(tf.stack(table, axis=0), tf.int32)
         return table
 
@@ -671,11 +672,12 @@ class V1Column(tf.keras.layers.Layer):
         all_inds = tf.boolean_mask(all_inds, all_inds >= 0)
         
         # sort to make it compatible with sparse tensor creation
-        all_inds = tf.sort(all_inds)
-        inds = tf.cast(all_inds, tf.int32)
+        # all_inds = tf.sort(all_inds)
+        # inds = tf.cast(all_inds, tf.int32)
+        inds = tf.sort(all_inds)
         
         remaining_pre = tf.gather(pre_inds, inds)
-        uniq_pre_inds, idx = tf.unique(remaining_pre, out_idx=tf.int32)
+        uniq_pre_inds, idx = tf.unique(remaining_pre, out_idx=tf.int64)
 
         new_pre = tf.gather(idx, tf.range(tf.size(inds)))
         new_post = tf.gather(post_inds, inds)
@@ -714,7 +716,8 @@ class V1Column(tf.keras.layers.Layer):
                         
                     weights_syn_receptors = picked_weights * tf.gather(self.recurrent_weights_factors[:, r_id], inds)
                     sliced_sparse = tf.sparse.SparseTensor(
-                        tf.cast(new_indices, tf.int64),
+                        # tf.cast(new_indices, tf.int64),
+                        new_indices,
                         weights_syn_receptors,
                         [self.recurrent_dense_shape[0], nnz]
                     )
