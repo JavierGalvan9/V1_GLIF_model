@@ -380,7 +380,7 @@ def main(_):
                 else:
                     _op = optimizer.apply_gradients([(g, v)])
 
-    # @tf.function
+    @tf.function
     def distributed_train_step(_x, _y, _w, grad_average_ind=None):
         strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
@@ -400,14 +400,14 @@ def main(_):
             _op = val_voltage_loss.update_state(_aux['voltage_loss'])
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
 
-    # @tf.function
+    @tf.function
     def distributed_validation_step(_x, _y, _w):
         strategy.run(validation_step, args=(_x, _y, _w))
 
     def reset_state():
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
 
-    # @tf.function
+    @tf.function
     def distributed_reset_state():
         strategy.run(reset_state)
     
@@ -469,6 +469,7 @@ def main(_):
     stop = False
     t0 = time()
    
+    @tf.function
     def safe_lgn_generation(lgn_iterator):
         """ Generate LGN data sefely.
         It looks that the LGN data generation fails randomly.

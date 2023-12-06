@@ -6,7 +6,7 @@ import pickle as pkl
 from time import time
 # from memory_profiler import profile
 from pympler.asizeof import asizeof, asized
-# from numba import njit
+from numba import njit
 
 
 # print("TensorFlow version:", tf.__version__) # 2.4.1
@@ -498,8 +498,8 @@ class V1Column(tf.keras.layers.Layer):
         indices[:, 1] = indices[:, 1] + self._n_neurons * (delays - 1)
 
         # Define the Tensorflow variables
-        self.recurrent_indices = tf.Variable(indices, dtype=tf.int64, trainable=False)
-        self.pre_ind_table = self.make_pre_ind_table_fast(indices)
+        self.recurrent_indices = tf.Variable(indices, dtype=tf.int32, trainable=False)
+        self.pre_ind_table = self.make_pre_ind_table(indices)
 
         # convert it to tensor
         # self.recurrent_indices = tf.convert_to_tensor(self.recurrent_indices, dtype=tf.int64)
@@ -616,7 +616,7 @@ class V1Column(tf.keras.layers.Layer):
         print(f"> BKG input synapses {len(bkg_input_indices)}")
         del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, synaptic_weights
     
-    def make_pre_ind_table_fast(self, indices):
+    def make_pre_ind_table(self, indices):
         """ This function creates a table that maps the presynaptyc index to 
         the indices of the recurrent_indices tensor. it takes a dimension of
         (number_of_neurons * max_delay) x (largest out-degree)
@@ -631,53 +631,31 @@ class V1Column(tf.keras.layers.Layer):
         
         # checking the possibility of address overflow
         if n_elem * max_elem > 2**31:
+            # with my observation, this never happens with the current model.
+            # with all 296991 neurons, the largest out-degree is 1548.
+            # this results in 1,838,968,272, which is barely below 2**31 (~2.1 billion)
+            print("n_elem: ", n_elem)
+            print("max_elem: ", max_elem)
+            print("n_elem * max_elem: ", n_elem * max_elem)
+            print("n_elem * max_elem > 2**31")
             raise ValueError("It will cause address overflow. Time to think about a different approach.")
         
+        @njit
         def make_table(pre_inds, n_elem, max_elem):
             # first, make a big array to allocate memory
             arr = np.ones((n_elem, max_elem), dtype=np.int32) * -1
-            arr_inds = np.zeros(n_elem, dtype=np.int64)
+            arr_inds = np.zeros(n_elem, dtype=np.int32)
             for i in range(pre_inds.shape[0]):
                 arr[pre_inds[i], arr_inds[pre_inds[i]]] = i
                 arr_inds[pre_inds[i]] += 1
             return arr
         
         table = make_table(pre_inds, n_elem, max_elem)
-        table = tf.cast(tf.stack(table, axis=0), tf.int32)
+        table = tf.convert_to_tensor(table, dtype=tf.int32)
+        # table = tf.cast(tf.stack(table, axis=0), tf.int32)
         return table
 
 
-
-
-
-        
-    # def make_pre_ind_table(self, indices, debug=False):
-    #     """ This function is obsolete. use make_pre_ind_table_fast instead."""
-    #     # pre_inds = self.recurrent_indices[:, 1]
-    #     pre_inds = indices[:, 1]
-    #     table = []
-    #     nelems = self._n_neurons * self.max_delay
-    #     for i in range(nelems):
-    #         # table.append(tf.where(pre_inds == i)[:, 0])
-    #         table.append(np.where(pre_inds == i)[0])
-
-    #     # determine the longest element (for padding)
-    #     max_elem = 0
-    #     for i in range(nelems):
-    #         if tf.shape(table[i])[0] > max_elem:
-    #             max_elem = tf.shape(table[i])[0]
-        
-    #     table2 = []
-    #     for i in range(nelems):
-    #         table2.append(tf.pad(table[i], [[0, max_elem - tf.shape(table[i])[0]]], constant_values=-1))
-            
-    #     if debug:
-    #         print("pre_ind_table created!")
-    #         print("longest element: ", max_elem)
-    #         print("table2: ", table2)
-            
-    #     return tf.stack(table2, axis=0)
-    
     def get_new_inds_table(self, non_zero_cols):
         """ a new function that prepares new sparse indices tensor.
         This effectively does 'gather' operation for the sparse tensor.
@@ -694,10 +672,10 @@ class V1Column(tf.keras.layers.Layer):
         
         # sort to make it compatible with sparse tensor creation
         all_inds = tf.sort(all_inds)
-        inds = tf.cast(all_inds, tf.int64)
+        inds = tf.cast(all_inds, tf.int32)
         
         remaining_pre = tf.gather(pre_inds, inds)
-        uniq_pre_inds, idx = tf.unique(remaining_pre, out_idx=tf.int64)
+        uniq_pre_inds, idx = tf.unique(remaining_pre, out_idx=tf.int32)
 
         new_pre = tf.gather(idx, tf.range(tf.size(inds)))
         new_post = tf.gather(post_inds, inds)
@@ -705,62 +683,8 @@ class V1Column(tf.keras.layers.Layer):
         return new_indices, inds
 
 
-    # def get_new_inds(self, non_zero_cols):
-    #     """ a function that prepares new sparse indices tensor.
-    #     This effectively does 'gather' operation for the sparse tensor.
-        
-    #     This function is obsolete. Use get_new_inds_table instead.
-    #     (mask creates a too large tensor and causes address overflow.
-    #     This function is kept for reference.)
-        
-    #     """
-    #     # tf.print(non_zero_cols)
-    #     pre_inds = self.recurrent_indices[:, 1]
-    #     # tf.print(pre_inds)
-    #     post_inds = self.recurrent_indices[:, 0]
-    #     # find where pre_inds is in non_zero_cols
-    #     nzc_ex = tf.expand_dims(non_zero_cols, 0)
-
-    #     # avoiding address overflow...
-    #     # nnz = tf.cast(tf.shape(non_zero_cols)[0], dtype=tf.int32)
-    #     # max_nnz = tf.cast(2**31 / tf.shape(pre_inds)[0], dtype=tf.int32)
-    #     mask = tf.reduce_any(tf.equal(tf.expand_dims(pre_inds, 1), nzc_ex), axis=1)
-    #     inds = tf.where(mask)[:, 0]
-    #     if tf.shape(inds)[0] == 0:
-    #         return tf.zeros((0, 2), dtype=tf.int64), inds
-
-    #     remaining_pre = tf.gather(pre_inds, inds)
-    #     uniq_pre_inds, idx = tf.unique(remaining_pre, out_idx=tf.int64)
-    #     # nnz = tf.cast(tf.shape(non_zero_cols)[0], dtype=tf.int64)
-
-    #     # if any indices are larger than nnz, alert.
-    #     # new_pre = tf.gather(idx, tf.argsort(inds))
-    #     new_pre = tf.gather(idx, tf.range(tf.size(inds)))
-    #     new_post = tf.gather(post_inds, inds)
-    #     new_indices = tf.stack((new_post, new_pre), axis=1)
-
-    #     return new_indices, inds
-
-    # def calculate_i_rec(self, rec_z_buf):
-    #     # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
-    #     # Original implementation
-    #     # Memory consumption and processing time are large, but stable
-    #     i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
-    #     for r_id in range(self._n_syn_basis):
-    #         i_receptor = tf.sparse.sparse_dense_matmul(
-    #                                                     self.sparse_w_rec[r_id],
-    #                                                     rec_z_buf,
-    #                                                     adjoint_b=True
-    #                                                 )
-    #         # Append i_receptor to the TensorArray
-    #         i_rec = i_rec.write(r_id, i_receptor)
-    #     # Stack the TensorArray into a single tensor
-    #     i_rec = i_rec.stack()
-        
-    #     return i_rec
-
     # @tf.function
-    def calculate_i_rec_parsimonious(self, rec_z_buf):
+    def calculate_i_rec(self, rec_z_buf):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
         # This is a new faster implementation that uses the pre_ind_table
         # Memory consumption and processing time depends on the number of
@@ -790,7 +714,7 @@ class V1Column(tf.keras.layers.Layer):
                         
                     weights_syn_receptors = picked_weights * tf.gather(self.recurrent_weights_factors[:, r_id], inds)
                     sliced_sparse = tf.sparse.SparseTensor(
-                        new_indices,
+                        tf.cast(new_indices, tf.int64),
                         weights_syn_receptors,
                         [self.recurrent_dense_shape[0], nnz]
                     )
@@ -805,24 +729,7 @@ class V1Column(tf.keras.layers.Layer):
                 i_rec = i_rec.stack()
        
         return i_rec
-    
-    # @tf.function
-    # def prepare_sparse_weight(self, verbose=False):
-    #     sparse_w_rec_v = []
-    #     if verbose:
-    #         tf.print("preparing the sparse weight")
-    #     for r_id in range(self._n_syn_basis):
-    #         weights_syn_receptors = self.recurrent_weight_values * self.recurrent_weights_factors[:, r_id]
-    #         sparse_w_rec = tf.sparse.SparseTensor(
-    #             self.recurrent_indices,
-    #             tf.cast(weights_syn_receptors, self._compute_dtype), 
-    #             self.recurrent_dense_shape,
-    #         )
-    #         sparse_w_rec_v.append(tf.cast(sparse_w_rec, self._compute_dtype))
-    #     self.sparse_w_rec = sparse_w_rec_v
-    #     # return sparse_w_rec_v
-    #     return
-        
+       
         
     # @tf.function
     def update_psc(self, psc, psc_rise, rec_inputs, syn_decay, psc_initial, dt):
@@ -864,12 +771,6 @@ class V1Column(tf.keras.layers.Layer):
         # tf.print('------------- MODEL CALLING OUT --------------')
         # tracker = GPUMemoryTracker()
 
-        
-        # if self.sparse_w_rec does not exist, make it
-        # if not hasattr(self, 'sparse_w_rec'):
-            # self.sparse_w_rec = self.prepare_sparse_weight()
-            # tf.print("!!!!! Sparse weight prepared!!!")
-
         batch_size = inputs.shape[0]
         if batch_size is None:
             batch_size = tf.shape(inputs)[0]
@@ -900,9 +801,7 @@ class V1Column(tf.keras.layers.Layer):
         psc = tf.reshape(psc, (batch_size, self._n_neurons, self._n_syn_basis))
 
         ### Calculate the recurrent input current ###
-        # i_rec = self.calculate_i_rec(tf.cast(rec_z_buf, self._compute_dtype))
-        # i_rec = self.calculate_i_rec(rec_z_buf)
-        i_rec = self.calculate_i_rec_parsimonious(rec_z_buf)
+        i_rec = self.calculate_i_rec(rec_z_buf)
         i_rec = tf.transpose(i_rec)
         rec_inputs = tf.cast(i_rec, self._compute_dtype)
         rec_inputs = tf.reshape(rec_inputs,
