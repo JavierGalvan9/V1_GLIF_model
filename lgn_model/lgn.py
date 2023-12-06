@@ -46,6 +46,7 @@ def create_one_unit_of_two_subunit_filter(prs, ttp_exp):
 
     return filt_new, filt_sum
 
+@tf.function
 def temporal_filter(all_spatial_responses, temporal_kernels):
     tr_spatial_responses = tf.pad(
         all_spatial_responses[None, :, None, :],
@@ -56,33 +57,40 @@ def temporal_filter(all_spatial_responses, temporal_kernels):
         tr_spatial_responses, tr_temporal_kernels, strides=[1, 1, 1, 1], padding='VALID')[0, :, 0]
     return filtered_output
 
+@tf.function
 def transfer_function(_a):
     _h = tf.cast(_a >= 0, tf.float32)
     return _h * _a
 
+@tf.function
 def select_spatial(x, y, convolved_movie):
-    i1 = np.stack((np.floor(y), np.floor(x)), -1).astype(np.int32)
-    i2 = np.stack((np.ceil(y), np.floor(x)), -1).astype(np.int32)
-    i3 = np.stack((np.floor(y), np.ceil(x)), -1).astype(np.int32)
-    i4 = np.stack((np.ceil(y), np.ceil(x)), -1).astype(np.int32)
-    # indices = np.stack((120 - y[sel], 240 - x[sel] - 1), -1)
-    transposed_convolved_movie = tf.transpose(convolved_movie, (1, 2, 0))
+    i1 = tf.cast(tf.stack([tf.floor(y), tf.floor(x)], axis=-1), dtype=tf.int32)
+    i2 = tf.cast(tf.stack([tf.math.ceil(y), tf.floor(x)], axis=-1), dtype=tf.int32)
+    i3 = tf.cast(tf.stack([tf.floor(y), tf.math.ceil(x)], axis=-1), dtype=tf.int32)
+    i4 = tf.cast(tf.stack([tf.math.ceil(y), tf.math.ceil(x)], axis=-1), dtype=tf.int32)
+
+    transposed_convolved_movie = tf.transpose(convolved_movie, perm=[1, 2, 0])
+
     sr1 = tf.gather_nd(transposed_convolved_movie, i1)
     sr2 = tf.gather_nd(transposed_convolved_movie, i2)
     sr3 = tf.gather_nd(transposed_convolved_movie, i3)
     sr4 = tf.gather_nd(transposed_convolved_movie, i4)
-    ss = tf.stack((sr1, sr2, sr3, sr4), 0)
-    y_factor = (y - np.floor(y))
-    x_factor = (x - np.floor(x))
-    weights = np.array([
-        (1 - x_factor) * (1 - y_factor),
-        (1 - x_factor) * y_factor,
-        x_factor * (1 - y_factor),
-        x_factor * y_factor
-    ])
 
-    spatial_responses = tf.reduce_sum(ss * weights[..., None], 0)
+    ss = tf.stack([sr1, sr2, sr3, sr4], axis=0)
+
+    y_factor = y - tf.floor(y)
+    x_factor = x - tf.floor(x)
+
+    weights = tf.stack([
+    (1 - x_factor) * (1 - y_factor),
+    (1 - x_factor) * y_factor,
+    x_factor * (1 - y_factor),
+    x_factor * y_factor
+    ], axis=0)
+
+    spatial_responses = tf.reduce_sum(ss * tf.expand_dims(weights, axis=-1), axis=0)
     spatial_responses = tf.transpose(spatial_responses)
+
     return spatial_responses
 
 
@@ -125,6 +133,7 @@ class LGN(object):
         root_path = os.path.split(__file__)[0]
         root_path = os.path.join(root_path, 'data')
         lgn_data_path = os.path.join(root_path, filename)
+        print(lgn_data_path)
         if os.path.exists(lgn_data_path):
             d = pd.read_csv(lgn_data_path, delimiter=' ')
         else:
@@ -139,7 +148,7 @@ class LGN(object):
             lge_node_type_path = os.path.join(model_path, 'lgn_node_types.csv')
             d = create_lgn_units_info(filename=lgn_data_path, csv_path=lge_node_type_path, h5_path=lgn_node_path)
                 
-        spatial_sizes = d['spatial_size'].to_numpy()
+        spatial_sizes = d['spatial_size'].to_numpy(dtype=np.float32)
         self.spatial_sizes = spatial_sizes
         model_id = d['model_id'].to_numpy()
         self.model_id = model_id
@@ -148,12 +157,13 @@ class LGN(object):
         is_composite = np.array([a.count('ON') > 0 and a.count(
             'OFF') > 0 for a in model_id]).astype(np.float32)
         self.is_composite = is_composite
-        x = d['x'].to_numpy()
-        y = d['y'].to_numpy()
+        x = d['x'].to_numpy(dtype=np.float32)
+        y = d['y'].to_numpy(dtype=np.float32)
+
         non_dominant_x = np.zeros_like(x)
         non_dominant_y = np.zeros_like(y)
-        tuning_angle = d['tuning_angle'].to_numpy()
-        subfield_separation = d['sf_sep'].to_numpy()  # for composite cells
+        tuning_angle = d['tuning_angle'].to_numpy(dtype=np.float32)
+        subfield_separation = d['sf_sep'].to_numpy(dtype=np.float32)  # for composite cells
 
         s_path = os.path.join(root_path, f'spontaneous_firing_rates_{col_size}x{row_size}.pkl')
         if not os.path.exists(s_path):
@@ -176,13 +186,13 @@ class LGN(object):
             with open(s_path, 'rb') as f:
                 spontaneous_firing_rates = pkl.load(f)
 
-        temporal_peaks_dom = np.stack((d['kpeaks_dom_0'].to_numpy(), d['kpeaks_dom_1'].to_numpy()), -1)
-        temporal_weights = np.stack((d['weight_dom_0'].to_numpy(), d['weight_dom_1'].to_numpy()), -1)
-        temporal_delays = np.stack((d['delay_dom_0'].to_numpy(), d['delay_dom_1'].to_numpy()), -1)
+        temporal_peaks_dom = np.stack((d['kpeaks_dom_0'].to_numpy(dtype=np.float32), d['kpeaks_dom_1'].to_numpy(dtype=np.float32)), -1)
+        temporal_weights = np.stack((d['weight_dom_0'].to_numpy(dtype=np.float32), d['weight_dom_1'].to_numpy(dtype=np.float32)), -1)
+        temporal_delays = np.stack((d['delay_dom_0'].to_numpy(dtype=np.float32), d['delay_dom_1'].to_numpy(dtype=np.float32)), -1)
 
-        temporal_peaks_non_dom = np.stack((d['kpeaks_non_dom_0'].to_numpy(), d['kpeaks_non_dom_1'].to_numpy()), -1)
-        temporal_weights_non_dom = np.stack((d['weight_non_dom_0'].to_numpy(), d['weight_non_dom_1'].to_numpy()), -1)
-        temporal_delays_non_dom = np.stack((d['delay_non_dom_0'].to_numpy(), d['delay_non_dom_1'].to_numpy()), -1)
+        temporal_peaks_non_dom = np.stack((d['kpeaks_non_dom_0'].to_numpy(dtype=np.float32), d['kpeaks_non_dom_1'].to_numpy(dtype=np.float32)), -1)
+        temporal_weights_non_dom = np.stack((d['weight_non_dom_0'].to_numpy(dtype=np.float32), d['weight_non_dom_1'].to_numpy(dtype=np.float32)), -1)
+        temporal_delays_non_dom = np.stack((d['delay_non_dom_0'].to_numpy(dtype=np.float32), d['delay_non_dom_1'].to_numpy(dtype=np.float32)), -1)
 
         # values from bmtk
         t_path = os.path.join(root_path, f'temporal_kernels_{col_size}x{row_size}.pkl')
@@ -254,8 +264,8 @@ class LGN(object):
                 non_dom_temporal_kernels=non_dom_temporal_kernels,
                 non_dominant_x=non_dominant_x,
                 non_dominant_y=non_dominant_y,
-                amplitude=amplitude,
-                non_dom_amplitude=non_dom_amplitude,
+                amplitude=amplitude.astype(np.float32),
+                non_dom_amplitude=non_dom_amplitude.astype(np.float32),
                 spontaneous_firing_rates=spontaneous_firing_rates
             )
             with open(t_path, 'wb') as f:
@@ -342,7 +352,7 @@ class LGN(object):
             self.model_id = self.model_id[:n_input]
             self.is_composite = self.is_composite[:n_input]
 
-
+    # @tf.function
     def spatial_response(self, movie):
         d_spatial = 1.
         spatial_range = np.arange(0, 15, d_spatial)
@@ -353,10 +363,16 @@ class LGN(object):
         non_dominant_x = tf.constant(self.non_dominant_x, dtype=tf.float32)
         non_dominant_y = tf.constant(self.non_dominant_y, dtype=tf.float32)
         spatial_sizes = tf.constant(self.spatial_sizes, dtype=tf.float32)
-        movie = tf.constant(movie, dtype=tf.float32)
+        # movie = tf.constant(movie, dtype=tf.float32)
+       
+        # if movie is not a tensor, convert it to one
+        if not isinstance(movie, tf.Tensor):
+            movie = tf.constant(movie, dtype=tf.float32)
+            print(f'Movie type: {type(movie)}')
 
         all_spatial_responses = []
         neuron_ids = []
+
         all_non_dom_spatial_responses = []
 
         for i in range(len(spatial_range) - 1):
@@ -379,13 +395,17 @@ class LGN(object):
 
             all_spatial_responses.append(spatial_responses)
             all_non_dom_spatial_responses.append(non_dom_spatial_responses)
-            neuron_ids.extend(tf.where(sel)[:, 0].numpy().tolist())
+            selected_indices = tf.where(sel)[:, 0]
+            
+            neuron_ids = tf.concat([neuron_ids, selected_indices], axis=0)
 
-        neuron_ids = np.array(neuron_ids)
-        all_spatial_responses = tf.concat(all_spatial_responses, 1)
-        all_non_dom_spatial_responses = tf.concat(all_non_dom_spatial_responses, 1)
+        neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
+        # neuron_ids = tf.constant(neuron_ids, dtype=tf.int32)
+        all_spatial_responses = tf.concat(all_spatial_responses, axis=1)
+        all_non_dom_spatial_responses = tf.concat(all_non_dom_spatial_responses, axis=1)
 
-        sorted_neuron_ids_indices = np.argsort(neuron_ids)
+        # sorted_neuron_ids_indices = np.argsort(neuron_ids)
+        sorted_neuron_ids_indices = tf.argsort(neuron_ids)
         all_spatial_responses = tf.gather(all_spatial_responses, sorted_neuron_ids_indices, axis=1)
         all_non_dom_spatial_responses = tf.gather(all_non_dom_spatial_responses, sorted_neuron_ids_indices, axis=1)
 
@@ -396,9 +416,9 @@ class LGN(object):
 
     # @tf.function
     # def do_conv(self, movie, gaussian_filter):
-    #     return tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1], padding='SAME')[..., 0]
+    #     return tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')[..., 0]
 
-    # @profile
+    @tf.function
     def firing_rates_from_spatial(self, all_spatial_responses, all_non_dom_spatial_responses):
         dom_filtered_output = temporal_filter(all_spatial_responses, self.dom_temporal_kernels)
         non_dom_filtered_output = temporal_filter(all_non_dom_spatial_responses, self.non_dom_temporal_kernels)

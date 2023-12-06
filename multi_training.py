@@ -32,6 +32,7 @@ import psutil
 
 # tf.debugging.enable_check_numerics()
 
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
 
 print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
 print("--- CUDNN version: ", tf.sysconfig.get_build_info()["cudnn_version"])
@@ -43,14 +44,14 @@ print("--- CUDA Library path: ", lib_path)
 
 debug = False
 
-def printgpu():
-    if tf.config.list_physical_devices('GPU'):
-        meminfo = tf.config.experimental.get_memory_info('GPU:0')
-        current = meminfo['current'] / 1e9
-        peak = meminfo['peak'] / 1e9
-        # tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
-        tf.print(f"GPU memory use: {current:.2f} GB, peak: {peak:.2f} GB")
-    return
+# def printgpu():
+#     if tf.config.list_physical_devices('GPU'):
+#         meminfo = tf.config.experimental.get_memory_info('GPU:0')
+#         current = meminfo['current'] / 1e9
+#         peak = meminfo['peak'] / 1e9
+#         # tf.print('GPU memory use: ', tf.config.experimental.get_memory_info('GPU:0'))
+#         tf.print(f"GPU memory use: {current:.2f} GB, peak: {peak:.2f} GB")
+#     return
 
 def print_vram(check_point_num=0):
     # print(f"GPU memory usage: {tf_ram:.3f} GB")
@@ -132,10 +133,10 @@ def main(_):
     print(f"Model data loading, {time()-t0:.2f} seconds")
   
     # Define the scope in which the model training will be executed
+    # tf.profiler.experimental.start(logdir=logdir, )
     with strategy.scope():
         t0 = time()
         # # Enable TensorFlow Profiler
-        # tf.profiler.experimental.start(logdir=logdir, )
         model = models.create_model(
             network,
             lgn_input,
@@ -160,7 +161,6 @@ def main(_):
             return_state=True,
         )
         
-
         del lgn_input, bkg_input
 
         model.build((flags.batch_size, flags.seq_len, flags.n_input))
@@ -184,6 +184,7 @@ def main(_):
         with open(os.path.join(flags.data_dir, 'np_gratings_firing_rates.pkl'), 'rb') as f:
             target_firing_rates = pkl.load(f)
 
+        tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)
         cell_type_ids = np.zeros(flags.neurons, dtype=np.int32)
         for i, (key, value) in enumerate(target_firing_rates.items()):
             # identify tne ids that are included in value["ids"]
@@ -213,14 +214,12 @@ def main(_):
         for i in connection_type_ids:
             same_connection_type_indices.append(np.where(connection_ids == i)[0])
         
+        del network 
 
         rate_distribution_regularizer = models.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost)
-        # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
-        # rate_loss = rate_distribution_regularizer(rsnn_layer.output[0])
-        rate_loss = rate_distribution_regularizer(rsnn_layer.output[0][0])
+        rate_loss = rate_distribution_regularizer(tf.cast(rsnn_layer.output[0][0], dtype=dtype))
 
         voltage_regularizer = models.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost)
-        # voltage_loss = voltage_regularizer(rsnn_layer.output[2]) 
         voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
 
         model.add_loss(rate_loss)
@@ -233,14 +232,15 @@ def main(_):
                                          outputs=[rsnn_layer.output, model.output, prediction_layer.output])
         # extractor_model = tf.keras.Model(inputs=model.inputs, outputs=[rsnn_layer.output])
 
-        loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
-            from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
+        # loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+        #     from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
 
-        def compute_loss(_l, _p, _w):
-            per_example_loss = loss_object(_l, _p, sample_weight=_w) * strategy.num_replicas_in_sync / tf.reduce_sum(_w)
-            rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
-            return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
+        # def compute_loss(_l, _p, _w):
+        #     per_example_loss = loss_object(_l, _p, sample_weight=_w) * strategy.num_replicas_in_sync / tf.reduce_sum(_w)
+        #     rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+        #     return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
 
+        @tf.function
         def calculate_delta_angle(stim_angle, tuning_angle):
             # angle unit is degrees.
             # this function calculates the difference between stim_angle and tuning_angle,
@@ -262,7 +262,7 @@ def main(_):
 
         def compute_loss_gratings(_y, _z):
             # I need to access the tuning angle. of all the neurons.
-            delta_angle = calculate_delta_angle(_y, network["tuning_angle"])
+            delta_angle = calculate_delta_angle(_y, tuning_angles)
             
             # sum spikes in _z, and multiply with delta_angle.
             sum_angle = tf.reduce_mean(_z, axis=[1]) * delta_angle
@@ -275,7 +275,8 @@ def main(_):
             rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
             return angle_loss + rec_weight_loss
         
-        optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)    
+        # optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)    
+        optimizer = tf.keras.optimizers.Adam(flags.learning_rate)   
 
         zero_state = rsnn_layer.cell.zero_state(flags.batch_size)
    
@@ -305,46 +306,44 @@ def main(_):
 
     checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
+    # @tf.function
     def roll_out(_x, _y, _w):
-        _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
-        # stt = time()
+        _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables) # initialize the _initial_state variable with the current values of the state_variables.
         dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
 
-        # print('------------- EXTRACTING MODEL --------------')
-        # tracker = GPUMemoryTracker()
-
         # _x = tf.cast(_x, tf.int16)
+        extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
+        extractor_model.get_layer('input_layer').prepare_sparse_weight()
+        extractor_model.get_layer('noise_layer').prepare_sparse_weight()
 
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
-        # tracker.get_gpu_memory()
-        # print('roll out time: ', time() - stt) # 1.23 seg
 
         _z, _v, _input_current = _out[0]
+        _z = tf.cast(_z, dtype)
         voltage_32 = (tf.cast(_v, tf.float32) - rsnn_layer.cell.voltage_offset) / rsnn_layer.cell.voltage_scale
         v_pos = tf.square(tf.nn.relu(voltage_32 - 1.))
         v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.))
         voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * flags.voltage_cost
         rate_loss = rate_distribution_regularizer(_z)
-        # classification loss is turned off for now.
         classification_loss = compute_loss_gratings(_y, _z)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss)
-
         _loss = classification_loss + rate_loss + voltage_loss
-        # _loss = rate_loss
+        # _loss = classification_loss
 
         return _out, _p, _loss, _aux
 
+    # @tf.function
     def train_step(_x, _y, _w, grad_average_ind=None):
         with tf.GradientTape() as tape:
-            v1 = extractor_model.get_layer('rsnn').cell
-            v1.prepare_sparse_weight()
+            # v1 = extractor_model.get_layer('rsnn').cell
+            # v1.prepare_sparse_weight()
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
             _op = train_loss.update_state(_loss)
-        _rate = tf.reduce_mean(_out[0][0])
+        _rate = tf.reduce_mean(tf.cast(_out[0][0], dtype))
         with tf.control_dependencies([_op]):
             _op = train_firing_rate.update_state(_rate)
         with tf.control_dependencies([_op]):
@@ -355,6 +354,10 @@ def main(_):
         grad = tape.gradient(_loss, model.trainable_variables)
              
         for g, v in zip(grad, model.trainable_variables):
+            print(f'{v.name} optimization')
+            print(f'Stimulus orientation: {_y}')
+            print(v[0], g[0])
+            print(_loss, np.sum(np.abs(g.numpy())))
             with tf.control_dependencies([_op]):
                 # if the trainable variable is recurrent connection, average the gradient
                 # for each cell type pair.
@@ -379,6 +382,7 @@ def main(_):
                         _op = optimizer.apply_gradients([(g, v)])
                 else:
                     _op = optimizer.apply_gradients([(g, v)])
+            print(v[0])
 
     # @tf.function
     def distributed_train_step(_x, _y, _w, grad_average_ind=None):
@@ -391,7 +395,7 @@ def main(_):
         _op = val_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
             _op = val_loss.update_state(_loss)
-        _rate = tf.reduce_mean(_out[0][0])
+        _rate = tf.reduce_mean(tf.cast(_out[0][0], dtype))
         with tf.control_dependencies([_op]):
             _op = val_firing_rate.update_state(_rate)
         with tf.control_dependencies([_op]):
@@ -440,13 +444,11 @@ def main(_):
         return _f
     
     # We define the dataset generates function under the strategy scope for a randomly selected orientation       
-    test_data_set = strategy.experimental_distribute_datasets_from_function(
-        get_dataset_fn())
-    train_data_set = strategy.experimental_distribute_datasets_from_function(
-        get_dataset_fn())
+    test_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+    train_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
     
     ### Training
-    step_counter = tf.Variable(0,trainable=False)
+    step_counter = tf.Variable(0, trainable=False)
     manager = tf.train.CheckpointManager(
         checkpoint, directory=logdir, max_to_keep=100,
         # keep_checkpoint_every_n_hours=2,
@@ -484,53 +486,43 @@ def main(_):
                 # resetting the lgn iterator
                 data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
                 lgn_iterator = iter(data_set)
+                x, y, _, w = next(lgn_iterator)
                 continue
+
         return x, y, _, w, lgn_iterator
     
-    # tf.profiler.experimental.start('logdir4')
+    # tf.profiler.experimental.start(logdir=logdir, )
     for epoch in range(flags.n_epochs):
-        printgpu()
+        # printgpu()
         if stop:
             break 
 
         it = iter(train_data_set)
         date_str = dt.datetime.now().strftime('%d-%m-%Y %H:%M')
         print(f'Epoch {epoch + 1:2d}/{flags.n_epochs} @ {date_str}')
-        # tf.print(f'Epoch {epoch + 1:2d}/{flags.n_epochs} @ {date_str}')
 
-        # quit()
         distributed_reset_state()
                                 #    options=tf.profiler.experimental.ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
         for step in range(flags.steps_per_epoch):
-            print(f'---- Step {step}')
             step_t0 = time()
-
-            # x, y, _, w = next(it)
-            # above line of code randomly prodeces an error.
-            # rewrite within try clause in while loop not to fail.
             x, y, _, w, it = safe_lgn_generation(it)
-            print(f'LGN spikes calculation time: {time() - step_t0:.2f}s')
+            lgn_t1 = time()
 
             t0 = time()
             if flags.average_grad_for_cell_type:
                 distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
             else:
                 distributed_train_step(x, y, w)
-            print(f'Step running time: {time() - t0:.2f}s')
-            
-            
-            # tracker = GPUMemoryTracker()
-            # tf.print(f'------------- TRAINING STEP {step} --------------')
-            # distributed_train_step(x, y, w)
-            # tracker.get_gpu_memory()
-            # tf.print(f'------------- TRAINING STEP DONE {step} --------------')
-            
-            if step % 1 == 0:
-                print_str = f'  Step {step + 1:2d}/{flags.steps_per_epoch}: {time() - step_t0:.2f}s\n'
-                print_str += '    ' + compose_str(train_loss.result(), train_accuracy.result(),
-                                            train_firing_rate.result(), train_rate_loss.result(), train_voltage_loss.result())
-                print(print_str, end='\n')
-                # tf.print(print_str, end='\n')
+                        
+            # if step % 10 == 0:
+            #     print_str = f'  Step {step + 1:2d}/{flags.steps_per_epoch}: {time() - step_t0:.2f}s\n'
+            #     print_str += '    ' + compose_str(train_loss.result(), train_accuracy.result(),
+            #                                 train_firing_rate.result(), train_rate_loss.result(), train_voltage_loss.result())
+            #     print(f'Step {step+1:2d} running time: {time() - step_t0:.2f}s')
+            #     print(f'LGN spikes calculation time: {lgn_t1 - step_t0:.2f}s')
+            #     print(f'Training {step+1:2d} running time: {time() - t0:.2f}s')
+            #     print(print_str, end='\n')
+            #     print('')
 
             if 0 < flags.max_time < (time() - t0) / 3600:
                 stop = True
@@ -539,22 +531,28 @@ def main(_):
             # if step == 1:
             #     tf.profiler.experimental.stop() 
 
+        print_str = '    ' + compose_str(train_loss.result(), train_accuracy.result(),
+                                    train_firing_rate.result(), train_rate_loss.result(), train_voltage_loss.result())
+        print(f'    Step running time: {time() - step_t0:.2f}s')
+        print(f'        - LGN spikes calculation time: {lgn_t1 - step_t0:.2f}s / step')
+        print(f'        - Training time: {time() - t0:.2f}s / step')
+        print(print_str, end='\n')
+        print('')
+        
         if stop:
             print(f'[ Maximum optimization time of {flags.max_time:.2f}h reached ]')
 
-        # distributed_reset_state()
-        # test_it = iter(test_data_set)
-        # for step in range(flags.val_steps):
-        #     x, y, _, w, it = safe_lgn_generation(test_it)
-        #     distributed_validation_step(x, y, w) 
+        distributed_reset_state()
+        test_it = iter(test_data_set)
+        for step in range(flags.val_steps):
+            x, y, _, w, it = safe_lgn_generation(test_it)
+            distributed_validation_step(x, y, w) 
 
-        # print_str = '  Validation: ' + compose_str(
-        #     val_loss.result(), val_accuracy.result(), val_firing_rate.result(),
-        #     val_rate_loss.result(), val_voltage_loss.result())
-
-        # print(print_str)
-        
+        print_str = '  Validation: ' + compose_str(
+            val_loss.result(), val_accuracy.result(), val_firing_rate.result(),
+            val_rate_loss.result(), val_voltage_loss.result())
         print(print_str)
+        
         keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
                 'train_voltage_loss', 'val_accuracy', 'val_loss',
                 'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
