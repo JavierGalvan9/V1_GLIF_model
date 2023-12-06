@@ -366,6 +366,12 @@ def load_network(
 
     return network
 
+def sort_indices_tf(indices, *arrays):
+    max_ind = tf.reduce_max(indices, axis=0)[0] + 1
+    q = indices[:, 0] * max_ind + indices[:, 1]
+    sorted_ind = tf.argsort(q)
+    sorted_arrays = [tf.gather(arr, sorted_ind) for arr in [indices, *arrays]]
+    return tuple(sorted_arrays)
 
 def load_input_tf(
     lgn_input,
@@ -521,7 +527,7 @@ def load_input_np(
 
     return input_populations
 
-
+import tensorflow as tf
 # Here we load the input from the LGN units and the background noise
 # @profile
 def load_input(
