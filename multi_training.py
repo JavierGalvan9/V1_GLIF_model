@@ -337,8 +337,8 @@ def main(_):
 
     def train_step(_x, _y, _w, grad_average_ind=None):
         with tf.GradientTape() as tape:
-            v1 = extractor_model.get_layer('rsnn').cell
-            v1.prepare_sparse_weight()
+            # v1 = extractor_model.get_layer('rsnn').cell
+            # v1.prepare_sparse_weight()
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
@@ -385,8 +385,8 @@ def main(_):
         strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
     def validation_step(_x, _y, _w):
-        v1 = extractor_model.get_layer('rsnn').cell
-        v1.prepare_sparse_weight()
+        # v1 = extractor_model.get_layer('rsnn').cell
+        # v1.prepare_sparse_weight()
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
         _op = val_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):

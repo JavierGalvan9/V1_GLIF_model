@@ -19,11 +19,11 @@ from time import time
 class Fake():
     def __init__(self):
         # self.neurons = 65871  # 400 micron core
-        # self.neurons = 65871  # 400 micron core
+        self.neurons = 65871  # 400 micron core
         # self.neurons = 37052 # 300 micron core
         # self.neurons = 25000 # maximum working number so far
         # self.neurons = 15000
-        self.neurons = 2000
+        # self.neurons = 2000
         self.batch_size = 1
         self.data_dir = 'GLIF_network'
         self.core_only = True
@@ -136,7 +136,7 @@ def train_step(ex_model, _x, _y, _w):
     with tf.GradientTape() as tape:
         v1 = ex_model.get_layer('rsnn').cell
         # v1.sparse_w_rec = v1.prepare_sparse_weight()
-        v1.prepare_sparse_weight()
+        # v1.prepare_sparse_weight()
         _out, _p, _loss, _aux = roll_out(ex_model, _x, _y, _w)
     tf.print("calculating gradient...")
     _grads = tape.gradient(_loss, model.trainable_variables)

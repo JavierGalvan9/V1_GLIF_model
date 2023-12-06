@@ -37,3 +37,4 @@ logs/
 results/
 legit_results/
 *.html
+.vscode/settings.json
