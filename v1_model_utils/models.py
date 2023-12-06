@@ -651,8 +651,9 @@ class V1Column(tf.keras.layers.Layer):
             return arr
         
         table = make_table(pre_inds, n_elem, max_elem)
-        # exit with int64 for faster processing on a GPU
+        # exit with int64 for faster processing on a GPU (don't know why...)
         table = tf.convert_to_tensor(table, dtype=tf.int64)
+        # table = tf.convert_to_tensor(table, dtype=tf.int32)
         # table = tf.cast(tf.stack(table, axis=0), tf.int32)
         return table
 
