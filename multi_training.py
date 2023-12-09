@@ -311,10 +311,10 @@ def main(_):
         _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables) # initialize the _initial_state variable with the current values of the state_variables.
         dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
 
-        # _x = tf.cast(_x, tf.int16)
-        extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
-        extractor_model.get_layer('input_layer').prepare_sparse_weight()
-        extractor_model.get_layer('noise_layer').prepare_sparse_weight()
+        # # _x = tf.cast(_x, tf.int16)
+        # extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
+        # extractor_model.get_layer('input_layer').prepare_sparse_weight()
+        # extractor_model.get_layer('noise_layer').prepare_sparse_weight()
 
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
 
@@ -338,6 +338,10 @@ def main(_):
         with tf.GradientTape() as tape:
             # v1 = extractor_model.get_layer('rsnn').cell
             # v1.prepare_sparse_weight()
+            # _x = tf.cast(_x, tf.int16)
+            extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
+            extractor_model.get_layer('input_layer').prepare_sparse_weight()
+            extractor_model.get_layer('noise_layer').prepare_sparse_weight()
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
@@ -384,13 +388,17 @@ def main(_):
                     _op = optimizer.apply_gradients([(g, v)])
             print(v[0])
 
-    # @tf.function
+    @tf.function
     def distributed_train_step(_x, _y, _w, grad_average_ind=None):
         strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
 
     def validation_step(_x, _y, _w):
-        v1 = extractor_model.get_layer('rsnn').cell
-        v1.prepare_sparse_weight()
+        # v1 = extractor_model.get_layer('rsnn').cell
+        # v1.prepare_sparse_weight()# _x = tf.cast(_x, tf.int16)
+        extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
+        extractor_model.get_layer('input_layer').prepare_sparse_weight()
+        extractor_model.get_layer('noise_layer').prepare_sparse_weight()
+
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
         _op = val_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
@@ -404,14 +412,14 @@ def main(_):
             _op = val_voltage_loss.update_state(_aux['voltage_loss'])
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
 
-    # @tf.function
+    @tf.function
     def distributed_validation_step(_x, _y, _w):
         strategy.run(validation_step, args=(_x, _y, _w))
 
     def reset_state():
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
 
-    # @tf.function
+    @tf.function
     def distributed_reset_state():
         strategy.run(reset_state)
     
@@ -471,6 +479,7 @@ def main(_):
     stop = False
     t0 = time()
    
+   @tf.function
     def safe_lgn_generation(lgn_iterator):
         """ Generate LGN data sefely.
         It looks that the LGN data generation fails randomly.
@@ -480,6 +489,9 @@ def main(_):
         while True:
             try:
                 x, y, _, w = next(lgn_iterator)
+                sumx = tf.reduce_sum(x)
+                # print in order to finish spike generation here.
+                tf.print(f"sum of x: {sumx}")
                 break
             except:
                 print("----- LGN input data generation failed. Renewing the LGN input generator...")
@@ -487,6 +499,9 @@ def main(_):
                 data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
                 lgn_iterator = iter(data_set)
                 x, y, _, w = next(lgn_iterator)
+                sumx = tf.reduce_sum(x)
+                # print in order to finish spike generation here.
+                tf.print(f"sum of x: {sumx}")                
                 continue
 
         return x, y, _, w, lgn_iterator
