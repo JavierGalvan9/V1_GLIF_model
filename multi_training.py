@@ -361,7 +361,7 @@ def main(_):
             print(f'{v.name} optimization')
             print(f'Stimulus orientation: {_y}')
             print(v[0], g[0])
-            print(_loss, np.sum(np.abs(g.numpy())))
+            # print(_loss, np.sum(np.abs(g.numpy())))
             with tf.control_dependencies([_op]):
                 # if the trainable variable is recurrent connection, average the gradient
                 # for each cell type pair.
@@ -479,7 +479,7 @@ def main(_):
     stop = False
     t0 = time()
    
-   @tf.function
+    @tf.function
     def safe_lgn_generation(lgn_iterator):
         """ Generate LGN data sefely.
         It looks that the LGN data generation fails randomly.
@@ -489,7 +489,7 @@ def main(_):
         while True:
             try:
                 x, y, _, w = next(lgn_iterator)
-                sumx = tf.reduce_sum(x)
+                sumx = tf.reduce_sum(tf.cast(x, tf.float32))
                 # print in order to finish spike generation here.
                 tf.print(f"sum of x: {sumx}")
                 break
@@ -499,7 +499,7 @@ def main(_):
                 data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
                 lgn_iterator = iter(data_set)
                 x, y, _, w = next(lgn_iterator)
-                sumx = tf.reduce_sum(x)
+                sumx = tf.reduce_sum(tf.cast(x, tf.float32))
                 # print in order to finish spike generation here.
                 tf.print(f"sum of x: {sumx}")                
                 continue

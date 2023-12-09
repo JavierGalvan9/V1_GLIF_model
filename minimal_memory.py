@@ -9,7 +9,7 @@ from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_
 import stim_dataset
 from time import time
 import os
-
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 # create the logdir directory 
 results_dir = os.path.join('minimal_logs')
@@ -17,6 +17,8 @@ os.makedirs(results_dir, exist_ok=True)
 sim_name = toolkit.get_random_identifier('b_')
 logdir = os.path.join(results_dir, sim_name)
 print(f'> Results for minimal.py will be stored in {logdir}')
+
+# tf.profiler.experimental.start('logdir5')
 
 class Fake():
     def __init__(self):
@@ -86,7 +88,7 @@ state_variables = tf.nest.map_structure(lambda a: tf.Variable(
     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
 ), zero_state)
 
-# @tf.function
+@tf.function
 def roll_out(ex_model, _x, _y, _w):
     _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
     dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
@@ -150,27 +152,36 @@ def train_step(ex_model, _x, _y, _w):
 
 
 # %%
-data = stim_dataset.generate_drifting_grating_tuning(
-    seq_len=flags.seq_len,
-    pre_delay=10,
-    post_delay=10,
-    n_input=flags.n_input
-)
+@tf.function
+def get_lgn_data():
+    data = stim_dataset.generate_drifting_grating_tuning(
+        seq_len=flags.seq_len,
+        pre_delay=10,
+        post_delay=10,
+        n_input=flags.n_input
+    )
 
-t0 = time()
-for value in data.take(1):
-    x, y, _, w = value
-    break
-x = tf.expand_dims(x, 0)
-print(f'LGN spikes calculation time: {time() - t0:.2f}s')
+    for value in data.take(1):
+        x, y, _, w = value
+        break
+    x = tf.expand_dims(x, 0)
+    return x, y, w
+
+for i in range(2):
+    t0 = time()
+    x, y, w = get_lgn_data()
+    # tf.print("x: ", x)
+    tf.print("# LGN spikes: ", tf.reduce_sum(x))
+    tf.print(f'LGN spikes calculation time {i}: {time() - t0:.2f}s')
 
 # %% run the model
 
 tf.profiler.experimental.start(logdir=logdir, )
-for i in range(1):
+for i in range(2):
     stime = time()
     out = train_step(extractor_model, x, y, w)
     print(out[-1]) # gradient
+    tf.debugging.check_numerics(out[-1], 'gradient is nan')
     print(tf.reduce_sum(out[-1][0]))
     print(out[-2]) # aux loss
     printgpu()

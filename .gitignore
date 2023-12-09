@@ -35,4 +35,6 @@ __pycache__
 *.out
 logs/
 results/
+legit_results/
 *.html
+.vscode/settings.json

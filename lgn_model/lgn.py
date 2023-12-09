@@ -62,7 +62,7 @@ def transfer_function(_a):
     _h = tf.cast(_a >= 0, tf.float32)
     return _h * _a
 
-@tf.function
+@tf.function(input_signature=[tf.TensorSpec(shape=(None,), dtype=tf.float32)])
 def select_spatial(x, y, convolved_movie):
     i1 = tf.cast(tf.stack([tf.floor(y), tf.floor(x)], axis=-1), dtype=tf.int32)
     i2 = tf.cast(tf.stack([tf.math.ceil(y), tf.floor(x)], axis=-1), dtype=tf.int32)
