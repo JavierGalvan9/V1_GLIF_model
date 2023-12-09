@@ -256,9 +256,9 @@ def load_simulation_results(full_data_path, n_simulations=None, skip_first_simul
         variables = ['v', 'z', 'input_current', 'recurrent_current', 'bottom_up_current', 'z_lgn']
     if type(variables) == str:
         variables = [variables]
-    data = {key: (np.zeros((n_simulations, simulation_length, n_input), np.uint8) if key=='z_lgn' 
-                  else np.zeros((n_simulations, simulation_length, n_neurons), np.uint8) if key=='z' 
-                  else np.zeros((n_simulations, simulation_length, n_core_neurons), dtype))
+    data = {key: (np.empty((n_simulations, simulation_length, n_input), np.uint8) if key=='z_lgn' 
+                  else np.empty((n_simulations, simulation_length, n_neurons), np.uint8) if key=='z' 
+                  else np.empty((n_simulations, simulation_length, n_core_neurons), dtype))
             for key in variables}
 
     for i in range(first_simulation, last_simulation):

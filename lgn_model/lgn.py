@@ -108,7 +108,7 @@ def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_mo
         node_id = h5_file['nodes']['lgn']['node_id'][:]
         node_type_id = h5_file['nodes']['lgn']['node_type_id'][:]
         for feature in h5_file['nodes']['lgn']['0'].keys():
-            df[feature] = h5_file['nodes']['lgn']['0'][feature][:]
+            df[feature] = np.array(h5_file['nodes']['lgn']['0'][feature][:], dtype=np.float32)
 
     node_info = {}
     for index, row in csv_file.iterrows():
@@ -118,9 +118,6 @@ def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_mo
     df['model_id'] = [node_info[node_type_id[i]]['model_id'] for i in range(len(node_type_id))]
     df['location'] = [node_info[node_type_id[i]]['location'] for i in range(len(node_type_id))]
     df['ei'] = [node_info[node_type_id[i]]['ei'] for i in range(len(node_type_id))]
-
-    print(os.getcwd())
-    print(filename)
 
     df.to_csv(filename, index=False, sep=' ', na_rep='NaN')
     return df
@@ -133,7 +130,6 @@ class LGN(object):
         root_path = os.path.split(__file__)[0]
         root_path = os.path.join(root_path, 'data')
         lgn_data_path = os.path.join(root_path, filename)
-        print(lgn_data_path)
         if os.path.exists(lgn_data_path):
             d = pd.read_csv(lgn_data_path, delimiter=' ')
         else:

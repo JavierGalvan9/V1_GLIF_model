@@ -444,7 +444,7 @@ def main(_):
         return _f
     
     # We define the dataset generates function under the strategy scope for a randomly selected orientation       
-    test_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+    # test_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
     train_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
     
     ### Training
@@ -543,7 +543,8 @@ def main(_):
             print(f'[ Maximum optimization time of {flags.max_time:.2f}h reached ]')
 
         distributed_reset_state()
-        test_it = iter(test_data_set)
+        # test_it = iter(test_data_set)
+        test_it = iter(train_data_set)
         for step in range(flags.val_steps):
             x, y, _, w, it = safe_lgn_generation(test_it)
             distributed_validation_step(x, y, w) 
@@ -586,12 +587,15 @@ if __name__ == '__main__':
     # make a condition for different machines. The allen institute has
     # cluster host name to be n??? where ??? is 3 digit number.
     # let's make regex for that.
-    if hostname.count('alleninstitute') > 0 or re.search(r'n\d{3}', hostname) is not None:
-        _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
-        _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/results'
-    else: 
-        _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
-        _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/results'
+    # if hostname.count('alleninstitute') > 0 or re.search(r'n\d{3}', hostname) is not None:
+    #     _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
+    #     _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/results'
+    # else: 
+    #     _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
+    #     _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/results'
+
+    _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
+    _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/results'
 
     absl.app.flags.DEFINE_string('data_dir', _data_dir, '')
     absl.app.flags.DEFINE_string('results_dir', _results_dir, '')
