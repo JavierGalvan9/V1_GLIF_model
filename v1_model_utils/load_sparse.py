@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from numba import njit
 from time import time
-from memory_profiler import profile
+# from memory_profiler import profile
 
 
 def sort_indices(indices, *arrays):
@@ -19,6 +19,8 @@ def sort_indices(indices, *arrays):
     sorted_arrays = list(map(lambda arr: arr[sorted_ind], [indices, *arrays]))
     return tuple(sorted_arrays)
 
+# The following function, although it provided a speed up, it creates bunch of tensor copies 
+# which are not garbage collected and thus it is not memory efficient
 def sort_indices_tf(indices, *arrays):
     indices = tf.cast(indices, dtype=tf.int64)    
     max_ind = tf.reduce_max(indices) + 1
@@ -138,234 +140,6 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
 
     return new_network_dat
 
-
-def load_network_original(
-    path="GLIF_network/network_dat.pkl",
-    h5_path="GLIF_network/network/v1_nodes.h5",
-    core_only=True,
-    n_neurons=296991,
-    seed=3000,
-    connected_selection=False,
-    n_syn_basis=5):
-
-    rd = np.random.RandomState(seed=seed)
-
-    # Create / Load the network_dat pickle file from the SONATA files
-    if not os.path.exists(path):
-        print("Creating network_dat.pkl file...")
-        d = create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1',
-                                output_file='GLIF_network/network_dat.pkl', save_pkl=True)
-    else:
-        print("Loading network_dat.pkl file...")
-        with open(path, "rb") as f:
-            d = pkl.load(f)  # d is a dictionary with 'nodes' and 'edges' keys
-
-    # This file contains the data related to each neuron class.
-    # The nodes key is a list of 201 entries (one per neuron class) with the following information:
-    #  'ids' (bmtk indices of the class neurons): array([173915, 174530, 175234, ..., 230780], dtype=uint32)
-    #  'params': {'asc_init': [0.0, 0.0],
-    #             'V_th': -34.78002413066345,
-    #             'g': 4.332666343216805,
-    #             'E_L': -71.3196309407552,
-    #             'k': [0.003, 0.029999999999999992],
-    #             'C_m': 61.776013140488196,
-    #             'V_reset': -71.3196309407552,
-    #             'V_dynamics_method': 'linear_exact',
-    #             'tau_syn': [5.5, 8.5, 2.8, 5.8],
-    #             't_ref': 2.2,
-    #             'asc_amps': [-6.621493991981387, -68.56339310938284]
-    #             'rheobase': [values....]}
-
-    # The 'edges' key is a list of 1783 entries (one per edge class) with the following information:
-    #  'source': array([   86,   195,   874, ..., 26266, 26563, 26755], dtype=uint64), # bmtk indices
-    #  'target': array([13289, 13289, 13289, ..., 26843, 26843, 26843], dtype=uint64), # bmtk indices
-    #  'params': {'model': 'static_synapse',
-    #             'receptor_type': 1,
-    #             'delay': 1.5,
-    #             'weight': array([2.05360475e-07, 1.18761259e-20, 1.04067864e-12, ...,
-    #                              3.33087865e-34, 1.26318969e-03, 1.20919572e-01])}
-
-    # Get the number of nodes in the full V1 network
-    n_nodes = sum([len(a["ids"]) for a in d["nodes"]])  # 296991 total neurons
-    # Create arrays to convert between bmtk and tf ides
-    bmtk_id_to_tf_id = np.arange(n_nodes, dtype=np.int32)
-    tf_id_to_bmtk_id = np.arange(n_nodes, dtype=np.int32)
-
-    # Extract from the SONATA file the nodes information
-    h5_file = h5py.File(h5_path, "r")
-    assert np.diff(h5_file["nodes"]["v1"]["node_id"]).var() < 1e-12
-    x = np.array(h5_file["nodes"]["v1"]["0"]["x"], dtype=np.float32) # horizontal axis
-    y = np.array(h5_file["nodes"]["v1"]["0"]["y"], dtype=np.float32) # depth
-    z = np.array(h5_file["nodes"]["v1"]["0"]["z"], dtype=np.float32) # horizontal axis
-    tuning_angle = np.array(h5_file['nodes']['v1']['0']['tuning_angle'], dtype=np.float32)
-    node_type_id = np.array(h5_file['nodes']['v1']['node_type_id'], dtype=np.int32)
-    r = np.sqrt(x**2 + z**2)  # the maximum radius is 845
-
-    ### CHOOSE THE NETWORK NODES ###
-    if n_neurons > 296991:
-        raise ValueError("There are only 296991 neurons in the network")
-    
-    elif connected_selection: # this condition takes the n_neurons closest neurons to the origin
-        sorted_ind = np.argsort(r)
-        sel = np.zeros(n_nodes, np.bool_)
-        sel[sorted_ind[:n_neurons]] = True
-        print(f"> Maximum sample radius: {r[sorted_ind[n_neurons - 1]]:.2f}")
-    
-    elif core_only: # this condition takes the n_neurons closest neurons to the origin (core)
-        sel = r < 400
-        if n_neurons > 66634:
-            raise ValueError("There are only 66634 neurons in the network core")
-        elif n_neurons > 0 and n_neurons <= 66634:
-            (inds,) = np.where(sel)
-            take_inds = rd.choice(inds, size=n_neurons, replace=False)
-            sel[:] = False
-            sel[take_inds] = True
-    
-    elif n_neurons > 0 and n_neurons <= 296991: # this condition randomly selects neurons from the whole V1
-        legit_neurons = np.arange(n_nodes)
-        take_inds = rd.choice(legit_neurons, size=n_neurons, replace=False)
-        sel = np.zeros(n_nodes, np.bool_)
-        sel[take_inds] = True
-    
-    else: # if no condition is met, all neurons are selected
-        sel = np.ones(n_nodes, np.bool_)
-
-    # Get the number of neurons in the chosen network and update the traslation arrays
-    n_nodes = np.sum(sel)
-    tf_id_to_bmtk_id = tf_id_to_bmtk_id[sel] # tf idx '0' corresponds to 'tf_id_to_bmtk_id[0]' bmtk idx
-    bmtk_id_to_tf_id = np.zeros_like(bmtk_id_to_tf_id) - 1
-    for tf_id, bmtk_id in enumerate(tf_id_to_bmtk_id):
-        bmtk_id_to_tf_id[bmtk_id] = tf_id
-    # bmtk idx '0' corresponds to 'bmtk_id_to_tf_id[0]' tf idx which can be '-1' in case
-    # the bmtk node is not in the tensorflow selection or another value in case it belongs the selection
-    
-    # Get the properties from the network neurons
-    x = x[sel]
-    y = y[sel]
-    z = z[sel]
-    tuning_angle = tuning_angle[sel]
-    node_type_id = node_type_id[sel]
-
-    # Count the number of edges in the current network
-    edges = d["edges"]
-    n_edges = 0
-    for edge in edges:
-        target_tf_ids = bmtk_id_to_tf_id[np.array(edge["target"], dtype=np.int32)]
-        source_tf_ids = bmtk_id_to_tf_id[np.array(edge["source"], dtype=np.int32)]
-        edge_exists = np.logical_and(target_tf_ids >= 0, source_tf_ids >= 0)
-        n_edges += np.sum(edge_exists)
-
-    print(f"> Number of Neurons: {n_nodes}")
-    print(f"> Number of Synapses: {n_edges}")
-
-    # GET THE NODES PARAMETERS
-    n_node_types = len(d["nodes"])
-    node_params = dict(
-        V_th=np.zeros(n_node_types, np.float32),
-        g=np.zeros(n_node_types, np.float32),
-        E_L=np.zeros(n_node_types, np.float32),
-        k=np.zeros((n_node_types, 2), np.float32),
-        C_m=np.zeros(n_node_types, np.float32),
-        V_reset=np.zeros(n_node_types, np.float32),
-        t_ref=np.zeros(n_node_types, np.float32),
-        asc_amps=np.zeros((n_node_types, 2), np.float32),
-    )
-
-    node_type_ids = np.zeros(n_nodes, np.int32)
-    for i, node_type in enumerate(d["nodes"]):
-        # get ALL the nodes of the given node type
-        tf_ids = bmtk_id_to_tf_id[np.array(node_type["ids"], dtype=np.int32)]
-        # choose only those that belong to our model
-        tf_ids = tf_ids[tf_ids >= 0]
-        # assign them all the same id (which does not relate with the neuron type)
-        node_type_ids[tf_ids] = i
-        for k, v in node_params.items():
-            # save in a dict the information of the nodes
-            v[i] = node_type["params"][k]
-
-    # GET THE EDGES INFORMATION
-    dense_shape = (n_nodes, n_nodes)
-    indices = np.zeros((n_edges, 2), dtype=np.int32) # Tf requires int64 for indices in sparse matrix 
-    weights = np.zeros(n_edges, np.float32)
-    delays = np.zeros(n_edges, np.float16)
-    syn_ids = np.zeros(n_edges, np.uint8)
-
-    current_edge = 0
-    for edge in edges:
-        # Identify which of the 10 types of inputs we have
-        # r = edge["params"]["receptor_type"] - 1
-        # r takes values within 0 - 9
-        target_tf_ids = bmtk_id_to_tf_id[np.array(edge["target"], dtype=np.int32)]
-        source_tf_ids = bmtk_id_to_tf_id[np.array(edge["source"], dtype=np.int32)]
-        edge_exists = np.logical_and(target_tf_ids >= 0, source_tf_ids >= 0)
-        # select the edges within our model
-        target_tf_ids = target_tf_ids[edge_exists]
-        source_tf_ids = source_tf_ids[edge_exists]
-        weights_tf = edge["params"]["weight"][edge_exists]
-        # tau_syn_weights = edge["params"]["tau_syn_weights"]
-        
-        # all the edges of a given type have the same delay and synaptic id
-        delays_tf = edge["params"]["delay"]
-        syn_id = edge["params"]["syn_id"]
-        n_new_edge = np.sum(edge_exists)
-        # we multiply by max_n_receptors and add r to identify the receptor_type easily:
-        # if target id is divisible by max_n_receptors the receptor_type is 0,
-        # if it is rest is 1 by dividing by max_n_receptors then its receptor type is 1, and so on...
-        # indices[current_edge: current_edge + n_new_edge] = np.array(
-        #     [target_tf_ids * max_n_receptors + r, source_tf_ids]
-        # ).T
-
-        indices[current_edge: current_edge + n_new_edge] = np.array(
-            [target_tf_ids, source_tf_ids]
-        ).T
-
-        weights[current_edge: current_edge + n_new_edge] = weights_tf
-        delays[current_edge: current_edge + n_new_edge] = delays_tf
-        # tau_syn_weights_array[current_edge: current_edge + n_new_edge, :] = tau_syn_weights
-        syn_ids[current_edge: current_edge + n_new_edge] = syn_id
-        current_edge += n_new_edge
-    # sort indices by considering first all the targets of node 0, then all of node 1, ...
-    # indices, weights, delays, tau_syn_weights_array, syn_ids = sort_indices(indices, weights, delays, tau_syn_weights_array, syn_ids)
-    indices, weights, delays, syn_ids = sort_indices(indices, weights, delays, syn_ids)
-
-    # # i want the weights array to be of the same shape as tau_syn_weights_array. make copies of the weights along a new axis to achieve this
-    # weights = np.repeat(weights[:, np.newaxis], n_syn_basis, axis=1)    
-    # # same for the delays
-    # delays = np.repeat(delays[:, np.newaxis], n_syn_basis, axis=1)
-    # delays = delays.flatten()
-
-    # # i want the indices array to be of the same length as tau_syn_weights_array shape[1]. 
-    # # make copies of the indices along its first axis adding 1 for every copy 
-    # # (this is because the indices are multiplied by the number of receptors)
-
-    # # element wise multiply the weights and tau_syn_weights_array
-    # weights = weights * tau_syn_weights_array
-    # # flatten the weights
-    # weights = weights.flatten()
-
-    # # indices = indices * n_syn_basis
-    # indices[:, 0] = indices[:, 0] * n_syn_basis
-    # indices = np.repeat(indices, n_syn_basis, axis=0)
-    # indices[:, 0] += np.tile(np.arange(n_syn_basis), n_edges)
-
-    network = dict(
-        x=x, y=y, z=z,
-        tuning_angle=tuning_angle,
-        node_type_id=node_type_id,
-        n_nodes=n_nodes,
-        n_edges=n_edges,
-        node_params=node_params,
-        node_type_ids=node_type_ids,
-        synapses=dict(indices=indices, weights=weights, delays=delays, 
-                    #   tau_syn_weights_array=tau_syn_weights_array,
-                      syn_ids=syn_ids,
-                      dense_shape=dense_shape),
-        tf_id_to_bmtk_id=tf_id_to_bmtk_id,
-        bmtk_id_to_tf_id=bmtk_id_to_tf_id,
-    )
-
-    return network
-
 # @profile
 def load_network(
     path="GLIF_network/network_dat.pkl",
@@ -374,7 +148,8 @@ def load_network(
     n_neurons=296991,
     seed=3000,
     connected_selection=False,
-    n_syn_basis=5):
+    n_syn_basis=5,
+    tensorflow_speed_up=False):
 
     rd = np.random.RandomState(seed=seed)
 
@@ -541,15 +316,20 @@ def load_network(
         syn_ids.append(syn_id)
 
     print(f"> Number of Synapses: {n_edges}")
-    indices = np.concatenate(indices, axis=0)
-    weights = np.concatenate(weights, axis=0)
-    delays = np.concatenate(delays, axis=0)
-    syn_ids = np.concatenate(syn_ids, axis=0)
+    indices = np.concatenate(indices, axis=0, dtype=np.int32)
+    weights = np.concatenate(weights, axis=0, dtype=np.float32)
+    delays = np.concatenate(delays, axis=0, dtype=np.float16)
+    syn_ids = np.concatenate(syn_ids, axis=0, dtype=np.uint8)
 
     # sort indices by considering first all the targets of node 0, then all of node 1, ...
     # indices, weights, delays, tau_syn_weights_array, syn_ids = sort_indices(indices, weights, delays, tau_syn_weights_array, syn_ids)
-    
-    indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+    # indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+    # indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+
+    if tensorflow_speed_up:
+        indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+    else:
+        indices, weights, delays, syn_ids = sort_indices(indices, weights, delays, syn_ids)
 
     network = dict(
         x=x, y=y, z=z,
@@ -568,122 +348,7 @@ def load_network(
 
     return network
 
-
-# Here we load the input from the LGN units and the background noise
 # @profile
-def load_input_original(
-    lgn_path="GLIF_network/lgn_input_dat.pkl",
-    bkg_path="GLIF_network/bkg_input_dat.pkl",
-    start=0,
-    duration=3000,
-    dt=1,
-    bmtk_id_to_tf_id=None,
-    # max_n_receptors=10
-):
-    # LOAD THE LGN INPUT
-    if not os.path.exists(lgn_path):
-        print("Creating lgn_input_dat.pkl file...")
-        # Process LGN input network
-        lgn_input = create_network_dat(data_dir='GLIF_network/network', source='lgn', target='v1', 
-                                        output_file=lgn_path, save_pkl=True)
-        print("Done.")
-    else:
-        with open(lgn_path, "rb") as f:
-            lgn_input = pkl.load(f)
-
-    # LOAD THE BACKGROUND INPUT
-    if not os.path.exists(bkg_path):
-        print("Creating bkg_input_dat.pkl file...")
-        # Process LGN input network
-        bkg_input = create_network_dat(data_dir='GLIF_network/network', source='bkg', target='v1', 
-                                        output_file=bkg_path, save_pkl=True)
-        print("Done.")
-    else:
-        with open(bkg_path, "rb") as f:
-            bkg_input = pkl.load(f)
-        
-    # Unite the edges information of the LGN and the background noise
-    input_edges = [lgn_input['edges'], bkg_input['edges']]
-       
-    input_populations = []
-    for idx, input_population in enumerate(input_edges):
-        post_indices = []
-        pre_indices = []
-        weights = []
-        delays = []
-        syn_ids = []
-
-        for edge in input_population:
-            target_bmtk_id = tf.constant(edge["target"], dtype=tf.int32)
-            source_tf_id = tf.constant(edge["source"], dtype=tf.int32)
-            weights_tf = tf.constant(edge["params"]["weight"], dtype=tf.float32)
-            delays_tf = tf.zeros_like(weights_tf, dtype=tf.float16) + edge["params"]["delay"]
-            syn_id = tf.zeros_like(weights_tf, dtype=tf.uint8) + edge["params"]["syn_id"]
-            
-            if bmtk_id_to_tf_id is not None:
-                target_tf_id = bmtk_id_to_tf_id[target_bmtk_id]
-                edge_exists = tf.greater_equal(target_tf_id, 0)
-                target_tf_id = tf.boolean_mask(target_tf_id, edge_exists)
-                source_tf_id = tf.boolean_mask(source_tf_id, edge_exists)
-                weights_tf = tf.boolean_mask(weights_tf, edge_exists)
-                delays_tf = tf.boolean_mask(delays_tf, edge_exists)
-                syn_id = tf.boolean_mask(syn_id, edge_exists)
-
-                new_target_tf_id = target_tf_id
-                post_indices.append(new_target_tf_id)
-                pre_indices.append(source_tf_id)
-                weights.append(weights_tf)
-                delays.append(delays_tf)
-                syn_ids.append(syn_id)
-
-        post_indices = tf.concat(post_indices, axis=0)
-        pre_indices = tf.concat(pre_indices, axis=0)
-        weights = tf.concat(weights, axis=0)
-        delays = tf.concat(delays, axis=0)
-        syn_ids = tf.concat(syn_ids, axis=0)
-
-        indices = tf.stack([post_indices, pre_indices], axis=-1)
-        indices = tf.cast(indices, dtype=tf.int32)
-        weights = tf.cast(weights, dtype=tf.float32)
-        delays = tf.cast(delays, dtype=tf.float16)
-        syn_ids = tf.cast(syn_ids, dtype=tf.uint8)
-
-        # Sort indices
-        indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
-
-        if idx == 0:
-            # we load the LGN nodes and their positions
-            lgn_nodes_h5_file = h5py.File("GLIF_network/network/lgn_nodes.h5", "r")
-            n_inputs = len(lgn_nodes_h5_file["nodes"]["lgn"]["node_id"])
-        else:
-            # we load the background nodes and their positions
-            bkg_nodes_h5_file = h5py.File("GLIF_network/network/bkg_nodes.h5", "r")
-            n_inputs = len(bkg_nodes_h5_file["nodes"]["bkg"]["node_id"])
-
-        input_populations.append(
-            dict(
-                n_inputs=n_inputs,
-                indices=indices,
-                weights=weights,
-                delays=delays,
-                syn_ids=syn_ids,
-            )
-        )
-
-        # n_neurons = len(input_population[0]['ids'])  # 17400
-        # spikes = np.zeros((int(duration / dt), n_neurons))
-        # # now we save the spikes of the input population
-        # for i, sp in zip(input_population[0]['ids'], input_population[0]['spikes']):
-        #     # consider only the spikes within the period we are taking
-        #     sp = sp[np.logical_and(start < sp, sp < start + duration)] - start
-        #     sp = (sp / dt).astype(np.int)
-        #     for s in sp:
-        #         spikes[s, i] += 1
-
-        # input_populations.append(dict(n_inputs=n_neurons, indices=indices.astype(
-        #     np.int64), weights=weights, delays=delays, spikes=spikes))
-    return input_populations
-
 def load_input(
     lgn_path="GLIF_network/lgn_input_dat.pkl",
     bkg_path="GLIF_network/bkg_input_dat.pkl",
@@ -691,7 +356,7 @@ def load_input(
     duration=3000,
     dt=1,
     bmtk_id_to_tf_id=None,
-    # max_n_receptors=10
+    tensorflow_speed_up=False
 ):
     # LOAD THE LGN INPUT
     if not os.path.exists(lgn_path):
@@ -761,20 +426,27 @@ def load_input(
                 # extend acts by extending the list with the given object
                 # new_target_tf_id = target_tf_id * max_n_receptors + r
                 new_target_tf_id = target_tf_id
-                post_indices.extend(new_target_tf_id)
-                pre_indices.extend(source_tf_id)
-                weights.extend(weights_tf)
-                delays.extend(delays_tf)
-                syn_ids.extend(syn_id)
+                post_indices.append(new_target_tf_id)
+                pre_indices.append(source_tf_id)
+                weights.append(weights_tf)
+                delays.append(delays_tf)
+                syn_ids.append(syn_id)
+
+        post_indices = np.concatenate(post_indices, axis=0, dtype=np.int32)
+        pre_indices = np.concatenate(pre_indices, axis=0, dtype=np.int32)
+        weights = np.concatenate(weights, axis=0, dtype=np.float32)
+        delays = np.concatenate(delays, axis=0, dtype=np.float16)
+        syn_ids = np.concatenate(syn_ids, axis=0, dtype=np.uint8)
 
         # first column are the post indices and second column the pre indices
-        indices = np.stack([post_indices, pre_indices], axis=-1).astype(np.int32)
-        weights = np.array(weights, dtype=np.float32)
-        delays = np.array(delays, dtype=np.float16) # np.concatenate(delays)
-        syn_ids = np.array(syn_ids, dtype=np.uint8)
+        indices = np.stack([post_indices, pre_indices], axis=-1)
 
         # Sort indices
-        indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+        # indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+        if tensorflow_speed_up:
+            indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+        else:
+            indices, weights, delays, syn_ids = sort_indices(indices, weights, delays, syn_ids)
 
         if idx == 0:
             # we load the LGN nodes and their positions
@@ -882,26 +554,16 @@ def reduce_input_population(input_population, new_n_input, seed=3000):
 def load_v1(flags, n_neurons):
     # Initialize the network 
     t0 = time()
-    network = load_network_original(
-        path=os.path.join(flags.data_dir, "network_dat.pkl"),
-        h5_path=os.path.join(flags.data_dir, "network/v1_nodes.h5"),
-        core_only=flags.core_only,
-        n_neurons=n_neurons,
-        seed=flags.seed,
-        connected_selection=flags.connected_selection,
-    )
-    print('Original load_network: %.2f seconds' % (time() - t0))
-
-    t0 = time()
     network = load_network(
-        path=os.path.join(flags.data_dir, "network_dat.pkl"),
-        h5_path=os.path.join(flags.data_dir, "network/v1_nodes.h5"),
-        core_only=flags.core_only,
-        n_neurons=n_neurons,
-        seed=flags.seed,
-        connected_selection=flags.connected_selection,
+                        path=os.path.join(flags.data_dir, "network_dat.pkl"),
+                        h5_path=os.path.join(flags.data_dir, "network/v1_nodes.h5"),
+                        core_only=flags.core_only,
+                        n_neurons=n_neurons,
+                        seed=flags.seed,
+                        connected_selection=flags.connected_selection,
+                        tensorflow_speed_up=False
     )
-    print('New load_network: %.2f seconds' % (time() - t0))
+    print('Load_network: %.2f seconds' % (time() - t0))
 
     ###### Select random l5e neurons for tracking output #########
     df = pd.read_csv(os.path.join(
@@ -929,30 +591,20 @@ def load_v1(flags, n_neurons):
     )
     readout_neurons = readout_neurons.reshape((flags.n_output, flags.neurons_per_output))
     network["readout_neuron_ids"] = readout_neurons
-    ##########################################
+    #########################################
 
-    ### Load the LGN and BKG input of the model
-    t0 = time()
-    inputs = load_input_original(
-        start=1000, 
-        duration=1000,
-        dt=1,
-        lgn_path=os.path.join(flags.data_dir, "lgn_input_dat.pkl"),
-        bkg_path=os.path.join(flags.data_dir, "bkg_input_dat.pkl"),
-        bmtk_id_to_tf_id=network["bmtk_id_to_tf_id"],
-    )
-    print('Original load_input: %.2f seconds' % (time() - t0))
-
+    ## Load the LGN and BKG input of the model
     t0 = time()
     inputs = load_input(
-        start=1000, 
-        duration=1000,
-        dt=1,
-        lgn_path=os.path.join(flags.data_dir, "lgn_input_dat.pkl"),
-        bkg_path=os.path.join(flags.data_dir, "bkg_input_dat.pkl"),
-        bmtk_id_to_tf_id=network["bmtk_id_to_tf_id"],
+                        start=1000, 
+                        duration=1000,
+                        dt=1,
+                        lgn_path=os.path.join(flags.data_dir, "lgn_input_dat.pkl"),
+                        bkg_path=os.path.join(flags.data_dir, "bkg_input_dat.pkl"),
+                        bmtk_id_to_tf_id=network["bmtk_id_to_tf_id"], 
+                        tensorflow_speed_up=False
     )
-    print('New load_input: %.2f seconds' % (time() - t0))
+    print('Load_input: %.2f seconds' % (time() - t0))
 
     lgn_input = inputs[0]
     bkg_input = inputs[1]

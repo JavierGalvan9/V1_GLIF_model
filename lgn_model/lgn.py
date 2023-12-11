@@ -58,14 +58,15 @@ def temporal_filter(all_spatial_responses, temporal_kernels):
     return filtered_output
 
 @tf.function
-def transfer_function(_a):
-    _h = tf.cast(_a >= 0, tf.float32)
-    return _h * _a
+def transfer_function(arg__a):
+    _h = tf.cast(arg__a >= 0, tf.float32)
+    return _h * arg__a
 
 @tf.function(input_signature=[
-    tf.TensorSpec(shape=(None,),dtpye=tf.float32), 
-    tf.TensorSpec(shape=(None,), dtype=tf.float32),
-    ])
+        tf.TensorSpec(shape=(None,), dtype=tf.float32), 
+        tf.TensorSpec(shape=(None,), dtype=tf.float32),
+        tf.TensorSpec(shape=(None, None, None), dtype=tf.float32),
+        ])
 def select_spatial(x, y, convolved_movie):
     i1 = tf.cast(tf.stack([tf.floor(y), tf.floor(x)], axis=-1), dtype=tf.int32)
     i2 = tf.cast(tf.stack([tf.math.ceil(y), tf.floor(x)], axis=-1), dtype=tf.int32)
@@ -387,7 +388,6 @@ class LGN(object):
             # Apply it
             convolved_movie = tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')
             convolved_movie = convolved_movie[..., 0]  # Assuming you only need one channel
-
             # Select items
             spatial_responses = select_spatial(tf.boolean_mask(x, sel), tf.boolean_mask(y, sel), convolved_movie)
             non_dom_spatial_responses = select_spatial(tf.boolean_mask(non_dominant_x, sel), tf.boolean_mask(non_dominant_y, sel), convolved_movie)

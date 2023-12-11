@@ -312,9 +312,9 @@ def main(_):
         dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
 
         # # _x = tf.cast(_x, tf.int16)
-        # extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
-        # extractor_model.get_layer('input_layer').prepare_sparse_weight()
-        # extractor_model.get_layer('noise_layer').prepare_sparse_weight()
+        extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
+        extractor_model.get_layer('input_layer').prepare_sparse_weight()
+        extractor_model.get_layer('noise_layer').prepare_sparse_weight()
 
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
 
@@ -339,9 +339,10 @@ def main(_):
             # v1 = extractor_model.get_layer('rsnn').cell
             # v1.prepare_sparse_weight()
             # _x = tf.cast(_x, tf.int16)
-            extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
-            extractor_model.get_layer('input_layer').prepare_sparse_weight()
-            extractor_model.get_layer('noise_layer').prepare_sparse_weight()
+
+            # extractor_model.get_layer('rsnn').cell.prepare_sparse_weight()
+            # extractor_model.get_layer('input_layer').prepare_sparse_weight()
+            # extractor_model.get_layer('noise_layer').prepare_sparse_weight()
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
 
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
@@ -387,10 +388,11 @@ def main(_):
                 else:
                     _op = optimizer.apply_gradients([(g, v)])
             print(v[0])
+            print('')
 
-    @tf.function
-    def distributed_train_step(_x, _y, _w, grad_average_ind=None):
-        strategy.run(train_step, args=(_x, _y, _w, grad_average_ind))
+    # @tf.function
+    def distributed_train_step(x, y, weights, grad_average_ind=None):
+        strategy.run(train_step, args=(x, y, weights, grad_average_ind))
 
     def validation_step(_x, _y, _w):
         # v1 = extractor_model.get_layer('rsnn').cell
@@ -412,9 +414,9 @@ def main(_):
             _op = val_voltage_loss.update_state(_aux['voltage_loss'])
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
 
-    @tf.function
-    def distributed_validation_step(_x, _y, _w):
-        strategy.run(validation_step, args=(_x, _y, _w))
+    # @tf.function
+    def distributed_validation_step(x, y, weights):
+        strategy.run(validation_step, args=(x, y, weights))
 
     def reset_state():
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
@@ -437,6 +439,7 @@ def main(_):
         _s += f'Rate {_rate:.4f}'
         return _s
 
+
     def get_dataset_fn():
         def _f(input_context):
             delays = [int(a) for a in flags.delays.split(',') if a != '']
@@ -453,7 +456,9 @@ def main(_):
     
     # We define the dataset generates function under the strategy scope for a randomly selected orientation       
     # test_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
-    train_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+    # train_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+    train_data_set = strategy.distribute_datasets_from_function(get_dataset_fn())
+    # train_data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
     
     ### Training
     step_counter = tf.Variable(0, trainable=False)
@@ -496,7 +501,8 @@ def main(_):
             except:
                 print("----- LGN input data generation failed. Renewing the LGN input generator...")
                 # resetting the lgn iterator
-                data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+                # data_set = strategy.experimental_distribute_datasets_from_function(get_dataset_fn())
+                data_set = strategy.distribute_datasets_from_function(get_dataset_fn())
                 lgn_iterator = iter(data_set)
                 x, y, _, w = next(lgn_iterator)
                 sumx = tf.reduce_sum(tf.cast(x, tf.float32))
