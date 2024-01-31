@@ -18,25 +18,27 @@ parentDir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(parentDir, "general_utils"))
 import file_management
 
-def pop_names(network, data_dir='GLIF_network'):
+def pop_names(network, core_radius = None, data_dir='GLIF_network'):
     path_to_csv = os.path.join(data_dir, 'network/v1_node_types.csv')
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
+
+    # Read data
     node_types = pd.read_csv(path_to_csv, sep=' ')
-    node_h5 = h5py.File(path_to_h5, mode='r')
-    node_type_id_to_pop_name = dict()
-    for nid in np.unique(node_h5['nodes']['v1']['node_type_id']): 
-        # if not np.unique all of the 230924 model neurons ids are considered, 
-        # but nearly all of them are repeated since there are only 111 different indices
-        ind_list = np.where(node_types.node_type_id == nid)[0]
-        assert len(ind_list) == 1
-        node_type_id_to_pop_name[nid] = node_types.pop_name[ind_list[0]]
-    true_pop_names = []  # it contains the pop_name of all the 230,924 neurons
-    for nid in node_h5['nodes']['v1']['node_type_id']:
-        true_pop_names.append(node_type_id_to_pop_name[nid])
-     # Select population names of neurons in the present network (core)
-    true_pop_names = np.array(true_pop_names)[network['tf_id_to_bmtk_id']]
-    
+    with h5py.File(path_to_h5, mode='r') as node_h5:
+        # Create mapping from node_type_id to pop_name
+        node_types.set_index('node_type_id', inplace=True)
+        node_type_id_to_pop_name = node_types['pop_name'].to_dict()
+
+        # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
+        node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][network['tf_id_to_bmtk_id']]
+        true_pop_names = np.array([node_type_id_to_pop_name[nid] for nid in node_type_ids])
+
+        if core_radius is not None:
+            selected_mask = isolate_core_neurons(network, radius=core_radius, data_dir=data_dir)
+            true_pop_names = true_pop_names[selected_mask]
+
     return true_pop_names
+
 
 def angle_tunning(network, data_dir='GLIF_network'):
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
@@ -45,41 +47,44 @@ def angle_tunning(network, data_dir='GLIF_network'):
     
     return angle_tunning
 
-def isolate_core_neurons(network, data_dir='GLIF_network'):
+def isolate_core_neurons(network, radius=400, data_dir='GLIF_network'):
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
     node_h5 = h5py.File(path_to_h5, mode='r')
-    x = np.array(node_h5['nodes']['v1']['0']['x'])
-    z = np.array(node_h5['nodes']['v1']['0']['z'])
+    x = node_h5['nodes']['v1']['0']['x'][()][network['tf_id_to_bmtk_id']]
+    z = node_h5['nodes']['v1']['0']['z'][()][network['tf_id_to_bmtk_id']]
     r = np.sqrt(x ** 2 + z ** 2)
-    r_network_nodes = r[network['tf_id_to_bmtk_id']]
-    selected_mask = r_network_nodes < 400
+    selected_mask = r < radius
        
     return selected_mask
     
 def isolate_neurons(network, neuron_population='e23', data_dir='GLIF_network'):
     n_neurons = network['n_nodes']
-    node_types = pd.read_csv(os.path.join(data_dir, 'network/v1_node_types.csv'), sep=' ')
+    node_types_path = os.path.join(data_dir, 'network/v1_node_types.csv')
+    node_types = pd.read_csv(node_types_path, sep=' ')
+
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
-    node_h5 = h5py.File(path_to_h5, mode='r')
-    node_type_id_to_pop_name = dict()
-    for nid in np.unique(node_h5['nodes']['v1']['node_type_id']): 
-        # if not np.unique all of the 230924 model neurons ids are considered, 
-        # but nearly all of them are repeated since there are only 111 different indices
-        ind_list = np.where(node_types.node_type_id == nid)[0]
-        assert len(ind_list) == 1
-        node_type_id_to_pop_name[nid] = node_types.pop_name[ind_list[0]]   
-    
-    node_type_ids = np.array(node_h5['nodes']['v1']['node_type_id'])
-    true_node_type_ids = node_type_ids[network['tf_id_to_bmtk_id']] 
-    selected_mask = np.zeros(n_neurons, bool)
-    for pop_id, pop_name in node_type_id_to_pop_name.items():
-        # if pop_name[0] == neuron_population[0] and pop_name[1] == neuron_population[1]:
-        if neuron_population in pop_name:
-            # choose all the neurons of the given pop_id
-            sel = true_node_type_ids == pop_id
-            selected_mask = np.logical_or(selected_mask, sel)
-    
+
+    with h5py.File(path_to_h5, mode='r') as node_h5:
+        # Create mapping from node_type_id to pop_name
+        node_types.set_index('node_type_id', inplace=True)
+        node_type_id_to_pop_name = node_types['pop_name'].to_dict()
+
+        # Get node_type_ids for the current network
+        node_type_ids = node_h5['nodes']['v1']['node_type_id'][()]
+        true_node_type_ids = node_type_ids[network['tf_id_to_bmtk_id']]
+        selected_mask = np.zeros(n_neurons, bool)
+
+        # Vectorize the selection of neurons based on population
+        for pop_id, pop_name in node_type_id_to_pop_name.items():
+            # if pop_name[0] == neuron_population[0] and pop_name[1] == neuron_population[1]:
+            if neuron_population in pop_name:
+                # choose all the neurons of the given pop_id
+                sel = true_node_type_ids == pop_id
+                selected_mask = np.logical_or(selected_mask, sel)
+
     return selected_mask
+
+
     
 def firing_rates_smoothing(z, sampling_rate=60, window_size=100): #window_size=300
     n_simulations, simulation_length, n_neurons = z.shape

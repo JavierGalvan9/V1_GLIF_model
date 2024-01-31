@@ -38,3 +38,6 @@ results/
 legit_results/
 *.html
 .vscode/settings.json
+prueba_tf212.py
+v1_model_utils/Old
+v1_model_utils/models2.py

@@ -46,18 +46,19 @@ def create_one_unit_of_two_subunit_filter(prs, ttp_exp):
 
     return filt_new, filt_sum
 
-@tf.function
+# @tf.function
 def temporal_filter(all_spatial_responses, temporal_kernels):
     tr_spatial_responses = tf.pad(
         all_spatial_responses[None, :, None, :],
         ((0, 0), (temporal_kernels.shape[-1] - 1, 0), (0, 0), (0, 0)))
 
     tr_temporal_kernels = tf.transpose(temporal_kernels)[:, None, :, None]
+    # tf.print(tr_spatial_responses.shape, tr_temporal_kernels.shape)
     filtered_output = tf.nn.depthwise_conv2d(
         tr_spatial_responses, tr_temporal_kernels, strides=[1, 1, 1, 1], padding='VALID')[0, :, 0]
     return filtered_output
 
-@tf.function
+# @tf.function
 def transfer_function(arg__a):
     _h = tf.cast(arg__a >= 0, tf.float32)
     return _h * arg__a
@@ -284,7 +285,7 @@ class LGN(object):
         truncation = np.min(np.sum(np.cumsum(np.abs(dom_temporal_kernels), axis=1) <= 1e-6, 1))
         non_dom_truncation = np.min(np.sum(np.cumsum(np.abs(non_dom_temporal_kernels), axis=1) <= 1e-6, 1))
         truncation = np.min([truncation, non_dom_truncation])
-        print(f'Could truncate {truncation} steps from filter')
+        # print(f'Could truncate {truncation} steps from filter')
 
         x = x * (col_size-1) / col_size  # 239 / 240
         y = y * (row_size-1) / row_size  # 119 / 120
@@ -356,6 +357,7 @@ class LGN(object):
     def spatial_response(self, movie):
         d_spatial = 1.
         spatial_range = np.arange(0, 15, d_spatial)
+        # spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
 
         # Preprocess data outside the loop if they don't change
         x = tf.constant(self.x, dtype=tf.float32)
@@ -363,7 +365,6 @@ class LGN(object):
         non_dominant_x = tf.constant(self.non_dominant_x, dtype=tf.float32)
         non_dominant_y = tf.constant(self.non_dominant_y, dtype=tf.float32)
         spatial_sizes = tf.constant(self.spatial_sizes, dtype=tf.float32)
-        # movie = tf.constant(movie, dtype=tf.float32)
        
         # if movie is not a tensor, convert it to one
         if not isinstance(movie, tf.Tensor):
@@ -372,14 +373,14 @@ class LGN(object):
 
         all_spatial_responses = []
         neuron_ids = []
-
         all_non_dom_spatial_responses = []
 
-        for i in range(len(spatial_range) - 1):
+        for i in range(len(spatial_range)-1):
+        # for i in tf.range(tf.shape(spatial_range)[0] - 1):
             sel = tf.math.logical_and(spatial_sizes < spatial_range[i + 1], spatial_sizes >= spatial_range[i])
             num_selected = tf.reduce_sum(tf.cast(sel, dtype=tf.int32))
 
-            if num_selected <= 0:
+            if tf.equal(num_selected, 0):
                 continue
 
             # Construct spatial filter
@@ -412,10 +413,6 @@ class LGN(object):
         # print(f'Non dominant spatial reponses computed: {all_non_dom_spatial_responses.shape}')
 
         return all_spatial_responses, all_non_dom_spatial_responses
-
-    # @tf.function
-    # def do_conv(self, movie, gaussian_filter):
-    #     return tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')[..., 0]
 
     @tf.function
     def firing_rates_from_spatial(self, all_spatial_responses, all_non_dom_spatial_responses):

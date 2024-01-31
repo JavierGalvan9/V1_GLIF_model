@@ -19,7 +19,7 @@ if version.parse(tf.__version__) < version.parse("2.4.0"):
 
 from general_utils import file_management
 from general_utils.other_utils import memory_tracer, timer
-from v1_model_utils import load_sparse, models, other_v1_utils, toolkit
+from v1_model_utils import load_sparse, models_javi, other_v1_utils, toolkit
 from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
 # import data_sets
 import stim_dataset
@@ -86,7 +86,7 @@ class PlotCallback(tf.keras.callbacks.Callback):
         toolkit.apply_style(self.activity_ax, scale=self.scale)
 
         all_pred_np = tf.nn.softmax(
-            models.exp_convolve(
+            models_javi.exp_convolve(
                 all_prediction[self.batch_ind], axis=0, decay=0.8)
         ).numpy()
         self.output_ax.plot(
@@ -198,7 +198,7 @@ def main(_):
         model_seq_len = 600
 
     t0 = time()
-    model = models.create_model(
+    model = models_javi.create_model(
         network,
         lgn_input,
         bkg_input,

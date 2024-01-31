@@ -10,55 +10,9 @@ from pympler.asizeof import asizeof, asized
 
 from time import time
 
-
-# def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True, image_duration=100, cpd = 0.05,
-#             temporal_f = 2, theta = 45, phase = None, contrast = 1.0):
-#     # parameters from Allen's code
-#     '''
-#     Create the grating movie with the desired parameters
-#     :param t_min: start time in seconds
-#     :param t_max: end time in seconds
-#     :param cpd: cycles per degree
-#     :param temporal_f: in Hz
-#     :param theta: orientation angle
-#     :return: Movie object of grating with desired parameters
-#     '''
-    
-#     #  Franz's code will accept something larger than 101 x 101 because of the
-#     #  kernel size.
-#     # row_size = row_size*2 # somehow, Franz's code only accept larger size; thus, i did the mulitplication
-#     # col_size = col_size*2
-#     frame_rate = 1000 # Hz
-#     t_min = 0
-#     t_max = image_duration/1000
-#     if phase is None:
-#         # phase = np.random.rand(1)*180
-#         phase = np.random.rand(1)*360 # if you want a random phase, it should be 360.
-
-#     assert contrast <= 1, "Contrast must be <= 1"
-#     assert contrast > 0, "Contrast must be > 0"
-
-#     # physical_spacing = 1. / (float(cpd) * 10)    #To make sure no aliasing occurs
-#     physical_spacing = 1.0  # 1 degree, fixed for now. tf version lgn model need this to keep true cpd;
-#     row_range  = np.linspace(0, row_size, int(row_size / physical_spacing), endpoint = True)
-#     col_range  = np.linspace(0, col_size, int(col_size / physical_spacing), endpoint = True)
-#     numberFramesNeeded = int(round(frame_rate * t_max))
-#     time_range = np.linspace(0, t_max, numberFramesNeeded, endpoint=True)   ### this was a bug... instead of zero it was gray_screen and so time was stretched! Fixed on Jan 11, 2018
-
-#     tt, yy, xx = np.meshgrid(time_range, row_range, col_range, indexing='ij')
-
-#     thetaRad = np.pi*(180-theta)/180.   #Add negative here to match brain observatory angles!
-#     phaseRad = np.pi*(180-phase)/180.
-#     xy = xx * np.cos(thetaRad) + yy * np.sin(thetaRad)
-#     data = contrast*np.sin(2*np.pi*(cpd * xy + temporal_f *tt) + phaseRad)
-
-#     if moving_flag: # decide whether the gratings drift or they are static 
-#         return data.astype(np.float32)
-#     else:
-#         return np.tile(data[0].astype(np.float32)[None,...],(image_duration,1,1))
-    
+@tf.function # Sometimes this function is called with different phase, causing 
 def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True, image_duration=100, cpd=0.05,
-                                   temporal_f=2, theta=45, phase=None, contrast=1.0):
+                                   temporal_f=2, theta=None, phase=0, contrast=1.0):
     '''
     Create the grating movie with the desired parameters
     :param t_min: start time in seconds
@@ -74,24 +28,33 @@ def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True,
     # col_size = col_size*2
     frame_rate = 1000  # Hz
     t_min = 0
-    t_max = image_duration / 1000
+    t_max = tf.cast(image_duration, tf.float32) / 1000
     if phase is None:
         phase = tf.random.uniform(shape=(1,), minval=0, maxval=360) 
 
-    assert contrast <= 1, "Contrast must be <= 1"
-    assert contrast > 0, "Contrast must be > 0"
+    # assert contrast <= 1, "Contrast must be <= 1"
+    # assert contrast > 0, "Contrast must be > 0"
+    # tf.debugging.assert_less_equal(contrast, 1.0, message="Contrast must be <= 1")
+    # tf.debugging.assert_greater(contrast, 0.0, message="Contrast must be > 0")
+
 
     # physical_spacing = 1. / (float(cpd) * 10)    #To make sure no aliasing occurs
     physical_spacing = 1.0  # 1 degree, fixed for now. tf version lgn model need this to keep true cpd;
     row_range = tf.linspace(0.0, row_size, int(row_size / physical_spacing))
     col_range = tf.linspace(0.0, col_size, int(col_size / physical_spacing))
-    number_frames_needed = int(round(frame_rate * t_max))
+    # number_frames_needed = int(round(frame_rate * t_max))
+    number_frames_needed = tf.cast(tf.math.round(frame_rate * t_max), tf.int32)
     time_range = tf.linspace(0.0, t_max, number_frames_needed)
 
     tt, yy, xx = tf.meshgrid(time_range, row_range, col_range, indexing='ij')
 
-    theta_rad = tf.constant(np.pi * (180 - theta) / 180.0, dtype=tf.float32) #Add negative here to match brain observatory angles!
-    phase_rad = tf.constant(np.pi * (180 - phase) / 180.0, dtype=tf.float32)
+    # theta_rad = tf.constant(np.pi * (180 - theta) / 180.0, dtype=tf.float32) #Add negative here to match brain observatory angles!
+    # phase_rad = tf.constant(np.pi * (180 - phase) / 180.0, dtype=tf.float32)
+
+    theta_rad = np.pi * (180 - theta) / 180.0
+    phase_rad = np.pi * (180 - phase) / 180.0
+
+
     xy = xx * tf.cos(theta_rad) + yy * tf.sin(theta_rad)
     data = contrast * tf.sin(2 * np.pi * (cpd * xy + temporal_f * tt) + phase_rad)
 
@@ -126,6 +89,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
             else:
                 theta = orientation
 
+            theta = tf.cast(theta, tf.float32)
             movie = make_drifting_grating_stimulus(moving_flag=True, image_duration=duration, cpd=cpd, temporal_f=temporal_f, theta=theta, phase=None, contrast=contrast)
             movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
 
