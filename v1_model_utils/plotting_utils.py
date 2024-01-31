@@ -933,10 +933,10 @@ class PopulationActivity:
 
 
 def calculate_Firing_Rate(z, drifting_gratings_init=500, drifting_gratings_end=1500):
-    dg_spikes = z[drifting_gratings_init:drifting_gratings_end, :]
+    dg_spikes = z[:, drifting_gratings_init:drifting_gratings_end, :]
     # if the number of dimensions of dg_spikes is 2, reshape it to 3 adding an additional first dimension
-    if dg_spikes.ndim == 2:
-        dg_spikes = dg_spikes.reshape(1, dg_spikes.shape[0], dg_spikes.shape[1])
+    # if dg_spikes.ndim == 2:
+    #     dg_spikes = dg_spikes.reshape(1, dg_spikes.shape[0], dg_spikes.shape[1])
     mean_dg_spikes = np.mean(dg_spikes, axis=0)
     mean_firing_rates = np.sum(mean_dg_spikes, axis=0)/((drifting_gratings_end-drifting_gratings_init)/1000)
     
@@ -1030,6 +1030,10 @@ class ModelMetricsAnalysis:
         # DG_angles = angle.numpy()[0]
         # DG_angles = angle.numpy()
             
+        # if spikes shape is (n_trials, n_neurons, n_time_steps) reshape it to (n_angles, n_trials, n_neurons, n_time_steps)
+        if spikes.shape[0] == len(DG_angles):
+            spikes = spikes.reshape(len(DG_angles), self.n_trials, spikes.shape[-2], self.n_neurons)
+        
         firing_rates_df = self.create_firing_rates_df(self.n_neurons, spikes, n_trials=self.n_trials, 
                                                       drifting_gratings_init=self.drifting_gratings_init, drifting_gratings_end=self.drifting_gratings_end, 
                                                       DG_angles=DG_angles)
@@ -1060,7 +1064,7 @@ class ModelMetricsAnalysis:
         # Iterate through each orientation
         for angle_id, angle in enumerate(DG_angles): 
             # Load the simulation results
-            firingRates = calculate_Firing_Rate(spikes[angle_id], drifting_gratings_init=drifting_gratings_init, drifting_gratings_end=drifting_gratings_end)
+            firingRates = calculate_Firing_Rate(spikes[angle_id, :, :, :], drifting_gratings_init=drifting_gratings_init, drifting_gratings_end=drifting_gratings_end)
             data = {
                     "DG_angle": float(angle),
                     "node_id": node_ids,
