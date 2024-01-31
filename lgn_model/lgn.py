@@ -53,7 +53,6 @@ def temporal_filter(all_spatial_responses, temporal_kernels):
         ((0, 0), (temporal_kernels.shape[-1] - 1, 0), (0, 0), (0, 0)))
 
     tr_temporal_kernels = tf.transpose(temporal_kernels)[:, None, :, None]
-    # tf.print(tr_spatial_responses.shape, tr_temporal_kernels.shape)
     filtered_output = tf.nn.depthwise_conv2d(
         tr_spatial_responses, tr_temporal_kernels, strides=[1, 1, 1, 1], padding='VALID')[0, :, 0]
     return filtered_output

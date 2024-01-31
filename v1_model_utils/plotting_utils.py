@@ -1057,8 +1057,6 @@ class ModelMetricsAnalysis:
         firing_rates_df = pd.DataFrame(columns=["DG_angle", "node_id", "Avg_rate(Hz)"])
         node_ids = np.arange(n_neurons)
 
-        print(spikes.shape)
-
         # Iterate through each orientation
         for angle_id, angle in enumerate(DG_angles): 
             # Load the simulation results
@@ -1069,12 +1067,9 @@ class ModelMetricsAnalysis:
                     "Avg_rate(Hz)": firingRates
                 }
             df = pd.DataFrame(data)
-            print(df.shape)
             # Drop empty or all-NA columns before concatenation
             df = df.dropna(axis=1, how='all')
-            print(df.shape)
             # how many nan rows are there?
-            print(df.isnull().sum())
             firing_rates_df = pd.concat([firing_rates_df, df], ignore_index=True)
 
         return firing_rates_df
@@ -1190,17 +1185,13 @@ class MetricsBoxplot:
         if metrics_df is None:
             metrics_df = f"V1_OSI_DSI_DF.csv"
 
-        print('HEYYY')
-        print(metrics_df)
+        # print(metrics_df)
 
         self.osi_dfs.append(self.get_osi_dsi_df(metric_file=metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
         self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
         
         df = pd.concat(self.osi_dfs, ignore_index=True)
-        print(df.shape)
-        print(df)
-        os.makedirs('Borrar', exist_ok=True)
         # df.to_csv(os.path.join('Borrar', f"help_DG_firing_rates_df.csv"), sep=" ", index=False)
 
         # Create a figure to compare several model metrics against Neuropixels data

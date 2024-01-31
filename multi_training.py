@@ -361,9 +361,23 @@ def main(_):
                 else:
                     _op = optimizer.apply_gradients([(g, v)])
 
+
+    @tf.function
+    def distributed_roll_out(x, y, w, output_spikes=True):
+        _z = strategy.run(roll_out, args=(x, y, w, output_spikes))
+        return _z
+        
+
     @tf.function
     def distributed_train_step(x, y, weights, grad_average_ind=None):
         strategy.run(train_step, args=(x, y, weights, grad_average_ind))
+
+
+    # @tf.function
+    # def distributed_train_step(dist_inputs):
+    #     per_replica_losses = mirrored_strategy.run(train_step, args=(dist_inputs,))
+    #     return mirrored_strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
+    #                             axis=None)
 
     def validation_step(_x, _y, _w):
         _out, _p, _loss, _aux = roll_out(_x, _y, _w)
@@ -420,9 +434,10 @@ def main(_):
         return _f
     
     # We define the dataset generates function under the strategy scope for a randomly selected orientation       
+    # train_data_set = strategy.distribute_datasets_from_function(get_dataset_fn())
+    test_data_set = strategy.distribute_datasets_from_function(get_dataset_fn(regular=True))
+    # osi_dsi_data_set = strategy.distribute_datasets_from_function(get_dataset_fn(regular=True))
     train_data_set = strategy.distribute_datasets_from_function(get_dataset_fn())
-    # test_data_set = strategy.distribute_datasets_from_function(get_dataset_fn())
-    osi_dsi_data_set = strategy.distribute_datasets_from_function(get_dataset_fn(regular=True))
 
     def safe_lgn_generation(lgn_iterator):
         """ Generate LGN data safely.
@@ -490,7 +505,7 @@ def main(_):
 
         # Load the dataset iterator - this must be done inside the epoch loop
         it = iter(train_data_set)
-        osi_dsi_data_set_it = iter(osi_dsi_data_set)
+        test_it = iter(test_data_set)
 
         # Register the init time 
         init_time = time()
@@ -514,8 +529,8 @@ def main(_):
             print(f'    Step running time: {time() - step_t0:.2f}s')
             print(f'        - LGN spikes calculation time: {lgn_t1 - step_t0:.3f}s / step')
             print(f'        - Training time: {time() - t0:.2f}s / step')
-            # mem_data = printgpu(verbose=1)
-            # print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB\n')
+            mem_data = printgpu(verbose=1)
+            print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB\n')
 
             if 0 < flags.max_time < (time() - init_time) / 3600:
                 stop = True
@@ -524,11 +539,11 @@ def main(_):
         if epoch == 2:
             tf.profiler.experimental.stop() 
 
-        ### VALIDATION AFTER EACH EPOCH
+        # ## VALIDATION AFTER EACH EPOCH
         # distributed_reset_state()
         # test_it = iter(test_data_set)
         # for step in range(flags.val_steps):
-        #     x, y, _, w, it = safe_lgn_generation(test_it)
+        #     x, y, _, w = next(test_it)
         #     distributed_validation_step(x, y, w) 
 
         # print_str = '  Validation: \n' 
@@ -550,55 +565,53 @@ def main(_):
         # if the model train loss is minimal, save the model.
         if epoch == 0:
             min_loss = values[1]
-        else:
-            if values[1] < min_loss:
-                min_loss = values[1]
-                print(f'[ Saving the model at epoch {epoch+1} ]\n')
-                # save_model()
+        
+        if values[1] < min_loss or epoch == 0:
+            min_loss = values[1]
+            print(f'[ Saving the model at epoch {epoch+1} ]\n')
+            # save_model()
 
-                ### Raster plot of the current model
-                z = roll_out(x, y, w, output_spikes=True)
-                z = z.numpy()
-                x = x.numpy()
-                y = y.numpy()
-                delays = [int(a) for a in flags.delays.split(',') if a != '']
-                images_dir = os.path.join(logdir, 'Raster_plots')
-                os.makedirs(images_dir, exist_ok=True)
-                graph = InputActivityFigure(
-                                            network,
-                                            flags.data_dir,
-                                            images_dir,
-                                            filename=f'Epoch_{epoch+1}',
-                                            frequency=flags.temporal_f,
-                                            stimuli_init_time=delays[0],
-                                            stimuli_end_time=flags.seq_len-delays[1],
-                                            reverse=False,
-                                            plot_core_only=True,
-                                            )
-                graph(x, z)
-                
-                ### Firing rate boxpltos
-                boxplots_dir = os.path.join(logdir, 'Boxplots')
-                os.makedirs(boxplots_dir, exist_ok=True)
-                metrics_analysis = ModelMetricsAnalysis(network, flags.neurons, data_dir=flags.data_dir,
-                                                        directory=boxplots_dir, filename=f'Epoch_{epoch+1}')
-                metrics_analysis(z, y)    
+            ### Raster plot of the current model
+            z = distributed_roll_out(x, y, w, output_spikes=True)
+            z = z.numpy()
+            x = x.numpy()
+            y = y.numpy()
+            delays = [int(a) for a in flags.delays.split(',') if a != '']
+            images_dir = os.path.join(logdir, 'Raster_plots')
+            os.makedirs(images_dir, exist_ok=True)
+            graph = InputActivityFigure(
+                                        network,
+                                        flags.data_dir,
+                                        images_dir,
+                                        filename=f'Epoch_{epoch+1}',
+                                        frequency=flags.temporal_f,
+                                        stimuli_init_time=delays[0],
+                                        stimuli_end_time=flags.seq_len-delays[1],
+                                        reverse=False,
+                                        plot_core_only=True,
+                                        )
+            graph(x, z)
+            
+            ### Firing rate boxplots
+            boxplots_dir = os.path.join(logdir, 'Boxplots')
+            os.makedirs(boxplots_dir, exist_ok=True)
+            metrics_analysis = ModelMetricsAnalysis(network, flags.neurons, data_dir=flags.data_dir,
+                                                    directory=boxplots_dir, filename=f'Epoch_{epoch+1}')
+            metrics_analysis(z, y)    
 
-                ### DSI and OSI plot of the current model
-                spikes = np.zeros((8, flags.seq_len, flags.neurons))
-                DG_angles = np.arange(0, 360, 45)
-                for angle_id, angle in enumerate(range(0, 360, 45)):
-                    x, y, _, w = next(osi_dsi_data_set_it)
-                    # x, y, _, w, osi_dsi_data_set_it = safe_lgn_generation_osi_dsi(osi_dsi_data_set_it)
-                    z = roll_out(x, y, w, output_spikes=True)
-                    z = z.numpy()
-                    spikes[angle_id] = z
+            ### DSI and OSI plot of the current model
+            spikes = np.zeros((8, flags.seq_len, flags.neurons))
+            DG_angles = np.arange(0, 360, 45)
+            for angle_id, angle in enumerate(range(0, 360, 45)):
+                x, y, _, w = next(test_it)
+                z = distributed_roll_out(x, y, w, output_spikes=True)
+                spikes[angle_id] = z.numpy()
 
-                boxplots_dir = os.path.join(logdir, 'Boxplots_OSI_DSI')
-                os.makedirs(boxplots_dir, exist_ok=True)
-                metrics_analysis = ModelMetricsAnalysis(network, flags.neurons, data_dir=flags.data_dir,
-                                                        directory=boxplots_dir, filename=f'Epoch_{epoch+1}')
-                metrics_analysis(spikes, DG_angles)    
+            boxplots_dir = os.path.join(logdir, 'Boxplots_OSI_DSI')
+            os.makedirs(boxplots_dir, exist_ok=True)
+            metrics_analysis = ModelMetricsAnalysis(network, flags.neurons, data_dir=flags.data_dir,
+                                                    directory=boxplots_dir, filename=f'Epoch_{epoch+1}')
+            metrics_analysis(spikes, DG_angles)    
 
 
         if stop:
