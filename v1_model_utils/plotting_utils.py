@@ -232,7 +232,7 @@ class RasterPlot:
         else:
             # Take the times where the spikes occur
             times, ids = np.where(
-                spikes[self.batch_ind].astype(np.float) > 0.5)
+                spikes[self.batch_ind].astype(float) > 0.5)
             ax.plot(
                 times, ids, ".", color=self.color, ms=self.marker_size, alpha=self.alpha
             )
@@ -427,29 +427,29 @@ class LaminarPlot:
         spikes = np.transpose(spikes[self.batch_ind, :, self.core_mask])
 
         # e
-        times, ids = np.where(spikes * self.e_mask[None, :].astype(np.float))
+        times, ids = np.where(spikes * self.e_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
         ax.plot(times, _y, ".", color="r", ms=ms, alpha=alpha)
 
         # Htr3a
         times, ids = np.where(
-            spikes * self.htr3a_mask[None, :].astype(np.float))
+            spikes * self.htr3a_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
         ax.plot(times, _y, ".", color="pink", ms=ms, alpha=alpha)
 
         # vip
-        times, ids = np.where(spikes * self.vip_mask[None, :].astype(np.float))
+        times, ids = np.where(spikes * self.vip_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
         ax.plot(times, _y, ".", color="darkviolet", ms=ms, alpha=alpha)
 
         # sst
-        times, ids = np.where(spikes * self.sst_mask[None, :].astype(np.float))
+        times, ids = np.where(spikes * self.sst_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
         ax.plot(times, _y, ".", color="g", ms=ms, alpha=alpha)
 
         # pvalb
         times, ids = np.where(
-            spikes * self.pvalb_mask[None, :].astype(np.float))
+            spikes * self.pvalb_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
         ax.plot(times, _y, ".", color="b", ms=ms, alpha=alpha)
 
@@ -461,7 +461,7 @@ class LaminarPlot:
         #     sel = np.zeros(self.n_neurons)
         #     sel[readout_neuron_ids] = 1.
         #     times, ids = np.where(
-        #         spikes[self.batch_ind] * sel[None, :].astype(np.float))
+        #         spikes[self.batch_ind] * sel[None, :].astype(float))
         #     _y = self.neuron_id_to_y[ids]
         #     ax.plot(times, _y, '.', color='k', ms=ms, alpha=alpha)
 
