@@ -203,9 +203,10 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
         rest_of_brain = tf.cast(tf.random.uniform(
                 (self._batch_size, self._seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
                 self._compute_dtype)
+
         rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * self._seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
         # Create a TensorArray to save the results for every receptor type
-        noise_input = self.calculate_bkg_i_in(tf.cast(rest_of_brain, self._compute_dtype))
+        noise_input = self.calculate_bkg_i_in(rest_of_brain)
         noise_input = tf.transpose(noise_input) # New shape (3000, 66634, 5)
         # Reshape properly the input current
         noise_input = tf.reshape(noise_input, (self._batch_size, self._seq_len, -1)) # (1, 3000, 333170)
@@ -372,6 +373,7 @@ class V1Column(tf.keras.layers.Layer):
         pseudo_gauss=False,
         train_recurrent=True,
         train_input=True,
+        train_noise=True,
         hard_reset=True,
     ):
         super().__init__()
@@ -563,7 +565,7 @@ class V1Column(tf.keras.layers.Layer):
             bkg_input_weights * input_weight_scale / lr_scale, 
             name="rest_of_brain_weights", 
             constraint=SignedConstraint(self.bkg_input_weight_positive),
-            trainable=train_input,
+            trainable=train_noise,
             dtype=self._compute_dtype
         )
         self.bkg_input_syn_ids = bkg_input_syn_ids
@@ -640,7 +642,8 @@ class V1Column(tf.keras.layers.Layer):
         # this faster method uses sparseness of the rec_z_buf.
         # it identifies the non_zero rows of rec_z_buf and only computes the
         # sparse matrix multiplication for those rows.
-        i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
+        rec_z_buf = tf.cast(rec_z_buf, tf.float32)
+        
         # find the non-zero rows of rec_z_buf
         non_zero_cols = tf.where(rec_z_buf)[:, 1]
         nnz = tf.cast(tf.shape(non_zero_cols)[0], dtype=tf.int32)  # number of non zero
@@ -648,6 +651,7 @@ class V1Column(tf.keras.layers.Layer):
             i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)
         else:
             sliced_rec_z_buf = tf.gather(rec_z_buf, non_zero_cols, axis=1)
+            sliced_rec_z_buf = tf.cast(sliced_rec_z_buf, self._compute_dtype)
             # let's make sparse arrays for multiplication
             # new_indices will be a version of indices that only contains the non-zero columns
             # in the non_zero_cols, and changes the indices accordingly.
@@ -655,6 +659,7 @@ class V1Column(tf.keras.layers.Layer):
             if tf.shape(inds)[0] == 0:  # if firing cells do not have any outputs
                 i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)
             else:
+                i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
                 picked_weights = tf.gather(self.recurrent_weight_values, inds)
                 # for some reason, changing the following range by tf.range damages speed performance
                 for r_id in range(self._n_syn_basis):
@@ -724,6 +729,7 @@ class V1Column(tf.keras.layers.Layer):
                 
         # Extract the network variables from the state
         z_buf, v, r, asc_1, asc_2, psc_rise, psc = state
+
         # Define the previous max_delay spike matrix
         shaped_z_buf = tf.reshape(z_buf, (-1, self.max_delay, self._n_neurons))  
         prev_z = shaped_z_buf[:, 0]  # previous spikes with shape (neurons,)
@@ -821,15 +827,17 @@ class V1Column(tf.keras.layers.Layer):
         return outputs, new_state
 
 
-def huber_quantile_loss(u, tau, kappa):
-    branch_1 = tf.abs(tau - tf.cast(u <= 0, tf.float32)) / \
-        (2 * kappa) * tf.square(u)
-    branch_2 = tf.abs(tau - tf.cast(u <= 0, tf.float32)) * \
-        (tf.abs(u) - 0.5 * kappa)
+def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
+    tau = tf.cast(tau, dtype)
+    num = tf.abs(tau - tf.cast(u <= 0, dtype))
+    kappa = tf.cast(kappa, dtype)
+
+    branch_1 = num / (2 * kappa) * tf.square(u)
+    branch_2 = num * (tf.abs(u) - 0.5 * kappa)
     return tf.where(tf.abs(u) <= kappa, branch_1, branch_2)
 
 ### To calculate the loss of firing rates between neuron types
-def compute_spike_rate_target_loss(_spikes, target_rates):
+def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
     # TODO: define this function
     # target_rates is a dictionary that contains all the cell types.
     # I should iterate on them, and add the cost for each one at the end.
@@ -837,7 +845,7 @@ def compute_spike_rate_target_loss(_spikes, target_rates):
     losses = []
     for key, value in target_rates.items():
         spikes_type = tf.gather(_spikes, value["neuron_ids"], axis=-1)
-        loss_type = compute_spike_rate_distribution_loss(spikes_type, value["sorted_target_rates"])
+        loss_type = compute_spike_rate_distribution_loss(spikes_type, value["sorted_target_rates"], dtype=dtype)
         losses.append(tf.reduce_mean(loss_type))
 
     return tf.reduce_sum(losses, axis=0)
@@ -847,36 +855,39 @@ class SpikeRateDistributionTarget:
     """ Instead of regularization, treat it as a target.
         The main difference is that this class will calculate the loss
         for each subtypes of the neurons."""
-    def __init__(self, target_rates, rate_cost=.5):
+    def __init__(self, target_rates, rate_cost=.5, dtype=tf.float32):
         self._rate_cost = rate_cost
         self._target_rates = target_rates
+        self._dtype = dtype
 
     def __call__(self, spikes):
-        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates) * self._rate_cost
+        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, dtype=self._dtype) * self._rate_cost
         return reg_loss
 
 
-def compute_spike_rate_distribution_loss(_spikes, target_rate):
+def compute_spike_rate_distribution_loss(_spikes, target_rate, dtype=tf.float32):
     _rate = tf.reduce_mean(_spikes, (0, 1))
     ind = tf.range(target_rate.shape[0])
     rand_ind = tf.random.shuffle(ind)
     _rate = tf.gather(_rate, rand_ind)
     sorted_rate = tf.sort(_rate)
     u = target_rate - sorted_rate
-    tau = (tf.cast(tf.range(target_rate.shape[0]), tf.float32) + 1) / target_rate.shape[0]
-    loss = huber_quantile_loss(u, tau, 0.002)
+    # tau = (tf.range(target_rate.shape[0]), dtype) + 1) / target_rate.shape[0]
+    tau = (tf.range(target_rate.shape[0]) + 1) / target_rate.shape[0]
+    loss = huber_quantile_loss(u, tau, 0.002, dtype=dtype)
 
     return loss
 
 
 class SpikeRateDistributionRegularization:
-    def __init__(self, target_rates, rate_cost=0.5):
+    def __init__(self, target_rates, rate_cost=0.5, dtype=tf.float32):
         self._rate_cost = rate_cost
         self._target_rates = target_rates
+        self._dtype = dtype
 
     def __call__(self, spikes):
         reg_loss = (
-            compute_spike_rate_distribution_loss(spikes, self._target_rates)
+            compute_spike_rate_distribution_loss(spikes, self._target_rates, dtype=self._dtype)
             * self._rate_cost
         )
         reg_loss = tf.reduce_sum(reg_loss)
@@ -885,20 +896,17 @@ class SpikeRateDistributionRegularization:
 
 
 class VoltageRegularization:
-    def __init__(self, cell, voltage_cost=1e-5):
+    def __init__(self, cell, voltage_cost=1e-5, dtype=tf.float32):
         self._voltage_cost = voltage_cost
         self._cell = cell
+        self._dtype = dtype
 
     def __call__(self, voltages):
-        voltage_32 = (
-            tf.cast(voltages, tf.float32) - self._cell.voltage_offset
-        ) / self._cell.voltage_scale
+        voltage_32 = (voltages - self._cell.voltage_offset) / self._cell.voltage_scale
+        voltage_32 = tf.cast(voltage_32, self._dtype)
         v_pos = tf.square(tf.nn.relu(voltage_32 - 1.0))
         v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.0))
-        voltage_loss = (
-            tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) *
-            self._voltage_cost
-        )
+        voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * self._voltage_cost
         return voltage_loss
 
 
@@ -928,6 +936,7 @@ def create_model(
     lr_scale=800.0,
     train_recurrent=True,
     train_input=True,
+    train_noise=True,
     neuron_output=False,
     recurrent_dampening_factor=0.5,
     use_state_input=False,
@@ -973,6 +982,7 @@ def create_model(
         pseudo_gauss=pseudo_gauss,
         train_recurrent=train_recurrent,
         train_input=train_input,
+        train_noise=train_noise,
         hard_reset=hard_reset,
     )
     # print(f"V1Column created in {time()-time0:.2f} seconds\n")
@@ -985,7 +995,7 @@ def create_model(
         # tensor in the zero_state tuple, except for the batch dimension. The batch
         # dimension is left unspecified, allowing the tensor to be fed variable-sized
         # batches of data.
-        initial_state_holder = tf.nest.map_structure(lambda _x: tf.keras.layers.Input(shape=_x.shape[1:]), zero_state)
+        initial_state_holder = tf.nest.map_structure(lambda _x: tf.keras.layers.Input(shape=_x.shape[1:], dtype=_x.dtype), zero_state)
         # The code then copies the input tensors into the rnn_initial_state variable
         # using tf.nest.map_structure(). This creates a nested structure of tensors with
         # the same shape as the original zero_state structure.
@@ -1054,7 +1064,8 @@ def create_model(
 
     # computes the mean of the spikes tensor along the second and third dimensions
     # (which represent time and neurons),
-    rate = tf.cast(tf.reduce_mean(spikes, (1, 2)), tf.float32)
+    # rate = tf.cast(tf.reduce_mean(spikes, (1, 2)), tf.float32)
+    rate = tf.reduce_mean(spikes, (1, 2))
 
     # The neuron output option selects only the output neurons from the spikes tensor
     if neuron_output:

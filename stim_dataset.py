@@ -94,8 +94,10 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
             movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
 
             # add an empty period before a period of gray image
-            z1 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (pre_delay, 1, 1, 1))
-            z2 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (post_delay, 1, 1, 1))
+            # z1 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (pre_delay, 1, 1, 1))
+            # z2 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (post_delay, 1, 1, 1))
+            z1 = tf.zeros((pre_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
+            z2 = tf.zeros((post_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
             videos = tf.concat((z1, movie, z2), 0)
             del movie, z1, z2
 
