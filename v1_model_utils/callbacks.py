@@ -137,7 +137,7 @@ class Callbacks:
             # After 50 epochs, plot the OSI and DSI
             # if (self.epoch-1) % 50 == 0:
            
-            if self.epoch % 50 == 0:
+            if self.epoch % 1 == 0:
                 t0 = time()
                 self.plot_osi_dsi()
                 print('OSI and DSI plot time:', 5*(time()-t0))
@@ -208,14 +208,14 @@ class Callbacks:
 
     def plot_osi_dsi(self):
         print('Starting to plot OSI and DSI...')
-        t0 = time()
-        test_it = iter(self.osi_dsi_data_set)
-        print('Data set generation time:', time()-t0)
         sim_duration = (2500//self.flags.seq_len + 1) * self.flags.seq_len
-        n_trials_per_angle = 2
+        n_trials_per_angle = 1
         spikes = np.zeros((8, sim_duration, self.flags.neurons), dtype=float)
         DG_angles = np.arange(0, 360, 45)
         for trial_id in range(n_trials_per_angle):
+            t0 = time()
+            test_it = iter(self.osi_dsi_data_set)
+            print('Data set generation time:', time()-t0)
             for angle_id, angle in enumerate(range(0, 360, 45)):
                 t0 = time()
                 x, y, _, w = next(test_it)
@@ -226,7 +226,11 @@ class Callbacks:
                     t0 = time()
                     chunk = x[:, i * chunk_size : (i + 1) * chunk_size, :]
                     # Process the chunk here
+                    mem_data = printgpu(verbose=1)
+                    print(f'    Pre OSI Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
                     z_chunk = self.distributed_roll_out(chunk, y, w, output_spikes=True)
+                    mem_data = printgpu(verbose=1)
+                    print(f'    Post OSI Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
                     print('Roll out time:', time()-t0)
                     spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += z_chunk.numpy()[0, :, :]
 

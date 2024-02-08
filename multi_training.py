@@ -182,12 +182,13 @@ def main(_):
         for i, (key, value) in enumerate(target_firing_rates.items()):
             # identify tne ids that are included in value["ids"]
             neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
+            neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
             target_firing_rates[key]['neuron_ids'] = neuron_ids
             type_n_neurons = len(neuron_ids)
-            target_firing_rates[key]['sorted_target_rates'] = models.sample_firing_rates(
-                value["rates"], type_n_neurons, flags.seed)
+            sorted_target_rates = models.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
+            target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
             cell_type_ids[neuron_ids] = i
-        
+
         # make a new array for neurons that contains neuron type ids.
         pre_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 0]]
         post_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 1] % flags.neurons]
@@ -296,19 +297,13 @@ def main(_):
     def roll_out(_x, _y, _w, output_spikes=False):
         _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
-
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
+
         _z, _v, _input_current = _out[0]
         # update state_variables with the new model state
         new_state = tuple(_out[1:])
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
 
-        # voltage_32 = (tf.cast(_v, tf.float32) - rsnn_layer.cell.voltage_offset) / rsnn_layer.cell.voltage_scale
-        # v_pos = tf.square(tf.nn.relu(voltage_32 - 1.))
-        # v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.))
-        # voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * flags.voltage_cost
-        # tf.print('Debugging...')
-        # tf.print(_v)
         voltage_loss = voltage_regularizer(_v) 
         rate_loss = rate_distribution_regularizer(_z)
         classification_loss = compute_loss_gratings(_y, _z)
@@ -316,10 +311,16 @@ def main(_):
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss)
         _loss = classification_loss + rate_loss + voltage_loss
 
+        return _out, _p, _loss, _aux
+
+    @tf.function
+    def distributed_roll_out(x, y, w, output_spikes=True):
+        _out, _p, _loss, _aux = strategy.run(roll_out, args=(x, y, w))
         if output_spikes:
-            return _z
+            return _out[0][0]
         else:
             return _out, _p, _loss, _aux
+
     
     def calculate_grad_average(g, v, grad_average_ind):
         print('Calculating gradient average...')
@@ -381,11 +382,6 @@ def main(_):
             # tf.print(f'Number of nan in gradients: {tf.reduce_sum(tf.cast(tf.math.is_nan(g), tf.float32))}')
             # tf.print(f'Number of nan in variables: {tf.reduce_sum(tf.cast(tf.math.is_nan(v), tf.float32))}')
 
-    @tf.function
-    def distributed_roll_out(x, y, w, output_spikes=True):
-        _z = strategy.run(roll_out, args=(x, y, w, output_spikes))
-        return _z
-        
 
     @tf.function
     def distributed_train_step(x, y, weights, grad_average_ind=None):
@@ -471,10 +467,6 @@ def main(_):
             raise ValueError(f"Invalid reset_type: {reset_type}")
 
     # @tf.function
-    # def distributed_reset_state():
-    #     strategy.run(reset_state)
-
-    @tf.function
     def distributed_reset_state(reset_type, gray_state=None):
         if reset_type == 'gray':
             if gray_state is None:
@@ -490,7 +482,7 @@ def main(_):
 
         else:
             strategy.run(reset_state, args=(reset_type, zero_state))
-   
+
 
     ############################ TRAINING #############################
 
@@ -509,9 +501,6 @@ def main(_):
         
         # Load the dataset iterator - this must be done inside the epoch loop
         it = iter(train_data_set)
-
-        # Register the init time 
-        # init_time = time()
 
         # tf.profiler.experimental.start(logdir=logdir)
         for step in range(flags.steps_per_epoch):
@@ -558,7 +547,6 @@ def main(_):
         reset_validation_metrics()
 
     callbacks.on_train_end(metric_values)
-    # print(distributed_train_step.pretty_printed_concrete_signatures())
 
  
 if __name__ == '__main__':
