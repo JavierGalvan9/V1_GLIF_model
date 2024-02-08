@@ -309,6 +309,8 @@ class LaminarPlot:
         # Select population names of neurons in the present network (core)
         true_pop_names = np.array(true_pop_names)[network["tf_id_to_bmtk_id"]][self.core_mask]
         true_node_type_ids = node_type_ids[network["tf_id_to_bmtk_id"]][self.core_mask]
+        # this might be the place if I want to order by preferred orientation
+        # TODO: implement the ordering by preferred orientation
 
         # Now order the pop_names according to their layer and type
         pop_orders = dict(
@@ -1011,8 +1013,10 @@ class ModelMetricsAnalysis:
 
         # Isolate the core neurons if necessary
         if self.analyze_core_only:
-            core_neurons = 65871
-            core_radius = 400
+            # core_neurons = 65871
+            # core_radius = 400
+            core_neurons = 16679  # within 200 um
+            core_radius = 200
             
             # Calculate the core_neurons mask
             if self.n_neurons > core_neurons:
@@ -1024,6 +1028,9 @@ class ModelMetricsAnalysis:
         else:
             self.core_mask = np.full(self.n_neurons, True)
        
+        # core_mask does not seem to be used in the following code
+        # TODO: ensure that core_mask is used in the following code
+
         # Calculate the firing rates along every orientation
         # DG_angles = np.arange(0, 360, 45)
         # convert the angle tensor into an array
