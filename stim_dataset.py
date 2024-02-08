@@ -63,6 +63,16 @@ def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True,
     else:
         return tf.tile(data[0][tf.newaxis, ...], (image_duration, 1, 1))
 
+@tf.function
+def movies_concat(movie, pre_delay, post_delay):
+    movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
+    # add an empty period before a period of gray image
+    # z1 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (pre_delay, 1, 1, 1))
+    # z2 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (post_delay, 1, 1, 1))
+    z1 = tf.zeros((pre_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
+    z2 = tf.zeros((post_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
+    videos = tf.concat((z1, movie, z2), 0)
+    return videos
 
 def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8, 
                                      row_size=80, col_size=120,
@@ -91,15 +101,18 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
 
             theta = tf.cast(theta, tf.float32)
             movie = make_drifting_grating_stimulus(moving_flag=True, image_duration=duration, cpd=cpd, temporal_f=temporal_f, theta=theta, phase=None, contrast=contrast)
-            movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
+            # movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
 
-            # add an empty period before a period of gray image
-            # z1 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (pre_delay, 1, 1, 1))
-            # z2 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (post_delay, 1, 1, 1))
-            z1 = tf.zeros((pre_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
-            z2 = tf.zeros((post_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
-            videos = tf.concat((z1, movie, z2), 0)
-            del movie, z1, z2
+            # # add an empty period before a period of gray image
+            # # z1 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (pre_delay, 1, 1, 1))
+            # # z2 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (post_delay, 1, 1, 1))
+            # z1 = tf.zeros((pre_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
+            # z2 = tf.zeros((post_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
+            # videos = tf.concat((z1, movie, z2), 0)
+            # del movie
+
+            videos = movies_concat(movie, pre_delay, post_delay)
+            del movie
 
             spatial = lgn.spatial_response(videos)
             del videos

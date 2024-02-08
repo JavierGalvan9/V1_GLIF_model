@@ -827,6 +827,16 @@ class V1Column(tf.keras.layers.Layer):
         return outputs, new_state
 
 
+def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
+    sorted_firing_rates = np.sort(firing_rates)
+    percentiles = (np.arange(firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
+    rate_rd = np.random.RandomState(seed=rnd_seed)
+    x_rand = rate_rd.uniform(size=n_neurons)
+    target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
+    
+    return target_firing_rates
+
+
 def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
     tau = tf.cast(tau, dtype)
     num = tf.abs(tau - tf.cast(u <= 0, dtype))
@@ -843,12 +853,26 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
     # I should iterate on them, and add the cost for each one at the end.
     # spikes will have a shape of (batch_size, n_steps, n_neurons)
     losses = []
-    for key, value in target_rates.items():
-        spikes_type = tf.gather(_spikes, value["neuron_ids"], axis=-1)
-        loss_type = compute_spike_rate_distribution_loss(spikes_type, value["sorted_target_rates"], dtype=dtype)
+    rates = tf.reduce_mean(_spikes, (0, 1))
+    for i, (key, value) in enumerate(target_rates.items()):
+        _rate_type = tf.gather(rates, value["neuron_ids"])
+        target_rate = value["sorted_target_rates"]
+        loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
         losses.append(tf.reduce_mean(loss_type))
 
     return tf.reduce_sum(losses, axis=0)
+
+def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
+    ind = tf.range(target_rate.shape[0])
+    rand_ind = tf.random.shuffle(ind)
+    _rate = tf.gather(_rates, rand_ind)
+    sorted_rate = tf.sort(_rate)
+    u = target_rate - sorted_rate
+    # tau = (tf.range(target_rate.shape[0]), dtype) + 1) / target_rate.shape[0]
+    tau = (tf.range(target_rate.shape[0]) + 1) / target_rate.shape[0]
+    loss = huber_quantile_loss(u, tau, 0.002, dtype=dtype)
+
+    return loss
 
 
 class SpikeRateDistributionTarget:
@@ -865,34 +889,20 @@ class SpikeRateDistributionTarget:
         return reg_loss
 
 
-def compute_spike_rate_distribution_loss(_spikes, target_rate, dtype=tf.float32):
-    _rate = tf.reduce_mean(_spikes, (0, 1))
-    ind = tf.range(target_rate.shape[0])
-    rand_ind = tf.random.shuffle(ind)
-    _rate = tf.gather(_rate, rand_ind)
-    sorted_rate = tf.sort(_rate)
-    u = target_rate - sorted_rate
-    # tau = (tf.range(target_rate.shape[0]), dtype) + 1) / target_rate.shape[0]
-    tau = (tf.range(target_rate.shape[0]) + 1) / target_rate.shape[0]
-    loss = huber_quantile_loss(u, tau, 0.002, dtype=dtype)
+# class SpikeRateDistributionRegularization:
+#     def __init__(self, target_rates, rate_cost=0.5, dtype=tf.float32):
+#         self._rate_cost = rate_cost
+#         self._target_rates = target_rates
+#         self._dtype = dtype
 
-    return loss
+#     def __call__(self, spikes):
+#         reg_loss = (
+#             compute_spike_rate_distribution_loss(spikes, self._target_rates, dtype=self._dtype)
+#             * self._rate_cost
+#         )
+#         reg_loss = tf.reduce_sum(reg_loss)
 
-
-class SpikeRateDistributionRegularization:
-    def __init__(self, target_rates, rate_cost=0.5, dtype=tf.float32):
-        self._rate_cost = rate_cost
-        self._target_rates = target_rates
-        self._dtype = dtype
-
-    def __call__(self, spikes):
-        reg_loss = (
-            compute_spike_rate_distribution_loss(spikes, self._target_rates, dtype=self._dtype)
-            * self._rate_cost
-        )
-        reg_loss = tf.reduce_sum(reg_loss)
-
-        return reg_loss
+#         return reg_loss
 
 
 class VoltageRegularization:
@@ -908,16 +918,6 @@ class VoltageRegularization:
         v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.0))
         voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * self._voltage_cost
         return voltage_loss
-
-
-def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
-    sorted_firing_rates = np.sort(firing_rates)
-    percentiles = (np.arange(firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
-    rate_rd = np.random.RandomState(seed=rnd_seed)
-    x_rand = rate_rd.uniform(size=n_neurons)
-    target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
-    
-    return target_firing_rates
 
 
 # @profile

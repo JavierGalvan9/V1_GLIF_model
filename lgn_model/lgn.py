@@ -57,16 +57,12 @@ def temporal_filter(all_spatial_responses, temporal_kernels):
         tr_spatial_responses, tr_temporal_kernels, strides=[1, 1, 1, 1], padding='VALID')[0, :, 0]
     return filtered_output
 
-# @tf.function
+
 def transfer_function(arg__a):
     _h = tf.cast(arg__a >= 0, tf.float32)
     return _h * arg__a
 
-@tf.function(input_signature=[
-        tf.TensorSpec(shape=(None,), dtype=tf.float32), 
-        tf.TensorSpec(shape=(None,), dtype=tf.float32),
-        tf.TensorSpec(shape=(None, None, None), dtype=tf.float32),
-        ])
+
 def select_spatial(x, y, convolved_movie):
     i1 = tf.cast(tf.stack([tf.floor(y), tf.floor(x)], axis=-1), dtype=tf.int32)
     i2 = tf.cast(tf.stack([tf.math.ceil(y), tf.floor(x)], axis=-1), dtype=tf.int32)
@@ -352,10 +348,10 @@ class LGN(object):
             self.model_id = self.model_id[:n_input]
             self.is_composite = self.is_composite[:n_input]
 
-    # @tf.function
+    @tf.function
     def spatial_response(self, movie):
-        d_spatial = 1.
-        spatial_range = np.arange(0, 15, d_spatial)
+        d_spatial = 1
+        spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
         # spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
 
         # Preprocess data outside the loop if they don't change
@@ -364,52 +360,45 @@ class LGN(object):
         non_dominant_x = tf.constant(self.non_dominant_x, dtype=tf.float32)
         non_dominant_y = tf.constant(self.non_dominant_y, dtype=tf.float32)
         spatial_sizes = tf.constant(self.spatial_sizes, dtype=tf.float32)
-       
-        # if movie is not a tensor, convert it to one
+        # movie = tf.constant(movie, dtype=tf.float32)
         if not isinstance(movie, tf.Tensor):
             movie = tf.constant(movie, dtype=tf.float32)
             print(f'Movie type: {type(movie)}')
-
+       
         all_spatial_responses = []
-        neuron_ids = []
         all_non_dom_spatial_responses = []
+        neuron_ids = []
 
         for i in range(len(spatial_range)-1):
-        # for i in tf.range(tf.shape(spatial_range)[0] - 1):
             sel = tf.math.logical_and(spatial_sizes < spatial_range[i + 1], spatial_sizes >= spatial_range[i])
             num_selected = tf.reduce_sum(tf.cast(sel, dtype=tf.int32))
-
-            if tf.equal(num_selected, 0):
-                continue
-
+            # if num_selected == 0:
+            #     tf.print('No neurons selected')
+            #     continue
+            
             # Construct spatial filter
             gaussian_filter = self.gaussian_filters[i]  # Assuming self.gaussian_filters is a list of precomputed filters
 
             # Apply it
             convolved_movie = tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')
             convolved_movie = convolved_movie[..., 0]  # Assuming you only need one channel
-            # Select items
+
             spatial_responses = select_spatial(tf.boolean_mask(x, sel), tf.boolean_mask(y, sel), convolved_movie)
             non_dom_spatial_responses = select_spatial(tf.boolean_mask(non_dominant_x, sel), tf.boolean_mask(non_dominant_y, sel), convolved_movie)
 
             all_spatial_responses.append(spatial_responses)
             all_non_dom_spatial_responses.append(non_dom_spatial_responses)
             selected_indices = tf.where(sel)[:, 0]
-            
-            neuron_ids = tf.concat([neuron_ids, selected_indices], axis=0)
+            neuron_ids.append(selected_indices)
 
+        neuron_ids = tf.concat(neuron_ids, axis=0)
         neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
-        # neuron_ids = tf.constant(neuron_ids, dtype=tf.int32)
         all_spatial_responses = tf.concat(all_spatial_responses, axis=1)
         all_non_dom_spatial_responses = tf.concat(all_non_dom_spatial_responses, axis=1)
 
-        # sorted_neuron_ids_indices = np.argsort(neuron_ids)
         sorted_neuron_ids_indices = tf.argsort(neuron_ids)
         all_spatial_responses = tf.gather(all_spatial_responses, sorted_neuron_ids_indices, axis=1)
         all_non_dom_spatial_responses = tf.gather(all_non_dom_spatial_responses, sorted_neuron_ids_indices, axis=1)
-
-        # print(f'Dominant spatial reponses computed: {all_spatial_responses.shape}')
-        # print(f'Non dominant spatial reponses computed: {all_non_dom_spatial_responses.shape}')
 
         return all_spatial_responses, all_non_dom_spatial_responses
 
