@@ -1,4 +1,4 @@
-node_id pop_name DSI OSI preferred_angle max_mean_rate(Hz) Avg_Rate(Hz)
+node_id pop_name DSI OSI preferred_angle max_mean_rate(Hz) Ave_Rate(Hz)
 0 e5Rbp4 1.0 1.0 180 0.2 0.025
 1 e5Rbp4 0.3022378754303918 0.4991341984846217 180 2.2 0.8500000000000001
 2 e5Rbp4 0.0678417598081819 0.1082288644497504 180 16.0 11.15

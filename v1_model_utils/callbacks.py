@@ -5,6 +5,8 @@ import numpy as np
 import tensorflow as tf
 import datetime as dt
 from time import time
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from matplotlib import pyplot as plt
 import stim_dataset
 from v1_model_utils.plotting_utils import InputActivityFigure, ModelMetricsAnalysis
 
@@ -30,16 +32,22 @@ def compose_str(metrics_values):
 
 
 class Callbacks:
-    def __init__(self, model, optimizer, distributed_roll_out, network, flags, logdir, strategy, metrics_keys):
+    def __init__(self, model, optimizer, distributed_roll_out, network, flags, logdir, strategy, 
+                metrics_keys, pre_delay=50, post_delay=50):
         self.network = network
         self.flags = flags
         self.logdir = logdir
         # self.manager = manager
-        self.osi_dsi_data_set = strategy.distribute_datasets_from_function(self.get_dataset_fn(regular=True))
+        self.osi_dsi_data_set = strategy.distribute_datasets_from_function(self.get_osi_dsi_dataset_fn(regular=True))
         self.distributed_roll_out = distributed_roll_out
         self.metrics_keys = metrics_keys
+        self.pre_delay = pre_delay
+        self.post_delay = post_delay
         self.epoch = 0
         self.step = 0
+        # please create a dictionary to save the values of the metric keys after each epoch
+        self.epoch_metric_values = {key: [] for key in self.metrics_keys}
+        self.epoch_metric_values['val_osi_dsi_loss'] = []
         # self.step_counter = tf.Variable(0, dtype=tf.int64)
         self.step_running_time = []
         self.min_val_loss = float('inf')
@@ -56,12 +64,12 @@ class Callbacks:
                 print(f'Model parameters of {self.flags.task_name} restored from {self.flags.restore_from}')
 
         self.manager = tf.train.CheckpointManager(
-                                            checkpoint, directory=self.logdir, max_to_keep=100,
+                                            checkpoint, directory=self.logdir, max_to_keep=1, # just keep the best model
                                             # checkpoint_interval = 5, # save ckpt for data analysis
                                             # step_counter=self.step_counter
                                         )
 
-    def get_dataset_fn(self, regular=False):
+    def get_osi_dsi_dataset_fn(self, regular=False):
         def _f(input_context):
             post_delay = self.flags.seq_len - (2500 % self.flags.seq_len)
             _data_set = stim_dataset.generate_drifting_grating_tuning(
@@ -109,12 +117,18 @@ class Callbacks:
         self.step = 0
         if self.initial_metric_values is None:
             self.initial_metric_values = metric_values
-            
+        
         if verbose:
             print_str = '  Validation: \n' 
             val_values = metric_values[len(metric_values)//2:]
-            print_str += '    ' + compose_str(val_values) + '\n'
+            print_str += '    ' + compose_str(val_values) 
             print(print_str)
+            mem_data = printgpu(verbose=1)
+            print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB'+ '\n')
+
+        val_classification_loss = metric_values[6] - metric_values[8] - metric_values[9] 
+        metric_values.append(val_classification_loss)
+        self.epoch_metric_values = {key: value + [metric_values[i]] for i, (key, value) in enumerate(self.epoch_metric_values.items())}
 
         if 'val_loss' in self.metrics_keys:
             val_loss_index = self.metrics_keys.index('val_loss')
@@ -126,6 +140,9 @@ class Callbacks:
         if val_loss_value < self.min_val_loss:
             self.min_val_loss = val_loss_value
 
+            # self.plot_lgn_activity(x)
+            self.plot_losses_curves()
+
             t0 = time()
             self.plot_raster(z, x, y)
             print('Raster plot time:', time()-t0)
@@ -134,14 +151,13 @@ class Callbacks:
             self.plot_mean_firing_rate_boxplot(z, y)
             print('Mean firing rate boxplot time:', time()-t0)
 
-            # After 50 epochs, plot the OSI and DSI
-            # if (self.epoch-1) % 50 == 0:
-           
-            if self.epoch % 1 == 0:
-                t0 = time()
-                self.plot_osi_dsi()
-                print('OSI and DSI plot time:', 5*(time()-t0))
             self.save_model()
+           
+        if (self.epoch - 1) % 50 == 0:
+            t0 = time()
+            self.plot_osi_dsi()
+            print('OSI and DSI plot time:', (time()-t0))
+
 
         with self.summary_writer.as_default():
             for k, v in zip(self.metrics_keys, metric_values):
@@ -166,21 +182,35 @@ class Callbacks:
             stop = False
         return stop
 
-
     def save_model(self):
         # self.step_counter.assign_add(1)
         print(f'[ Saving the model at epoch {self.epoch} ]')
         try:
-            p = self.manager.save(check_interval=True)
+            p = self.manager.save(checkpoint_number=self.epoch)
             print(f'Model saved in {p}\n')
         except:
             print("Saving failed. Maybe next time?")
 
+    def plot_losses_curves(self):
+        # plotting_metrics = ['val_loss', 'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
+        plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss']
+        images_dir = os.path.join(self.logdir, 'Loss_curves')
+        os.makedirs(images_dir, exist_ok=True)
+
+        fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+        for i, metric_key in enumerate(plotting_metrics):
+            ax = axs[i // 2, i % 2]
+            ax.plot(range(1, self.epoch + 1), self.epoch_metric_values[metric_key])
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel(metric_key)
+        plt.tight_layout()
+        plt.savefig(os.path.join(images_dir, f'losses_curves_epoch_{self.epoch}.png'), dpi=300, transparent=False)
+        plt.close()
+    
     def plot_raster(self, z, x, y):
         z = z.numpy()
         x = x.numpy()
         y = y.numpy()
-        delays = [int(a) for a in self.flags.delays.split(',') if a != '']
         images_dir = os.path.join(self.logdir, 'Raster_plots')
         os.makedirs(images_dir, exist_ok=True)
         graph = InputActivityFigure(
@@ -189,12 +219,22 @@ class Callbacks:
                                     images_dir,
                                     filename=f'Epoch_{self.epoch}',
                                     frequency=self.flags.temporal_f,
-                                    stimuli_init_time=delays[0],
-                                    stimuli_end_time=self.flags.seq_len-delays[1],
+                                    stimuli_init_time=self.pre_delay,
+                                    stimuli_end_time=self.flags.seq_len-self.post_delay,
                                     reverse=False,
                                     plot_core_only=True,
                                     )
         graph(x, z)
+
+    # def plot_lgn_activity(self, x):
+    #     x = x.numpy()[0, :, :]
+    #     x_mean = np.mean(x, axis=1)
+    #     plt.figure(figsize=(10, 5))
+    #     plt.plot(x_mean)
+    #     plt.title('Mean input activity')
+    #     plt.xlabel('Time (ms)')
+    #     plt.ylabel('Mean input activity')
+    #     plt.savefig(os.path.join(self.logdir, 'Mean_input_activity.png'))
 
 
     def plot_mean_firing_rate_boxplot(self, z, y):
@@ -203,47 +243,55 @@ class Callbacks:
         boxplots_dir = os.path.join(self.logdir, 'Boxplots')
         os.makedirs(boxplots_dir, exist_ok=True)
         metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir, n_trials=1,
+                                                analyze_core_only=True, drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay, 
                                                 directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
         metrics_analysis(z, y)    
 
     def plot_osi_dsi(self):
         print('Starting to plot OSI and DSI...')
         sim_duration = (2500//self.flags.seq_len + 1) * self.flags.seq_len
-        n_trials_per_angle = 1
+        n_trials_per_angle = 10
         spikes = np.zeros((8, sim_duration, self.flags.neurons), dtype=float)
         DG_angles = np.arange(0, 360, 45)
         for trial_id in range(n_trials_per_angle):
             t0 = time()
             test_it = iter(self.osi_dsi_data_set)
-            print('Data set generation time:', time()-t0)
             for angle_id, angle in enumerate(range(0, 360, 45)):
                 t0 = time()
                 x, y, _, w = next(test_it)
-                print('Data set generation time:', time()-t0)
                 chunk_size = self.flags.seq_len
                 num_chunks = (2500//self.flags.seq_len + 1)
                 for i in range(num_chunks):
                     t0 = time()
                     chunk = x[:, i * chunk_size : (i + 1) * chunk_size, :]
-                    # Process the chunk here
-                    mem_data = printgpu(verbose=1)
-                    print(f'    Pre OSI Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
                     z_chunk = self.distributed_roll_out(chunk, y, w, output_spikes=True)
-                    mem_data = printgpu(verbose=1)
-                    print(f'    Post OSI Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
-                    print('Roll out time:', time()-t0)
-                    spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += z_chunk.numpy()[0, :, :]
+                    spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += z_chunk.numpy()[0, :, :].astype(float)
 
                 # spikes[angle_id, :, :] += z.numpy()[0, :, :]
         spikes = spikes/n_trials_per_angle
         # Slice only the first 2500 ms
         spikes = spikes[:, :2500, :]
+
+        images_dir = os.path.join(self.logdir, 'Raster_plots_OSI_DSI')
+        os.makedirs(images_dir, exist_ok=True)
+        graph = InputActivityFigure(
+                                    self.network,
+                                    self.flags.data_dir,
+                                    images_dir,
+                                    filename=f'Epoch_{self.epoch}',
+                                    frequency=self.flags.temporal_f,
+                                    stimuli_init_time=500,
+                                    stimuli_end_time=2500,
+                                    reverse=False,
+                                    plot_core_only=True,
+                                    )
+        graph(x[:, :2500, :].numpy(), spikes)
         
         boxplots_dir = os.path.join(self.logdir, 'Boxplots_OSI_DSI')
         os.makedirs(boxplots_dir, exist_ok=True)
-        metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir, n_trials=1,
+        metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir,
                                                 drifting_gratings_init=500, drifting_gratings_end=2500,
-                                                directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
+                                                analyze_core_only=True, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
         metrics_analysis(spikes, DG_angles)
         # save the spike for later analysis
         np.save(os.path.join(boxplots_dir, f'spikes_epoch_{self.epoch}.npy'), spikes)
