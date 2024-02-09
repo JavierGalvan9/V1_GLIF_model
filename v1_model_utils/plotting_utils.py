@@ -279,8 +279,11 @@ class LaminarPlot:
         self.n_neurons = network["n_nodes"]
 
         if plot_core_only:
-            if self.n_neurons > 66634:
-                self.n_neurons = 66634
+            num_core_neurons = 16679
+            # if self.n_neurons > 66634:
+                # self.n_neurons = 66634
+            if self.n_neurons > num_core_neurons:
+                self.n_neurons = num_core_neurons
             self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, data_dir=self.data_dir
             )
@@ -944,7 +947,7 @@ def calculate_Firing_Rate(z, drifting_gratings_init=500, drifting_gratings_end=1
     
     return mean_firing_rates
 
-def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius=None, remove_zero_rate_neurons=True):
+def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius=None, core_mask=None, remove_zero_rate_neurons=True):
     
     # Get the pop names of the neurons
     if core_radius is not None:
@@ -978,15 +981,22 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius
                 np.abs((all_rates * np.exp(2j * phase_rad)).sum(axis=1)) / denominator,
                 1)
 
+
+    print(f"DSI: {dsi}")
+    print(f"dsi shape: {dsi.shape}")
+    print(f"node_ids shape: {node_ids.shape}")
+
+
+    
     # Save the results in a dataframe
     osi_df = pd.DataFrame()
     osi_df["node_id"] = node_ids
     osi_df["pop_name"] = pop_names
-    osi_df["DSI"] = dsi
-    osi_df["OSI"] = osi
-    osi_df["preferred_angle"] = preferred_DG_angle
-    osi_df["max_mean_rate(Hz)"] = preferred_rates
-    osi_df["Avg_Rate(Hz)"] = average_rates
+    osi_df["DSI"] = dsi[core_mask]
+    osi_df["OSI"] = osi[core_mask]
+    osi_df["preferred_angle"] = preferred_DG_angle[core_mask]
+    osi_df["max_mean_rate(Hz)"] = preferred_rates[core_mask]
+    osi_df["Avg_Rate(Hz)"] = average_rates[core_mask]
 
     if remove_zero_rate_neurons:
         osi_df = osi_df[osi_df["Avg_Rate(Hz)"] != 0]
@@ -1049,7 +1059,7 @@ class ModelMetricsAnalysis:
         # firing_rates_df.to_csv(os.path.join(self.save_dir, f"V1_DG_firing_rates_df.csv"), sep=" ", index=False)
 
         # Calculate the orientation and direction selectivity indices
-        metrics_df = calculate_OSI_DSI(firing_rates_df, self.network, DG_angles=DG_angles, core_radius=core_radius)
+        metrics_df = calculate_OSI_DSI(firing_rates_df, self.network, DG_angles=DG_angles, core_radius=core_radius, core_mask=self.core_mask)
         # metrics_df.to_csv(os.path.join(self.directory, f"V1_OSI_DSI_DF.csv"), sep=" ", index=False)
 
         # Make the boxplots to compare with the neuropixels data
@@ -1166,6 +1176,10 @@ class MetricsBoxplot:
             df["cell_type"] = df["cell_type"].apply(self.neuropixels_cell_type_to_cell_type)
         elif data_dir == 'Billeh_column_metrics':
             df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
+        elif data_dir == "NEST_metrics":
+            df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
+            # plot only neurons within 200 um.
+            df = df[(df["x"] ** 2 + df["z"] ** 2) < (200 ** 2)]
         else:
             df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
 
@@ -1201,6 +1215,7 @@ class MetricsBoxplot:
         self.osi_dfs.append(self.get_osi_dsi_df(metric_file=metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
         self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
+        self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
         
         df = pd.concat(self.osi_dfs, ignore_index=True)
         # df.to_csv(os.path.join('Borrar', f"help_DG_firing_rates_df.csv"), sep=" ", index=False)
@@ -1216,7 +1231,8 @@ class MetricsBoxplot:
         color_pal = {
             "V1 GLIF model": "tab:orange",
             "Neuropixels": "tab:gray",
-            "Billeh et al (2020)": "tab:blue"
+            "Billeh et al (2020)": "tab:blue",
+            "NEST simulation": "tab:pink"
         }
 
         # Establish the order of the neuron types in the boxplots
