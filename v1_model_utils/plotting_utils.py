@@ -91,7 +91,9 @@ class InputActivityFigure:
             os.path.join(self.images_dir, self.filename), dpi=300, transparent=False
         )
 
-        return self.figure
+        plt.close(self.figure)
+
+        # return self.figure
 
 
 class InputActivityFigureWithoutStimulus:
@@ -164,7 +166,8 @@ class InputActivityFigureWithoutStimulus:
             os.path.join(self.images_dir, self.filename), dpi=300, transparent=False
         )
 
-        return self.figure
+        # return self.figure
+        plt.close(self.figure)
 
 
 def pop_ordering(x):
@@ -279,38 +282,58 @@ class LaminarPlot:
         self.n_neurons = network["n_nodes"]
 
         if plot_core_only:
-            if self.n_neurons > 66634:
-                self.n_neurons = 66634
+            core_neurons = 16679 #65871 
+            core_radius = 200 #400
+            if self.n_neurons > core_neurons:
+                self.n_neurons = core_neurons
             self.core_mask = other_v1_utils.isolate_core_neurons(
-                self.network, data_dir=self.data_dir
+                self.network, radius=core_radius, data_dir=self.data_dir
             )
         else:
             self.core_mask = np.full(self.n_neurons, True)
+
+         # use the true_pop_names, true_node_type_ids to create a dictionary with the node_type_id as key and the pop_name as value
+        # since many of them are repeated we can use the unique function to get the unique pop_names
 
         node_types = pd.read_csv(
             os.path.join(self.data_dir, "network/v1_node_types.csv"), sep=" "
         )
         path_to_h5 = os.path.join(self.data_dir, "network/v1_nodes.h5")
-        node_h5 = h5py.File(path_to_h5, mode="r")
+        with h5py.File(path_to_h5, mode='r') as node_h5:
+            # Create mapping from node_type_id to pop_name
+            node_types.set_index('node_type_id', inplace=True)
+            node_type_id_to_pop_name = node_types['pop_name'].to_dict()
 
-        node_type_id_to_pop_name = dict()
-        for nid in np.unique(node_h5["nodes"]["v1"]["node_type_id"]):
-            # if not np.unique all of the 230924 model neurons ids are considered,
-            # but nearly all of them are repeated since there are only 111 different indices
-            ind_list = np.where(node_types.node_type_id == nid)[0]
-            assert len(ind_list) == 1
-            node_type_id_to_pop_name[nid] = node_types.pop_name[ind_list[0]]
+            # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
+            node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][network['tf_id_to_bmtk_id']]
+            true_pop_names = np.array([node_type_id_to_pop_name[nid] for nid in node_type_ids])
 
-        node_type_ids = np.array(node_h5["nodes"]["v1"]["node_type_id"])
-        true_pop_names = []  # it contains the pop_name of all the 230,924 neurons
-        for nid in node_h5["nodes"]["v1"]["node_type_id"]:
-            true_pop_names.append(node_type_id_to_pop_name[nid])
+            # Select population names of neurons in the present network (core)
+            true_pop_names = true_pop_names[self.core_mask]
+            true_node_type_ids = node_type_ids[self.core_mask]
 
-        # Select population names of neurons in the present network (core)
-        true_pop_names = np.array(true_pop_names)[network["tf_id_to_bmtk_id"]][self.core_mask]
-        true_node_type_ids = node_type_ids[network["tf_id_to_bmtk_id"]][self.core_mask]
 
-        # Now order the pop_names according to their layer and type
+        # node_h5 = h5py.File(path_to_h5, mode="r")
+
+        # node_type_id_to_pop_name = dict()
+        # for nid in np.unique(node_h5["nodes"]["v1"]["node_type_id"]):
+        #     # if not np.unique all of the 230924 model neurons ids are considered,
+        #     # but nearly all of them are repeated since there are only 111 different indices
+        #     ind_list = np.where(node_types.node_type_id == nid)[0]
+        #     assert len(ind_list) == 1
+        #     node_type_id_to_pop_name[nid] = node_types.pop_name[ind_list[0]]
+
+        # node_type_ids = np.array(node_h5["nodes"]["v1"]["node_type_id"])
+        # true_pop_names = []  # it contains the pop_name of all the 230,924 neurons
+        # for nid in node_h5["nodes"]["v1"]["node_type_id"]:
+        #     true_pop_names.append(node_type_id_to_pop_name[nid])
+
+        # # Select population names of neurons in the present network (core)
+        # true_pop_names = np.array(true_pop_names)[network["tf_id_to_bmtk_id"]][self.core_mask]
+        # true_node_type_ids = node_type_ids[network["tf_id_to_bmtk_id"]][self.core_mask]
+    
+        # Now order the pop_names
+        #  according to their layer and type
         pop_orders = dict(
             sorted(
                 node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1])
@@ -615,6 +638,8 @@ class LGN_sample_plot:
             os.makedirs(path, exist_ok=True)
             fig.savefig(os.path.join(
                 path, f"LGN unit idx_{neuron_idx}.png"), dpi=300)
+            # close figure
+            plt.close(fig)
 
 
 class PopulationActivity:
@@ -753,6 +778,7 @@ class PopulationActivity:
             fig.tight_layout()
             fig.savefig(os.path.join(
                 path, f"{label}_population_activity.png"), dpi=300)
+            plt.close(fig)
 
     def subplot_populations_activity(self, bin_size=10):
         layers_label = [
@@ -930,9 +956,10 @@ class PopulationActivity:
         # fig.tight_layout()
         fig.savefig(os.path.join(
             path, "subplot_population_activity.png"), dpi=300)
+        plt.close(fig)
 
 
-def calculate_Firing_Rate(z, drifting_gratings_init=500, drifting_gratings_end=1500):
+def calculate_Firing_Rate(z, drifting_gratings_init=500, drifting_gratings_end=2500):
     dg_spikes = z[:, drifting_gratings_init:drifting_gratings_end, :]
     # if the number of dimensions of dg_spikes is 2, reshape it to 3 adding an additional first dimension
     # if dg_spikes.ndim == 2:
@@ -955,7 +982,7 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius
     node_ids = np.arange(n_neurons)
     
     # Get the firing rates for every neuron and DG angle
-    all_rates = np.array([g["Avg_rate(Hz)"] for _, g in rates_df.groupby("DG_angle")]).T
+    all_rates = np.array([g["Ave_Rate(Hz)"] for _, g in rates_df.groupby("DG_angle")]).T
     average_rates = np.mean(all_rates, axis=1)
 
     # Find the preferred DG angle for each neuron
@@ -971,10 +998,10 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius
 
     dsi = np.where(denominator != 0, 
                np.abs((all_rates * np.exp(1j * phase_rad)).sum(axis=1)) / denominator, 
-               1)
+               np.nan)
     osi = np.where(denominator != 0,
                 np.abs((all_rates * np.exp(2j * phase_rad)).sum(axis=1)) / denominator,
-                1)
+                np.nan)
 
     # Save the results in a dataframe
     osi_df = pd.DataFrame()
@@ -984,10 +1011,10 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius
     osi_df["OSI"] = osi
     osi_df["preferred_angle"] = preferred_DG_angle
     osi_df["max_mean_rate(Hz)"] = preferred_rates
-    osi_df["Avg_Rate(Hz)"] = average_rates
+    osi_df["Ave_Rate(Hz)"] = average_rates
 
     if remove_zero_rate_neurons:
-        osi_df = osi_df[osi_df["Avg_Rate(Hz)"] != 0]
+        osi_df = osi_df[osi_df["Ave_Rate(Hz)"] != 0]
 
     return osi_df
 
@@ -1002,7 +1029,6 @@ class ModelMetricsAnalysis:
         self.n_trials = n_trials
         self.drifting_gratings_init = drifting_gratings_init
         self.drifting_gratings_end = drifting_gratings_end
-        # self.skip_first_simulation = flags.skip_first_simulation
         self.analyze_core_only = analyze_core_only
         self.directory=directory
         self.filename = filename
@@ -1011,26 +1037,24 @@ class ModelMetricsAnalysis:
 
         # Isolate the core neurons if necessary
         if self.analyze_core_only:
-            core_neurons = 65871
-            core_radius = 400
+            core_neurons = 16679 #65871 
+            core_radius = 200 #400
             
             # Calculate the core_neurons mask
             if self.n_neurons > core_neurons:
                 self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir) 
-                n_neurons = core_neurons
+                self.n_neurons = core_neurons
             else:
                 self.core_mask = np.full(self.n_neurons, True)
 
         else:
             self.core_mask = np.full(self.n_neurons, True)
+            core_radius = None
+
+        spikes = spikes[:, :, self.core_mask]
        
-        # Calculate the firing rates along every orientation
-        # DG_angles = np.arange(0, 360, 45)
-        # convert the angle tensor into an array
-        # DG_angles = angle.numpy()[0]
-        # DG_angles = angle.numpy()
-            
-        # if spikes shape is (n_trials, n_neurons, n_time_steps) reshape it to (n_angles, n_trials, n_neurons, n_time_steps)
+        # Calculate the firing rates along every orientation            
+        # if spikes shape is (n_angles, n_time_steps, n_neurons) reshape it to (n_angles, n_trials, n_time_steps, n_neurons)
         if spikes.shape[0] == len(DG_angles):
             spikes = spikes.reshape(len(DG_angles), self.n_trials, spikes.shape[-2], self.n_neurons)
         
@@ -1047,7 +1071,7 @@ class ModelMetricsAnalysis:
 
         # Make the boxplots to compare with the neuropixels data
         if len(DG_angles) == 1:
-            metrics = ["Rate at preferred direction (Hz)"]
+            metrics = ["Ave_Rate(Hz)"]
         else:
             metrics = ["Rate at preferred direction (Hz)", "OSI", "DSI"]
 
@@ -1058,7 +1082,7 @@ class ModelMetricsAnalysis:
                                drifting_gratings_end=550, DG_angles=np.arange(0, 360, 45)):
         
         # Calculate the firing rates for each neuron in each orientation
-        firing_rates_df = pd.DataFrame(columns=["DG_angle", "node_id", "Avg_rate(Hz)"])
+        firing_rates_df = pd.DataFrame(columns=["DG_angle", "node_id", "Ave_Rate(Hz)"])
         node_ids = np.arange(n_neurons)
 
         # Iterate through each orientation
@@ -1068,7 +1092,7 @@ class ModelMetricsAnalysis:
             data = {
                     "DG_angle": float(angle),
                     "node_id": node_ids,
-                    "Avg_rate(Hz)": firingRates
+                    "Ave_Rate(Hz)": firingRates
                 }
             df = pd.DataFrame(data)
             # Drop empty or all-NA columns before concatenation
@@ -1164,6 +1188,7 @@ class MetricsBoxplot:
 
         # Rename the maximum rate column
         df.rename(columns={"max_mean_rate(Hz)": "Rate at preferred direction (Hz)"}, inplace=True)
+        # df.rename(columns={"Ave_Rate(Hz)": "Average rate (Hz)"}, inplace=True)
 
         # Cut off neurons with low firing rate at the preferred direction
         nonresponding = df["Rate at preferred direction (Hz)"] < 0.5
@@ -1179,7 +1204,7 @@ class MetricsBoxplot:
         else:
             df["data_type"] = data_dir
 
-        columns = ["cell_type", "data_type", "Rate at preferred direction (Hz)", "OSI", "DSI"]
+        columns = ["cell_type", "data_type", "Rate at preferred direction (Hz)", "OSI", "DSI", 'Ave_Rate(Hz)']
         df = df[columns]
 
         return df
@@ -1216,7 +1241,7 @@ class MetricsBoxplot:
         cell_type_order = np.sort(df['cell_type'].unique())
 
         for idx, metric in enumerate(metrics):
-            if metric == "Rate at preferred direction (Hz)":
+            if metric in ["Rate at preferred direction (Hz)", 'Ave_Rate(Hz)']:
                 ylims = [0, 100]
             else:
                 ylims = [0, 1]

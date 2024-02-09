@@ -18,7 +18,7 @@ parentDir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(parentDir, "general_utils"))
 import file_management
 
-def pop_names(network, core_radius = None, data_dir='GLIF_network'):
+def pop_names(network, core_radius = None, data_dir='GLIF_network', return_node_type_ids=False):
     path_to_csv = os.path.join(data_dir, 'network/v1_node_types.csv')
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
 
@@ -36,8 +36,12 @@ def pop_names(network, core_radius = None, data_dir='GLIF_network'):
         if core_radius is not None:
             selected_mask = isolate_core_neurons(network, radius=core_radius, data_dir=data_dir)
             true_pop_names = true_pop_names[selected_mask]
+            node_type_ids = node_type_ids[selected_mask]
 
-    return true_pop_names
+    if return_node_type_ids:
+        return true_pop_names, node_type_ids
+    else:
+        return true_pop_names
 
 
 def angle_tunning(network, data_dir='GLIF_network'):

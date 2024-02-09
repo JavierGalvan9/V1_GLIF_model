@@ -175,7 +175,7 @@ def main(_):
 
         # Load the firing rates distribution as a regularizer that we have and generate target firing rates for every neuron type
         with open(os.path.join(flags.data_dir, 'np_gratings_firing_rates.pkl'), 'rb') as f:
-            target_firing_rates = pkl.load(f)
+            target_firing_rates = pkl.load(f) # they are in Hz and divided by 1000 to make it in kHz and match the dt = 1 ms
 
         tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)
         cell_type_ids = np.zeros(flags.neurons, dtype=np.int32)
@@ -208,7 +208,10 @@ def main(_):
             same_connection_type_indices.append(np.where(connection_ids == i)[0])
         
         # Create rate and voltage regularizers
-        rate_distribution_regularizer = models.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost, dtype=dtype)
+        delays = [int(a) for a in flags.delays.split(',') if a != '']
+        rate_distribution_regularizer = models.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost, 
+                                                                        pre_delay=delays[0], post_delay=delays[1], 
+                                                                        dtype=dtype)
         # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
         rate_loss = rate_distribution_regularizer(rsnn_layer.output[0][0])
         voltage_regularizer = models.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype)
@@ -472,7 +475,7 @@ def main(_):
             if gray_state is None:
                 gray_it = next(iter(gray_data_set))
                 x, y, _, w = gray_it
-                tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
+                tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)    
                 _out, _p, _loss, _aux = distributed_roll_out(x, y, w, output_spikes=False)
                 gray_state = tuple(_out[1:])
                 strategy.run(reset_state, args=(reset_type, gray_state))
@@ -491,7 +494,9 @@ def main(_):
     metric_keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
             'train_voltage_loss', 'val_accuracy', 'val_loss',
             'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
-    callbacks = Callbacks(model, optimizer, distributed_roll_out, network, flags, logdir, strategy, metric_keys)
+    delays = [int(a) for a in flags.delays.split(',') if a != '']
+    callbacks = Callbacks(model, optimizer, distributed_roll_out, network, flags, logdir, strategy, 
+                        metric_keys, pre_delay=delays[0], post_delay=delays[1])
     
     callbacks.on_train_begin()
     for epoch in range(flags.n_epochs):
@@ -518,7 +523,7 @@ def main(_):
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss]]
 
-            stop = callbacks.on_step_end(train_values, y, verbose=True)
+            stop = callbacks.on_step_end(train_values, y, verbose=False)
 
         # tf.profiler.experimental.stop() 
 
@@ -572,7 +577,7 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_string('restore_from', '../results/multi_training/b_53dw/results/ckpt-49', '')
     absl.app.flags.DEFINE_string('restore_from', '', '')
     absl.app.flags.DEFINE_string('comment', '', '')
-    absl.app.flags.DEFINE_string('delays', '50,50', '')
+    absl.app.flags.DEFINE_string('delays', '100,0', '')
     # absl.app.flags.DEFINE_string('neuron_model', 'GLIF3', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')
 
@@ -607,8 +612,8 @@ if __name__ == '__main__':
 
     # absl.app.flags.DEFINE_integer('pre_chunks', 3, '')
     # absl.app.flags.DEFINE_integer('post_chunks', 8, '') # the pure calssification task only need 1 but to make consistent with other tasks one has to make up here
-    absl.app.flags.DEFINE_integer('pre_delay', 50, '')
-    absl.app.flags.DEFINE_integer('post_delay', 450, '')
+    # absl.app.flags.DEFINE_integer('pre_delay', 50, '')
+    # absl.app.flags.DEFINE_integer('post_delay', 450, '')
 
     # absl.app.flags.DEFINE_boolean('use_rand_connectivity', False, '')
     # absl.app.flags.DEFINE_boolean('use_uniform_neuron_type', False, '')

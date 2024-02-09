@@ -840,7 +840,6 @@ def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
 def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
     tau = tf.cast(tau, dtype)
     num = tf.abs(tau - tf.cast(u <= 0, dtype))
-    kappa = tf.cast(kappa, dtype)
 
     branch_1 = num / (2 * kappa) * tf.square(u)
     branch_2 = num * (tf.abs(u) - 0.5 * kappa)
@@ -879,12 +878,18 @@ class SpikeRateDistributionTarget:
     """ Instead of regularization, treat it as a target.
         The main difference is that this class will calculate the loss
         for each subtypes of the neurons."""
-    def __init__(self, target_rates, rate_cost=.5, dtype=tf.float32):
+    def __init__(self, target_rates, rate_cost=.5, pre_delay=None, post_delay=None, dtype=tf.float32):
         self._rate_cost = rate_cost
         self._target_rates = target_rates
+        self._pre_delay = pre_delay
+        self._post_delay = post_delay
         self._dtype = dtype
 
     def __call__(self, spikes):
+        if self._pre_delay is not None:
+            spikes = spikes[:, self._pre_delay:, :]
+        if self._post_delay is not None and self._post_delay != 0:
+            spikes = spikes[:, :-self._post_delay, :]
         reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, dtype=self._dtype) * self._rate_cost
         return reg_loss
 
