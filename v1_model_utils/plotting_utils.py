@@ -311,26 +311,6 @@ class LaminarPlot:
             # Select population names of neurons in the present network (core)
             true_pop_names = true_pop_names[self.core_mask]
             true_node_type_ids = node_type_ids[self.core_mask]
-
-
-        # node_h5 = h5py.File(path_to_h5, mode="r")
-
-        # node_type_id_to_pop_name = dict()
-        # for nid in np.unique(node_h5["nodes"]["v1"]["node_type_id"]):
-        #     # if not np.unique all of the 230924 model neurons ids are considered,
-        #     # but nearly all of them are repeated since there are only 111 different indices
-        #     ind_list = np.where(node_types.node_type_id == nid)[0]
-        #     assert len(ind_list) == 1
-        #     node_type_id_to_pop_name[nid] = node_types.pop_name[ind_list[0]]
-
-        # node_type_ids = np.array(node_h5["nodes"]["v1"]["node_type_id"])
-        # true_pop_names = []  # it contains the pop_name of all the 230,924 neurons
-        # for nid in node_h5["nodes"]["v1"]["node_type_id"]:
-        #     true_pop_names.append(node_type_id_to_pop_name[nid])
-
-        # # Select population names of neurons in the present network (core)
-        # true_pop_names = np.array(true_pop_names)[network["tf_id_to_bmtk_id"]][self.core_mask]
-        # true_node_type_ids = node_type_ids[network["tf_id_to_bmtk_id"]][self.core_mask]
     
         # Now order the pop_names
         #  according to their layer and type
@@ -360,8 +340,12 @@ class LaminarPlot:
             # choose all the neurons of the given pop_id
             sel = true_node_type_ids == pop_id
             _n = np.sum(sel)
-            # order the neurons by type in the y axis
-            neuron_id_to_y[sel] = np.arange(current_ind, current_ind + _n)
+            pop_y_positions = np.arange(current_ind, current_ind + _n)
+            tuning_angles = network['tuning_angle'][self.core_mask][sel]
+            sorted_indices = np.argsort(tuning_angles)
+            pop_y_positions = pop_y_positions[sorted_indices]
+            # order the neurons by type and tuning angle in the y axis
+            neuron_id_to_y[sel] = pop_y_positions
 
             if int(pop_name[1]) > int(current_pop_name[1]):
                 # register the change of layer
