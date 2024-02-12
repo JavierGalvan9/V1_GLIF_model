@@ -316,7 +316,7 @@ def main(_):
 
         return _out, _p, _loss, _aux
 
-    @tf.function
+    # @tf.function
     def distributed_roll_out(x, y, w, output_spikes=True):
         _out, _p, _loss, _aux = strategy.run(roll_out, args=(x, y, w))
         if output_spikes:
@@ -386,7 +386,7 @@ def main(_):
             # tf.print(f'Number of nan in variables: {tf.reduce_sum(tf.cast(tf.math.is_nan(v), tf.float32))}')
 
 
-    @tf.function
+    # @tf.function
     def distributed_train_step(x, y, weights, grad_average_ind=None):
         strategy.run(train_step, args=(x, y, weights, grad_average_ind))
 
@@ -414,7 +414,7 @@ def main(_):
             return _out[0][0]
 
 
-    @tf.function
+    # @tf.function
     def distributed_validation_step(x, y, weights, output_spikes=True):
         if output_spikes:
             return strategy.run(validation_step, args=(x, y, weights, output_spikes))
@@ -523,7 +523,7 @@ def main(_):
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss]]
 
-            stop = callbacks.on_step_end(train_values, y, verbose=False)
+            callbacks.on_step_end(train_values, y, verbose=False)
 
         # tf.profiler.experimental.stop() 
 
@@ -541,10 +541,9 @@ def main(_):
         metric_values = train_values + val_values
 
         # if the model train loss is minimal, save the model.
-        callbacks.on_epoch_end(z, x, y, metric_values)
+        stop = callbacks.on_epoch_end(z, x, y, metric_values)
 
         if stop:
-            print(f'[ Maximum optimization time of {flags.max_time:.2f}h reached ]')
             break
         
         # Reset the metrics for the next epoch

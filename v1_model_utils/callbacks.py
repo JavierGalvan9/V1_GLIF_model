@@ -45,6 +45,7 @@ class Callbacks:
         self.post_delay = post_delay
         self.epoch = 0
         self.step = 0
+        self.no_improve_epochs = 0
         # please create a dictionary to save the values of the metric keys after each epoch
         self.epoch_metric_values = {key: [] for key in self.metrics_keys}
         self.epoch_metric_values['val_osi_dsi_loss'] = []
@@ -139,6 +140,7 @@ class Callbacks:
 
         if val_loss_value < self.min_val_loss:
             self.min_val_loss = val_loss_value
+            self.no_improve_epochs = 0
 
             # self.plot_lgn_activity(x)
             self.plot_losses_curves()
@@ -152,16 +154,30 @@ class Callbacks:
             print('Mean firing rate boxplot time:', time()-t0)
 
             self.save_model()
+        else:
+            self.no_improve_epochs += 1
            
         if (self.epoch - 1) % 50 == 0:
             t0 = time()
-            self.plot_osi_dsi()
+            # self.plot_osi_dsi()
             print('OSI and DSI plot time:', (time()-t0))
-
 
         with self.summary_writer.as_default():
             for k, v in zip(self.metrics_keys, metric_values):
                 tf.summary.scalar(k, v, step=self.epoch)
+
+        # EARLY STOPPING CONDITIONS
+        if (0 < self.flags.max_time < (time() - self.epoch_init_time) / 3600):
+            print(f'[ Maximum optimization time of {self.flags.max_time:.2f}h reached ]')
+            stop = True
+        elif self.no_improve_epochs >= 50:
+            print("Early stopping: Validation loss has not improved for 50 epochs.")
+            stop = True  
+        else:
+            stop = False
+
+        return stop
+
 
     def on_step_start(self):
         self.step += 1
@@ -176,11 +192,7 @@ class Callbacks:
             print(f'    Step running time: {time() - self.step_init_time:.2f}s')
             mem_data = printgpu(verbose=1)
             print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
-        if 0 < self.flags.max_time < (time() - self.epoch_init_time) / 3600:
-            stop = True
-        else:
-            stop = False
-        return stop
+        
 
     def save_model(self):
         # self.step_counter.assign_add(1)
