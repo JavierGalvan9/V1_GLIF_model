@@ -46,7 +46,6 @@ def create_one_unit_of_two_subunit_filter(prs, ttp_exp):
 
     return filt_new, filt_sum
 
-# @tf.function
 def temporal_filter(all_spatial_responses, temporal_kernels):
     tr_spatial_responses = tf.pad(
         all_spatial_responses[None, :, None, :],

@@ -195,14 +195,15 @@ def load_network(
     bmtk_id_to_tf_id = np.full(n_nodes, -1, dtype=np.int32)
 
     # Extract from the SONATA file the nodes information
-    h5_file = h5py.File(h5_path, "r")
-    assert np.diff(h5_file["nodes"]["v1"]["node_id"]).var() < 1e-12
-    x = np.array(h5_file["nodes"]["v1"]["0"]["x"], dtype=np.float32) # horizontal axis
-    y = np.array(h5_file["nodes"]["v1"]["0"]["y"], dtype=np.float32) # depth
-    z = np.array(h5_file["nodes"]["v1"]["0"]["z"], dtype=np.float32) # horizontal axis
-    tuning_angle = np.array(h5_file['nodes']['v1']['0']['tuning_angle'], dtype=np.float32)
-    node_type_id = np.array(h5_file['nodes']['v1']['node_type_id'], dtype=np.int32)
-    r = np.sqrt(x**2 + z**2)  # the maximum radius is 845
+    # h5_file = h5py.File(h5_path, "r")
+    with h5py.File(h5_path, "r") as h5_file:
+        assert np.diff(h5_file["nodes"]["v1"]["node_id"]).var() < 1e-12
+        x = np.array(h5_file["nodes"]["v1"]["0"]["x"], dtype=np.float32) # horizontal axis
+        y = np.array(h5_file["nodes"]["v1"]["0"]["y"], dtype=np.float32) # depth
+        z = np.array(h5_file["nodes"]["v1"]["0"]["z"], dtype=np.float32) # horizontal axis
+        tuning_angle = np.array(h5_file['nodes']['v1']['0']['tuning_angle'], dtype=np.float32)
+        node_type_id = np.array(h5_file['nodes']['v1']['node_type_id'], dtype=np.int32)
+        r = np.sqrt(x**2 + z**2)  # the maximum radius is 845
 
     ### CHOOSE THE NETWORK NODES ###
     if n_neurons > 296991:
@@ -210,7 +211,7 @@ def load_network(
     
     elif connected_selection: # this condition takes the n_neurons closest neurons to the origin
         sorted_ind = np.argsort(r)
-        sel = np.zeros(n_nodes, np.bool_)
+        sel = np.zeros(n_nodes, dtype=np.bool_)
         sel[sorted_ind[:n_neurons]] = True
         print(f"> Maximum sample radius: {r[sorted_ind[n_neurons - 1]]:.2f}")
     
@@ -231,10 +232,11 @@ def load_network(
         sel[take_inds] = True
     
     else: # if no condition is met, all neurons are selected
-        sel = np.ones(n_nodes, np.bool_)
+        sel = np.ones(n_nodes, dtype=np.bool_)
 
     # Get the number of neurons in the chosen network and update the traslation arrays
     n_nodes = np.sum(sel)
+    print(f"> Number of Neurons: {n_nodes}")
     tf_id_to_bmtk_id = tf_id_to_bmtk_id[sel] # tf idx '0' corresponds to 'tf_id_to_bmtk_id[0]' bmtk idx
     bmtk_id_to_tf_id[tf_id_to_bmtk_id] = np.arange(n_nodes, dtype=np.int32) 
     # bmtk idx '0' corresponds to 'bmtk_id_to_tf_id[0]' tf idx which can be '-1' in case
@@ -249,8 +251,6 @@ def load_network(
     z = z[sel]
     tuning_angle = tuning_angle[sel]
     node_type_id = node_type_id[sel]
-
-    print(f"> Number of Neurons: {n_nodes}")
 
     # GET THE NODES PARAMETERS
     n_node_types = len(d["nodes"])
@@ -287,14 +287,13 @@ def load_network(
     delays = []
     syn_ids = []
 
-    # Count the number of edges in the current network
     for edge in edges:
         # Identify which of the 10 types of inputs we have
         # r = edge["params"]["receptor_type"] - 1
         # r takes values within 0 - 9
         target_tf_ids = bmtk_id_to_tf_id[np.array(edge["target"], dtype=np.int32)]
         source_tf_ids = bmtk_id_to_tf_id[np.array(edge["source"], dtype=np.int32)]
-        edge_exists = np.logical_and(target_tf_ids >= 0, source_tf_ids >= 0)
+        edge_exists = np.logical_and(target_tf_ids != -1, source_tf_ids != -1)
         # select the edges within our model
         target_tf_ids = target_tf_ids[edge_exists]
         source_tf_ids = source_tf_ids[edge_exists]
@@ -304,9 +303,6 @@ def load_network(
         n_edges += int(n_new_edge)
         
         # all the edges of a given type have the same delay and synaptic id
-        # delays_tf = np.zeros(n_new_edge) + edge["params"]["delay"]
-        # syn_id = np.zeros(n_new_edge) + edge["params"]["syn_id"]
-
         delays_tf = np.full(n_new_edge, edge["params"]["delay"], dtype=np.float16)
         syn_id = np.full(n_new_edge, edge["params"]["syn_id"], dtype=np.uint8)
 
@@ -495,54 +491,44 @@ def reduce_input_population(input_population, new_n_input, seed=3000):
     # but they are randonmly selected
     assignment = rd.choice(np.arange(new_n_input, dtype=np.int32), size=input_population["n_inputs"], replace=True)
 
-    weight_dict = dict()
-    delays_dict = dict()
-    syn_ids_dict = dict()
-    # go through all the asignment selection made
-    for input_neuron in range(input_population["n_inputs"]):
-        assigned_neuron = assignment[input_neuron]
-        # consider that neurons connected to the input_neuron
-        sel = in_ind[:, 1] == input_neuron
-        # keep that neurons connected to the input_neuron
-        sel_post_inds = in_ind[sel, 0]
-        sel_weights = in_weights[sel]
-        sel_delays = in_delays[sel]
-        sel_syn_ids = in_syn_ids[sel]
-        for post_ind, weight, delay, syn_id in zip(sel_post_inds, sel_weights, sel_delays, sel_syn_ids):
-            # tuple with the indices of the post model neuron and the pre LGN neuron
-            t_inds = post_ind, assigned_neuron
-            if t_inds not in weight_dict.keys():  # in case the key hasnt been already created
-                weight_dict[t_inds] = 0.0
-            # in case a LGN unit connection is repeated we consider that the weights are add up
-            weight_dict[t_inds] += weight
-            delays_dict[t_inds] = delay
-            syn_ids_dict[t_inds] = syn_id
+    # Create a tuple of indices for vectorized operations
+    post_indices = in_ind[:, 0]
+    input_neuron_indices = in_ind[:, 1]
+    assigned_neuron_indices = assignment[input_neuron_indices]
 
-    n_synapses = len(weight_dict)
-    # we now save the synapses in arrays of indices and weights
-    new_in_ind = np.empty((n_synapses, 2), dtype=np.int32)
-    new_in_weights = np.empty(n_synapses, dtype=np.float32)
-    new_in_delays = np.empty(n_synapses, dtype=np.float16)
-    new_in_syn_ids = np.empty(n_synapses, dtype=np.uint8)
-    for i, (t_ind, w) in enumerate(weight_dict.items()):
-        new_in_ind[i] = t_ind
-        new_in_weights[i] = w
-        new_in_delays[i] = delays_dict[t_ind]
-        new_in_syn_ids[i] = syn_ids_dict[t_ind]
+    # Calculate unique pairs and their indices in the original array
+    unique_pairs, inverse_indices = np.unique(np.stack((post_indices, assigned_neuron_indices), axis=1), axis=0, return_inverse=True)
+
+    # Accumulate weights for repeated pairs
+    new_in_weights = np.bincount(inverse_indices, weights=in_weights)
+
+    # Lets get the average delay by the connection strength (synaptic weight), 
+    # assuming stronger connections might have a more significant impact on the timing.
+    # Calculate mean delays for each unique pair
+    # First, accumulate the total delays for each unique pair
+    total_delays = np.bincount(inverse_indices, weights=in_delays)
+    # Count the occurrences of each unique pair to divide and get the mean
+    counts = np.bincount(inverse_indices)
+    # Calculate the mean by dividing total delays by counts
+    new_in_delays = total_delays / counts
+
+    # Similarly for the syn_ids
+    new_in_syn_ids = np.bincount(inverse_indices, weights=in_syn_ids.astype(np.int32))
+    new_in_syn_ids = (new_in_syn_ids/counts).astype(np.uint8)
 
     # new_in_ind, new_in_weights, new_in_delays = sort_input_indices(
     #     new_in_ind, new_in_weights, new_in_delays
     # )
 
     new_in_ind, new_in_weights, new_in_delays, new_in_syn_ids = sort_indices(
-        new_in_ind, new_in_weights, new_in_delays, new_in_syn_ids
+        unique_pairs, new_in_weights, new_in_delays, new_in_syn_ids
     )
     
     new_input_population = dict(
         n_inputs=new_n_input,
-        indices=new_in_ind,
-        weights=new_in_weights,
-        delays=new_in_delays,
+        indices=new_in_ind.astype(np.int32),
+        weights=new_in_weights.astype(np.float32),
+        delays=new_in_delays.astype(np.float16),
         syn_ids=new_in_syn_ids,
         # spikes=None,
     )
