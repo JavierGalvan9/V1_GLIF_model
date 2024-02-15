@@ -953,7 +953,7 @@ def calculate_Firing_Rate(z, drifting_gratings_init=500, drifting_gratings_end=2
     
     return mean_firing_rates
 
-def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius=None, core_mask=None, remove_zero_rate_neurons=True):
+def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius=None, core_mask=None, remove_zero_rate_neurons=False):
     
     # Get the pop names of the neurons
     if core_radius is not None:
@@ -1039,9 +1039,12 @@ class ModelMetricsAnalysis:
             # Calculate the core_neurons mask
             if self.n_neurons > core_neurons:
                 self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir) 
-                self.n_neurons = core_neurons
+                # self.n_neurons = core_neurons
+                # if n_neurons is overridden, it won't run for the second time...
+                n_neurons_plot = core_neurons
             else:
                 self.core_mask = np.full(self.n_neurons, True)
+                n_neurons_plot = self.n_neurons
 
         else:
             self.core_mask = np.full(self.n_neurons, True)
@@ -1052,9 +1055,9 @@ class ModelMetricsAnalysis:
         # Calculate the firing rates along every orientation            
         # if spikes shape is (n_angles, n_time_steps, n_neurons) reshape it to (n_angles, n_trials, n_time_steps, n_neurons)
         if spikes.shape[0] == len(DG_angles):
-            spikes = spikes.reshape(len(DG_angles), self.n_trials, spikes.shape[-2], self.n_neurons)
+            spikes = spikes.reshape(len(DG_angles), self.n_trials, spikes.shape[-2], n_neurons_plot)
         
-        firing_rates_df = self.create_firing_rates_df(self.n_neurons, spikes, n_trials=self.n_trials, 
+        firing_rates_df = self.create_firing_rates_df(n_neurons_plot, spikes, n_trials=self.n_trials, 
                                                       drifting_gratings_init=self.drifting_gratings_init, drifting_gratings_end=self.drifting_gratings_end, 
                                                       DG_angles=DG_angles)
         
