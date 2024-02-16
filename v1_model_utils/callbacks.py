@@ -159,7 +159,7 @@ class Callbacks:
            
         if (self.epoch - 1) % 50 == 0:
             t0 = time()
-            # self.plot_osi_dsi()
+            self.plot_osi_dsi()
             print('OSI and DSI plot time:', (time()-t0))
 
         with self.summary_writer.as_default():
@@ -306,4 +306,4 @@ class Callbacks:
                                                 analyze_core_only=True, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
         metrics_analysis(spikes, DG_angles)
         # save the spike for later analysis
-        np.save(os.path.join(boxplots_dir, f'spikes_epoch_{self.epoch}.npy'), spikes)
+        # np.save(os.path.join(boxplots_dir, f'spikes_epoch_{self.epoch}.npy'), spikes)
