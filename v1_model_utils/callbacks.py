@@ -305,5 +305,3 @@ class Callbacks:
                                                 drifting_gratings_init=500, drifting_gratings_end=2500,
                                                 analyze_core_only=True, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
         metrics_analysis(spikes, DG_angles)
-        # save the spike for later analysis
-        # np.save(os.path.join(boxplots_dir, f'spikes_epoch_{self.epoch}.npy'), spikes)
