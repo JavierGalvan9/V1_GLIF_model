@@ -207,7 +207,6 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
         rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * self._seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
         # Create a TensorArray to save the results for every receptor type
         noise_input = self.calculate_bkg_i_in(rest_of_brain)
-        # noise_input = tf.zeros_like(noise_input)
         noise_input = tf.transpose(noise_input) # New shape (3000, 66634, 5)
         # Reshape properly the input current
         noise_input = tf.reshape(noise_input, (self._batch_size, self._seq_len, -1)) # (1, 3000, 333170)
@@ -744,7 +743,6 @@ class V1Column(tf.keras.layers.Layer):
 
         ### Calculate the recurrent input current ###
         i_rec = self.calculate_i_rec(rec_z_buf)
-        # i_rec = tf.zeros_like(i_rec)  # for testing purposes
         i_rec = tf.transpose(i_rec)
         rec_inputs = self.reshape_recurrent_currents(i_rec, batch_size)
 
