@@ -93,11 +93,11 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
 
     with h5py.File(edges_h5_path, "r") as edges_h5_file:
         source_to_target = f"{source}_to_{target}"
-        edge_type_ids = np.array(edges_h5_file["edges"][source_to_target]["edge_type_id"], dtype=np.int32)
-        source_node_ids = np.array(edges_h5_file["edges"][source_to_target]["source_node_id"], dtype=np.int32)
-        target_node_ids = np.array(edges_h5_file["edges"][source_to_target]["target_node_id"], dtype=np.int32)
+        edge_type_ids = edges_h5_file["edges"][source_to_target]["edge_type_id"][()].astype(np.int32)
+        source_node_ids = edges_h5_file["edges"][source_to_target]["source_node_id"][()].astype(np.int32)
+        target_node_ids = edges_h5_file["edges"][source_to_target]["target_node_id"][()].astype(np.int32)
         if source != 'bkg':
-            syn_weights = np.array(edges_h5_file["edges"][source_to_target]["0"]["syn_weight"], dtype=np.float32)
+            syn_weights = edges_h5_file["edges"][source_to_target]["0"]["syn_weight"][()].astype(np.float32)
 
     if source == 'bkg':
         syn_weights = np.zeros(len(source_node_ids), dtype=np.float32)
@@ -291,8 +291,8 @@ def load_network(
         # Identify which of the 10 types of inputs we have
         # r = edge["params"]["receptor_type"] - 1
         # r takes values within 0 - 9
-        target_tf_ids = bmtk_id_to_tf_id[np.array(edge["target"], dtype=np.int32)]
-        source_tf_ids = bmtk_id_to_tf_id[np.array(edge["source"], dtype=np.int32)]
+        target_tf_ids = bmtk_id_to_tf_id[edge["target"]]
+        source_tf_ids = bmtk_id_to_tf_id[edge["source"]]
         edge_exists = np.logical_and(target_tf_ids != -1, source_tf_ids != -1)
         # select the edges within our model
         target_tf_ids = target_tf_ids[edge_exists]
@@ -391,9 +391,9 @@ def load_input(
             # Identify the which of the 10 types of inputs we have
             # r = edge["params"]["receptor_type"] - 1
             # r takes values within 0 - 9
-            target_bmtk_id = np.array(edge["target"], dtype=np.int32)
-            source_tf_id = np.array(edge["source"], dtype=np.int32)
-            weights_tf = np.array(edge["params"]["weight"], dtype=np.float32)
+            target_bmtk_id = edge["target"]
+            source_tf_id = edge["source"]
+            weights_tf = edge["params"]["weight"]
             
             # delays_tf = np.array(edge["params"]["delay"], dtype=np.float16)
             # syn_id = np.array(edge["params"]["syn_id"], dtype=np.uint8)
@@ -409,7 +409,7 @@ def load_input(
                 # (notice that only the target must exist since the source is within the LGN module)
                 # This means that source index is within 0-17400
                 target_tf_id = bmtk_id_to_tf_id[target_bmtk_id]
-                edge_exists = target_tf_id >= 0
+                edge_exists = target_tf_id != -1
                 target_tf_id = target_tf_id[edge_exists]
                 source_tf_id = source_tf_id[edge_exists]
                 weights_tf = weights_tf[edge_exists]

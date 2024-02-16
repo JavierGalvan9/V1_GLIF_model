@@ -159,7 +159,7 @@ class Callbacks:
            
         if (self.epoch - 1) % 50 == 0:
             t0 = time()
-            # self.plot_osi_dsi()
+            self.plot_osi_dsi()
             print('OSI and DSI plot time:', (time()-t0))
 
         with self.summary_writer.as_default():
