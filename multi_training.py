@@ -316,7 +316,7 @@ def main(_):
 
         return _out, _p, _loss, _aux
 
-    # @tf.function
+    @tf.function
     def distributed_roll_out(x, y, w, output_spikes=True):
         _out, _p, _loss, _aux = strategy.run(roll_out, args=(x, y, w))
         if output_spikes:
@@ -386,7 +386,7 @@ def main(_):
             # tf.print(f'Number of nan in variables: {tf.reduce_sum(tf.cast(tf.math.is_nan(v), tf.float32))}')
 
 
-    # @tf.function
+    @tf.function
     def distributed_train_step(x, y, weights, grad_average_ind=None):
         strategy.run(train_step, args=(x, y, weights, grad_average_ind))
 
@@ -414,7 +414,7 @@ def main(_):
             return _out[0][0]
 
 
-    # @tf.function
+    @tf.function
     def distributed_validation_step(x, y, weights, output_spikes=True):
         if output_spikes:
             return strategy.run(validation_step, args=(x, y, weights, output_spikes))
@@ -469,7 +469,7 @@ def main(_):
         else:
             raise ValueError(f"Invalid reset_type: {reset_type}")
 
-    # @tf.function
+
     def distributed_reset_state(reset_type, gray_state=None):
         if reset_type == 'gray':
             if gray_state is None:
@@ -512,7 +512,12 @@ def main(_):
             callbacks.on_step_start()
             distributed_reset_state('gray', gray_state=gray_state)
 
+
+            t0 = time()
             x, y, _, w = next(it) # x dtype tf.bool
+            print(f"LGN generation time: {time()-t0:.2f} s")
+
+            t1 = time()
     
             # with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
             if flags.average_grad_for_cell_type:
@@ -520,6 +525,7 @@ def main(_):
             else:
                 distributed_train_step(x, y, w)
                 
+            print(f"Training step time: {time()-t1:.2f} s")
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss]]
 

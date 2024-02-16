@@ -312,8 +312,8 @@ class SparseLayer(tf.keras.layers.Layer):
             
             # Concatenate the partial results to get the final result
             input_current = result_array.stack() # ( 9, 5, 66634, 68)
+            input_current = tf.transpose(input_current, perm=[1, 2, 0, 3])
             # input_current = tf.transpose(input_current, perm=[1, 2, 3, 0]) # New shape (5, 66634, 68, 9)
-            input_current = tf.transpose(input_current, perm=[1, 2, 0, 3]) # New shape (5, 66634, 9, 68)
             input_current = tf.reshape(input_current, (self._n_syn_basis, -1, num_chunks * self._max_batch)) # New shape (5, 66634, 612)
             input_current = tf.transpose(input_current, perm=[2, 1, 0]) # New shape (612, 66634, 5)
             
