@@ -152,6 +152,7 @@ def main(_):
             train_input=flags.train_input,
             train_noise=flags.train_noise,
             train_recurrent=flags.train_recurrent,
+            train_recurrent_per_type=flags.train_recurrent_per_type,
             neuron_output=flags.neuron_output,
             recurrent_dampening_factor=flags.recurrent_dampening_factor,
             batch_size=flags.batch_size,
@@ -430,7 +431,8 @@ def main(_):
                 pre_delay=delays[0],
                 post_delay=delays[1],
                 n_input=flags.n_input,
-                regular=regular
+                regular=regular,
+                bmtk_compat=flags.bmtk_compat_lgn,
             ).batch(per_replica_batch_size)
                         
             return _data_set
@@ -630,6 +632,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', False, '')
     absl.app.flags.DEFINE_boolean('train_recurrent', True, '')
+    absl.app.flags.DEFINE_boolean('train_recurrent_per_type', False, '')
     absl.app.flags.DEFINE_boolean('connected_selection', True, '')
     absl.app.flags.DEFINE_boolean('neuron_output', False, '')
     # absl.app.flags.DEFINE_boolean('localized_readout', True, '')
@@ -644,6 +647,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("hard_reset", False, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
     absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", False, "")
+    absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
 
     absl.app.run(main)
 
