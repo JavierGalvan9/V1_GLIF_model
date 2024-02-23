@@ -512,12 +512,7 @@ def main(_):
             callbacks.on_step_start()
             distributed_reset_state('gray', gray_state=gray_state)
 
-
-            t0 = time()
             x, y, _, w = next(it) # x dtype tf.bool
-            print(f"LGN generation time: {time()-t0:.2f} s")
-
-            t1 = time()
     
             # with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
             if flags.average_grad_for_cell_type:
@@ -525,7 +520,6 @@ def main(_):
             else:
                 distributed_train_step(x, y, w)
                 
-            print(f"Training step time: {time()-t1:.2f} s")
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss]]
 
@@ -587,7 +581,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('scale', '2,2', '')
 
     absl.app.flags.DEFINE_float('learning_rate', .01, '')
-    absl.app.flags.DEFINE_float('rate_cost', 10., '')
+    absl.app.flags.DEFINE_float('rate_cost', 100., '')
     absl.app.flags.DEFINE_float('voltage_cost', .00001, '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float('gauss_std', .28, '')

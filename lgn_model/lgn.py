@@ -140,8 +140,8 @@ class LGN(object):
             model_path = os.path.join(model_path, 'GLIF_network')
             model_path = os.path.join(model_path, 'network')
             lgn_node_path = os.path.join(model_path, 'lgn_nodes.h5')
-            lge_node_type_path = os.path.join(model_path, 'lgn_node_types.csv')
-            d = create_lgn_units_info(filename=lgn_data_path, csv_path=lge_node_type_path, h5_path=lgn_node_path)
+            lgn_node_type_path = os.path.join(model_path, 'lgn_node_types.csv')
+            d = create_lgn_units_info(filename=lgn_data_path, csv_path=lgn_node_type_path, h5_path=lgn_node_path)
                 
         spatial_sizes = d['spatial_size'].to_numpy(dtype=np.float32)
         self.spatial_sizes = spatial_sizes
