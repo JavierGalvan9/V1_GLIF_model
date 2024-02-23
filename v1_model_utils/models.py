@@ -225,7 +225,7 @@ class SparseLayer(tf.keras.layers.Layer):
     """
 
     def __init__(self, indices, weights, dense_shape, synaptic_weights, syn_ids, # tau_syn_weights,
-                 n_neurons, lr_scale=1.0, dtype=tf.float32, **kwargs,):
+                 lr_scale=1.0, dtype=tf.float32, **kwargs,):
         super().__init__(**kwargs)
         self._dtype = dtype
         self._lr_scale = lr_scale
@@ -233,7 +233,6 @@ class SparseLayer(tf.keras.layers.Layer):
         self._input_weights = weights
         self._n_syn_basis = synaptic_weights.shape[1] # 5
         self._dense_shape = dense_shape
-        self._n_neurons = n_neurons
         self._input_weights_factors = tf.gather(synaptic_weights, syn_ids, axis=0)
         # Define a threshold that determines whether to compute the sparse
         # matrix multiplication directly or split it into smaller batches in a GPU.
@@ -554,7 +553,7 @@ class V1Column(tf.keras.layers.Layer):
         bkg_input_weights = (bkg_input_weights/voltage_scale[self._node_type_ids[bkg_input_indices[:, 0]]])
         bkg_input_delays = np.round(np.clip(bkg_input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # Introduce the delays in the postsynaptic neuron indices
-        # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
+        # bkg_input_indices[:, 1] = bkg_input_indices[:, 1] + self._n_neurons * (bkg_input_delays - 1)
         self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int64)
 
         bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int32)
@@ -657,6 +656,7 @@ class V1Column(tf.keras.layers.Layer):
             # new_indices will be a version of indices that only contains the non-zero columns
             # in the non_zero_cols, and changes the indices accordingly.
             new_indices, inds = self.get_new_inds_table(non_zero_cols)
+
             if tf.shape(inds)[0] == 0:  # if firing cells do not have any outputs
                 i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)
             else:
@@ -1021,7 +1021,6 @@ def create_model(
         cell.lgn_input_dense_shape,
         cell.synaptic_weights,
         cell.input_syn_ids,
-        cell._n_neurons,
         lr_scale=lr_scale,
         dtype=dtype,
         name="input_layer",
