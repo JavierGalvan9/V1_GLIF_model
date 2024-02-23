@@ -5,6 +5,7 @@ import pickle as pkl
 from time import time
 from numba import njit
 import subprocess
+from . import other_v1_utils
 
 class GPUMemoryTracker:
     def __init__(self):
@@ -372,6 +373,7 @@ class V1Column(tf.keras.layers.Layer):
         max_delay=5,
         pseudo_gauss=False,
         train_recurrent=True,
+        train_recurrent_per_type=True,
         train_input=True,
         train_noise=True,
         hard_reset=True,
@@ -494,14 +496,51 @@ class V1Column(tf.keras.layers.Layer):
         self.recurrent_weight_positive = tf.Variable(
             weights >= 0.0, name="recurrent_weights_sign", trainable=False)
 
+        # if training the recurrent connection per type, turn off recurrent training
+        # of individual connections
+        if train_recurrent:
+            if train_recurrent_per_type:
+                individual_training = False
+                per_type_training = True
+            else:
+                individual_training = True
+                per_type_training = False
+        else:
+            individual_training = False
+            per_type_training = False
+
         # Scale the weights
         self.recurrent_weight_values = tf.Variable(
             weights * recurrent_weight_scale / lr_scale,
             name="sparse_recurrent_weights",
             constraint=SignedConstraint(self.recurrent_weight_positive),
-            trainable=train_recurrent,
+            trainable=individual_training,
             dtype=self._compute_dtype
         ) # shape = (n_synapses,)
+        
+        # prepare per_type variable, if required
+
+        if per_type_training:
+            self.per_type_training = True
+            self.connection_type_ids = other_v1_utils.connection_type_ids(network)
+            max_id = np.max(self.connection_type_ids)
+
+            # prepare a variable and gather with type ids.
+            self.recurrent_per_type_weight_values = tf.Variable(
+                tf.ones(max_id),
+                name="recurrent_per_type_weights",
+                trainable=True,
+                dtype=self._compute_dtype
+            ) # shape = (n_connection_types (21 * 21))
+
+            # multiply this to the weights (this needs to be done in the loop)
+            # self.recurrent_weight_values = self.recurrent_weight_values * tf.gather(
+            #     self.recurrent_per_type_weight_values, connection_type_ids
+            # )
+        else:
+            self.per_type_training = False
+            
+
 
         self.recurrent_weights_factors = tf.gather(self.synaptic_weights, syn_ids, axis=0)
         print(f"    > # Recurrent synapses: {len(indices)}")
@@ -662,6 +701,11 @@ class V1Column(tf.keras.layers.Layer):
             else:
                 i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)
                 picked_weights = tf.gather(self.recurrent_weight_values, inds)
+                if self.per_type_training:
+                    picked_weights = picked_weights * tf.gather(
+                        self.recurrent_per_type_weight_values,
+                        tf.gather(self.connection_type_ids, inds)
+                    )
                 # for some reason, changing the following range by tf.range damages speed performance
                 for r_id in range(self._n_syn_basis):
                     weights_syn_receptors = picked_weights * tf.gather(self.recurrent_weights_factors[:, r_id], inds)
@@ -941,6 +985,7 @@ def create_model(
     dampening_factor=0.2,
     lr_scale=800.0,
     train_recurrent=True,
+    train_recurrent_per_type=False,
     train_input=True,
     train_noise=True,
     neuron_output=False,
@@ -987,6 +1032,7 @@ def create_model(
         max_delay=max_delay,
         pseudo_gauss=pseudo_gauss,
         train_recurrent=train_recurrent,
+        train_recurrent_per_type=train_recurrent_per_type,
         train_input=train_input,
         train_noise=train_noise,
         hard_reset=hard_reset,
@@ -1166,6 +1212,7 @@ if __name__ == "__main__":
         dampening_factor=0.2,
         lr_scale=800.0,
         train_recurrent=True,
+        train_recurrent_per_type=False,
         train_input=True,
         neuron_output=False,
         recurrent_dampening_factor=0.5,

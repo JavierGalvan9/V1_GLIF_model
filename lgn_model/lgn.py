@@ -348,7 +348,7 @@ class LGN(object):
             self.is_composite = self.is_composite[:n_input]
 
     @tf.function
-    def spatial_response(self, movie):
+    def spatial_response(self, movie, bmtk_compat=True):
         d_spatial = 1
         spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
         # spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
@@ -380,6 +380,13 @@ class LGN(object):
 
             # Apply it
             convolved_movie = tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')
+            
+            # Making BMTK compatible by normalizing the edge values
+            if bmtk_compat:
+                ones = tf.ones_like(movie)
+                gaussian_fraction = tf.nn.conv2d(ones, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')
+                convolved_movie = convolved_movie / gaussian_fraction
+            
             convolved_movie = convolved_movie[..., 0]  # Assuming you only need one channel
 
             spatial_responses = select_spatial(tf.boolean_mask(x, sel), tf.boolean_mask(y, sel), convolved_movie)

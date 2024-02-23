@@ -77,7 +77,8 @@ def movies_concat(movie, pre_delay, post_delay):
 def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8, 
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,
-                                     current_input=False, regular=False, n_input=17400):
+                                     current_input=False, regular=False, n_input=17400,
+                                     bmtk_compat=True):
     """ make a drifting gratings stimulus for FR and OSI tuning."""
     # mimc_lgn_std, mimc_lgn_mean = 0.02855, 0.02146
 
@@ -114,7 +115,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
             videos = movies_concat(movie, pre_delay, post_delay)
             del movie
 
-            spatial = lgn.spatial_response(videos)
+            spatial = lgn.spatial_response(videos, bmtk_compat)
             del videos
 
             firing_rates = lgn.firing_rates_from_spatial(*spatial)

@@ -43,6 +43,23 @@ def pop_names(network, core_radius = None, data_dir='GLIF_network', return_node_
     else:
         return true_pop_names
 
+def connection_type_ids(network, core_radius=None, data_dir='GLIF_network'):
+    # first, get the pop_names
+    pop_names_var = pop_names(network, core_radius=core_radius, data_dir=data_dir)
+    
+    # make a inverse index of the pop_names
+    all_names, pop_ids_cells = np.unique(pop_names_var, return_inverse=True)
+    
+    # get the pre and post cells
+    pre_cells = network["synapses"]["indices"][:, 0]
+    post_cells = network["synapses"]["indices"][:, 1] % network["n_nodes"]
+    
+    # make a unique number for the connection from each type to another type
+    pop_ids_synapses = pop_ids_cells[pre_cells] * 1000 + pop_ids_cells[post_cells]
+    
+    # make a inverse dictionary of the ids. This defines connection type_ids.
+    all_pop_ids, connection_type_ids = np.unique(pop_ids_synapses, return_inverse=True)
+    return connection_type_ids
 
 def angle_tunning(network, data_dir='GLIF_network'):
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
