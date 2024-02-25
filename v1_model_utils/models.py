@@ -201,16 +201,19 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
     def call(self, inp): # inp only provides the shape
         # Generate the background spikes
-        rest_of_brain = tf.cast(tf.random.uniform(
-                (self._batch_size, self._seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
-                self._compute_dtype)
+        rest_of_brain = tf.random.poisson(shape=(self._batch_size, self._seq_len, self._n_bkg_units), 
+                                        lam=self._bkg_firing_rate * .001, 
+                                        dtype=self._compute_dtype) # (1, 600, 100
+        # rest_of_brain = tf.cast(tf.random.uniform(
+        #         (self._batch_size, self._seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
+        #         self._compute_dtype) # (1, 600, 100)
 
         rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * self._seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
         # Create a TensorArray to save the results for every receptor type
-        noise_input = self.calculate_bkg_i_in(rest_of_brain)
-        noise_input = tf.transpose(noise_input) # New shape (3000, 66634, 5)
+        noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 66634, 600)
+        noise_input = tf.transpose(noise_input) # (600, 50000, 5) # New shape (3000, 66634, 5)
         # Reshape properly the input current
-        noise_input = tf.reshape(noise_input, (self._batch_size, self._seq_len, -1)) # (1, 3000, 333170)
+        noise_input = tf.reshape(noise_input, (self._batch_size, self._seq_len, -1)) # (1, 600, 250000) # (1, 3000, 333170)
 
         return noise_input
     
@@ -311,11 +314,9 @@ class SparseLayer(tf.keras.layers.Layer):
             
             # Concatenate the partial results to get the final result
             input_current = result_array.stack() # ( 9, 5, 66634, 68)
-            input_current = tf.transpose(input_current, perm=[1, 2, 0, 3])
-            # input_current = tf.transpose(input_current, perm=[1, 2, 3, 0]) # New shape (5, 66634, 68, 9)
+            input_current = tf.transpose(input_current, perm=[1, 2, 0, 3]) # New shape (5, 66634, 9, 68)
             input_current = tf.reshape(input_current, (self._n_syn_basis, -1, num_chunks * self._max_batch)) # New shape (5, 66634, 612)
             input_current = tf.transpose(input_current, perm=[2, 1, 0]) # New shape (612, 66634, 5)
-            
             if num_pad_elements > 0: # Remove the padded 0's
                 input_current = input_current[:-num_pad_elements, :] # New shape (600, 66634, 5)
 
