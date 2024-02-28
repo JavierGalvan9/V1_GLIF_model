@@ -62,7 +62,6 @@ class InputActivityFigure:
         self.network = network
         self.n_neurons = self.network["n_nodes"]
         self.batch_ind = batch_ind
-        self.plot_core_only = plot_core_only
         self.images_dir = images_dir
         self.filename = filename
 
@@ -139,7 +138,6 @@ class InputActivityFigureWithoutStimulus:
         self.network = network
         self.n_neurons = self.network["n_nodes"]
         self.batch_ind = batch_ind
-        self.plot_core_only = plot_core_only
         self.images_dir = images_dir
         self.filename = filename
 
@@ -170,29 +168,40 @@ class InputActivityFigureWithoutStimulus:
         plt.close(self.figure)
 
 
-def pop_ordering(x):
-    if (
-        x[1:3].count("23") > 0
-    ):  # count('str') finds if the string belongs to the given string
-        # Those neurons belonging to layers 2/3 assign then to layer 2 by default (representation purposes)
-        p_c = 2  # p_c represents the layer number
-    else:
-        p_c = int(x[1:2])
-    if x[0] == "e":
-        inter_order = (
-            4  # inter_order represents the neurons type order inside the layer
-        )
-    elif x.count("Vip") or x.count("Htr3a") > 0:
+def pop_ordering(pop_name):
+    layer_order = 2 if '23' in pop_name[1:3] else int(pop_name[1:2])
+    
+    if pop_name[0] == "e":
+        inter_order = 4 
+    elif pop_name.count("Vip") or pop_name.count("Htr3a") > 0:
         inter_order = 1
-    elif x.count("Sst") > 0:
+    elif pop_name.count("Sst") > 0:
         inter_order = 2
-    elif x.count("Pvalb") > 0:
+    elif pop_name.count("Pvalb") > 0:
         inter_order = 3
     else:
-        print(x)
+        print(pop_name)
         raise ValueError()
-    ordering = p_c * 10 + inter_order
-    return ordering
+
+    return layer_order * 10 + inter_order
+
+def model_name_to_cell_type(pop_name):
+    # Convert pop_name in the old format to cell types. E.g., 'e4Rorb' -> 'L4 Exc', 'i4Pvalb' -> 'L4 PV', 'i23Sst' -> 'L2/3 SST'
+    shift = 0  # letter shift for L23
+    ei = pop_name[0]
+    layer = pop_name[1]
+    if layer == "2":
+        layer = "23"
+        shift = 1
+    elif layer == "1":
+        return "i1Htr3a"  # special case
+    class_name = pop_name[2 + shift :]
+    if ei == 'e':  # excitatory
+        class_name = ""
+    elif (class_name == "Vip") or (class_name == "Htr3a"):
+        class_name = "Vip"
+
+    return f"{ei}{layer}{class_name}"
 
 
 class RasterPlot:
@@ -295,9 +304,7 @@ class LaminarPlot:
          # use the true_pop_names, true_node_type_ids to create a dictionary with the node_type_id as key and the pop_name as value
         # since many of them are repeated we can use the unique function to get the unique pop_names
 
-        node_types = pd.read_csv(
-            os.path.join(self.data_dir, "network/v1_node_types.csv"), sep=" "
-        )
+        node_types = pd.read_csv(os.path.join(self.data_dir, "network/v1_node_types.csv"), sep=" ")
         path_to_h5 = os.path.join(self.data_dir, "network/v1_nodes.h5")
         with h5py.File(path_to_h5, mode='r') as node_h5:
             # Create mapping from node_type_id to pop_name
@@ -315,15 +322,14 @@ class LaminarPlot:
         # Now order the pop_names
         #  according to their layer and type
         pop_orders = dict(
-            sorted(
-                node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1])
-            )
+            sorted(node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1]))
         )
+        reversed_pop_orders = {model_name_to_cell_type(v): [] for k, v in pop_orders.items()}
+        for k, v in pop_orders.items():
+            reversed_pop_orders[model_name_to_cell_type(v)].append(k)
 
         # Now we convert the neuron id (related to its pop_name) to an index related to its position in the y axis
-        neuron_id_to_y = (
-            np.zeros(self.n_neurons, np.int32) - 1
-        )  # rest 1 to check at the end if every neuron has an index
+        neuron_id_to_y = (np.zeros(self.n_neurons, np.int32) - 1)  # rest 1 to check at the end if every neuron has an index
         current_ind = 0
 
         self.e_mask = np.zeros(self.n_neurons, np.bool_)
@@ -336,9 +342,9 @@ class LaminarPlot:
         ie_bounds = []
         current_pop_name = "e0"
 
-        for pop_id, pop_name in pop_orders.items():
-            # choose all the neurons of the given pop_id
-            sel = true_node_type_ids == pop_id
+        for pop_name, pop_ids in reversed_pop_orders.items():
+            # choose all the neurons of the cell_type
+            sel = np.isin(true_node_type_ids, pop_ids)
             _n = np.sum(sel)
             pop_y_positions = np.arange(current_ind, current_ind + _n)
             tuning_angles = network['tuning_angle'][self.core_mask][sel]
@@ -383,8 +389,7 @@ class LaminarPlot:
 
         y_to_neuron_id = np.zeros(self.n_neurons, np.int32)
         y_to_neuron_id[neuron_id_to_y] = np.arange(self.n_neurons)
-        assert np.all(y_to_neuron_id[neuron_id_to_y]
-                      == np.arange(self.n_neurons))
+        assert np.all(y_to_neuron_id[neuron_id_to_y] == np.arange(self.n_neurons))
         # y_to_neuron_id: E.g., la neurona séptima por orden de capas tiene id 0, y_to_neuron_id[7]=0
         # neuron_id_to_y: E.g., la neurona con id 0 es la séptima por orden de capas, neuron_id_to_y[0] = 7
 
@@ -941,6 +946,9 @@ class PopulationActivity:
         fig.savefig(os.path.join(
             path, "subplot_population_activity.png"), dpi=300)
         plt.close(fig)
+
+
+
 
 
 def calculate_Firing_Rate(z, drifting_gratings_init=500, drifting_gratings_end=2500):

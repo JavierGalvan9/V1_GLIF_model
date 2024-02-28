@@ -22,10 +22,11 @@ def printgpu(verbose=0):
             return current, peak
 
 def compose_str(metrics_values):
-        _acc, _loss, _rate, _rate_loss, _voltage_loss = metrics_values
+        _acc, _loss, _rate, _rate_loss, _voltage_loss, _osi_loss = metrics_values
         _s = f'Loss {_loss:.4f}, '
         _s += f'RLoss {_rate_loss:.4f}, '
         _s += f'VLoss {_voltage_loss:.4f}, '
+        _s += f'VLoss {_osi_loss:.4f}, '
         _s += f'Accuracy {_acc:.4f}, '
         _s += f'Rate {_rate:.4f}'
         return _s
@@ -48,7 +49,7 @@ class Callbacks:
         self.no_improve_epochs = 0
         # please create a dictionary to save the values of the metric keys after each epoch
         self.epoch_metric_values = {key: [] for key in self.metrics_keys}
-        self.epoch_metric_values['val_osi_dsi_loss'] = []
+        # self.epoch_metric_values['val_osi_dsi_loss'] = []
         # self.step_counter = tf.Variable(0, dtype=tf.int64)
         self.step_running_time = []
         self.min_val_loss = float('inf')
@@ -127,8 +128,8 @@ class Callbacks:
             mem_data = printgpu(verbose=1)
             print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB'+ '\n')
 
-        val_classification_loss = metric_values[6] - metric_values[8] - metric_values[9] 
-        metric_values.append(val_classification_loss)
+        # val_classification_loss = metric_values[6] - metric_values[8] - metric_values[9] 
+        # metric_values.append(val_classification_loss)
         self.epoch_metric_values = {key: value + [metric_values[i]] for i, (key, value) in enumerate(self.epoch_metric_values.items())}
 
         if 'val_loss' in self.metrics_keys:
@@ -205,7 +206,7 @@ class Callbacks:
 
     def plot_losses_curves(self):
         # plotting_metrics = ['val_loss', 'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
-        plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss']
+        plotting_metrics = ['val_loss', 'val_osi_loss', 'val_rate_loss', 'val_voltage_loss']
         images_dir = os.path.join(self.logdir, 'Loss_curves')
         os.makedirs(images_dir, exist_ok=True)
 
@@ -216,7 +217,7 @@ class Callbacks:
             ax.set_xlabel('Epoch')
             ax.set_ylabel(metric_key)
         plt.tight_layout()
-        plt.savefig(os.path.join(images_dir, f'losses_curves_epoch_{self.epoch}.png'), dpi=300, transparent=False)
+        plt.savefig(os.path.join(images_dir, f'losses_curves_epoch.png'), dpi=300, transparent=False)
         plt.close()
     
     def plot_raster(self, z, x, y):

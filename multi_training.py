@@ -23,6 +23,7 @@ else:
 from general_utils import file_management
 from general_utils.other_utils import memory_tracer, timer
 from v1_model_utils import load_sparse, other_v1_utils, toolkit
+import v1_model_utils.loss_functions as losses
 from v1_model_utils.plotting_utils import InputActivityFigure, LaminarPlot, LGN_sample_plot, PopulationActivity, RasterPlot
 import stim_dataset
 from time import time
@@ -90,7 +91,7 @@ def main(_):
 
     results_dir = os.path.join(flags.results_dir, 'multi_training')
     os.makedirs(results_dir, exist_ok=True)
-     # Save the flags configuration in a JSON file
+    # Save the flags configuration in a JSON file
     with open(os.path.join(results_dir, 'flags_config.json'), 'w') as fp:
         json.dump(flags.flag_values_dict(), fp)
 
@@ -171,8 +172,6 @@ def main(_):
         # Extract outputs of intermediate keras layers to get access to
         # spikes and membrane voltages of the model
         rsnn_layer = model.get_layer("rsnn")
-        rec_weight_regularizer = models.StiffRegularizer(flags.recurrent_weight_regularization,
-                                                         rsnn_layer.cell.recurrent_weight_values)
 
         # Load the firing rates distribution as a regularizer that we have and generate target firing rates for every neuron type
         with open(os.path.join(flags.data_dir, 'np_gratings_firing_rates.pkl'), 'rb') as f:
@@ -186,7 +185,7 @@ def main(_):
             neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
             target_firing_rates[key]['neuron_ids'] = neuron_ids
             type_n_neurons = len(neuron_ids)
-            sorted_target_rates = models.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
+            sorted_target_rates = losses.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
             target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
             cell_type_ids[neuron_ids] = i
 
@@ -208,19 +207,39 @@ def main(_):
         for i in connection_type_ids:
             same_connection_type_indices.append(np.where(connection_ids == i)[0])
         
+        ### BUILD THE LOSS FUNCTIONS ###
         # Create rate and voltage regularizers
         delays = [int(a) for a in flags.delays.split(',') if a != '']
-        rate_distribution_regularizer = models.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost, 
-                                                                        pre_delay=delays[0], post_delay=delays[1], 
-                                                                        dtype=dtype)
+        if flags.core_loss:
+            core_radius = 200
+            core_mask = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
+            core_mask = tf.constant(core_mask, dtype=tf.bool)
+        else:
+            core_mask = None
+
+        voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype, core_mask=core_mask)
+        voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
+
+        rate_distribution_regularizer = losses.SpikeRateDistributionTarget(target_firing_rates, flags.rate_cost, 
+                                                                            pre_delay=delays[0], post_delay=delays[1], 
+                                                                            core_mask=core_mask, dtype=dtype)
         # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
         rate_loss = rate_distribution_regularizer(rsnn_layer.output[0][0])
-        voltage_regularizer = models.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype)
-        voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
+
+        rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization,
+                                                         rsnn_layer.cell.recurrent_weight_values)
+                                                         
+        OSI_Loss = losses.OrientationSelectivityLoss(tuning_angles, osi_cost=flags.osi_cost, 
+                                                    pre_delay=delays[0], post_delay=delays[1], 
+                                                    dtype=dtype, core_mask=core_mask)
+        osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,))) # this is just a placeholder
+
         model.add_loss(rate_loss)
         model.add_loss(voltage_loss)
+        model.add_loss(osi_loss)
         model.add_metric(rate_loss, name='rate_loss')
         model.add_metric(voltage_loss, name='voltage_loss')
+        model.add_metric(osi_loss, name='osi_loss')
 
         prediction_layer = model.get_layer('prediction')
         extractor_model = tf.keras.Model(inputs=model.inputs,
@@ -228,45 +247,12 @@ def main(_):
         # extractor_model = tf.keras.Model(inputs=model.inputs, outputs=[rsnn_layer.output])
 
         # Loss from Guozhang classification task (unused in our case)
-        loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
-            from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
-        def compute_loss(_l, _p, _w):
-            per_example_loss = loss_object(_l, _p, sample_weight=_w) * strategy.num_replicas_in_sync / tf.reduce_sum(_w)
-            rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
-            return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
-
-        def calculate_delta_angle(stim_angle, tuning_angle):
-            # angle unit is degrees.
-            # this function calculates the difference between stim_angle and tuning_angle,
-            # but it is fine to have the opposite direction.
-            # so, delta angle is always between -90 and 90.
-            # they are both vector, so dimension matche is needed.
-            # stim_angle is a length of batch size
-            # tuning_angle is a length of n_neurons
-
-            # delta_angle = stim_angle - tuning_angle
-            delta_angle = tf.expand_dims(stim_angle, axis=1) - tuning_angle
-            delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
-            delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
-            # # do it twice to make sure
-            delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
-            delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
-
-            return delta_angle
-
-        def compute_loss_gratings(_y, _z):
-            # I need to access the tuning angle. of all the neurons.
-            _y = tf.cast(_y, dtype)
-            delta_angle = calculate_delta_angle(_y, tuning_angles)
-            # sum spikes in _z, and multiply with delta_angle.
-            sum_angle = tf.reduce_mean(_z, axis=[1]) * delta_angle
-            # make a huber loss for this.
-            # angle_loss = tf.keras.losses.Huber(delta=1, reduction=tf.keras.losses.Reduction.SUM)(sum_angle, tf.zeros_like(sum_angle))
-            angle_loss = tf.reduce_mean(tf.abs(sum_angle))
-            # it might be nice to add regularization of weights
-            rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
-
-            return angle_loss + rec_weight_loss
+        # loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+        #     from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
+        # def compute_loss(_l, _p, _w):
+        #     per_example_loss = loss_object(_l, _p, sample_weight=_w) * strategy.num_replicas_in_sync / tf.reduce_sum(_w)
+        #     rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+        #     return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
         
         optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
 
@@ -287,14 +273,16 @@ def main(_):
         val_rate_loss = tf.keras.metrics.Mean()
         train_voltage_loss = tf.keras.metrics.Mean()
         val_voltage_loss = tf.keras.metrics.Mean()
+        train_osi_loss = tf.keras.metrics.Mean()
+        val_osi_loss = tf.keras.metrics.Mean()
 
         def reset_train_metrics():
             train_loss.reset_states(), train_accuracy.reset_states(), train_firing_rate.reset_states()
-            train_rate_loss.reset_states(), train_voltage_loss.reset_states()
+            train_rate_loss.reset_states(), train_voltage_loss.reset_states(), train_osi_loss.reset_states()
 
         def reset_validation_metrics():
             val_loss.reset_states(), val_accuracy.reset_states(), val_firing_rate.reset_states()
-            val_rate_loss.reset_states(), val_voltage_loss.reset_states()
+            val_rate_loss.reset_states(), val_voltage_loss.reset_states(), val_osi_loss.reset_states()
 
     # checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
@@ -310,10 +298,11 @@ def main(_):
 
         voltage_loss = voltage_regularizer(_v) 
         rate_loss = rate_distribution_regularizer(_z)
-        classification_loss = compute_loss_gratings(_y, _z)
+        osi_loss = OSI_Loss(_z, _y)
+        weights_l2_regularizer = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
 
-        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss)
-        _loss = classification_loss + rate_loss + voltage_loss
+        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_loss=osi_loss)
+        _loss = osi_loss + rate_loss + voltage_loss + weights_l2_regularizer
 
         return _out, _p, _loss, _aux
 
@@ -352,16 +341,17 @@ def main(_):
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
             _op = train_loss.update_state(_loss)
-        _rate = tf.reduce_mean(_out[0][0])
-        with tf.control_dependencies([_op]):
+            _rate = tf.reduce_mean(_out[0][0])
             _op = train_firing_rate.update_state(_rate)
-        with tf.control_dependencies([_op]):
             _op = train_rate_loss.update_state(_aux['rate_loss'])
-        with tf.control_dependencies([_op]):
             _op = train_voltage_loss.update_state(_aux['voltage_loss'])
+            _op = train_osi_loss.update_state(_aux['osi_loss'])
+        
+            
+        # with tf.control_dependencies([_op]):
+        #     _op = train_voltage_loss.update_state(_aux['voltage_loss'])
 
         grad = tape.gradient(_loss, model.trainable_variables)
-             
         for g, v in zip(grad, model.trainable_variables):
             tf.print(f'{v.name} optimization')
             tf.print('First Var / grad: ', v[0].dtype, g[0].dtype)
@@ -402,13 +392,12 @@ def main(_):
         _op = val_accuracy.update_state(_y, _p, sample_weight=_w)
         with tf.control_dependencies([_op]):
             _op = val_loss.update_state(_loss)
-        _rate = tf.reduce_mean(_out[0][0])
-        with tf.control_dependencies([_op]):
+            _rate = tf.reduce_mean(_out[0][0])
             _op = val_firing_rate.update_state(_rate)
-        with tf.control_dependencies([_op]):
             _op = val_rate_loss.update_state(_aux['rate_loss'])
-        with tf.control_dependencies([_op]):
             _op = val_voltage_loss.update_state(_aux['voltage_loss'])
+            _op = val_osi_loss.update_state(_aux['osi_loss'])
+            
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
 
         if output_spikes:
@@ -494,8 +483,8 @@ def main(_):
     stop = False
     # Initialize your callbacks
     metric_keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
-            'train_voltage_loss', 'val_accuracy', 'val_loss',
-            'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
+            'train_voltage_loss', 'train_osi_loss', 'val_accuracy', 'val_loss',
+            'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_osi_loss']
     delays = [int(a) for a in flags.delays.split(',') if a != '']
     callbacks = Callbacks(model, optimizer, distributed_roll_out, network, flags, logdir, strategy, 
                         metric_keys, pre_delay=delays[0], post_delay=delays[1])
@@ -523,7 +512,7 @@ def main(_):
                 distributed_train_step(x, y, w)
                 
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
-                                                         train_rate_loss, train_voltage_loss]]
+                                                         train_rate_loss, train_voltage_loss, train_osi_loss]]
 
             callbacks.on_step_end(train_values, y, verbose=False)
 
@@ -539,7 +528,7 @@ def main(_):
             z = distributed_validation_step(x, y, w, output_spikes=True) 
 
         val_values = [a.result().numpy() for a in [val_accuracy, val_loss, val_firing_rate, 
-                                                   val_rate_loss, val_voltage_loss]]
+                                                   val_rate_loss, val_voltage_loss, val_osi_loss]]
         metric_values = train_values + val_values
 
         # if the model train loss is minimal, save the model.
@@ -585,6 +574,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('learning_rate', .01, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
     absl.app.flags.DEFINE_float('voltage_cost', .00001, '')
+    absl.app.flags.DEFINE_float('osi_cost', 1., '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float('gauss_std', .28, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
@@ -622,6 +612,7 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean('use_dale_law', True, '')
     absl.app.flags.DEFINE_boolean('caching', True, '') # if one wants to use caching, remember to update the caching function
     absl.app.flags.DEFINE_boolean('core_only', False, '')
+    absl.app.flags.DEFINE_boolean('core_loss', True, '')
     # absl.app.flags.DEFINE_boolean('train_input', True, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', False, '')
