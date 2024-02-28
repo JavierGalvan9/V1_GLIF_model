@@ -14,7 +14,7 @@ class StiffRegularizer(tf.keras.regularizers.Regularizer):
         
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     sorted_firing_rates = np.sort(firing_rates)
-    percentiles = (np.arange(firing_rates.shape[-1]) + 1).astype(np.float32) / firing_rates.shape[-1]
+    percentiles = (np.arange(firing_rates.shape[-1])).astype(np.float32) / (firing_rates.shape[-1] - 1)
     rate_rd = np.random.RandomState(seed=rnd_seed)
     x_rand = rate_rd.uniform(size=n_neurons)
     target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
@@ -42,14 +42,16 @@ def compute_spike_rate_target_loss(_spikes, target_rates, core_mask=None, dtype=
         core_neurons_ids = np.where(core_mask)[0]
 
     for i, (key, value) in enumerate(target_rates.items()):
-        if core_mask is not None:
-            key_core_mask = np.isin(value["neuron_ids"], core_neurons_ids)
-            neuron_ids =  np.where(key_core_mask)[0]
-            _rate_type = tf.gather(rates, neuron_ids)
-            target_rate = value["sorted_target_rates"][key_core_mask]
-        else:
-            _rate_type = tf.gather(rates, value["neuron_ids"])
-            target_rate = value["sorted_target_rates"]
+        _rate_type = tf.gather(rates, value["neuron_ids"])
+        target_rate = value["sorted_target_rates"]
+        # if core_mask is not None:
+        #     key_core_mask = np.isin(value["neuron_ids"], core_neurons_ids)
+        #     neuron_ids =  np.where(key_core_mask)[0]
+        #     _rate_type = tf.gather(rates, neuron_ids)
+        #     target_rate = value["sorted_target_rates"][key_core_mask]
+        # else:
+        #     _rate_type = tf.gather(rates, value["neuron_ids"])
+        #     target_rate = value["sorted_target_rates"]
 
         loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
         losses.append(tf.reduce_mean(loss_type))
@@ -57,10 +59,12 @@ def compute_spike_rate_target_loss(_spikes, target_rates, core_mask=None, dtype=
     return tf.reduce_sum(losses, axis=0)
 
 def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
-    ind = tf.range(target_rate.shape[0])
-    rand_ind = tf.random.shuffle(ind)
-    _rate = tf.gather(_rates, rand_ind)
-    sorted_rate = tf.sort(_rate)
+    tf.print(f"target_rate: {target_rate}")
+    # ind = tf.range(target_rate.shape[0])
+    # rand_ind = tf.random.shuffle(ind)
+    # _rate = tf.gather(_rates, rand_ind)
+    # sorted_rate = tf.sort(_rate)
+    sorted_rate = tf.sort(_rates)
     u = target_rate - sorted_rate
     # tau = (tf.range(target_rate.shape[0]), dtype) + 1) / target_rate.shape[0]
     tau = (tf.range(target_rate.shape[0]) + 1) / target_rate.shape[0]
