@@ -59,7 +59,7 @@ def compute_spike_rate_target_loss(_spikes, target_rates, core_mask=None, dtype=
     return tf.reduce_sum(losses, axis=0)
 
 def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
-    tf.print(f"target_rate: {target_rate}")
+    # tf.print(f"target_rate: {target_rate}")
     # ind = tf.range(target_rate.shape[0])
     # rand_ind = tf.random.shuffle(ind)
     # _rate = tf.gather(_rates, rand_ind)
@@ -118,12 +118,18 @@ class VoltageRegularization:
         self._dtype = dtype
         self._core_mask = core_mask
 
+        if core_mask is None:
+            self.voltage_offset = self._cell.voltage_offset
+            self.voltage_scale = self._cell.voltage_scale
+        else:
+            self.voltage_offset = tf.boolean_mask(self._cell.voltage_offset, core_mask)
+            self.voltage_scale = tf.boolean_mask(self._cell.voltage_scale, core_mask)
+
     def __call__(self, voltages):
         if self._core_mask is not None:
             voltages = tf.boolean_mask(voltages, self._core_mask, axis=2)
             
-        voltage_32 = (voltages - self._cell.voltage_offset) / self._cell.voltage_scale
-        voltage_32 = tf.cast(voltage_32, self._dtype)
+        voltage_32 = (voltages - self.voltage_offset) / self.voltage_scale
         v_pos = tf.square(tf.nn.relu(voltage_32 - 1.0))
         v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.0))
         voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * self._voltage_cost
@@ -154,7 +160,7 @@ class OrientationSelectivityLoss:
         delta_angle = tf.expand_dims(stim_angle, axis=1) - tuning_angle
         delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
         delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
-        # # do it twice to make sure
+        # # do it twice to make sure everything is between -90 and 90.
         delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
         delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
 
@@ -174,10 +180,11 @@ class OrientationSelectivityLoss:
 
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
         # sum spikes in _z, and multiply with delta_angle.
-        sum_angle = tf.reduce_mean(spikes, axis=[1]) * delta_angle
-        # make a huber loss for this.
-        # angle_loss = tf.keras.losses.Huber(delta=1, reduction=tf.keras.losses.Reduction.SUM)(sum_angle, tf.zeros_like(sum_angle))
-        angle_loss = tf.reduce_mean(tf.abs(sum_angle))
-        # it might be nice to add regularization of weights
-        # rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+        mean_spikes = tf.reduce_mean(spikes, axis=[1])
+        mean_angle = mean_spikes * delta_angle
+        # Here, the expected value with random firing to subtract
+        # (this prevents the osi loss to drive the firing rates to go to zero.)
+        expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
+        
+        angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle
         return angle_loss * self._osi_cost

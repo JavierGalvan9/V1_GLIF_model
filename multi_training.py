@@ -178,25 +178,31 @@ def main(_):
             target_firing_rates = pkl.load(f) # they are in Hz and divided by 1000 to make it in kHz and match the dt = 1 ms
 
         tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)
-        for i, (key, value) in enumerate(target_firing_rates.items()):
-            # identify tne ids that are included in value["ids"]
-            neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
-            neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
-            target_firing_rates[key]['neuron_ids'] = neuron_ids
-            type_n_neurons = len(neuron_ids)
-            sorted_target_rates = losses.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
-            target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
-
         
         ### BUILD THE LOSS FUNCTIONS ###
         # Create rate and voltage regularizers
         delays = [int(a) for a in flags.delays.split(',') if a != '']
         if flags.core_loss:
             core_radius = 200
-            core_mask = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
-            core_mask = tf.constant(core_mask, dtype=tf.bool)
+            core_mask_np = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
+            core_mask = tf.constant(core_mask_np, dtype=tf.bool)
         else:
+            core_mask_np = None
             core_mask = None
+
+        # Sort the target firing rates for each neuron type
+        for i, (key, value) in enumerate(target_firing_rates.items()):
+            # identify tne ids that are included in value["ids"]
+            neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
+            if core_mask_np is not None:
+                # if core_mask is not None, use only neurons in the core
+                neuron_ids = neuron_ids[core_mask_np[neuron_ids]]
+
+            neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
+            target_firing_rates[key]['neuron_ids'] = neuron_ids
+            type_n_neurons = len(neuron_ids)
+            sorted_target_rates = losses.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
+            target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
 
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype, core_mask=core_mask)
         voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
@@ -317,17 +323,17 @@ def main(_):
 
         grad = tape.gradient(_loss, model.trainable_variables)
         for g, v in zip(grad, model.trainable_variables):
-            tf.print(f'{v.name} optimization')
-            tf.print('First Var / grad: ', v[0].dtype, g[0].dtype)
+            # tf.print(f'{v.name} optimization')
+            # tf.print('First Var / grad: ', v[0].dtype, g[0].dtype)
             # tf.print('First Var / grad: ', v[0], g[0])
-            tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
-            tf.print(g)
-            tf.print(v)
+            # tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
+            # tf.print(g)
+            # tf.print(v)
             with tf.control_dependencies([_op]):
                 _op = optimizer.apply_gradients([(g, v)])
 
             # print the number of nan values in the gradients and the variables.
-            tf.print(v)
+            # tf.print(v)
             # tf.print(f'Number of nan in gradients: {tf.reduce_sum(tf.cast(tf.math.is_nan(g), tf.float32))}')
             # tf.print(f'Number of nan in variables: {tf.reduce_sum(tf.cast(tf.math.is_nan(v), tf.float32))}')
 
@@ -466,7 +472,8 @@ def main(_):
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss, train_osi_loss]]
 
-            callbacks.on_step_end(train_values, y, verbose=False)
+            # callbacks.on_step_end(train_values, y, verbose=False)
+            callbacks.on_step_end(train_values, y, verbose=True)
 
         # tf.profiler.experimental.stop() 
 
