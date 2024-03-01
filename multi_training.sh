@@ -13,4 +13,4 @@
 
 
 # run -g 1 -m 24 -t 0:30 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 1 --neurons 40000 --seq_len 600 --n_epochs 3"
-run -c 1 -m 24 -t 3:15 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 1 --neurons 1000 --seq_len 600 --n_epochs 10 --steps_per_epoch 1"
+run -g 1 -m 24 -t 0:15 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 1 --neurons 50000 --seq_len 600 --n_epochs 120 --steps_per_epoch 20"

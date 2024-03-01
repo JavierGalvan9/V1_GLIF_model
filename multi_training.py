@@ -231,7 +231,6 @@ def main(_):
         prediction_layer = model.get_layer('prediction')
         extractor_model = tf.keras.Model(inputs=model.inputs,
                                          outputs=[rsnn_layer.output, model.output, prediction_layer.output])
-        # extractor_model = tf.keras.Model(inputs=model.inputs, outputs=[rsnn_layer.output])
 
         # Loss from Guozhang classification task (unused in our case)
         # loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
@@ -317,25 +316,13 @@ def main(_):
             _op = train_voltage_loss.update_state(_aux['voltage_loss'])
             _op = train_osi_loss.update_state(_aux['osi_loss'])
         
-            
-        # with tf.control_dependencies([_op]):
-        #     _op = train_voltage_loss.update_state(_aux['voltage_loss'])
-
         grad = tape.gradient(_loss, model.trainable_variables)
         for g, v in zip(grad, model.trainable_variables):
-            # tf.print(f'{v.name} optimization')
-            # tf.print('First Var / grad: ', v[0].dtype, g[0].dtype)
+            tf.print(f'{v.name} optimization')
             # tf.print('First Var / grad: ', v[0], g[0])
-            # tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
-            # tf.print(g)
-            # tf.print(v)
+            tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
             with tf.control_dependencies([_op]):
                 _op = optimizer.apply_gradients([(g, v)])
-
-            # print the number of nan values in the gradients and the variables.
-            # tf.print(v)
-            # tf.print(f'Number of nan in gradients: {tf.reduce_sum(tf.cast(tf.math.is_nan(g), tf.float32))}')
-            # tf.print(f'Number of nan in variables: {tf.reduce_sum(tf.cast(tf.math.is_nan(v), tf.float32))}')
 
 
     @tf.function
@@ -360,7 +347,6 @@ def main(_):
             _op = val_osi_loss.update_state(_aux['osi_loss'])
             
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
-
         if output_spikes:
             return _out[0][0]
 
@@ -472,7 +458,6 @@ def main(_):
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss, train_osi_loss]]
 
-            # callbacks.on_step_end(train_values, y, verbose=False)
             callbacks.on_step_end(train_values, y, verbose=True)
 
         # tf.profiler.experimental.stop() 
