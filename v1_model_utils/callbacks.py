@@ -26,7 +26,7 @@ def compose_str(metrics_values):
         _s = f'Loss {_loss:.4f}, '
         _s += f'RLoss {_rate_loss:.4f}, '
         _s += f'VLoss {_voltage_loss:.4f}, '
-        _s += f'VLoss {_osi_loss:.4f}, '
+        _s += f'OLoss {_osi_loss:.4f}, '
         _s += f'Accuracy {_acc:.4f}, '
         _s += f'Rate {_rate:.4f}'
         return _s

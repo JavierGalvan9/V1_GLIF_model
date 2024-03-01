@@ -178,44 +178,31 @@ def main(_):
             target_firing_rates = pkl.load(f) # they are in Hz and divided by 1000 to make it in kHz and match the dt = 1 ms
 
         tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)
-        cell_type_ids = np.zeros(flags.neurons, dtype=np.int32)
-        for i, (key, value) in enumerate(target_firing_rates.items()):
-            # identify tne ids that are included in value["ids"]
-            neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
-            neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
-            target_firing_rates[key]['neuron_ids'] = neuron_ids
-            type_n_neurons = len(neuron_ids)
-            sorted_target_rates = losses.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
-            target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
-            cell_type_ids[neuron_ids] = i
-
-        # make a new array for neurons that contains neuron type ids.
-        pre_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 0]]
-        post_cell_type_ids = cell_type_ids[network["synapses"]["indices"][:, 1] % flags.neurons]
-        # division by neurons is needed to cancel the delay embedding.
-        
-        # assign connection type id to each unique pair of the sending and recieving ids.
-        connection_ids = np.zeros(network["synapses"]["indices"].shape[0], dtype=np.int32)
-        connection_ids = pre_cell_type_ids * 1000 + post_cell_type_ids
-        
-        # for each connection type, make a list of synapse indices.
-        connection_type_ids = np.unique(connection_ids)
-        connection_type_ids = connection_type_ids[connection_type_ids != 0]
-        connection_type_ids = np.sort(connection_type_ids)
-        connection_type_ids = connection_type_ids.tolist()
-        same_connection_type_indices = []
-        for i in connection_type_ids:
-            same_connection_type_indices.append(np.where(connection_ids == i)[0])
         
         ### BUILD THE LOSS FUNCTIONS ###
         # Create rate and voltage regularizers
         delays = [int(a) for a in flags.delays.split(',') if a != '']
         if flags.core_loss:
             core_radius = 200
-            core_mask = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
-            core_mask = tf.constant(core_mask, dtype=tf.bool)
+            core_mask_np = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
+            core_mask = tf.constant(core_mask_np, dtype=tf.bool)
         else:
+            core_mask_np = None
             core_mask = None
+
+        # Sort the target firing rates for each neuron type
+        for i, (key, value) in enumerate(target_firing_rates.items()):
+            # identify tne ids that are included in value["ids"]
+            neuron_ids = np.where(np.isin(network["node_type_ids"], value["ids"]))[0]
+            if core_mask_np is not None:
+                # if core_mask is not None, use only neurons in the core
+                neuron_ids = neuron_ids[core_mask_np[neuron_ids]]
+
+            neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
+            target_firing_rates[key]['neuron_ids'] = neuron_ids
+            type_n_neurons = len(neuron_ids)
+            sorted_target_rates = losses.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
+            target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
 
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype, core_mask=core_mask)
         voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
@@ -314,25 +301,8 @@ def main(_):
         else:
             return _out, _p, _loss, _aux
 
-    
-    def calculate_grad_average(g, v, grad_average_ind):
-        print('Calculating gradient average...')
-        newg = tf.zeros_like(g)
-        for inds in grad_average_ind:
-            v_gathered = tf.gather(v, inds)
-            g_gathered = tf.gather(g, inds)
-            # Avoid division by zero and replace NaNs
-            safe_divisor = tf.where(v_gathered != 0, v_gathered, tf.ones_like(v_gathered))
-            mean_frac_change = tf.reduce_mean(g_gathered / safe_divisor)
-            # mean_frac_change = tf.reduce_mean(tf.gather(g, inds) / tf.gather(v, inds))
-            mean_frac_change = tf.where(tf.math.is_nan(mean_frac_change), tf.zeros_like(mean_frac_change), mean_frac_change)
-            mean_rel_change = tf.gather(v, inds) * mean_frac_change
-            # newg[inds].assign(mean_rel_change)
-            newg = tf.tensor_scatter_nd_update(newg, tf.expand_dims(inds, axis=1), mean_rel_change)
-        
-        return newg
 
-    def train_step(_x, _y, _w, grad_average_ind=None):
+    def train_step(_x, _y, _w):
         ### Forward propagation of the model
         with tf.GradientTape() as tape:
             _out, _p, _loss, _aux = roll_out(_x, _y, _w)
@@ -353,33 +323,24 @@ def main(_):
 
         grad = tape.gradient(_loss, model.trainable_variables)
         for g, v in zip(grad, model.trainable_variables):
-            tf.print(f'{v.name} optimization')
-            tf.print('First Var / grad: ', v[0].dtype, g[0].dtype)
+            # tf.print(f'{v.name} optimization')
+            # tf.print('First Var / grad: ', v[0].dtype, g[0].dtype)
             # tf.print('First Var / grad: ', v[0], g[0])
-            tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
-            tf.print(g)
-            tf.print(v)
+            # tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
+            # tf.print(g)
+            # tf.print(v)
             with tf.control_dependencies([_op]):
-                # if the trainable variable is recurrent connection, average the gradient
-                # for each cell type pair.
-                if grad_average_ind is not None:
-                    if v.name == "sparse_recurrent_weights:0":
-                        newg = calculate_grad_average(g, v, grad_average_ind)
-                        _op = optimizer.apply_gradients([(newg, v)])
-                    else:
-                        _op = optimizer.apply_gradients([(g, v)])
-                else:
-                    _op = optimizer.apply_gradients([(g, v)])
+                _op = optimizer.apply_gradients([(g, v)])
 
             # print the number of nan values in the gradients and the variables.
-            tf.print(v)
+            # tf.print(v)
             # tf.print(f'Number of nan in gradients: {tf.reduce_sum(tf.cast(tf.math.is_nan(g), tf.float32))}')
             # tf.print(f'Number of nan in variables: {tf.reduce_sum(tf.cast(tf.math.is_nan(v), tf.float32))}')
 
 
     @tf.function
-    def distributed_train_step(x, y, weights, grad_average_ind=None):
-        strategy.run(train_step, args=(x, y, weights, grad_average_ind))
+    def distributed_train_step(x, y, weights):
+        strategy.run(train_step, args=(x, y, weights))
 
     # @tf.function
     # def distributed_train_step(dist_inputs):
@@ -506,15 +467,13 @@ def main(_):
             x, y, _, w = next(it) # x dtype tf.bool
     
             # with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
-            if flags.average_grad_for_cell_type:
-                distributed_train_step(x, y, w, grad_average_ind=same_connection_type_indices)
-            else:
-                distributed_train_step(x, y, w)
+            distributed_train_step(x, y, w)
                 
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss, train_osi_loss]]
 
-            callbacks.on_step_end(train_values, y, verbose=False)
+            # callbacks.on_step_end(train_values, y, verbose=False)
+            callbacks.on_step_end(train_values, y, verbose=True)
 
         # tf.profiler.experimental.stop() 
 
@@ -631,7 +590,6 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_boolean("hard_reset", False, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
-    absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", False, "")
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
 
     absl.app.run(main)
