@@ -347,6 +347,14 @@ class SparseSignedConstraint(tf.keras.constraints.Constraint):
         return tf.where(self._mask, sign_corrected_w, tf.zeros_like(sign_corrected_w))
 
 
+class ClipConstraint(tf.keras.constraints.Constraint):
+    def __init__(self, lower_limit, upper_limit):
+        self._lower_limit = lower_limit
+        self._upper_limit = upper_limit
+
+    def __call__(self, w):
+        return tf.clip_by_value(w, self._lower_limit, self._upper_limit)
+
 class V1Column(tf.keras.layers.Layer):
     def __init__(
         self,
@@ -520,6 +528,7 @@ class V1Column(tf.keras.layers.Layer):
             self.recurrent_per_type_weight_values = tf.Variable(
                 tf.ones(max_id),
                 name="recurrent_per_type_weights",
+                constraint=ClipConstraint(0.5, 2.0),
                 trainable=True,
                 dtype=self._compute_dtype
             ) # shape = (n_connection_types (21 * 21))
