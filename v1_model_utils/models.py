@@ -655,15 +655,18 @@ class V1Column(tf.keras.layers.Layer):
         all_inds = tf.reshape(all_inds, [-1])  # flatten the tensor
         # remove unecessary -1's
         all_inds = tf.boolean_mask(all_inds, all_inds != -1)
-        # sort to make it compatible with sparse tensor creation
-        inds = tf.sort(all_inds)
-        remaining_pre = tf.gather(pre_inds, inds)
-        _, idx = tf.unique(remaining_pre, out_idx=tf.int64)
-        new_pre = tf.gather(idx, tf.range(tf.size(inds)))
-        new_post = tf.gather(post_inds, inds)
-        new_indices = tf.stack((new_post, new_pre), axis=1)
+        if tf.size(all_inds) == 0:
+            return tf.zeros((0, 2), dtype=tf.int64), tf.zeros((0,), dtype=tf.int64)
+        else:
+            # sort to make it compatible with sparse tensor creation
+            inds = tf.sort(all_inds)
+            remaining_pre = tf.gather(pre_inds, inds)
+            _, idx = tf.unique(remaining_pre, out_idx=tf.int64)
+            new_pre = tf.gather(idx, tf.range(tf.size(inds)))
+            new_post = tf.gather(post_inds, inds)
+            new_indices = tf.stack((new_post, new_pre), axis=1)
 
-        return new_indices, inds
+            return new_indices, inds
 
     def calculate_i_rec(self, rec_z_buf):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
@@ -676,7 +679,7 @@ class V1Column(tf.keras.layers.Layer):
         
         # find the non-zero rows of rec_z_buf
         non_zero_cols = tf.where(rec_z_buf)[:, 1]
-        nnz = tf.cast(tf.shape(non_zero_cols)[0], dtype=tf.int32)  # number of non zero
+        nnz = tf.cast(tf.size(non_zero_cols), dtype=tf.int32)  # number of non zero
         if nnz == 0: # nothing is firing
             i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)
         else:
@@ -687,7 +690,7 @@ class V1Column(tf.keras.layers.Layer):
             # in the non_zero_cols, and changes the indices accordingly.
             new_indices, inds = self.get_new_inds_table(non_zero_cols)
 
-            if tf.shape(inds)[0] == 0:  # if firing cells do not have any outputs
+            if tf.size(inds) == 0:  # if firing cells do not have any outputs
                 i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)
             else:
                 i_rec = tf.TensorArray(dtype=self._compute_dtype, size=self._n_syn_basis)

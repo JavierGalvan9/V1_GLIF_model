@@ -139,12 +139,13 @@ class Callbacks:
             val_loss_index = self.metrics_keys.index('train_loss')
             val_loss_value = metric_values[val_loss_index]
 
+        self.plot_losses_curves()
+
         if val_loss_value < self.min_val_loss:
             self.min_val_loss = val_loss_value
             self.no_improve_epochs = 0
 
             # self.plot_lgn_activity(x)
-            self.plot_losses_curves()
 
             t0 = time()
             self.plot_raster(z, x, y)

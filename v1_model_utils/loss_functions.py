@@ -36,27 +36,35 @@ def compute_spike_rate_target_loss(_spikes, target_rates, core_mask=None, dtype=
     # target_rates is a dictionary that contains all the cell types.
     # I should iterate on them, and add the cost for each one at the end.
     # spikes will have a shape of (batch_size, n_steps, n_neurons)
-    losses = []
+    # losses = []
+    total_loss = tf.constant(0.0, dtype=dtype)
     rates = tf.reduce_mean(_spikes, (0, 1))
     # if core_mask is not None:
     #     core_neurons_ids = np.where(core_mask)[0]
 
     for i, (key, value) in enumerate(target_rates.items()):
-        _rate_type = tf.gather(rates, value["neuron_ids"])
-        target_rate = value["sorted_target_rates"]
-        # if core_mask is not None:
-        #     key_core_mask = np.isin(value["neuron_ids"], core_neurons_ids)
-        #     neuron_ids =  np.where(key_core_mask)[0]
-        #     _rate_type = tf.gather(rates, neuron_ids)
-        #     target_rate = value["sorted_target_rates"][key_core_mask]
-        # else:
-        #     _rate_type = tf.gather(rates, value["neuron_ids"])
-        #     target_rate = value["sorted_target_rates"]
+        if tf.size(value["neuron_ids"]) != 0:
+            _rate_type = tf.gather(rates, value["neuron_ids"])
+            target_rate = value["sorted_target_rates"]
+            # if core_mask is not None:
+            #     key_core_mask = np.isin(value["neuron_ids"], core_neurons_ids)
+            #     neuron_ids =  np.where(key_core_mask)[0]
+            #     _rate_type = tf.gather(rates, neuron_ids)
+            #     target_rate = value["sorted_target_rates"][key_core_mask]
+            # else:
+            #     _rate_type = tf.gather(rates, value["neuron_ids"])
+            #     target_rate = value["sorted_target_rates"]
 
-        loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
-        losses.append(tf.reduce_mean(loss_type))
+            loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
+            mean_loss_type = tf.reduce_mean(loss_type)
+        else:
+            mean_loss_type = tf.constant(0, dtype=dtype)
 
-    return tf.reduce_sum(losses, axis=0)
+        # losses.append(mean_loss_type)
+        total_loss += mean_loss_type
+        
+    # total_loss = tf.reduce_sum(losses, axis=0)
+    return total_loss
 
 def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
     # tf.print(f"target_rate: {target_rate}")
@@ -195,7 +203,7 @@ class OrientationSelectivityLoss:
         
         # Calculate OSI approximation
         osi_approx = tf.abs(approximated_numerator / tf.cast(approximated_denominator, tf.complex64))
-        tf.print(osi_approx)
+
         return tf.square(osi_approx - 1) * self._osi_cost
 
 
