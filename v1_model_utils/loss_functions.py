@@ -36,27 +36,35 @@ def compute_spike_rate_target_loss(_spikes, target_rates, core_mask=None, dtype=
     # target_rates is a dictionary that contains all the cell types.
     # I should iterate on them, and add the cost for each one at the end.
     # spikes will have a shape of (batch_size, n_steps, n_neurons)
-    losses = []
+    # losses = []
+    total_loss = tf.constant(0.0, dtype=dtype)
     rates = tf.reduce_mean(_spikes, (0, 1))
-    if core_mask is not None:
-        core_neurons_ids = np.where(core_mask)[0]
+    # if core_mask is not None:
+    #     core_neurons_ids = np.where(core_mask)[0]
 
     for i, (key, value) in enumerate(target_rates.items()):
-        _rate_type = tf.gather(rates, value["neuron_ids"])
-        target_rate = value["sorted_target_rates"]
-        # if core_mask is not None:
-        #     key_core_mask = np.isin(value["neuron_ids"], core_neurons_ids)
-        #     neuron_ids =  np.where(key_core_mask)[0]
-        #     _rate_type = tf.gather(rates, neuron_ids)
-        #     target_rate = value["sorted_target_rates"][key_core_mask]
-        # else:
-        #     _rate_type = tf.gather(rates, value["neuron_ids"])
-        #     target_rate = value["sorted_target_rates"]
+        if tf.size(value["neuron_ids"]) != 0:
+            _rate_type = tf.gather(rates, value["neuron_ids"])
+            target_rate = value["sorted_target_rates"]
+            # if core_mask is not None:
+            #     key_core_mask = np.isin(value["neuron_ids"], core_neurons_ids)
+            #     neuron_ids =  np.where(key_core_mask)[0]
+            #     _rate_type = tf.gather(rates, neuron_ids)
+            #     target_rate = value["sorted_target_rates"][key_core_mask]
+            # else:
+            #     _rate_type = tf.gather(rates, value["neuron_ids"])
+            #     target_rate = value["sorted_target_rates"]
 
-        loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
-        losses.append(tf.reduce_mean(loss_type))
+            loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
+            mean_loss_type = tf.reduce_mean(loss_type)
+        else:
+            mean_loss_type = tf.constant(0, dtype=dtype)
 
-    return tf.reduce_sum(losses, axis=0)
+        # losses.append(mean_loss_type)
+        total_loss += mean_loss_type
+        
+    # total_loss = tf.reduce_sum(losses, axis=0)
+    return total_loss
 
 def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
     # tf.print(f"target_rate: {target_rate}")
@@ -147,28 +155,29 @@ class OrientationSelectivityLoss:
         if self._core_mask is not None:
             self._tuning_angles = tf.boolean_mask(self._tuning_angles, self._core_mask)
 
-    def calculate_delta_angle(self, stim_angle, tuning_angle):
-        # angle unit is degrees.
-        # this function calculates the difference between stim_angle and tuning_angle,
-        # but it is fine to have the opposite direction.
-        # so, delta angle is always between -90 and 90.
-        # they are both vector, so dimension matche is needed.
-        # stim_angle is a length of batch size
-        # tuning_angle is a length of n_neurons
+    # def calculate_delta_angle(self, stim_angle, tuning_angle):
+    #     # angle unit is degrees.
+    #     # this function calculates the difference between stim_angle and tuning_angle,
+    #     # but it is fine to have the opposite direction.
+    #     # so, delta angle is always between -90 and 90.
+    #     # they are both vector, so dimension matche is needed.
+    #     # stim_angle is a length of batch size
+    #     # tuning_angle is a length of n_neurons
 
-        # delta_angle = stim_angle - tuning_angle
-        delta_angle = tf.expand_dims(stim_angle, axis=1) - tuning_angle
-        delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
-        delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
-        # # do it twice to make sure everything is between -90 and 90.
-        delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
-        delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
+    #     # delta_angle = stim_angle - tuning_angle
+    #     delta_angle = tf.expand_dims(stim_angle, axis=1) - tuning_angle
+    #     delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
+    #     delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
+    #     # # do it twice to make sure everything is between -90 and 90.
+    #     delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
+    #     delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
 
-        return delta_angle
-
+    #     return delta_angle
+    
     def __call__(self, spikes, angle):
-        # I need to access the tuning angle. of all the neurons.
-        angle = tf.cast(angle, self._dtype)
+        angle = tf.cast(angle, self._dtype) 
+        delta_angle = tf.expand_dims(angle, axis=1) -  self._tuning_angles
+        delta_angle = delta_angle * (np.pi / 180)
 
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
@@ -178,13 +187,45 @@ class OrientationSelectivityLoss:
         if self._post_delay is not None and self._post_delay != 0:
             spikes = spikes[:, :-self._post_delay, :]
 
-        delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
         # sum spikes in _z, and multiply with delta_angle.
-        mean_spikes = tf.reduce_mean(spikes, axis=[1])
-        mean_angle = mean_spikes * delta_angle
-        # Here, the expected value with random firing to subtract
-        # (this prevents the osi loss to drive the firing rates to go to zero.)
-        expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
+        mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
+
+        # Convert mean_spikes to a complex tensor with zero imaginary part
+        mean_spikes = tf.cast(mean_spikes, tf.complex64)
+
+        # Calculate weighted responses for OSI numerator
+        # Adjust for preferred orientation by incorporating e^(2i(theta - theta_pref))
+        weighted_responses_numerator = mean_spikes * tf.exp(tf.complex(0.0, 2.0 * delta_angle))
+        approximated_numerator = tf.reduce_sum(weighted_responses_numerator)
         
-        angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle
-        return angle_loss * self._osi_cost
+        # Calculate denominator as the sum of mean_spikes
+        approximated_denominator = tf.reduce_sum(mean_spikes)
+        
+        # Calculate OSI approximation
+        osi_approx = tf.abs(approximated_numerator / tf.cast(approximated_denominator, tf.complex64))
+
+        return tf.square(osi_approx - 1) * self._osi_cost
+
+
+    # def __call__(self, spikes, angle):
+    #     # I need to access the tuning angle. of all the neurons.
+    #     angle = tf.cast(angle, self._dtype)
+
+    #     if self._core_mask is not None:
+    #         spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
+            
+    #     if self._pre_delay is not None:
+    #         spikes = spikes[:, self._pre_delay:, :]
+    #     if self._post_delay is not None and self._post_delay != 0:
+    #         spikes = spikes[:, :-self._post_delay, :]
+
+    #     delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
+    #     # sum spikes in _z, and multiply with delta_angle.
+    #     mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
+    #     mean_angle = mean_spikes * delta_angle
+    #     # Here, the expected value with random firing to subtract
+    #     # (this prevents the osi loss to drive the firing rates to go to zero.)
+    #     expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
+        
+    #     angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle
+    #     return tf.abs(angle_loss) * self._osi_cost
