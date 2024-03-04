@@ -522,7 +522,7 @@ class V1Column(tf.keras.layers.Layer):
         if per_type_training:
             self.per_type_training = True
             self.connection_type_ids = other_v1_utils.connection_type_ids(network)
-            max_id = np.max(self.connection_type_ids)
+            max_id = np.max(self.connection_type_ids) + 1
 
             # prepare a variable and gather with type ids.
             self.recurrent_per_type_weight_values = tf.Variable(
