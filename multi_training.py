@@ -218,7 +218,9 @@ def main(_):
                                                          
         OSI_Loss = losses.OrientationSelectivityLoss(tuning_angles, osi_cost=flags.osi_cost, 
                                                     pre_delay=delays[0], post_delay=delays[1], 
-                                                    dtype=dtype, core_mask=core_mask)
+                                                    dtype=dtype, core_mask=core_mask,
+                                                    method=flags.osi_loss_method,
+                                                    subtraction_ratio=flags.osi_loss_subtraction_ratio)
         osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,))) # this is just a placeholder
 
         model.add_loss(rate_loss)
@@ -530,6 +532,8 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
     absl.app.flags.DEFINE_float('voltage_cost', .00001, '')
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
+    absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
+    absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float('gauss_std', .28, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
