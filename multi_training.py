@@ -218,7 +218,9 @@ def main(_):
                                                          
         OSI_Loss = losses.OrientationSelectivityLoss(tuning_angles, osi_cost=flags.osi_cost, 
                                                     pre_delay=delays[0], post_delay=delays[1], 
-                                                    dtype=dtype, core_mask=core_mask)
+                                                    dtype=dtype, core_mask=core_mask,
+                                                    method=flags.osi_loss_method,
+                                                    subtraction_ratio=flags.osi_loss_subtraction_ratio)
         osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,))) # this is just a placeholder
 
         model.add_loss(rate_loss)
@@ -240,7 +242,13 @@ def main(_):
         #     rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         #     return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
         
-        optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
+        if flags.optimizer == 'adam':
+            optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
+        elif flags.optimizer == 'sgd':
+            optimizer = tf.keras.optimizers.SGD(flags.learning_rate, momentum=0.0, nesterov=False)
+        else:
+            print(f"Invalid optimizer: {flags.optimizer}")
+            raise ValueError
 
         zero_state = rsnn_layer.cell.zero_state(flags.batch_size, dtype=dtype)
         state_variables = tf.nest.map_structure(lambda a: tf.Variable(
@@ -448,7 +456,11 @@ def main(_):
         # tf.profiler.experimental.start(logdir=logdir)
         for step in range(flags.steps_per_epoch):
             callbacks.on_step_start()
-            distributed_reset_state('gray', gray_state=gray_state)
+            # try resetting every iteration
+            if flags.reset_every_step:
+                distributed_reset_state('gray')
+            else:
+                distributed_reset_state('gray', gray_state=gray_state)
 
             x, y, _, w = next(it) # x dtype tf.bool
     
@@ -515,10 +527,13 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_string('neuron_model', 'GLIF3', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')
 
+    absl.app.flags.DEFINE_string('optimizer', 'adam', '')
     absl.app.flags.DEFINE_float('learning_rate', .01, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
     absl.app.flags.DEFINE_float('voltage_cost', .00001, '')
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
+    absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
+    absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float('gauss_std', .28, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
@@ -576,6 +591,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("hard_reset", False, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
+    absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
 
     absl.app.run(main)
 

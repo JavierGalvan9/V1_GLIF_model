@@ -145,36 +145,45 @@ class VoltageRegularization:
 
 
 class OrientationSelectivityLoss:
-    def __init__(self, tuning_angles, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, core_mask=None):
+    def __init__(self, tuning_angles, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, core_mask=None, method="crowd_osi", subtraction_ratio=1.0):
         self._tuning_angles = tuning_angles
         self._osi_cost = osi_cost
         self._pre_delay = pre_delay
         self._post_delay = post_delay
         self._dtype = dtype
         self._core_mask = core_mask
+        self._method = method
+        self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
         if self._core_mask is not None:
             self._tuning_angles = tf.boolean_mask(self._tuning_angles, self._core_mask)
 
-    # def calculate_delta_angle(self, stim_angle, tuning_angle):
-    #     # angle unit is degrees.
-    #     # this function calculates the difference between stim_angle and tuning_angle,
-    #     # but it is fine to have the opposite direction.
-    #     # so, delta angle is always between -90 and 90.
-    #     # they are both vector, so dimension matche is needed.
-    #     # stim_angle is a length of batch size
-    #     # tuning_angle is a length of n_neurons
+    def calculate_delta_angle(self, stim_angle, tuning_angle):
+        # angle unit is degrees.
+        # this function calculates the difference between stim_angle and tuning_angle,
+        # but it is fine to have the opposite direction.
+        # so, delta angle is always between -90 and 90.
+        # they are both vector, so dimension matche is needed.
+        # stim_angle is a length of batch size
+        # tuning_angle is a length of n_neurons
 
-    #     # delta_angle = stim_angle - tuning_angle
-    #     delta_angle = tf.expand_dims(stim_angle, axis=1) - tuning_angle
-    #     delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
-    #     delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
-    #     # # do it twice to make sure everything is between -90 and 90.
-    #     delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
-    #     delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
+        # delta_angle = stim_angle - tuning_angle
+        delta_angle = tf.expand_dims(stim_angle, axis=1) - tuning_angle
+        delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
+        delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
+        # # do it twice to make sure everything is between -90 and 90.
+        delta_angle = tf.where(delta_angle > 90, delta_angle - 180, delta_angle)
+        delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
 
-    #     return delta_angle
+        return delta_angle
     
     def __call__(self, spikes, angle):
+        if self._method == "crowd_osi":
+            return self.crowd_osi_loss(spikes, angle)
+        elif self._method == "crowd_spikes":
+            return self.crowd_spikes_loss(spikes, angle)
+        
+    
+    def crowd_osi_loss(self, spikes, angle):
         angle = tf.cast(angle, self._dtype) 
         delta_angle = tf.expand_dims(angle, axis=1) -  self._tuning_angles
         delta_angle = delta_angle * (np.pi / 180)
@@ -207,25 +216,25 @@ class OrientationSelectivityLoss:
         return tf.square(osi_approx - 1) * self._osi_cost
 
 
-    # def __call__(self, spikes, angle):
-    #     # I need to access the tuning angle. of all the neurons.
-    #     angle = tf.cast(angle, self._dtype)
+    def crowd_spikes_loss(self, spikes, angle):
+        # I need to access the tuning angle. of all the neurons.
+        angle = tf.cast(angle, self._dtype)
 
-    #     if self._core_mask is not None:
-    #         spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
+        if self._core_mask is not None:
+            spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
             
-    #     if self._pre_delay is not None:
-    #         spikes = spikes[:, self._pre_delay:, :]
-    #     if self._post_delay is not None and self._post_delay != 0:
-    #         spikes = spikes[:, :-self._post_delay, :]
+        if self._pre_delay is not None:
+            spikes = spikes[:, self._pre_delay:, :]
+        if self._post_delay is not None and self._post_delay != 0:
+            spikes = spikes[:, :-self._post_delay, :]
 
-    #     delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
-    #     # sum spikes in _z, and multiply with delta_angle.
-    #     mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
-    #     mean_angle = mean_spikes * delta_angle
-    #     # Here, the expected value with random firing to subtract
-    #     # (this prevents the osi loss to drive the firing rates to go to zero.)
-    #     expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
+        delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
+        # sum spikes in _z, and multiply with delta_angle.
+        mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
+        mean_angle = mean_spikes * delta_angle
+        # Here, the expected value with random firing to subtract
+        # (this prevents the osi loss to drive the firing rates to go to zero.)
+        expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
         
-    #     angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle
-    #     return tf.abs(angle_loss) * self._osi_cost
+        angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle * self._subtraction_ratio
+        return tf.abs(angle_loss) * self._osi_cost
