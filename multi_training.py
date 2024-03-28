@@ -203,6 +203,12 @@ def main(_):
             type_n_neurons = len(neuron_ids)
             sorted_target_rates = losses.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
             target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
+            
+        # here we need information of the layer mask for the OSI loss
+        if flags.osi_loss_method == 'neuropixels_fr':
+            layer_info = other_v1_utils.get_layer_info(network)
+        else:
+            layer_info = None
 
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype, core_mask=core_mask)
         voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
@@ -220,7 +226,8 @@ def main(_):
                                                     pre_delay=delays[0], post_delay=delays[1], 
                                                     dtype=dtype, core_mask=core_mask,
                                                     method=flags.osi_loss_method,
-                                                    subtraction_ratio=flags.osi_loss_subtraction_ratio)
+                                                    subtraction_ratio=flags.osi_loss_subtraction_ratio,
+                                                    layer_info=layer_info)
         osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,))) # this is just a placeholder
 
         model.add_loss(rate_loss)

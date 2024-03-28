@@ -350,9 +350,15 @@ class LaminarPlot:
             pop_y_positions = np.arange(current_ind, current_ind + _n)
             tuning_angles = network['tuning_angle'][self.core_mask][sel]
             sorted_indices = np.argsort(tuning_angles)
-            pop_y_positions = pop_y_positions[sorted_indices]
+            # Correctly map the sorted y positions to the selected neurons
+            # Convert boolean mask 'sel' to indices
+            sel_indices = np.where(sel)[0]
+            # Assign y positions based on sorted order
+            neuron_id_to_y[sel_indices[sorted_indices]] = pop_y_positions
+
+            # pop_y_positions = pop_y_positions[sorted_indices]
             # order the neurons by type and tuning angle in the y axis
-            neuron_id_to_y[sel] = pop_y_positions
+            # neuron_id_to_y[sel] = pop_y_positions
 
             if int(pop_name[1]) > int(current_pop_name[1]):
                 # register the change of layer

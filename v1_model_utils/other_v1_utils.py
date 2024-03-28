@@ -75,6 +75,17 @@ def pop_name_to_cell_type(pop_name):
     return f"L{layer} {subclass}"    
 
 
+def get_layer_info(network):
+    pop_name = pop_names(network)
+    layer_query = ["e23", "e4", "e5", "e6"]
+    layer_names = ["EXC_L23", "EXC_L4", "EXC_L5", "EXC_L6"]
+    layer_info = {}
+    for i in range(4):
+        layer_info[layer_names[i]] = np.char.startswith(pop_name, layer_query[i])
+    return layer_info
+    
+    
+
 def connection_type_ids(network, core_radius=None, data_dir='GLIF_network', return_names=False):
     # first, get the pop_names
     pop_names_var = pop_names(network, core_radius=core_radius, data_dir=data_dir)
