@@ -141,7 +141,8 @@ class Callbacks:
 
         self.plot_losses_curves()
 
-        if val_loss_value < self.min_val_loss:
+        # if val_loss_value < self.min_val_loss:
+        if True:
             self.min_val_loss = val_loss_value
             self.no_improve_epochs = 0
 
@@ -159,7 +160,7 @@ class Callbacks:
         else:
             self.no_improve_epochs += 1
            
-        if (self.epoch - 1) % 50 == 0:
+        if (self.epoch) % 50 == 0:
             t0 = time()
             self.plot_osi_dsi()
             print('OSI and DSI plot time:', (time()-t0))
@@ -172,7 +173,7 @@ class Callbacks:
         if (0 < self.flags.max_time < (time() - self.epoch_init_time) / 3600):
             print(f'[ Maximum optimization time of {self.flags.max_time:.2f}h reached ]')
             stop = True
-        elif self.no_improve_epochs >= 50:
+        elif self.no_improve_epochs >= 500:
             print("Early stopping: Validation loss has not improved for 50 epochs.")
             stop = True  
         else:
