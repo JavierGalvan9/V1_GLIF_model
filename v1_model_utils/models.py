@@ -528,8 +528,8 @@ class V1Column(tf.keras.layers.Layer):
             self.recurrent_per_type_weight_values = tf.Variable(
                 tf.ones(max_id),
                 name="recurrent_per_type_weights",
-                # constraint=ClipConstraint(0.5, 2.0),
-                constraint=ClipConstraint(0.1, 10.0),
+                constraint=ClipConstraint(0.2, 5.0),
+                # constraint=ClipConstraint(0.1, 10.0),
                 trainable=True,
                 dtype=self._compute_dtype
             ) # shape = (n_connection_types (21 * 21))

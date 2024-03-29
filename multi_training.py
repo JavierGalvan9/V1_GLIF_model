@@ -478,6 +478,7 @@ def main(_):
                                                          train_rate_loss, train_voltage_loss, train_osi_loss]]
 
             callbacks.on_step_end(train_values, y, verbose=True)
+            reset_train_metrics()  # resetting for each step makes more sense
 
         # tf.profiler.experimental.stop() 
 
@@ -501,7 +502,7 @@ def main(_):
             break
         
         # Reset the metrics for the next epoch
-        reset_train_metrics()
+        # reset_train_metrics()
         reset_validation_metrics()
 
     callbacks.on_train_end(metric_values)

@@ -185,6 +185,8 @@ class Callbacks:
     def on_step_start(self):
         self.step += 1
         self.step_init_time = time()
+        # reset the gpu memory stat
+        tf.config.experimental.reset_memory_stats('GPU:0')
 
     def on_step_end(self, train_values, y, verbose=True):
         self.step_running_time.append(time() - self.step_init_time)
