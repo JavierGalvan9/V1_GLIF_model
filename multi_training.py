@@ -289,7 +289,8 @@ def main(_):
 
     def roll_out(_x, _y, _w, trim=True, output_spikes=False):
         _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
-        dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
+        seq_len = tf.shape(_x)[1]
+        dummy_zeros = tf.zeros((flags.batch_size, seq_len, flags.neurons), dtype)
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
 
         _z, _v, _input_current = _out[0]
