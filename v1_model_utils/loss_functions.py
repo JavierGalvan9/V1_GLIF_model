@@ -97,11 +97,12 @@ class SpikeRateDistributionTarget:
         self._core_mask = core_mask
         self._dtype = dtype
 
-    def __call__(self, spikes):
-        if self._pre_delay is not None:
-            spikes = spikes[:, self._pre_delay:, :]
-        if self._post_delay is not None and self._post_delay != 0:
-            spikes = spikes[:, :-self._post_delay, :]
+    def __call__(self, spikes, trim=True):
+        if trim:
+            if self._pre_delay is not None:
+                spikes = spikes[:, self._pre_delay:, :]
+            if self._post_delay is not None and self._post_delay != 0:
+                spikes = spikes[:, :-self._post_delay, :]
         reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, core_mask=self._core_mask, 
                                                 dtype=self._dtype) * self._rate_cost
         return reg_loss
@@ -144,7 +145,7 @@ class VoltageRegularization:
         voltage_32 = (voltages - self.voltage_offset) / self.voltage_scale
         v_pos = tf.square(tf.nn.relu(voltage_32 - 1.0))
         v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.0))
-        voltage_loss = tf.reduce_mean(tf.reduce_sum(v_pos + v_neg, -1)) * self._voltage_cost
+        voltage_loss = tf.reduce_mean(tf.reduce_mean(v_pos + v_neg, -1)) * self._voltage_cost
         return voltage_loss
 
 
@@ -207,16 +208,16 @@ class OrientationSelectivityLoss:
 
         return delta_angle
     
-    def __call__(self, spikes, angle):
+    def __call__(self, spikes, angle, trim):
         if self._method == "crowd_osi":
-            return self.crowd_osi_loss(spikes, angle)
+            return self.crowd_osi_loss(spikes, angle, trim)
         elif self._method == "crowd_spikes":
-            return self.crowd_spikes_loss(spikes, angle)
+            return self.crowd_spikes_loss(spikes, angle, trim)
         elif self._method == "neuropixels_fr":
-            return self.neuropixels_fr_loss(spikes, angle)
+            return self.neuropixels_fr_loss(spikes, angle, trim)
         
         
-    def neuropixels_fr_loss(self, spikes, angle):
+    def neuropixels_fr_loss(self, spikes, angle, trim=True):
         # if the trget fr is not set, construct them
         if not hasattr(self, "_target_frs"):
 
@@ -231,7 +232,7 @@ class OrientationSelectivityLoss:
                 self._target_frs[key] = self.vonmises_model_fr(structure, key)
                 # TODO: convert it to tensor if needed.
         
-        spikes = self.spike_preprocessing(spikes)
+        spikes = self.spike_trimming(spikes, trim)
         # assuming 1 ms bins
         spike_rates = tf.reduce_mean(spikes, axis=[0, 1]) / spikes.shape[1] * 1000
         angle_bins = tf.constant(np.arange(-90, 91, 10), dtype=tf.float32)
@@ -278,7 +279,7 @@ class OrientationSelectivityLoss:
         return final_loss
         
     
-    def crowd_osi_loss(self, spikes, angle):
+    def crowd_osi_loss(self, spikes, angle, trim=True):
         angle = tf.cast(angle, self._dtype) 
         delta_angle = tf.expand_dims(angle, axis=1) -  self._tuning_angles
         delta_angle = delta_angle * (np.pi / 180)
@@ -290,7 +291,7 @@ class OrientationSelectivityLoss:
         #     spikes = spikes[:, self._pre_delay:, :]
         # if self._post_delay is not None and self._post_delay != 0:
         #     spikes = spikes[:, :-self._post_delay, :]
-        spikes = self.spike_preprocessing(spikes)
+        spikes = self.spike_trimming(spikes, trim)
 
         # sum spikes in _z, and multiply with delta_angle.
         mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
@@ -311,16 +312,18 @@ class OrientationSelectivityLoss:
 
         return tf.square(osi_approx - 1) * self._osi_cost
 
-    def spike_preprocessing(self, spikes):
+    def spike_trimming(self, spikes, trim=True):
         # remove pre and post delays
+        if not trim:
+            return spikes
         
         if self._pre_delay is not None:
             spikes = spikes[:, self._pre_delay:, :]
         if self._post_delay is not None and self._post_delay != 0:
             spikes = spikes[:, :-self._post_delay, :]
         return spikes
-
-    def crowd_spikes_loss(self, spikes, angle):
+    
+    def crowd_spikes_loss(self, spikes, angle, trim=True):
         # I need to access the tuning angle. of all the neurons.
         angle = tf.cast(angle, self._dtype)
 
@@ -331,7 +334,7 @@ class OrientationSelectivityLoss:
         #     spikes = spikes[:, self._pre_delay:, :]
         # if self._post_delay is not None and self._post_delay != 0:
         #     spikes = spikes[:, :-self._post_delay, :]
-        spikes = self.spike_preprocessing(spikes)
+        spikes = self.spike_trimming(spikes, trim)
 
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
         # sum spikes in _z, and multiply with delta_angle.

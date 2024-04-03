@@ -228,7 +228,7 @@ def main(_):
                                                     method=flags.osi_loss_method,
                                                     subtraction_ratio=flags.osi_loss_subtraction_ratio,
                                                     layer_info=layer_info)
-        osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,))) # this is just a placeholder
+        osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,)), trim=True) # this is just a placeholder
 
         model.add_loss(rate_loss)
         model.add_loss(voltage_loss)
@@ -287,7 +287,7 @@ def main(_):
 
     # checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
-    def roll_out(_x, _y, _w, output_spikes=False):
+    def roll_out(_x, _y, _w, trim=True, output_spikes=False):
         _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
@@ -297,9 +297,9 @@ def main(_):
         new_state = tuple(_out[1:])
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
 
-        voltage_loss = voltage_regularizer(_v) 
-        rate_loss = rate_distribution_regularizer(_z)
-        osi_loss = OSI_Loss(_z, _y)
+        voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
+        rate_loss = rate_distribution_regularizer(_z, trim)
+        osi_loss = OSI_Loss(_z, _y, trim)
         weights_l2_regularizer = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_loss=osi_loss)
@@ -307,7 +307,7 @@ def main(_):
 
         return _out, _p, _loss, _aux
 
-    @tf.function
+    # @tf.function
     def distributed_roll_out(x, y, w, output_spikes=True):
         _out, _p, _loss, _aux = strategy.run(roll_out, args=(x, y, w))
         if output_spikes:
@@ -316,10 +316,10 @@ def main(_):
             return _out, _p, _loss, _aux
 
 
-    def train_step(_x, _y, _w):
+    def train_step(_x, _y, _w, trim):
         ### Forward propagation of the model
         with tf.GradientTape() as tape:
-            _out, _p, _loss, _aux = roll_out(_x, _y, _w)
+            _out, _p, _loss, _aux = roll_out(_x, _y, _w, trim)
 
         ### Backpropagation of the model
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
@@ -341,8 +341,8 @@ def main(_):
 
 
     @tf.function
-    def distributed_train_step(x, y, weights):
-        strategy.run(train_step, args=(x, y, weights))
+    def distributed_train_step(x, y, weights, trim):
+        strategy.run(train_step, args=(x, y, weights, trim))
 
     # @tf.function
     # def distributed_train_step(dist_inputs):
@@ -439,6 +439,26 @@ def main(_):
         else:
             strategy.run(reset_state, args=(reset_type, zero_state))
 
+    def get_next_chunknum(chunknum, seq_len, direction='up'):
+        # get the next chunk number (diviser) for seq_len.
+        if direction == 'up':
+            chunknum += 1
+            # check if it is a valid diviser
+            while seq_len % chunknum != 0:
+                chunknum += 1
+                if chunknum >= seq_len:
+                    print('Chunk number reached seq_len')
+                    return seq_len
+        elif direction == 'down':
+            chunknum -= 1
+            while seq_len % chunknum != 0:
+                chunknum -= 1
+                if chunknum <= 1:
+                    print('Chunk number reached 1')
+                    return 1
+        else:
+            raise ValueError(f"Invalid direction: {direction}")
+        return chunknum
 
     ############################ TRAINING #############################
 
@@ -452,6 +472,8 @@ def main(_):
                         metric_keys, pre_delay=delays[0], post_delay=delays[1])
     
     callbacks.on_train_begin()
+    chunknum = 1
+    max_working_fr = {}   # defined for each chunknum
     for epoch in range(flags.n_epochs):
         callbacks.on_epoch_start()  
         # Reset the model state to the gray state    
@@ -472,10 +494,47 @@ def main(_):
             x, y, _, w = next(it) # x dtype tf.bool
     
             # with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
-            distributed_train_step(x, y, w)
-                
+            while True:
+                try:
+                    x_chunks = tf.split(x, chunknum, axis=1)
+                    seq_len_local = x.shape[1] // chunknum
+                    for j in range(chunknum):
+                        x_chunk = x_chunks[j]
+                        distributed_train_step(x_chunk, y, w, trim=chunknum==1)
+                    # distributed_train_step(x, y, w, trim=chunknum==1)
+                    break
+                except tf.errors.ResourceExhaustedError as e:
+                    print("OOM error occured")
+                    import gc
+                    gc.collect()
+                    # increase the chunknum
+                    chunknum = get_next_chunknum(chunknum, flags.seq_len, direction='up')
+                    tf.print("Increasing chunknum to: ", chunknum)
+                    tf.print("BPTT truncation: ", flags.seq_len / chunknum)
+                    tf.print(max_working_fr)
+                    
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss, train_osi_loss]]
+            # update max working fr for the chunk num
+            current_fr = train_values[2]
+            if chunknum not in max_working_fr:
+                max_working_fr[chunknum] = current_fr
+            else:
+                max_working_fr[chunknum] = max(max_working_fr[chunknum], train_values[2])
+            # determine if the chunknum should be decreased
+            if chunknum > 1:
+                chunknum_down = get_next_chunknum(chunknum, flags.seq_len, direction='down')
+                if chunknum_down in max_working_fr:
+                    if current_fr < max_working_fr[chunknum_down]:
+                        chunknum = chunknum_down
+                        tf.print("Decreasing chunknum to: ", chunknum)
+                        tf.print(max_working_fr)
+                else:  # data not available, estimate from the current one.
+                    fr_ratio = current_fr / max_working_fr[chunknum]
+                    chunknum_ratio = chunknum_down / chunknum
+                    if fr_ratio < chunknum_ratio:  # potentially good to decrease
+                        chunknum = chunknum_down
+                
 
             callbacks.on_step_end(train_values, y, verbose=True)
             reset_train_metrics()  # resetting for each step makes more sense
