@@ -2,6 +2,7 @@ import matplotlib
 matplotlib.use('agg')# to avoid GUI request on clusters
 import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # before import tensorflow
 import socket
 import absl
 import json
@@ -35,7 +36,6 @@ from v1_model_utils.callbacks import Callbacks
 
 # Define the environment variables for optimal GPU performance
 # os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
 print("--- CUDNN version: ", tf.sysconfig.get_build_info()["cudnn_version"])
