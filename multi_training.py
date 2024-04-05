@@ -308,7 +308,7 @@ def main(_):
 
         return _out, _p, _loss, _aux
 
-    # @tf.function
+    @tf.function
     def distributed_roll_out(x, y, w, output_spikes=True):
         _out, _p, _loss, _aux = strategy.run(roll_out, args=(x, y, w))
         if output_spikes:
