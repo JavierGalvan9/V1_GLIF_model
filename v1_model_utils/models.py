@@ -481,7 +481,7 @@ class V1Column(tf.keras.layers.Layer):
 
         # Use the maximum delay to clip the synaptic delays
         delays = np.round(np.clip(delays, dt, self.max_delay)/dt).astype(np.int32)
-        # Introduce the delays in the postsynaptic neuron indices
+        # Introduce the delays in the presynaptic neuron indices
         indices[:, 1] = indices[:, 1] + self._n_neurons * (delays - 1)
 
         self.recurrent_dense_shape = dense_shape[0], self.max_delay * dense_shape[1] 

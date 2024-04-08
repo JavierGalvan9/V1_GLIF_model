@@ -355,7 +355,6 @@ class LaminarPlot:
             sel_indices = np.where(sel)[0]
             # Assign y positions based on sorted order
             neuron_id_to_y[sel_indices[sorted_indices]] = pop_y_positions
-
             # pop_y_positions = pop_y_positions[sorted_indices]
             # order the neurons by type and tuning angle in the y axis
             # neuron_id_to_y[sel] = pop_y_positions

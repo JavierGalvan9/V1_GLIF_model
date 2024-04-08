@@ -33,7 +33,7 @@ def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
     return tf.where(tf.abs(u) <= kappa, branch_1, branch_2)
 
 ### To calculate the loss of firing rates between neuron types
-def compute_spike_rate_target_loss(_spikes, target_rates, core_mask=None, dtype=tf.float32):
+def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
     # TODO: define this function
     # target_rates is a dictionary that contains all the cell types.
     # I should iterate on them, and add the cost for each one at the end.
@@ -103,8 +103,9 @@ class SpikeRateDistributionTarget:
                 spikes = spikes[:, self._pre_delay:, :]
             if self._post_delay is not None and self._post_delay != 0:
                 spikes = spikes[:, :-self._post_delay, :]
-        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, core_mask=self._core_mask, 
-                                                dtype=self._dtype) * self._rate_cost
+        if self._core_mask is not None:
+            spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
+        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, dtype=self._dtype) * self._rate_cost
         return reg_loss
 
 
@@ -187,7 +188,6 @@ class OrientationSelectivityLoss:
         model_fr = a + b * vonmises_pdf(angles)
 
         return model_fr
-
 
     def calculate_delta_angle(self, stim_angle, tuning_angle):
         # angle unit is degrees.
@@ -293,24 +293,25 @@ class OrientationSelectivityLoss:
         #     spikes = spikes[:, :-self._post_delay, :]
         spikes = self.spike_trimming(spikes, trim)
 
-        # sum spikes in _z, and multiply with delta_angle.
-        mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
 
-        # Convert mean_spikes to a complex tensor with zero imaginary part
-        mean_spikes = tf.cast(mean_spikes, tf.complex64)
+    #     # sum spikes in _z, and multiply with delta_angle.
+    #     mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
 
-        # Calculate weighted responses for OSI numerator
-        # Adjust for preferred orientation by incorporating e^(2i(theta - theta_pref))
-        weighted_responses_numerator = mean_spikes * tf.exp(tf.complex(0.0, 2.0 * delta_angle))
-        approximated_numerator = tf.reduce_sum(weighted_responses_numerator)
+    #     # Convert mean_spikes to a complex tensor with zero imaginary part
+    #     mean_spikes = tf.cast(mean_spikes, tf.complex64)
+
+    #     # Calculate weighted responses for OSI numerator
+    #     # Adjust for preferred orientation by incorporating e^(2i(theta - theta_pref))
+    #     weighted_responses_numerator = mean_spikes * tf.exp(tf.complex(0.0, 2.0 * delta_angle))
+    #     approximated_numerator = tf.reduce_sum(weighted_responses_numerator)
         
-        # Calculate denominator as the sum of mean_spikes
-        approximated_denominator = tf.reduce_sum(mean_spikes)
+    #     # Calculate denominator as the sum of mean_spikes
+    #     approximated_denominator = tf.reduce_sum(mean_spikes)
         
-        # Calculate OSI approximation
-        osi_approx = tf.abs(approximated_numerator / tf.cast(approximated_denominator, tf.complex64))
+    #     # Calculate OSI approximation
+    #     osi_approx = tf.abs(approximated_numerator / tf.cast(approximated_denominator, tf.complex64))
 
-        return tf.square(osi_approx - 1) * self._osi_cost
+    #     return tf.square(osi_approx - 1) * self._osi_cost
 
     def spike_trimming(self, spikes, trim=True):
         # remove pre and post delays

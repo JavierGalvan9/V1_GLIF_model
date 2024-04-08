@@ -306,6 +306,8 @@ def main(_):
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_loss=osi_loss)
         _loss = osi_loss + rate_loss + voltage_loss + weights_l2_regularizer
 
+        tf.print(osi_loss, rate_loss, voltage_loss, weights_l2_regularizer)
+
         return _out, _p, _loss, _aux
 
     @tf.function
@@ -622,7 +624,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('seed', 3000, '')
     # absl.app.flags.DEFINE_integer('port', 12778, '')
     absl.app.flags.DEFINE_integer("n_output", 2, "")
-    absl.app.flags.DEFINE_integer('neurons_per_output', 30, '')
+    absl.app.flags.DEFINE_integer('neurons_per_output', 2, '')
     absl.app.flags.DEFINE_integer('steps_per_epoch', 2, '')# EA and garret dose not need this many but pure classification needs 781 = int(50000/64)
     absl.app.flags.DEFINE_integer('val_steps', 1, '')# EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
     # absl.app.flags.DEFINE_integer('max_delay', 5, '')
