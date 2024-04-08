@@ -201,19 +201,20 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
     def call(self, inp): # inp only provides the shape
         # Generate the background spikes
-        rest_of_brain = tf.random.poisson(shape=(self._batch_size, self._seq_len, self._n_bkg_units), 
+        seq_len = tf.shape(inp)[1]
+        rest_of_brain = tf.random.poisson(shape=(self._batch_size, seq_len, self._n_bkg_units), 
                                         lam=self._bkg_firing_rate * .001, 
                                         dtype=self._compute_dtype) # (1, 600, 100
         # rest_of_brain = tf.cast(tf.random.uniform(
         #         (self._batch_size, self._seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
         #         self._compute_dtype) # (1, 600, 100)
 
-        rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * self._seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
+        rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
         # Create a TensorArray to save the results for every receptor type
         noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 66634, 600)
         noise_input = tf.transpose(noise_input) # (600, 50000, 5) # New shape (3000, 66634, 5)
         # Reshape properly the input current
-        noise_input = tf.reshape(noise_input, (self._batch_size, self._seq_len, -1)) # (1, 600, 250000) # (1, 3000, 333170)
+        noise_input = tf.reshape(noise_input, (self._batch_size, seq_len, -1)) # (1, 600, 250000) # (1, 3000, 333170)
 
         return noise_input
     
@@ -346,6 +347,14 @@ class SparseSignedConstraint(tf.keras.constraints.Constraint):
             self._positive, tf.nn.relu(w), -tf.nn.relu(-w))
         return tf.where(self._mask, sign_corrected_w, tf.zeros_like(sign_corrected_w))
 
+
+class ClipConstraint(tf.keras.constraints.Constraint):
+    def __init__(self, lower_limit, upper_limit):
+        self._lower_limit = lower_limit
+        self._upper_limit = upper_limit
+
+    def __call__(self, w):
+        return tf.clip_by_value(w, self._lower_limit, self._upper_limit)
 
 class V1Column(tf.keras.layers.Layer):
     def __init__(
@@ -514,12 +523,14 @@ class V1Column(tf.keras.layers.Layer):
         if per_type_training:
             self.per_type_training = True
             self.connection_type_ids = other_v1_utils.connection_type_ids(network)
-            max_id = np.max(self.connection_type_ids)
+            max_id = np.max(self.connection_type_ids) + 1
 
             # prepare a variable and gather with type ids.
             self.recurrent_per_type_weight_values = tf.Variable(
                 tf.ones(max_id),
                 name="recurrent_per_type_weights",
+                constraint=ClipConstraint(0.2, 5.0),
+                # constraint=ClipConstraint(0.1, 10.0),
                 trainable=True,
                 dtype=self._compute_dtype
             ) # shape = (n_connection_types (21 * 21))
@@ -898,11 +909,11 @@ def create_model(
 ):
 
     # Create the input layer of the model
-    x = tf.keras.layers.Input(shape=(seq_len, n_input,))
+    x = tf.keras.layers.Input(shape=(None, n_input,))
     neurons = network["n_nodes"]
 
     # Create an input layer for the initial state of the RNN
-    state_input_holder = tf.keras.layers.Input(shape=(seq_len, neurons))
+    state_input_holder = tf.keras.layers.Input(shape=(None, neurons))
     state_input = tf.cast(tf.identity(state_input_holder), dtype)  
 
     # If batch_size is not provided as an argument, it is automatically inferred from the

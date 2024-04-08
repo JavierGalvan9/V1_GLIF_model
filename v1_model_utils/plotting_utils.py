@@ -291,13 +291,14 @@ class LaminarPlot:
         self.n_neurons = network["n_nodes"]
 
         if plot_core_only:
-            core_neurons = 16679 #65871 
+            # core_neurons = 16679 #65871 
             core_radius = 200 #400
-            if self.n_neurons > core_neurons:
-                self.n_neurons = core_neurons
             self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, radius=core_radius, data_dir=self.data_dir
             )
+            core_neurons = np.sum(self.core_mask)
+            if self.n_neurons > core_neurons:
+                self.n_neurons = core_neurons
         else:
             self.core_mask = np.full(self.n_neurons, True)
 
@@ -354,6 +355,9 @@ class LaminarPlot:
             sel_indices = np.where(sel)[0]
             # Assign y positions based on sorted order
             neuron_id_to_y[sel_indices[sorted_indices]] = pop_y_positions
+            # pop_y_positions = pop_y_positions[sorted_indices]
+            # order the neurons by type and tuning angle in the y axis
+            # neuron_id_to_y[sel] = pop_y_positions
 
             if int(pop_name[1]) > int(current_pop_name[1]):
                 # register the change of layer
@@ -1031,18 +1035,20 @@ class ModelMetricsAnalysis:
 
         # Isolate the core neurons if necessary
         if self.analyze_core_only:
-            core_neurons = 16679 #65871 
+            # core_neurons = 16679 #65871 
             core_radius = 200 #400
+            self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
+            n_neurons_plot = np.sum(self.core_mask)
             
             # Calculate the core_neurons mask
-            if self.n_neurons > core_neurons:
-                self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir) 
-                # self.n_neurons = core_neurons
-                # if n_neurons is overridden, it won't run for the second time...
-                n_neurons_plot = core_neurons
-            else:
-                self.core_mask = np.full(self.n_neurons, True)
-                n_neurons_plot = self.n_neurons
+            # if self.n_neurons > core_neurons:
+            #     self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir) 
+            #     # self.n_neurons = core_neurons
+            #     # if n_neurons is overridden, it won't run for the second time...
+            #     n_neurons_plot = core_neurons
+            # else:
+            #     self.core_mask = np.full(self.n_neurons, True)
+            #     n_neurons_plot = self.n_neurons
 
         else:
             self.core_mask = np.full(self.n_neurons, True)

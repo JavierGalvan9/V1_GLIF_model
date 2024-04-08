@@ -2,6 +2,7 @@ import matplotlib
 matplotlib.use('agg')# to avoid GUI request on clusters
 import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # before import tensorflow
 import socket
 import absl
 import json
@@ -35,7 +36,6 @@ from v1_model_utils.callbacks import Callbacks
 
 # Define the environment variables for optimal GPU performance
 # os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
 print("--- CUDNN version: ", tf.sysconfig.get_build_info()["cudnn_version"])
@@ -203,6 +203,12 @@ def main(_):
             type_n_neurons = len(neuron_ids)
             sorted_target_rates = losses.sample_firing_rates(value["rates"], type_n_neurons, flags.seed)
             target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
+            
+        # here we need information of the layer mask for the OSI loss
+        if flags.osi_loss_method == 'neuropixels_fr':
+            layer_info = other_v1_utils.get_layer_info(network)
+        else:
+            layer_info = None
 
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype, core_mask=core_mask)
         voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
@@ -218,8 +224,11 @@ def main(_):
                                                          
         OSI_Loss = losses.OrientationSelectivityLoss(tuning_angles, osi_cost=flags.osi_cost, 
                                                     pre_delay=delays[0], post_delay=delays[1], 
-                                                    dtype=dtype, core_mask=core_mask)
-        osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,))) # this is just a placeholder
+                                                    dtype=dtype, core_mask=core_mask,
+                                                    method=flags.osi_loss_method,
+                                                    subtraction_ratio=flags.osi_loss_subtraction_ratio,
+                                                    layer_info=layer_info)
+        osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,)), trim=True) # this is just a placeholder
 
         model.add_loss(rate_loss)
         model.add_loss(voltage_loss)
@@ -240,7 +249,13 @@ def main(_):
         #     rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         #     return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
         
-        optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
+        if flags.optimizer == 'adam':
+            optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
+        elif flags.optimizer == 'sgd':
+            optimizer = tf.keras.optimizers.SGD(flags.learning_rate, momentum=0.0, nesterov=False)
+        else:
+            print(f"Invalid optimizer: {flags.optimizer}")
+            raise ValueError
 
         zero_state = rsnn_layer.cell.zero_state(flags.batch_size, dtype=dtype)
         state_variables = tf.nest.map_structure(lambda a: tf.Variable(
@@ -272,9 +287,10 @@ def main(_):
 
     # checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
-    def roll_out(_x, _y, _w, output_spikes=False):
+    def roll_out(_x, _y, _w, trim=True, output_spikes=False):
         _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
-        dummy_zeros = tf.zeros((flags.batch_size, flags.seq_len, flags.neurons), dtype)
+        seq_len = tf.shape(_x)[1]
+        dummy_zeros = tf.zeros((flags.batch_size, seq_len, flags.neurons), dtype)
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
 
         _z, _v, _input_current = _out[0]
@@ -282,9 +298,9 @@ def main(_):
         new_state = tuple(_out[1:])
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
 
-        voltage_loss = voltage_regularizer(_v) 
-        rate_loss = rate_distribution_regularizer(_z)
-        osi_loss = OSI_Loss(_z, _y)
+        voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
+        rate_loss = rate_distribution_regularizer(_z, trim)
+        osi_loss = OSI_Loss(_z, _y, trim)
         weights_l2_regularizer = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_loss=osi_loss)
@@ -303,10 +319,10 @@ def main(_):
             return _out, _p, _loss, _aux
 
 
-    def train_step(_x, _y, _w):
+    def train_step(_x, _y, _w, trim):
         ### Forward propagation of the model
         with tf.GradientTape() as tape:
-            _out, _p, _loss, _aux = roll_out(_x, _y, _w)
+            _out, _p, _loss, _aux = roll_out(_x, _y, _w, trim)
 
         ### Backpropagation of the model
         _op = train_accuracy.update_state(_y, _p, sample_weight=_w)
@@ -328,8 +344,8 @@ def main(_):
 
 
     @tf.function
-    def distributed_train_step(x, y, weights):
-        strategy.run(train_step, args=(x, y, weights))
+    def distributed_train_step(x, y, weights, trim):
+        strategy.run(train_step, args=(x, y, weights, trim))
 
     # @tf.function
     # def distributed_train_step(dist_inputs):
@@ -426,6 +442,26 @@ def main(_):
         else:
             strategy.run(reset_state, args=(reset_type, zero_state))
 
+    def get_next_chunknum(chunknum, seq_len, direction='up'):
+        # get the next chunk number (diviser) for seq_len.
+        if direction == 'up':
+            chunknum += 1
+            # check if it is a valid diviser
+            while seq_len % chunknum != 0:
+                chunknum += 1
+                if chunknum >= seq_len:
+                    print('Chunk number reached seq_len')
+                    return seq_len
+        elif direction == 'down':
+            chunknum -= 1
+            while seq_len % chunknum != 0:
+                chunknum -= 1
+                if chunknum <= 1:
+                    print('Chunk number reached 1')
+                    return 1
+        else:
+            raise ValueError(f"Invalid direction: {direction}")
+        return chunknum
 
     ############################ TRAINING #############################
 
@@ -439,6 +475,8 @@ def main(_):
                         metric_keys, pre_delay=delays[0], post_delay=delays[1])
     
     callbacks.on_train_begin()
+    chunknum = 1
+    max_working_fr = {}   # defined for each chunknum
     for epoch in range(flags.n_epochs):
         callbacks.on_epoch_start()  
         # Reset the model state to the gray state    
@@ -450,17 +488,59 @@ def main(_):
         # tf.profiler.experimental.start(logdir=logdir)
         for step in range(flags.steps_per_epoch):
             callbacks.on_step_start()
-            distributed_reset_state('gray', gray_state=gray_state)
+            # try resetting every iteration
+            if flags.reset_every_step:
+                distributed_reset_state('gray')
+            else:
+                distributed_reset_state('gray', gray_state=gray_state)
 
             x, y, _, w = next(it) # x dtype tf.bool
     
             # with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
-            distributed_train_step(x, y, w)
-                
+            while True:
+                try:
+                    x_chunks = tf.split(x, chunknum, axis=1)
+                    seq_len_local = x.shape[1] // chunknum
+                    for j in range(chunknum):
+                        x_chunk = x_chunks[j]
+                        distributed_train_step(x_chunk, y, w, trim=chunknum==1)
+                    # distributed_train_step(x, y, w, trim=chunknum==1)
+                    break
+                except tf.errors.ResourceExhaustedError as e:
+                    print("OOM error occured")
+                    import gc
+                    gc.collect()
+                    # increase the chunknum
+                    chunknum = get_next_chunknum(chunknum, flags.seq_len, direction='up')
+                    tf.print("Increasing chunknum to: ", chunknum)
+                    tf.print("BPTT truncation: ", flags.seq_len / chunknum)
+                    tf.print(max_working_fr)
+                    
             train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                          train_rate_loss, train_voltage_loss, train_osi_loss]]
+            # update max working fr for the chunk num
+            current_fr = train_values[2]
+            if chunknum not in max_working_fr:
+                max_working_fr[chunknum] = current_fr
+            else:
+                max_working_fr[chunknum] = max(max_working_fr[chunknum], train_values[2])
+            # determine if the chunknum should be decreased
+            if chunknum > 1:
+                chunknum_down = get_next_chunknum(chunknum, flags.seq_len, direction='down')
+                if chunknum_down in max_working_fr:
+                    if current_fr < max_working_fr[chunknum_down]:
+                        chunknum = chunknum_down
+                        tf.print("Decreasing chunknum to: ", chunknum)
+                        tf.print(max_working_fr)
+                else:  # data not available, estimate from the current one.
+                    fr_ratio = current_fr / max_working_fr[chunknum]
+                    chunknum_ratio = chunknum_down / chunknum
+                    if fr_ratio < chunknum_ratio:  # potentially good to decrease
+                        chunknum = chunknum_down
+                
 
             callbacks.on_step_end(train_values, y, verbose=True)
+            reset_train_metrics()  # resetting for each step makes more sense
 
         # tf.profiler.experimental.stop() 
 
@@ -484,7 +564,7 @@ def main(_):
             break
         
         # Reset the metrics for the next epoch
-        reset_train_metrics()
+        # reset_train_metrics()
         reset_validation_metrics()
 
     callbacks.on_train_end(metric_values)
@@ -517,10 +597,13 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_string('neuron_model', 'GLIF3', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')
 
+    absl.app.flags.DEFINE_string('optimizer', 'adam', '')
     absl.app.flags.DEFINE_float('learning_rate', .01, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
     absl.app.flags.DEFINE_float('voltage_cost', .00001, '')
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
+    absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
+    absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float('gauss_std', .28, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
@@ -578,6 +661,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("hard_reset", False, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
+    absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
 
     absl.app.run(main)
 

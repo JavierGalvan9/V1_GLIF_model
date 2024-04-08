@@ -43,12 +43,56 @@ def pop_names(network, core_radius = None, data_dir='GLIF_network', return_node_
     else:
         return true_pop_names
 
-def connection_type_ids(network, core_radius=None, data_dir='GLIF_network'):
+def pop_name_to_cell_type(pop_name):
+    """convert pop_name in the old format to cell types.
+    for example,
+    'e4Rorb' -> 'L4 Exc'
+    'i4Pvalb' -> 'L4 PV'
+    'i23Sst' -> 'L2/3 SST'
+    'e5ET' -> 'L5 ET'
+    """
+    shift = 0  # letter shift for L23
+    layer = pop_name[1]
+    if layer == "2":
+        layer = "2/3"
+        shift = 1
+    elif layer == "1":
+        return "L1 Htr3a"  # special case
+
+    class_name = pop_name[2 + shift :]
+    if class_name == "Pvalb":
+        subclass = "PV"
+    elif class_name == "Sst":
+        subclass = "SST"
+    elif (class_name == "Vip") or (class_name == "Htr3a"):
+        subclass = "VIP"
+    else:  # excitatory
+        if layer == "5":
+            subclass = class_name
+        else:
+            subclass = "Exc"
+
+    return f"L{layer} {subclass}"    
+
+
+def get_layer_info(network):
+    pop_name = pop_names(network)
+    layer_query = ["e23", "e4", "e5", "e6"]
+    layer_names = ["EXC_L23", "EXC_L4", "EXC_L5", "EXC_L6"]
+    layer_info = {}
+    for i in range(4):
+        layer_info[layer_names[i]] = np.char.startswith(pop_name, layer_query[i])
+    return layer_info
+    
+    
+
+def connection_type_ids(network, core_radius=None, data_dir='GLIF_network', return_names=False):
     # first, get the pop_names
     pop_names_var = pop_names(network, core_radius=core_radius, data_dir=data_dir)
+    cell_types = [pop_name_to_cell_type(pop_name) for pop_name in pop_names_var]
     
-    # make a inverse index of the pop_names
-    all_names, pop_ids_cells = np.unique(pop_names_var, return_inverse=True)
+    # make an inverse index of the pop_names
+    all_names, pop_ids_cells = np.unique(cell_types, return_inverse=True)
     
     # get the pre and post cells
     pre_cells = network["synapses"]["indices"][:, 0]
@@ -57,8 +101,19 @@ def connection_type_ids(network, core_radius=None, data_dir='GLIF_network'):
     # make a unique number for the connection from each type to another type
     pop_ids_synapses = pop_ids_cells[pre_cells] * 1000 + pop_ids_cells[post_cells]
     
-    # make a inverse dictionary of the ids. This defines connection type_ids.
+    # make an inverse dictionary of the ids. This defines connection type_ids.
     all_pop_ids, connection_type_ids = np.unique(pop_ids_synapses, return_inverse=True)
+    
+    if return_names:
+        # decode the names from the all_pop_ids
+        names = {}
+        names["pre_id"] = all_pop_ids//1000
+        names["pre"] = all_names[names["pre_id"]]
+        names["post_id"] = all_pop_ids%1000
+        names["post"] = all_names[names["post_id"]]
+        names["all_names"] = [f'{names["pre"][i]} -> {names["post"][i]}' for i in range(len(all_pop_ids))]
+        return connection_type_ids, names
+    
     return connection_type_ids
 
 def angle_tunning(network, data_dir='GLIF_network'):
