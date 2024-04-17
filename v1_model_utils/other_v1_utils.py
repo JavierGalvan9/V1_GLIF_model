@@ -18,30 +18,6 @@ parentDir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(parentDir, "general_utils"))
 import file_management
 
-def pop_names(network, core_radius = None, data_dir='GLIF_network', return_node_type_ids=False):
-    path_to_csv = os.path.join(data_dir, 'network/v1_node_types.csv')
-    path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
-
-    # Read data
-    node_types = pd.read_csv(path_to_csv, sep=' ')
-    with h5py.File(path_to_h5, mode='r') as node_h5:
-        # Create mapping from node_type_id to pop_name
-        node_types.set_index('node_type_id', inplace=True)
-        node_type_id_to_pop_name = node_types['pop_name'].to_dict()
-
-        # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
-        node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][network['tf_id_to_bmtk_id']]
-        true_pop_names = np.array([node_type_id_to_pop_name[nid] for nid in node_type_ids])
-
-        if core_radius is not None:
-            selected_mask = isolate_core_neurons(network, radius=core_radius, data_dir=data_dir)
-            true_pop_names = true_pop_names[selected_mask]
-            node_type_ids = node_type_ids[selected_mask]
-
-    if return_node_type_ids:
-        return true_pop_names, node_type_ids
-    else:
-        return true_pop_names
 
 def pop_name_to_cell_type(pop_name):
     """convert pop_name in the old format to cell types.
@@ -72,8 +48,7 @@ def pop_name_to_cell_type(pop_name):
         else:
             subclass = "Exc"
 
-    return f"L{layer} {subclass}"    
-
+    return f"L{layer} {subclass}"  
 
 def get_layer_info(network):
     pop_name = pop_names(network)
@@ -82,7 +57,40 @@ def get_layer_info(network):
     layer_info = {}
     for i in range(4):
         layer_info[layer_names[i]] = np.char.startswith(pop_name, layer_query[i])
-    return layer_info
+    return layer_info  
+
+def pop_names(network, core_radius = None, n_selected_neurons=None, data_dir='GLIF_network', return_node_type_ids=False):
+    path_to_csv = os.path.join(data_dir, 'network/v1_node_types.csv')
+    path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
+
+    # Read data
+    node_types = pd.read_csv(path_to_csv, sep=' ')
+    with h5py.File(path_to_h5, mode='r') as node_h5:
+        # Create mapping from node_type_id to pop_name
+        node_types.set_index('node_type_id', inplace=True)
+        node_type_id_to_pop_name = node_types['pop_name'].to_dict()
+
+        # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
+        node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][network['tf_id_to_bmtk_id']]
+        true_pop_names = np.array([node_type_id_to_pop_name[nid] for nid in node_type_ids])
+
+        if core_radius is not None:
+            selected_mask = isolate_core_neurons(network, radius=core_radius, data_dir=data_dir)
+        elif n_selected_neurons is not None:
+            selected_mask = isolate_core_neurons(network, n_selected_neurons=n_selected_neurons, data_dir=data_dir)
+        else:
+            selected_mask = np.full(len(true_pop_names), True)
+            
+        true_pop_names = true_pop_names[selected_mask]
+        node_type_ids = node_type_ids[selected_mask]
+
+    if return_node_type_ids:
+        return true_pop_names, node_type_ids
+    else:
+        return true_pop_names
+
+
+
     
     
 
@@ -123,13 +131,18 @@ def angle_tunning(network, data_dir='GLIF_network'):
     
     return angle_tunning
 
-def isolate_core_neurons(network, radius=400, data_dir='GLIF_network'):
+def isolate_core_neurons(network, radius=400, n_selected_neurons=None, data_dir='GLIF_network'):
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
     node_h5 = h5py.File(path_to_h5, mode='r')
     x = node_h5['nodes']['v1']['0']['x'][()][network['tf_id_to_bmtk_id']]
     z = node_h5['nodes']['v1']['0']['z'][()][network['tf_id_to_bmtk_id']]
     r = np.sqrt(x ** 2 + z ** 2)
-    selected_mask = r < radius
+    if radius is not None:
+        selected_mask = r < radius
+    # if a number of neurons is given, select the closest neurons
+    elif n_selected_neurons is not None:
+        selected_mask = np.argsort(r)[:n_selected_neurons]
+        selected_mask = np.isin(np.arange(len(r)), selected_mask)
        
     return selected_mask
     

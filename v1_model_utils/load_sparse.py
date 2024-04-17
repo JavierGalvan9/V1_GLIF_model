@@ -217,9 +217,9 @@ def load_network(
     
     elif core_only: # this condition takes the n_neurons closest neurons to the origin (core)
         sel = r < 400
-        if n_neurons > 66634:
-            raise ValueError("There are only 66634 neurons in the network core")
-        elif n_neurons > 0 and n_neurons <= 66634:
+        if n_neurons > 65871:
+            raise ValueError("There are only 65871 neurons in the network core")
+        elif n_neurons > 0 and n_neurons <= 65871:
             (inds,) = np.where(sel)
             take_inds = rd.choice(inds, size=n_neurons, replace=False)
             sel[:] = False
@@ -537,7 +537,7 @@ def reduce_input_population(input_population, new_n_input, seed=3000):
 
   
 # @profile
-def load_v1(flags, n_neurons):
+def load_v1(flags, n_neurons, flag_str=''):
     # Initialize the network 
     t0 = time()
     network = load_network(
@@ -603,10 +603,13 @@ def load_v1(flags, n_neurons):
 
 
 # If the model already exist we can load it, or if it does not just save it for future occasions
-def cached_load_v1(flags, n_neurons):
+def cached_load_v1(flags, n_neurons, flag_str=''):
     store = False
     network, lgn_input, bkg_input = None, None, None
-    flag_str = (f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}")
+
+    if flag_str == '':
+        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}"
+    
     file_dir = os.path.split(__file__)[0]
     cache_path = os.path.join(file_dir, f".cache/V1_network_{flag_str}.pkl")
     print(f"> Looking for cached V1 model in {cache_path}")

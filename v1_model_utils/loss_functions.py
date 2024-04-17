@@ -1,7 +1,12 @@
-import pickle
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
+import pandas as pd
+import pickle as pkl
+import os
+import sys
+sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
+import other_v1_utils
 
 
 class StiffRegularizer(tf.keras.regularizers.Regularizer):
@@ -12,6 +17,15 @@ class StiffRegularizer(tf.keras.regularizers.Regularizer):
 
     def __call__(self, x):
         return self._strength * tf.reduce_sum(tf.square(x - self._initial_value))
+    
+class L2Regularizer(tf.keras.regularizers.Regularizer):
+    def __init__(self, strength, initial_value):
+        super().__init__()
+        self._strength = strength
+        self._initial_value = tf.Variable(initial_value, trainable=False)
+
+    def __call__(self, x):
+        return self._strength * tf.reduce_mean(tf.square(x))
 
         
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
@@ -38,7 +52,6 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
     # target_rates is a dictionary that contains all the cell types.
     # I should iterate on them, and add the cost for each one at the end.
     # spikes will have a shape of (batch_size, n_steps, n_neurons)
-    # losses = []
     total_loss = tf.constant(0.0, dtype=dtype)
     rates = tf.reduce_mean(_spikes, (0, 1))
     # if core_mask is not None:
@@ -79,23 +92,132 @@ def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
     u = sorted_rate - target_rate
     # tau = (tf.range(target_rate.shape[0]), dtype) + 1) / target_rate.shape[0]
     tau = (tf.range(target_rate.shape[0]) + 1) / target_rate.shape[0]
-    # loss = huber_quantile_loss(u, tau, 0.002, dtype=dtype)
-    loss = huber_quantile_loss(u, tau, 0.1, dtype=dtype)
+    loss = huber_quantile_loss(u, tau, 0.002, dtype=dtype)
+    # loss = huber_quantile_loss(u, tau, 0.1, dtype=dtype)
 
     return loss
+
+def process_neuropixels_data(path=''):
+    # Load data
+    neuropixels_data_path = f'Neuropixels_data/cortical_metrics_1.4.csv'
+    df_all = pd.read_csv(neuropixels_data_path, sep=",")
+    # Exc and PV have sufficient number of cells, so we'll filter out non-V1 Exc and PV.
+    # SST and VIP are small populations, so let's keep also non-V1 neurons
+    exclude = (df_all["cell_type"].isnull() | df_all["cell_type"].str.contains("EXC") | df_all["cell_type"].str.contains("PV")) \
+            & (df_all["ecephys_structure_acronym"] != 'VISp')
+    df = df_all[~exclude]
+    print(f"Original: {df_all.shape[0]} cells,   filtered: {df.shape[0]} cells")
+
+    # Some cells have very large values of RF. They are likely not-good fits, so ignore.
+    df.loc[(df["width_rf"] > 100), "width_rf"] = np.nan
+    df.loc[(df["height_rf"] > 100), "height_rf"] = np.nan
+
+    # Save the processed table
+    df.to_csv(f'Neuropixels_data/v1_OSI_DSI_DF.csv', sep=" ", index=False)
+    return df
+
+
+def neuropixels_cell_type_to_cell_type(pop_name):
+    # Convert pop_name in the neuropixels cell type to cell types. E.g, 'EXC_L23' -> 'L2/3 Exc', 'PV_L5' -> 'L5 PV'
+    layer = pop_name.split('_')[1]
+    class_name = pop_name.split('_')[0]
+    if "2" in layer:
+        layer = "L2/3"
+    elif layer == "L1":
+        return "L1 Htr3a"  # special case
+    if class_name == "EXC":
+        class_name = "Exc"
+    if class_name == 'Htr3a':
+        class_name = 'VIP'
+
+    return f"{layer} {class_name}"
 
 
 class SpikeRateDistributionTarget:
     """ Instead of regularization, treat it as a target.
         The main difference is that this class will calculate the loss
         for each subtypes of the neurons."""
-    def __init__(self, target_rates, rate_cost=.5, pre_delay=None, post_delay=None, core_mask=None, dtype=tf.float32):
+    def __init__(self, network, rate_cost=.5, pre_delay=None, post_delay=None, 
+                 data_dir='GLIF_network', core_mask=None, seed=42, dtype=tf.float32):
+        self._network = network
         self._rate_cost = rate_cost
-        self._target_rates = target_rates
         self._pre_delay = pre_delay
         self._post_delay = post_delay
         self._core_mask = core_mask
+        if self._core_mask is not None:
+            self._np_core_mask = self._core_mask.numpy()
+        self._data_dir = data_dir
         self._dtype = dtype
+        self._seed = seed
+        self.neuropixels_feature = 'Ave_Rate(Hz)'
+        self._target_rates = self.get_neuropixels_firing_rates()
+
+    def get_neuropixels_firing_rates(self):
+        """
+        Processes neuropixels data to obtain neurons average firing rates.
+
+        Returns:
+            dict: Dictionary containing rates and node_type_ids for each population query.
+        """
+        # Load data
+        neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
+        if not os.path.exists(neuropixels_data_path):
+            np_df = process_neuropixels_data(path=neuropixels_data_path)
+        else:
+            np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ")
+
+        area_node_types = pd.read_csv(os.path.join(self._data_dir, f'network/v1_node_types.csv'), sep=" ")
+
+        # Define population queries
+        query_mapping = {
+            "i1H": 'ALL_L1',
+            "e23": 'EXC_L23',
+            "i23P": 'PV_L23',
+            "i23S": 'SST_L23',
+            "i23H": 'VIP_L23',
+            "e4": 'EXC_L4',
+            "i4P": 'PV_L4',
+            "i4S": 'SST_L4',
+            "i4H": 'VIP_L4',
+            "e5": 'EXC_L5',
+            "i5P": 'PV_L5',
+            "i5S": 'SST_L5',
+            "i5H": 'VIP_L5',
+            "e6": 'EXC_L6',
+            "i6P": 'PV_L6',
+            "i6S": 'SST_L6',
+            "i6H": 'VIP_L6'
+        }
+
+        # define the reverse mapping
+        reversed_query_mapping = {v:k for k, v in query_mapping.items()}
+
+        # Process rates
+        type_rates_dict = {
+                            reversed_query_mapping[cell_type]: np.sort(np.append(subdf[self.neuropixels_feature].dropna().values / 1000, 0))
+                            for cell_type, subdf in np_df.groupby("cell_type")
+                        }
+
+        # Identify node_type_ids for each population query
+        pop_ids = {query: area_node_types[area_node_types.pop_name.str.contains(query)].index.values for query in query_mapping.keys()}
+
+        # Create a dictionary with rates and IDs
+        target_firing_rates = {pop_query: {'rates': type_rates_dict[pop_query], 'ids': pop_ids[pop_query]} for pop_query in pop_ids.keys()}
+        
+        for i, (key, value) in enumerate(target_firing_rates.items()):
+            # identify tne ids that are included in value["ids"]
+            neuron_ids = np.where(np.isin(self._network["node_type_ids"], value["ids"]))[0]
+            if self._core_mask is not None:
+                # if core_mask is not None, use only neurons in the core
+                neuron_ids = neuron_ids[self._np_core_mask[neuron_ids]]
+
+            neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
+            target_firing_rates[key]['neuron_ids'] = neuron_ids
+            type_n_neurons = len(neuron_ids)
+            sorted_target_rates = sample_firing_rates(value["rates"], type_n_neurons, self._seed)
+            target_firing_rates[key]['sorted_target_rates'] = tf.cast(sorted_target_rates, dtype=tf.float32) 
+
+        return target_firing_rates    
 
     def __call__(self, spikes, trim=True):
         if trim:
@@ -103,10 +225,13 @@ class SpikeRateDistributionTarget:
                 spikes = spikes[:, self._pre_delay:, :]
             if self._post_delay is not None and self._post_delay != 0:
                 spikes = spikes[:, :-self._post_delay, :]
+        
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
-        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, dtype=self._dtype) * self._rate_cost
-        return reg_loss
+        
+        reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, dtype=self._dtype)
+        
+        return reg_loss * self._rate_cost
 
 
 # class SpikeRateDistributionRegularization:
@@ -146,8 +271,9 @@ class VoltageRegularization:
         voltage_32 = (voltages - self.voltage_offset) / self.voltage_scale
         v_pos = tf.square(tf.nn.relu(voltage_32 - 1.0))
         v_neg = tf.square(tf.nn.relu(-voltage_32 + 1.0))
-        voltage_loss = tf.reduce_mean(tf.reduce_mean(v_pos + v_neg, -1)) * self._voltage_cost
-        return voltage_loss
+        voltage_loss = tf.reduce_mean(tf.reduce_mean(v_pos + v_neg, -1)) 
+
+        return voltage_loss * self._voltage_cost
 
 
 
@@ -159,8 +285,10 @@ class CustomMeanLayer(Layer):
 
 
 class OrientationSelectivityLoss:
-    def __init__(self, tuning_angles, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None):
+    def __init__(self, tuning_angles, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, 
+                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None):
         self._tuning_angles = tuning_angles
+        self._network = network
         self._osi_cost = osi_cost
         self._pre_delay = pre_delay
         self._post_delay = post_delay
@@ -170,24 +298,16 @@ class OrientationSelectivityLoss:
         self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
         if (self._core_mask is not None) and (self._method == "crowd_spikes"):
             self._tuning_angles = tf.boolean_mask(self._tuning_angles, self._core_mask)
-        self._layer_info = layer_info  # needed for neuropixels_fr method
-        # the layer_info should be a dictionary that contains
-        # the cell id of the corresponding layer.
-        # the keys should be something like "EXC_L23" or "PV_L5"
         
+        if self._method == "neuropixels_fr":
+            self._layer_info = layer_info  # needed for neuropixels_fr method
+            # the layer_info should be a dictionary that contains
+            # the cell id of the corresponding layer.
+            # the keys should be something like "EXC_L23" or "PV_L5"   
 
-    def vonmises_model_fr(self, structure, population):
-        from scipy.stats import vonmises
-        paramdic = self._von_mises_params
-        _params = paramdic[structure][population]
-        if len(_params) == 4:
-            mu, kappa, a, b = _params
-        vonmises_pdf = vonmises(kappa, loc=mu).pdf
-        
-        angles = np.deg2rad(np.arange(-85, 86, 10)) * 2  # *2 needed to make it proper model
-        model_fr = a + b * vonmises_pdf(angles)
-
-        return model_fr
+        elif self._method == "crowd_osi":
+            # Get the target OSI
+            self._target_osi = self.get_neuropixels_osi()
 
     def calculate_delta_angle(self, stim_angle, tuning_angle):
         # angle unit is degrees.
@@ -208,15 +328,70 @@ class OrientationSelectivityLoss:
 
         return delta_angle
     
-    def __call__(self, spikes, angle, trim):
-        if self._method == "crowd_osi":
-            return self.crowd_osi_loss(spikes, angle, trim)
-        elif self._method == "crowd_spikes":
-            return self.crowd_spikes_loss(spikes, angle, trim)
-        elif self._method == "neuropixels_fr":
-            return self.neuropixels_fr_loss(spikes, angle, trim)
+    def spike_trimming(self, spikes, trim=True):
+        # remove pre and post delays
+        if not trim:
+            return spikes
+        
+        if self._pre_delay is not None:
+            spikes = spikes[:, self._pre_delay:, :]
+        if self._post_delay is not None and self._post_delay != 0:
+            spikes = spikes[:, :-self._post_delay, :]
+        return spikes
+    
+    def get_neuropixels_osi(self):
+        """
+        Processes neuropixels data to obtain neurons average firing rates.
+
+        Returns:
+            dict: Dictionary containing rates and node_type_ids for each population query.
+        """
+        # Load data
+        neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
+        if not os.path.exists(neuropixels_data_path):
+            np_df = process_neuropixels_data(path=neuropixels_data_path)
+        else:
+            np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ")
+
+        osi_df = np_df[['cell_type', 'OSI', "Ave_Rate(Hz)", "max_mean_rate(Hz)"]]
+        nonresponding = osi_df["max_mean_rate(Hz)"] < 0.5
+        osi_df.loc[nonresponding, "OSI"] = np.nan
+        osi_df = osi_df[osi_df["Ave_Rate(Hz)"] != 0]
+        osi_df.dropna(inplace=True)
+        osi_df["cell_type"] = osi_df["cell_type"].apply(neuropixels_cell_type_to_cell_type)
+        # osi_df.groupby("cell_type")['OSI'].mean()
+        osi_df.groupby("cell_type")['OSI'].median()
+
+        original_pop_names = other_v1_utils.pop_names(self._network)
+        if self._core_mask is not None:
+            original_pop_names = original_pop_names[self._core_mask] 
+
+        cell_types = np.array([other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in original_pop_names])
+        node_ids = np.arange(len(cell_types))
+        cell_ids = {key: node_ids[cell_types == key] for key in set(osi_df['cell_type'])}
+
+        # osi_target = osi_df.groupby("cell_type")['OSI'].mean()
+        osi_target = osi_df.groupby("cell_type")['OSI'].median()
+        # osi_df.groupby("cell_type")['OSI'].median()
+        # convert to dict
+        osi_exp_dict = {key: {'OSI': val, 'ids': cell_ids[key]} for key, val in osi_target.to_dict().items()}
+
+        return osi_exp_dict
         
         
+    def vonmises_model_fr(self, structure, population):
+        from scipy.stats import vonmises
+        paramdic = self._von_mises_params
+        _params = paramdic[structure][population]
+        if len(_params) == 4:
+            mu, kappa, a, b = _params
+        vonmises_pdf = vonmises(kappa, loc=mu).pdf
+        
+        angles = np.deg2rad(np.arange(-85, 86, 10)) * 2  # *2 needed to make it proper model
+        model_fr = a + b * vonmises_pdf(angles)
+
+        return model_fr
+    
     def neuropixels_fr_loss(self, spikes, angle, trim=True):
         # if the trget fr is not set, construct them
         if not hasattr(self, "_target_frs"):
@@ -224,7 +399,7 @@ class OrientationSelectivityLoss:
             # self._von_mises_params = np.load("GLIF_network/param_dict_orientation.npy")
             # pickle instead
             with open("GLIF_network/param_dict_orientation.pkl", 'rb') as f:
-                self._von_mises_params = pickle.load(f)
+                self._von_mises_params = pkl.load(f)
             # get the model values with 10 degree increments 
             structure = "VISp"
             self._target_frs = {}
@@ -279,51 +454,6 @@ class OrientationSelectivityLoss:
         return final_loss
         
     
-    def crowd_osi_loss(self, spikes, angle, trim=True):
-        angle = tf.cast(angle, self._dtype) 
-        delta_angle = tf.expand_dims(angle, axis=1) -  self._tuning_angles
-        delta_angle = delta_angle * (np.pi / 180)
-
-        if self._core_mask is not None:
-            spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
-            
-        # if self._pre_delay is not None:
-        #     spikes = spikes[:, self._pre_delay:, :]
-        # if self._post_delay is not None and self._post_delay != 0:
-        #     spikes = spikes[:, :-self._post_delay, :]
-        spikes = self.spike_trimming(spikes, trim)
-
-
-    #     # sum spikes in _z, and multiply with delta_angle.
-    #     mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
-
-    #     # Convert mean_spikes to a complex tensor with zero imaginary part
-    #     mean_spikes = tf.cast(mean_spikes, tf.complex64)
-
-    #     # Calculate weighted responses for OSI numerator
-    #     # Adjust for preferred orientation by incorporating e^(2i(theta - theta_pref))
-    #     weighted_responses_numerator = mean_spikes * tf.exp(tf.complex(0.0, 2.0 * delta_angle))
-    #     approximated_numerator = tf.reduce_sum(weighted_responses_numerator)
-        
-    #     # Calculate denominator as the sum of mean_spikes
-    #     approximated_denominator = tf.reduce_sum(mean_spikes)
-        
-    #     # Calculate OSI approximation
-    #     osi_approx = tf.abs(approximated_numerator / tf.cast(approximated_denominator, tf.complex64))
-
-    #     return tf.square(osi_approx - 1) * self._osi_cost
-
-    def spike_trimming(self, spikes, trim=True):
-        # remove pre and post delays
-        if not trim:
-            return spikes
-        
-        if self._pre_delay is not None:
-            spikes = spikes[:, self._pre_delay:, :]
-        if self._post_delay is not None and self._post_delay != 0:
-            spikes = spikes[:, :-self._post_delay, :]
-        return spikes
-    
     def crowd_spikes_loss(self, spikes, angle, trim=True):
         # I need to access the tuning angle. of all the neurons.
         angle = tf.cast(angle, self._dtype)
@@ -331,10 +461,6 @@ class OrientationSelectivityLoss:
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
             
-        # if self._pre_delay is not None:
-        #     spikes = spikes[:, self._pre_delay:, :]
-        # if self._post_delay is not None and self._post_delay != 0:
-        #     spikes = spikes[:, :-self._post_delay, :]
         spikes = self.spike_trimming(spikes, trim)
 
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
@@ -346,5 +472,63 @@ class OrientationSelectivityLoss:
         expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
         
         angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle * self._subtraction_ratio
+        
         return tf.abs(angle_loss) * self._osi_cost
+
+    def crowd_osi_loss(self, spikes, angle, trim=True):
+        # Calculate the angle deltas between current angle and tuning angle
+        # angle = tf.cast(angle, self._dtype) 
+        angle = tf.cast(angle[0], self._dtype) 
+        delta_angle = tf.expand_dims(angle, axis=0) -  self._tuning_angles
+        # i want the delta_angle to be within 0-360
+        clipped_delta_angle = tf.math.floormod(delta_angle, 360)
+        radians_delta_angle = clipped_delta_angle * (np.pi / 180)
+        # Instead of complex numbers, use cosine and sine separately
+        cos_component = tf.math.cos(2.0 * radians_delta_angle)
+        sin_component = tf.math.sin(2.0 * radians_delta_angle)
+
+        if self._core_mask is not None:
+            spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
+            
+        spikes = self.spike_trimming(spikes, trim)
+        # sum spikes in _z, and multiply with delta_angle.
+        rates = tf.reduce_mean(tf.cast(spikes, dtype=self._dtype), axis=[1]) 
+
+        # For weighted responses, we separately consider the contributions from cosine and sine
+        weighted_cos_responses = rates * cos_component
+        weighted_sin_responses = rates * sin_component
+
+        total_osi_loss = tf.constant(0.0, dtype=self._dtype)
+        for i, (key, value) in enumerate(self._target_osi.items()):
+            if tf.size(value["ids"]) != 0:
+                _rates_type = tf.gather(rates[0], value['ids'])
+                _weighted_cos_responses_type = tf.gather(weighted_cos_responses[0], value['ids'])
+                _weighted_sin_responses_type = tf.gather(weighted_sin_responses[0], value['ids'])
+
+                # Define small epsilon values to avoid differentiability issues when 0 spikes are recorded within the population
+                epsilon1 = 1e-12
+                epsilon2 = 1e-3
+                # Calculate the approximated OSI for the population
+                approximated_numerator = tf.sqrt(tf.maximum(tf.square(tf.reduce_sum(_weighted_cos_responses_type)) +
+                                                            tf.square(tf.reduce_sum(_weighted_sin_responses_type))
+                                                            , epsilon1))
+                approximated_denominator = tf.maximum(tf.reduce_sum(_rates_type), epsilon2)
+                osi_approx_type = approximated_numerator / approximated_denominator
+                
+                # Calculate the OSI loss
+                osi_loss_type = tf.math.square(osi_approx_type - value['OSI'])
+                total_osi_loss += osi_loss_type
+            else:
+                pass
+            
+        return total_osi_loss * self._osi_cost
     
+
+    def __call__(self, spikes, angle, trim):
+        if self._method == "crowd_osi":
+            return self.crowd_osi_loss(spikes, angle, trim)
+        elif self._method == "crowd_spikes":
+            return self.crowd_spikes_loss(spikes, angle, trim)
+        elif self._method == "neuropixels_fr":
+            return self.neuropixels_fr_loss(spikes, angle, trim)
+        

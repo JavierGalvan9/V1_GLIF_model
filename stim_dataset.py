@@ -78,7 +78,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,
                                      current_input=False, regular=False, n_input=17400,
-                                     bmtk_compat=True):
+                                     bmtk_compat=True, return_firing_rates=False):
     """ make a drifting gratings stimulus for FR and OSI tuning."""
     # mimc_lgn_std, mimc_lgn_mean = 0.02855, 0.02146
 
@@ -119,31 +119,38 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
             del videos
 
             firing_rates = lgn.firing_rates_from_spatial(*spatial)
-            del spatial
-            # sample rate
-            # assuming dt = 1 ms
-            _p = 1 - tf.exp(-firing_rates / 1000.) # probability of having a spike before dt = 1 ms
-            del firing_rates
-            # _z = tf.cast(fixed_noise < _p, dtype)
-            if current_input:
-                _z = _p * 1.3
+            if return_firing_rates:
+                yield tf.constant(firing_rates, dtype=tf.float32, shape=(seq_len, n_input))
+
             else:
-                _z = tf.random.uniform(tf.shape(_p)) < _p
-            del _p
+                del spatial
+                # sample rate
+                # assuming dt = 1 ms
+                _p = 1 - tf.exp(-firing_rates / 1000.) # probability of having a spike before dt = 1 ms
+                del firing_rates
+                # _z = tf.cast(fixed_noise < _p, dtype)
+                if current_input:
+                    _z = _p * 1.3
+                else:
+                    _z = tf.random.uniform(tf.shape(_p)) < _p
+                del _p
 
-            yield _z, tf.constant(theta, dtype=tf.float32, shape=(1,)), tf.constant(contrast, dtype=tf.float32, shape=(1,)), tf.constant(duration, dtype=tf.float32, shape=(1,))
-            # yield _z, np.array([theta], dtype=np.float32)
+                yield _z, tf.constant(theta, dtype=tf.float32, shape=(1,)), tf.constant(contrast, dtype=tf.float32, shape=(1,)), tf.constant(duration, dtype=tf.float32, shape=(1,))
+                # yield _z, np.array([theta], dtype=np.float32)
 
-    output_dtypes = (tf.bool, tf.float32, tf.float32, tf.float32)
-    
-    # output_dtypes = (tf.float32, tf.float32)
-    # when using generator for dataset, it should not contain the batch dim
-    output_shapes = (tf.TensorShape((seq_len, n_input)), tf.TensorShape((1)), tf.TensorShape((1)), tf.TensorShape((1)))
-    # output_shapes = (tf.TensorShape((seq_len, 17400)), tf.TensorShape((1)))
-    data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b, _c, _d:
-                (tf.cast(_a, tf.bool), tf.cast(_b, tf.float32), tf.cast(_c, tf.float32), tf.cast(_d, tf.float32)))
-    # data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b:
-                # (tf.cast(_a, tf.float32), tf.cast(_b, tf.float32)))
+    if return_firing_rates:
+         output_dtypes = (tf.float32)
+         output_shapes = (tf.TensorShape((seq_len, n_input)))
+         data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a: (tf.cast(_a, tf.float32)))
+    else:
+        output_dtypes = (tf.bool, tf.float32, tf.float32, tf.float32)
+        # when using generator for dataset, it should not contain the batch dim
+        output_shapes = (tf.TensorShape((seq_len, n_input)), tf.TensorShape((1)), tf.TensorShape((1)), tf.TensorShape((1)))
+        # output_shapes = (tf.TensorShape((seq_len, 17400)), tf.TensorShape((1)))
+        data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b, _c, _d:
+                    (tf.cast(_a, tf.bool), tf.cast(_b, tf.float32), tf.cast(_c, tf.float32), tf.cast(_d, tf.float32)))
+        # data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b:
+                    # (tf.cast(_a, tf.float32), tf.cast(_b, tf.float32)))
     return data_set
 
 

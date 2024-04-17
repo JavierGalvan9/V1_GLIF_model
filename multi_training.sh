@@ -13,4 +13,6 @@
 
 
 # run -g 1 -m 24 -t 0:30 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 1 --neurons 40000 --seq_len 600 --n_epochs 3"
-run -g 1 -m 24 -t 0:15 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 1 --neurons 10000 --seq_len 600 --n_epochs 2 --steps_per_epoch 1"
+# run -g 1 -m 60 -t 1:45 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 1 --neurons 65871 --train_recurrent --osi_loss_method 'crowd_osi' --osi_cost 2 --rate_cost 100 --voltage_cost 1 --learning_rate 0.1 --seq_len 600 --n_epochs 10 --steps_per_epoch 20"
+
+python parallel_training_testing.py --neurons 65871 --train_recurrent --osi_loss_method 'crowd_osi' --osi_cost 2 --rate_cost 100 --voltage_cost 1 --learning_rate 0.1 --n_runs 20 --n_epochs 20 --steps_per_epoch 20

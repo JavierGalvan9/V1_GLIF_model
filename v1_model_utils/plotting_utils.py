@@ -46,7 +46,7 @@ class InputActivityFigure:
             stimuli_init_time=stimuli_init_time,
             stimuli_end_time=stimuli_end_time,
             scale=scale,
-            alpha=0.2,
+            alpha=0.4,
             plot_core_only=plot_core_only,
         )
         self.drifting_grating_plot = DriftingGrating(
@@ -59,8 +59,7 @@ class InputActivityFigure:
 
         self.tightened = True  # False
         self.scale = scale
-        self.network = network
-        self.n_neurons = self.network["n_nodes"]
+        self.n_neurons = network["n_nodes"]
         self.batch_ind = batch_ind
         self.images_dir = images_dir
         self.filename = filename
@@ -135,8 +134,7 @@ class InputActivityFigureWithoutStimulus:
 
         self.tightened = True  # False
         self.scale = scale
-        self.network = network
-        self.n_neurons = self.network["n_nodes"]
+        self.n_neurons = network["n_nodes"]
         self.batch_ind = batch_ind
         self.images_dir = images_dir
         self.filename = filename
@@ -289,16 +287,17 @@ class LaminarPlot:
         self.data_dir = data_dir
         self.network = network
         self.n_neurons = network["n_nodes"]
+        self.core_neurons = 65871
 
         if plot_core_only:
+            if self.n_neurons > self.core_neurons:
+                self.n_neurons = self.core_neurons
             # core_neurons = 16679 #65871 
-            core_radius = 200 #400
+            core_radius = 400 #200
             self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, radius=core_radius, data_dir=self.data_dir
             )
-            core_neurons = np.sum(self.core_mask)
-            if self.n_neurons > core_neurons:
-                self.n_neurons = core_neurons
+            # core_neurons = np.sum(self.core_mask)
         else:
             self.core_mask = np.full(self.n_neurons, True)
 
@@ -322,15 +321,13 @@ class LaminarPlot:
     
         # Now order the pop_names
         #  according to their layer and type
-        pop_orders = dict(
-            sorted(node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1]))
-        )
+        pop_orders = dict(sorted(node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1])))
         reversed_pop_orders = {model_name_to_cell_type(v): [] for k, v in pop_orders.items()}
         for k, v in pop_orders.items():
             reversed_pop_orders[model_name_to_cell_type(v)].append(k)
 
         # Now we convert the neuron id (related to its pop_name) to an index related to its position in the y axis
-        neuron_id_to_y = (np.zeros(self.n_neurons, np.int32) - 1)  # rest 1 to check at the end if every neuron has an index
+        neuron_id_to_y = np.zeros(self.n_neurons, np.int32) - 1  # rest 1 to check at the end if every neuron has an index
         current_ind = 0
 
         self.e_mask = np.zeros(self.n_neurons, np.bool_)
@@ -423,10 +420,7 @@ class LaminarPlot:
         alpha = self.alpha
         seq_len = spikes.shape[1]
         layer_label = ["1", "2/3", "4", "5", "6"]
-        for i, (y, h) in enumerate(
-            zip(self.layer_bounds, np.diff(
-                self.layer_bounds, append=[self.n_neurons]))
-        ):
+        for i, (y, h) in enumerate(zip(self.layer_bounds, np.diff(self.layer_bounds, append=[self.n_neurons]))):
             ax.annotate(
                 f"L{layer_label[i]}",
                 (5, (self.n_neurons - y - h / 2)),
@@ -600,18 +594,12 @@ class LGN_sample_plot:
         for neuron_idx in np.random.choice(
             range(self.firing_rates_shape[1]), size=self.n_samples
         ):
-            times = np.linspace(
-                0, self.firing_rates_shape[0], self.firing_rates_shape[0]
-            )
+            times = np.linspace(0, self.firing_rates_shape[0], self.firing_rates_shape[0])
 
             fig, axs = plt.subplots(2, sharex=True)
-            axs[0].plot(
-                times, self.firing_rates[:, neuron_idx], color="r", ms=1, alpha=0.7
-            )
+            axs[0].plot(times, self.firing_rates[:, neuron_idx], color="r", ms=1, alpha=0.7)
             axs[0].set_ylabel("Firing rate [Hz]")
-            axs[1].plot(
-                times, self.spikes[0, :, neuron_idx], color="b", ms=1, alpha=0.7
-            )
+            axs[1].plot(times, self.spikes[0, :, neuron_idx], color="b", ms=1, alpha=0.7)
             axs[1].set_yticks([0, 1])
             axs[1].set_ylim(0, 1)
             axs[1].set_xlabel("Time [ms]")
@@ -638,69 +626,52 @@ class LGN_sample_plot:
 
 
 class PopulationActivity:
-    def __init__(
-        self,
-        n_neurons,
-        network,
-        stimuli_init_time=500,
-        stimuli_end_time=1500,
-        image_path="",
-        data_dir="",
-    ):
+    def __init__(self, n_neurons, network, stimuli_init_time=500, stimuli_end_time=1500,
+                image_path="", data_dir="", filename=''):
         self.data_dir = data_dir
         self.n_neurons = n_neurons
         self.network = network
         self.stimuli_init_time = stimuli_init_time
         self.stimuli_end_time = stimuli_end_time
+        self.filename = filename
         self.images_path = image_path
         os.makedirs(self.images_path, exist_ok=True)
 
     def __call__(self, spikes, plot_core_only=True, bin_size=10):
         if plot_core_only:
-            if self.n_neurons > 66634:
-                self.n_neurons = 66634
-            self.core_mask = other_v1_utils.isolate_core_neurons(
-                self.network, data_dir=self.data_dir
-            )
+            if self.n_neurons > 65871:
+                self.n_neurons = 65871
+                core_radius = 400
+                self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
+            else:
+                self.core_mask = np.full(self.n_neurons, True)
         else:
             self.core_mask = np.full(self.n_neurons, True)
 
         self.spikes = np.array(spikes)[0, :, self.core_mask]
         self.spikes = np.transpose(self.spikes)
         self.neurons_ordering()
-        self.plot_populations_activity(bin_size)
+        # self.plot_populations_activity(bin_size)
         self.subplot_populations_activity(bin_size)
 
     def neurons_ordering(self):
-        node_types = pd.read_csv(
-            os.path.join(self.data_dir, "network/v1_node_types.csv"), sep=" "
-        )
+        node_types = pd.read_csv(os.path.join(self.data_dir, "network/v1_node_types.csv"), sep=" ")
         path_to_h5 = os.path.join(self.data_dir, "network/v1_nodes.h5")
-        node_h5 = h5py.File(path_to_h5, mode="r")
-        node_type_id_to_pop_name = dict()
-        for nid in np.unique(node_h5["nodes"]["v1"]["node_type_id"]):
-            # if not np.unique all of the 230924 model neurons ids are considered,
-            # but nearly all of them are repeated since there are only 111 different indices
-            ind_list = np.where(node_types.node_type_id == nid)[0]
-            assert len(ind_list) == 1
-            node_type_id_to_pop_name[nid] = node_types.pop_name[ind_list[0]]
 
-        node_type_ids = np.array(node_h5["nodes"]["v1"]["node_type_id"])
-        # Select population names of neurons in the present network (core)
-        true_node_type_ids = node_type_ids[
-            self.network["tf_id_to_bmtk_id"][self.core_mask]
-        ]
+        with h5py.File(path_to_h5, mode='r') as node_h5:
+            # Create mapping from node_type_id to pop_name
+            node_types.set_index('node_type_id', inplace=True)
+            node_type_id_to_pop_name = node_types['pop_name'].to_dict()
+
+            # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
+            node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][self.network['tf_id_to_bmtk_id']]
+            true_node_type_ids = node_type_ids[self.core_mask]
+
         # Now order the pop_names according to their layer and type
-        pop_orders = dict(
-            sorted(
-                node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1])
-            )
-        )
+        pop_orders = dict(sorted(node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1])))
 
         # Now we convert the neuron id (related to its pop_name) to an index related to its position in the y axis
-        neuron_id_to_y = (
-            np.zeros(self.n_neurons, np.int32) - 1
-        )  # rest 1 to check at the end if every neuron has an index
+        neuron_id_to_y = np.zeros(self.n_neurons, np.int32) - 1  # rest 1 to check at the end if every neuron has an index
         current_ind = 0
         self.layer_bounds = []
         self.ie_bounds = []
@@ -725,13 +696,11 @@ class PopulationActivity:
         assert np.sum(neuron_id_to_y < 0) == 0
         self.y_to_neuron_id = np.zeros(self.n_neurons, np.int32)
         self.y_to_neuron_id[neuron_id_to_y] = np.arange(self.n_neurons)
-        assert np.all(
-            self.y_to_neuron_id[neuron_id_to_y] == np.arange(self.n_neurons))
+        assert np.all(self.y_to_neuron_id[neuron_id_to_y] == np.arange(self.n_neurons))
 
     def plot_populations_activity(self, bin_size=10):
         layers_label = ["i1", "i23", "e23", "i4", "e4", "i5", "e5", "i6", "e6"]
-        neuron_class_bounds = np.concatenate(
-            (self.ie_bounds, self.layer_bounds))
+        neuron_class_bounds = np.concatenate((self.ie_bounds, self.layer_bounds))
         neuron_class_bounds = np.append(neuron_class_bounds, self.n_neurons)
         neuron_class_bounds.sort()
 
@@ -743,14 +712,11 @@ class PopulationActivity:
             class_spikes = self.spikes[:, neuron_ids]
             m, n = class_spikes.shape
             H, W = int(m / bin_size), 1  # block-size
-            n_spikes_bin = class_spikes.reshape(
-                H, m // H, W, n // W).sum(axis=(1, 3))
-            population_activity = n_spikes_bin / \
-                (n_neurons_class * bin_size * 0.001)
+            n_spikes_bin = class_spikes.reshape(H, m // H, W, n // W).sum(axis=(1, 3))
+            population_activity = n_spikes_bin / (n_neurons_class * bin_size * 0.001)
 
             fig = plt.figure()
-            plt.plot(
-                np.arange(0, self.spikes.shape[0], bin_size), population_activity)
+            plt.plot(np.arange(0, self.spikes.shape[0], bin_size), population_activity)
             plt.axvline(
                 self.stimuli_init_time,
                 linestyle="dashed",
@@ -771,8 +737,7 @@ class PopulationActivity:
             path = os.path.join(self.images_path, "Populations activity")
             os.makedirs(path, exist_ok=True)
             fig.tight_layout()
-            fig.savefig(os.path.join(
-                path, f"{label}_population_activity.png"), dpi=300)
+            fig.savefig(os.path.join(path, f"{label}_population_activity.png"), dpi=300)
             plt.close(fig)
 
     def subplot_populations_activity(self, bin_size=10):
@@ -787,8 +752,7 @@ class PopulationActivity:
             "Inhibitory L6 neurons",
             "Excitatory L6 neurons",
         ]
-        neuron_class_bounds = np.concatenate(
-            (self.ie_bounds, self.layer_bounds))
+        neuron_class_bounds = np.concatenate((self.ie_bounds, self.layer_bounds))
         neuron_class_bounds = np.append(neuron_class_bounds, self.n_neurons)
         neuron_class_bounds.sort()
 
@@ -802,21 +766,16 @@ class PopulationActivity:
             class_spikes = self.spikes[:, neuron_ids]
             m, n = class_spikes.shape
             H, W = int(m / bin_size), 1  # block-size
-            n_spikes_bin = class_spikes.reshape(
-                H, m // H, W, n // W).sum(axis=(1, 3))
-            population_activity = n_spikes_bin / \
-                (n_neurons_class * bin_size * 0.001)
+            n_spikes_bin = class_spikes.reshape(H, m // H, W, n // W).sum(axis=(1, 3))
+            population_activity = n_spikes_bin / (n_neurons_class * bin_size * 0.001)
             population_activity_dict[label] = population_activity
 
         time = np.arange(0, self.spikes.shape[0], bin_size)
         fig = plt.figure(constrained_layout=False)
         # fig.set_constrained_layout_pads(w_pad=4 / 72, h_pad=4 / 72, hspace=0.15, wspace=0.15)
         ax1 = plt.subplot(5, 1, 1)
-        plt.plot(
-            time,
-            population_activity_dict["Inhibitory L1 neurons"],
-            label="Inhibitory L1 neurons",
-            color="b",
+        plt.plot(time, population_activity_dict["Inhibitory L1 neurons"],
+            label="Inhibitory L1 neurons", color="b",
         )
         plt.legend(fontsize=6)
         plt.tick_params(axis="both", labelsize=7)
@@ -842,12 +801,8 @@ class PopulationActivity:
         for i in range(3, 9):
             if i % 2 == 1:
                 ax1 = plt.subplot(5, 2, i, sharex=ax1, sharey=ax1)
-                plt.plot(
-                    time,
-                    population_activity_dict[layers_label[i - 2]],
-                    label=layers_label[i - 2],
-                    color="b",
-                )
+                plt.plot(time, population_activity_dict[layers_label[i - 2]],
+                    label=layers_label[i - 2], color="b",)
                 plt.ylabel("Population \n activity (Hz)", fontsize=7)
                 plt.setp(ax1.get_xticklabels(), visible=False)
                 plt.legend(fontsize=6, loc="upper right")
@@ -859,20 +814,14 @@ class PopulationActivity:
                     linewidth=1,
                     zorder=10,
                 )
-                plt.axvline(
-                    1500, linestyle="dashed", color="gray", linewidth=1, zorder=10
-                )
+                plt.axvline(1500, linestyle="dashed", color="gray", linewidth=1, zorder=10)
             else:
                 if ax2 == None:
                     ax2 = plt.subplot(5, 2, i, sharex=ax1)
                 else:
                     ax2 = plt.subplot(5, 2, i, sharex=ax2, sharey=ax2)
-                plt.plot(
-                    time,
-                    population_activity_dict[layers_label[i - 2]],
-                    label=layers_label[i - 2],
-                    color="r",
-                )
+                plt.plot(time, population_activity_dict[layers_label[i - 2]],
+                    label=layers_label[i - 2], color="r",)
                 plt.setp(ax2.get_xticklabels(), visible=False)
                 plt.legend(fontsize=6, loc="upper right")
                 plt.tick_params(axis="both", labelsize=7)
@@ -954,351 +903,3 @@ class PopulationActivity:
         plt.close(fig)
 
 
-
-
-
-def calculate_Firing_Rate(z, drifting_gratings_init=500, drifting_gratings_end=2500):
-    dg_spikes = z[:, drifting_gratings_init:drifting_gratings_end, :]
-    # if the number of dimensions of dg_spikes is 2, reshape it to 3 adding an additional first dimension
-    # if dg_spikes.ndim == 2:
-    #     dg_spikes = dg_spikes.reshape(1, dg_spikes.shape[0], dg_spikes.shape[1])
-    mean_dg_spikes = np.mean(dg_spikes, axis=0)
-    mean_firing_rates = np.sum(mean_dg_spikes, axis=0)/((drifting_gratings_end-drifting_gratings_init)/1000)
-    
-    return mean_firing_rates
-
-def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), core_radius=None, remove_zero_rate_neurons=False):
-    
-    # Get the pop names of the neurons
-    if core_radius is not None:
-        pop_names = other_v1_utils.pop_names(network, core_radius=core_radius) 
-    else:
-        pop_names = other_v1_utils.pop_names(network)
-
-    # Get the number of neurons and DG angles
-    n_neurons = len(pop_names)
-    node_ids = np.arange(n_neurons)
-    
-    # Get the firing rates for every neuron and DG angle
-    all_rates = np.array([g["Ave_Rate(Hz)"] for _, g in rates_df.groupby("DG_angle")]).T
-    average_rates = np.mean(all_rates, axis=1)
-
-    # Find the preferred DG angle for each neuron
-    preferred_angle_ind = np.argmax(all_rates, axis=1)
-    preferred_rates = np.max(all_rates, axis=1)
-    preferred_DG_angle = np.array(DG_angles)[preferred_angle_ind]
-
-    # Calculate the DSI and OSI
-    phase_rad = np.array(DG_angles) * np.pi / 180.0
-    denominator = all_rates.sum(axis=1)
-    # dsi = np.abs((all_rates * np.exp(1j * phase_rad)).sum(axis=1) / denominator)
-    # osi = np.abs((all_rates * np.exp(2j * phase_rad)).sum(axis=1) / denominator)
-
-    dsi = np.where(denominator != 0, 
-               np.abs((all_rates * np.exp(1j * phase_rad)).sum(axis=1)) / denominator, 
-               np.nan)
-    osi = np.where(denominator != 0,
-                np.abs((all_rates * np.exp(2j * phase_rad)).sum(axis=1)) / denominator,
-                np.nan)
-
-    # Save the results in a dataframe
-    osi_df = pd.DataFrame()
-    osi_df["node_id"] = node_ids
-    osi_df["pop_name"] = pop_names
-    osi_df["DSI"] = dsi
-    osi_df["OSI"] = osi
-    osi_df["preferred_angle"] = preferred_DG_angle
-    osi_df["max_mean_rate(Hz)"] = preferred_rates
-    osi_df["Ave_Rate(Hz)"] = average_rates
-
-    if remove_zero_rate_neurons:
-        osi_df = osi_df[osi_df["Ave_Rate(Hz)"] != 0]
-
-    return osi_df
-
-
-class ModelMetricsAnalysis:    
-
-    def __init__(self, network, neurons, data_dir='', directory='', filename='', n_trials=1, drifting_gratings_init=50, 
-                 drifting_gratings_end=550, analyze_core_only=True):
-        self.n_neurons = neurons
-        self.network = network
-        self.data_dir = data_dir 
-        self.n_trials = n_trials
-        self.drifting_gratings_init = drifting_gratings_init
-        self.drifting_gratings_end = drifting_gratings_end
-        self.analyze_core_only = analyze_core_only
-        self.directory=directory
-        self.filename = filename
-    
-    def __call__(self, spikes, DG_angles):
-
-        # Isolate the core neurons if necessary
-        if self.analyze_core_only:
-            # core_neurons = 16679 #65871 
-            core_radius = 200 #400
-            self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
-            n_neurons_plot = np.sum(self.core_mask)
-            
-            # Calculate the core_neurons mask
-            # if self.n_neurons > core_neurons:
-            #     self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir) 
-            #     # self.n_neurons = core_neurons
-            #     # if n_neurons is overridden, it won't run for the second time...
-            #     n_neurons_plot = core_neurons
-            # else:
-            #     self.core_mask = np.full(self.n_neurons, True)
-            #     n_neurons_plot = self.n_neurons
-
-        else:
-            self.core_mask = np.full(self.n_neurons, True)
-            core_radius = None
-
-        spikes = spikes[:, :, self.core_mask]
-       
-        # Calculate the firing rates along every orientation            
-        # if spikes shape is (n_angles, n_time_steps, n_neurons) reshape it to (n_angles, n_trials, n_time_steps, n_neurons)
-        if spikes.shape[0] == len(DG_angles):
-            spikes = spikes.reshape(len(DG_angles), self.n_trials, spikes.shape[-2], n_neurons_plot)
-        
-        firing_rates_df = self.create_firing_rates_df(n_neurons_plot, spikes, n_trials=self.n_trials, 
-                                                      drifting_gratings_init=self.drifting_gratings_init, drifting_gratings_end=self.drifting_gratings_end, 
-                                                      DG_angles=DG_angles)
-        
-        # Save the firing rates
-        # firing_rates_df.to_csv(os.path.join(self.save_dir, f"V1_DG_firing_rates_df.csv"), sep=" ", index=False)
-
-        # Calculate the orientation and direction selectivity indices
-        metrics_df = calculate_OSI_DSI(firing_rates_df, self.network, DG_angles=DG_angles, core_radius=core_radius)
-        # metrics_df.to_csv(os.path.join(self.directory, f"V1_OSI_DSI_DF.csv"), sep=" ", index=False)
-
-        # Make the boxplots to compare with the neuropixels data
-        if len(DG_angles) == 1:
-            metrics = ["Ave_Rate(Hz)"]
-        else:
-            metrics = ["Rate at preferred direction (Hz)", "OSI", "DSI"]
-
-        boxplot = MetricsBoxplot(save_dir=self.directory, filename=self.filename)
-        boxplot.plot(metrics=metrics, metrics_df=metrics_df)
-
-    def create_firing_rates_df(self, n_neurons, spikes, n_trials=10, drifting_gratings_init=50, 
-                               drifting_gratings_end=550, DG_angles=np.arange(0, 360, 45)):
-        
-        # Calculate the firing rates for each neuron in each orientation
-        firing_rates_df = pd.DataFrame(columns=["DG_angle", "node_id", "Ave_Rate(Hz)"])
-        node_ids = np.arange(n_neurons)
-
-        # Iterate through each orientation
-        for angle_id, angle in enumerate(DG_angles): 
-            # Load the simulation results
-            firingRates = calculate_Firing_Rate(spikes[angle_id, :, :, :], drifting_gratings_init=drifting_gratings_init, drifting_gratings_end=drifting_gratings_end)
-            data = {
-                    "DG_angle": float(angle),
-                    "node_id": node_ids,
-                    "Ave_Rate(Hz)": firingRates
-                }
-            df = pd.DataFrame(data)
-            # Drop empty or all-NA columns before concatenation
-            df = df.dropna(axis=1, how='all')
-            # how many nan rows are there?
-            firing_rates_df = pd.concat([firing_rates_df, df], ignore_index=True)
-
-        return firing_rates_df
-    
-
-class MetricsBoxplot:
-    def __init__(self, save_dir='Metrics_analysis', filename=''):
-        self.save_dir = save_dir
-        self.filename = filename
-        self.osi_dfs = []
-
-    @staticmethod
-    def pop_name_to_cell_type(pop_name):
-        # Convert pop_name in the old format to cell types. E.g., 'e4Rorb' -> 'L4 Exc', 'i4Pvalb' -> 'L4 PV', 'i23Sst' -> 'L2/3 SST'
-        shift = 0  # letter shift for L23
-        layer = pop_name[1]
-        if layer == "2":
-            layer = "2/3"
-            shift = 1
-        elif layer == "1":
-            return "L1 Htr3a"  # special case
-
-        class_name = pop_name[2 + shift :]
-        if class_name == "Pvalb":
-            subclass = "PV"
-        elif class_name == "Sst":
-            subclass = "SST"
-        elif (class_name == "Vip") or (class_name == "Htr3a"):
-            subclass = "VIP"
-        else:  # excitatory
-            subclass = "Exc"
-
-        return f"L{layer} {subclass}"
-
-    @staticmethod
-    def neuropixels_cell_type_to_cell_type(pop_name):
-        # Convert pop_name in the neuropixels cell type to cell types. E.g, 'EXC_L23' -> 'L2/3 Exc', 'PV_L5' -> 'L5 PV'
-        layer = pop_name.split('_')[1]
-        class_name = pop_name.split('_')[0]
-        if "2" in layer:
-            layer = "L2/3"
-        elif layer == "L1":
-            return "L1 Htr3a"  # special case
-        if class_name == "EXC":
-            class_name = "Exc"
-
-        return f"{layer} {class_name}"
-
-    @staticmethod
-    def get_borders(ticklabel):
-        prev_layer = "1"
-        borders = [-0.5]
-        for i in ticklabel:
-            x = i.get_position()[0]
-            text = i.get_text()
-            if text[1] != prev_layer:
-                borders.append(x - 0.5)
-                prev_layer = text[1]
-        borders.append(x + 0.5)
-        return borders
-
-    @staticmethod
-    def draw_borders(ax, borders, ylim):
-        for i in range(0, len(borders), 2):
-            w = borders[i + 1] - borders[i]
-            h = ylim[1] - ylim[0]
-            ax.add_patch(
-                patches.Rectangle((borders[i], ylim[0]), w, h, alpha=0.08, color="k", zorder=-10)
-            )
-        return ax   
-
-    def get_osi_dsi_df(self, metric_file="V1_OSI_DSI_DF.csv", data_source_name="", data_dir=""):
-        # Load the data csv file and remove rows with empty cell type
-        # if metric_file is a dataframe, then do not load it
-        if isinstance(metric_file, pd.DataFrame):
-            df = metric_file
-        else:
-            df = pd.read_csv(f"{data_dir}/{metric_file}", sep=" ")
-
-        # Rename the cell types
-        if data_dir == "Neuropixels_data":
-            df = df[df['cell_type'].notna()]
-            df["cell_type"] = df["cell_type"].apply(self.neuropixels_cell_type_to_cell_type)
-        elif data_dir == 'Billeh_column_metrics':
-            df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
-        elif data_dir == "NEST_metrics":
-            df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
-            # plot only neurons within 200 um.
-            df = df[(df["x"] ** 2 + df["z"] ** 2) < (200 ** 2)]
-        else:
-            df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
-
-        # Rename the maximum rate column
-        df.rename(columns={"max_mean_rate(Hz)": "Rate at preferred direction (Hz)"}, inplace=True)
-        # df.rename(columns={"Ave_Rate(Hz)": "Average rate (Hz)"}, inplace=True)
-
-        # Cut off neurons with low firing rate at the preferred direction
-        nonresponding = df["Rate at preferred direction (Hz)"] < 0.5
-        df.loc[nonresponding, "OSI"] = np.nan
-        df.loc[nonresponding, "DSI"] = np.nan
-
-        # Sort the neurons by neuron types
-        df = df.sort_values(by="cell_type")
-
-        # Add a column for the data source name
-        if len(data_source_name) > 0:
-            df["data_type"] = data_source_name
-        else:
-            df["data_type"] = data_dir
-
-        columns = ["cell_type", "data_type", "Rate at preferred direction (Hz)", "OSI", "DSI", 'Ave_Rate(Hz)']
-        df = df[columns]
-
-        return df
-
-    def plot(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], metrics_df=None):
-        # Get the dataframes for the model and Neuropixels OSI and DSI 
-        if metrics_df is None:
-            metrics_df = f"V1_OSI_DSI_DF.csv"
-
-        # print(metrics_df)
-
-        self.osi_dfs.append(self.get_osi_dsi_df(metric_file=metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
-        self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
-        # self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
-        self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
-        
-        df = pd.concat(self.osi_dfs, ignore_index=True)
-        # df.to_csv(os.path.join('Borrar', f"help_DG_firing_rates_df.csv"), sep=" ", index=False)
-
-        # Create a figure to compare several model metrics against Neuropixels data
-        n_metrics = len(metrics)
-        height = int(7*n_metrics)
-        fig, axs = plt.subplots(n_metrics, 1, figsize=(12, height))
-        # fig, axs = plt.subplots(n_metrics, 1, figsize=(12, 20))
-        if n_metrics == 1:
-            axs = [axs]
-
-        color_pal = {
-            "V1 GLIF model": "tab:orange",
-            "Neuropixels": "tab:gray",
-            # "Billeh et al (2020)": "tab:blue",
-            "NEST simulation": "tab:pink"
-        }
-
-        # Establish the order of the neuron types in the boxplots
-        cell_type_order = np.sort(df['cell_type'].unique())
-
-        for idx, metric in enumerate(metrics):
-            if metric in ["Rate at preferred direction (Hz)", 'Ave_Rate(Hz)']:
-                ylims = [0, 100]
-            else:
-                ylims = [0, 1]
-
-            plot_one_metric(axs[idx], df, metric, ylims, color_pal, hue_order=cell_type_order)
-
-        axs[0].legend(loc="upper right", fontsize=16)
-        if len(axs) > 1:
-            for i in range(len(axs)-1):
-                axs[i].set_xticklabels([])
-
-        xticklabel = axs[n_metrics-1].get_xticklabels()
-        for label in xticklabel:
-            label.set_fontsize(14)
-            label.set_weight("bold")
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.save_dir, self.filename+'.png'), dpi=300, transparent=False)
-        plt.close()
-
-
-def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None):
-
-    sns.boxplot(
-        x="cell_type",
-        y=metric_name,
-        hue="data_type",
-        order=hue_order,
-        data=df,
-        ax=ax,
-        width=0.7,
-        palette=cpal,
-    )
-    ax.tick_params(axis="x", labelrotation=90)
-    ax.set_ylim(ylim)
-    ax.set_xlabel("")
-    # Modify the label sizes
-    ax.set_ylabel(metric_name, fontsize=16)
-    yticklabel = ax.get_yticklabels()
-    for label in yticklabel:
-        label.set_fontsize(14)
-
-    # Apply shadings to each layer
-    xticklabel = ax.get_xticklabels()
-    borders = MetricsBoxplot.get_borders(xticklabel)
-    MetricsBoxplot.draw_borders(ax, borders, ylim)
-
-    # Hide the legend
-    ax.get_legend().remove()
-
-    return ax

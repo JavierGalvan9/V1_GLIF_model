@@ -192,7 +192,7 @@ def main(_):
     # firing_rates = firing_rates[None, :]
 
     ### Build the model
-    if flags.neurons > 66634:
+    if flags.neurons > 65871:
         model_seq_len = 100
     else:
         model_seq_len = 600

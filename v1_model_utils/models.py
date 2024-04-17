@@ -211,8 +211,8 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
         rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
         # Create a TensorArray to save the results for every receptor type
-        noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 66634, 600)
-        noise_input = tf.transpose(noise_input) # (600, 50000, 5) # New shape (3000, 66634, 5)
+        noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 65871, 600)
+        noise_input = tf.transpose(noise_input) # (600, 50000, 5) # New shape (3000, 65871, 5)
         # Reshape properly the input current
         noise_input = tf.reshape(noise_input, (self._batch_size, seq_len, -1)) # (1, 600, 250000) # (1, 3000, 333170)
 
@@ -309,17 +309,17 @@ class SparseLayer(tf.keras.layers.Layer):
                 end_idx = int((i + 1) * self._max_batch)
                 chunk = inp[start_idx:end_idx, :]
                 chunk = tf.reshape(chunk, (self._max_batch, -1))
-                partial_input_current = self.calculate_i_in(chunk)  # ( 5, 66634, 68)
+                partial_input_current = self.calculate_i_in(chunk)  # ( 5, 65871, 68)
                 # Store the partial result in the tensor array     
                 result_array = result_array.write(i, partial_input_current)
             
             # Concatenate the partial results to get the final result
-            input_current = result_array.stack() # ( 9, 5, 66634, 68)
-            input_current = tf.transpose(input_current, perm=[1, 2, 0, 3]) # New shape (5, 66634, 9, 68)
-            input_current = tf.reshape(input_current, (self._n_syn_basis, -1, num_chunks * self._max_batch)) # New shape (5, 66634, 612)
-            input_current = tf.transpose(input_current, perm=[2, 1, 0]) # New shape (612, 66634, 5)
+            input_current = result_array.stack() # ( 9, 5, 65871, 68)
+            input_current = tf.transpose(input_current, perm=[1, 2, 0, 3]) # New shape (5, 65871, 9, 68)
+            input_current = tf.reshape(input_current, (self._n_syn_basis, -1, num_chunks * self._max_batch)) # New shape (5, 65871, 612)
+            input_current = tf.transpose(input_current, perm=[2, 1, 0]) # New shape (612, 65871, 5)
             if num_pad_elements > 0: # Remove the padded 0's
-                input_current = input_current[:-num_pad_elements, :] # New shape (600, 66634, 5)
+                input_current = input_current[:-num_pad_elements, :] # New shape (600, 65871, 5)
 
         # Reshape properly the input current
         input_current = tf.reshape(input_current, (shp[0], shp[1], -1)) # New shape (1, 3000, 333170)
@@ -1055,29 +1055,30 @@ def create_model(
     # averaging over sequences of length down_sample in the output tensor.
     # Otherwise, mean_output is simply the mean of the last cue_duration time steps
     # of the output tensor.
-    if return_sequences:
-        mean_output = tf.reshape(output, (-1, int(seq_len / down_sample), down_sample, n_output))
-        mean_output = tf.reduce_mean(mean_output, 2)
-        mean_output = tf.nn.softmax(mean_output, axis=-1)
-    else:
-        mean_output = tf.reduce_mean(output[:, -cue_duration:], 1)
-        mean_output = tf.nn.softmax(mean_output)
+    # if return_sequences:
+    #     mean_output = tf.reshape(output, (-1, int(seq_len / down_sample), down_sample, n_output))
+    #     mean_output = tf.reduce_mean(mean_output, 2)
+    #     mean_output = tf.nn.softmax(mean_output, axis=-1)
+    # else:
+    #     mean_output = tf.reduce_mean(output[:, -cue_duration:], 1)
+    #     mean_output = tf.nn.softmax(mean_output)
 
     if use_state_input:
-        many_input_model = tf.keras.Model(
-            inputs=[x, state_input_holder, initial_state_holder], 
-            outputs=mean_output
-        )
         # many_input_model = tf.keras.Model(
-        #     inputs=[x, state_input_holder,initial_state_holder],
-        #     outputs=[])
+        #     inputs=[x, state_input_holder, initial_state_holder], 
+        #     outputs=mean_output
+        # )
+        many_input_model = tf.keras.Model(
+            inputs=[x, state_input_holder,initial_state_holder],
+            outputs=[output])
     else:
-        many_input_model = tf.keras.Model(
-            inputs=[x, state_input_holder], 
-            outputs=mean_output
-        )
         # many_input_model = tf.keras.Model(
-        #     inputs=[x, state_input_holder])
+        #     inputs=[x, state_input_holder], 
+        #     outputs=mean_output
+        # )
+        many_input_model = tf.keras.Model(
+            inputs=[x, state_input_holder],
+            outputs=[output])
 
     if add_metric:
         # add the firing rate of the neurons as a metric to the model

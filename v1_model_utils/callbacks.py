@@ -2,13 +2,18 @@ import os
 import sys
 import json
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import datetime as dt
 from time import time
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+import pickle as pkl
 from matplotlib import pyplot as plt
+import seaborn as sns
+# from scipy.signal import correlate
 import stim_dataset
-from v1_model_utils.plotting_utils import InputActivityFigure, ModelMetricsAnalysis
+from v1_model_utils import other_v1_utils, load_sparse
+from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivity
+from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
 
 
 def printgpu(verbose=0):
@@ -33,61 +38,67 @@ def compose_str(metrics_values):
 
 
 class Callbacks:
-    def __init__(self, model, optimizer, distributed_roll_out, network, flags, logdir, strategy, 
-                metrics_keys, pre_delay=50, post_delay=50):
-        self.network = network
+    def __init__(self, model, optimizer, distributed_roll_out, flags, logdir, flag_str, strategy, 
+                metrics_keys, pre_delay=50, post_delay=50, checkpoint=None, model_variables_init=None, 
+                save_optimizer=True):
+        
+        self.n_neurons = flags.neurons
+        if flags.caching:
+            load_fn = load_sparse.cached_load_v1
+        else:
+            load_fn = load_sparse.load_v1
+        self.network, _, _ = load_fn(flags, self.n_neurons, flag_str=flag_str)      
+
+        self.neuropixels_feature = 'Ave_Rate(Hz)'  
+        self.model = model
+        self.optimizer = optimizer
         self.flags = flags
         self.logdir = logdir
-        # self.manager = manager
-        self.osi_dsi_data_set = strategy.distribute_datasets_from_function(self.get_osi_dsi_dataset_fn(regular=True))
+        self.strategy = strategy
         self.distributed_roll_out = distributed_roll_out
         self.metrics_keys = metrics_keys
         self.pre_delay = pre_delay
         self.post_delay = post_delay
-        self.epoch = 0
         self.step = 0
-        self.no_improve_epochs = 0
-        # please create a dictionary to save the values of the metric keys after each epoch
-        self.epoch_metric_values = {key: [] for key in self.metrics_keys}
-        # self.epoch_metric_values['val_osi_dsi_loss'] = []
-        # self.step_counter = tf.Variable(0, dtype=tf.int64)
+        self.total_epochs = flags.n_runs * flags.n_epochs
         self.step_running_time = []
-        self.min_val_loss = float('inf')
+        self.model_variables_dict = model_variables_init
         self.initial_metric_values = None
         self.summary_writer = tf.summary.create_file_writer(self.logdir)
         with open(os.path.join(self.logdir, 'config.json'), 'w') as f:
             json.dump(flags.flag_values_dict(), f, indent=4)
-    
-        checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-        if flags.restore_from != '':
-            with strategy.scope():
-                # checkpoint.restore(tf.train.latest_checkpoint(flags.restore_from))
-                checkpoint.restore(self.flags.restore_from)
-                print(f'Model parameters of {self.flags.task_name} restored from {self.flags.restore_from}')
 
-        self.manager = tf.train.CheckpointManager(
-                                            checkpoint, directory=self.logdir, max_to_keep=1, # just keep the best model
-                                            # checkpoint_interval = 5, # save ckpt for data analysis
-                                            # step_counter=self.step_counter
-                                        )
+        if checkpoint is None:
+            if save_optimizer:
+                checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            else:
+                checkpoint = tf.train.Checkpoint(model=model)
+            self.min_val_loss = float('inf')
+            self.no_improve_epochs = 0
+            # create a dictionary to save the values of the metric keys after each epoch
+            self.epoch_metric_values = {key: [] for key in self.metrics_keys}
+        else:
+            # Load epoch_metric_values and min_val_loss from the file
+            with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'rb') as f:
+                data_loaded = pkl.load(f)
+            self.epoch_metric_values = data_loaded['epoch_metric_values']
+            self.min_val_loss = data_loaded['min_val_loss']
+            self.no_improve_epochs = data_loaded['no_improve_epochs']
 
-    def get_osi_dsi_dataset_fn(self, regular=False):
-        def _f(input_context):
-            post_delay = self.flags.seq_len - (2500 % self.flags.seq_len)
-            _data_set = stim_dataset.generate_drifting_grating_tuning(
-                seq_len=2500+post_delay,
-                pre_delay=500,
-                post_delay = post_delay,
-                n_input=self.flags.n_input,
-                regular=regular
-            ).batch(1)
-                        
-            return _data_set
-        return _f
+        # Manager for the best model
+        self.best_manager = tf.train.CheckpointManager(
+            checkpoint, directory=self.logdir, max_to_keep=1
+        )
+        # Manager for osi/dsi checkpoints 
+        self.epoch_manager = tf.train.CheckpointManager(
+            checkpoint, directory=self.logdir + '/OSI_DSI_checkpoints', max_to_keep=None
+        )
+
 
     def on_train_begin(self):
         print("---------- Training started at ", dt.datetime.now().strftime('%d-%m-%Y %H:%M'), ' ----------\n')
         self.train_start_time = time()
+        self.epoch = self.flags.run_session * self.flags.n_epochs
 
     def on_train_end(self, metric_values):
         self.train_end_time = time()
@@ -107,21 +118,33 @@ class Callbacks:
         for initial, final, key in zip(self.initial_metric_values[n_metrics:], self.final_metric_values[n_metrics:], self.metrics_keys[n_metrics:]):
             print(f"| {key:<{max_key_length}} | {initial:<{max_key_length}.3f} | {final:<{max_key_length}.3f} |")
 
+        # Save epoch_metric_values and min_val_loss to a file
+        data_to_save = {
+            'epoch_metric_values': self.epoch_metric_values,
+            'min_val_loss': self.min_val_loss,
+            'no_improve_epochs': self.no_improve_epochs
+        }
+        with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'wb') as f:
+            pkl.dump(data_to_save, f)
+
+        if self.flags.n_runs > 1:
+            self.plot_osi_dsi(parallel=True)
+
     def on_epoch_start(self):
         self.epoch += 1
         # self.step_counter.assign_add(1)
         self.epoch_init_time = time()
         date_str = dt.datetime.now().strftime('%d-%m-%Y %H:%M')
-        print(f'Epoch {self.epoch:2d}/{self.flags.n_epochs} @ {date_str}')
-        tf.print(f'\nEpoch {self.epoch:2d}/{self.flags.n_epochs} @ {date_str}')
+        print(f'Epoch {self.epoch:2d}/{self.total_epochs} @ {date_str}')
+        tf.print(f'\nEpoch {self.epoch:2d}/{self.total_epochs} @ {date_str}')
 
-    def on_epoch_end(self, z, x, y, metric_values, verbose=True):
+    def on_epoch_end(self, x, z, y, metric_values, verbose=True):
         self.step = 0
         if self.initial_metric_values is None:
             self.initial_metric_values = metric_values
         
         if verbose:
-            print_str = '  Validation: \n' 
+            print_str = f'  Validation: - Angle: {y[0][0]:.2f}\n' 
             val_values = metric_values[len(metric_values)//2:]
             print_str += '    ' + compose_str(val_values) 
             print(print_str)
@@ -141,30 +164,29 @@ class Callbacks:
 
         self.plot_losses_curves()
 
-        # if val_loss_value < self.min_val_loss:
-        if True:
+        if val_loss_value < self.min_val_loss:
+        # if True:
             self.min_val_loss = val_loss_value
             self.no_improve_epochs = 0
 
+            self.save_best_model()
+            self.plot_raster(x, z, y)
+            self.plot_mean_firing_rate_boxplot(z, y)
             # self.plot_lgn_activity(x)
 
-            t0 = time()
-            self.plot_raster(z, x, y)
-            print('Raster plot time:', time()-t0)
+            self.model_variables_dict['Best'] = {var.name: var.numpy() for var in self.model.trainable_variables}
+            for var in self.model_variables_dict['Best'].keys():
+                t0 = time()
+                self.variable_change_analysis(var)
+                print(f'Time spent in {var}: {time()-t0}')
 
-            t0 = time()
-            self.plot_mean_firing_rate_boxplot(z, y)
-            print('Mean firing rate boxplot time:', time()-t0)
-
-            self.save_model()
         else:
             self.no_improve_epochs += 1
-           
-        if (self.epoch) % 50 == 0:
-            t0 = time()
-            self.plot_osi_dsi()
-            print('OSI and DSI plot time:', (time()-t0))
 
+        # Plot osi_dsi if only 1 run and the osi/dsi period is reached
+        if self.flags.n_runs == 1 and (self.epoch % self.flags.osi_dsi_eval_period == 0 or self.epoch==1):
+            self.plot_osi_dsi(parallel=False)
+           
         with self.summary_writer.as_default():
             for k, v in zip(self.metrics_keys, metric_values):
                 tf.summary.scalar(k, v, step=self.epoch)
@@ -180,7 +202,6 @@ class Callbacks:
             stop = False
 
         return stop
-
 
     def on_step_start(self):
         self.step += 1
@@ -199,11 +220,11 @@ class Callbacks:
             print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
         
 
-    def save_model(self):
+    def save_best_model(self):
         # self.step_counter.assign_add(1)
         print(f'[ Saving the model at epoch {self.epoch} ]')
         try:
-            p = self.manager.save(checkpoint_number=self.epoch)
+            p = self.best_manager.save(checkpoint_number=self.epoch)
             print(f'Model saved in {p}\n')
         except:
             print("Saving failed. Maybe next time?")
@@ -224,7 +245,7 @@ class Callbacks:
         plt.savefig(os.path.join(images_dir, f'losses_curves_epoch.png'), dpi=300, transparent=False)
         plt.close()
     
-    def plot_raster(self, z, x, y):
+    def plot_raster(self, x, z, y):
         z = z.numpy()
         x = x.numpy()
         y = y.numpy()
@@ -253,60 +274,255 @@ class Callbacks:
     #     plt.ylabel('Mean input activity')
     #     plt.savefig(os.path.join(self.logdir, 'Mean_input_activity.png'))
 
+    def plot_populations_activity(self, z):
+        z = z.numpy()
+
+        # Plot the mean firing rate of the population of neurons
+        filename = f'Epoch_{self.epoch}'
+        Population_activity = PopulationActivity(n_neurons=self.n_neurons, network=self.network, 
+                                                stimuli_init_time=self.pre_delay, stimuli_end_time=self.flags.seq_len-self.post_delay, 
+                                                image_path=self.logdir, filename=filename, data_dir=self.flags.data_dir)
+        Population_activity(z, plot_core_only=True, bin_size=10)
+
 
     def plot_mean_firing_rate_boxplot(self, z, y):
         z = z.numpy()
         y = y.numpy()
-        boxplots_dir = os.path.join(self.logdir, 'Boxplots')
+        boxplots_dir = os.path.join(self.logdir, f'Boxplots/{self.neuropixels_feature}')
         os.makedirs(boxplots_dir, exist_ok=True)
-        metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir, n_trials=1,
+        metrics_analysis = ModelMetricsAnalysis(self.network, neuropixels_feature="Ave_Rate(Hz)", data_dir=self.flags.data_dir, n_trials=1,
                                                 analyze_core_only=True, drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay, 
                                                 directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
         metrics_analysis(z, y)    
 
-    def plot_osi_dsi(self):
-        print('Starting to plot OSI and DSI...')
-        sim_duration = (2500//self.flags.seq_len + 1) * self.flags.seq_len
-        n_trials_per_angle = 10
-        spikes = np.zeros((8, sim_duration, self.flags.neurons), dtype=float)
-        DG_angles = np.arange(0, 360, 45)
-        for trial_id in range(n_trials_per_angle):
-            t0 = time()
-            test_it = iter(self.osi_dsi_data_set)
-            for angle_id, angle in enumerate(range(0, 360, 45)):
-                t0 = time()
-                x, y, _, w = next(test_it)
-                chunk_size = self.flags.seq_len
-                num_chunks = (2500//self.flags.seq_len + 1)
-                for i in range(num_chunks):
-                    t0 = time()
-                    chunk = x[:, i * chunk_size : (i + 1) * chunk_size, :]
-                    z_chunk = self.distributed_roll_out(chunk, y, w, output_spikes=True)
-                    spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += z_chunk.numpy()[0, :, :].astype(float)
 
-                # spikes[angle_id, :, :] += z.numpy()[0, :, :]
-        spikes = spikes/n_trials_per_angle
-        # Slice only the first 2500 ms
-        spikes = spikes[:, :2500, :]
-
-        images_dir = os.path.join(self.logdir, 'Raster_plots_OSI_DSI')
-        os.makedirs(images_dir, exist_ok=True)
-        graph = InputActivityFigure(
-                                    self.network,
-                                    self.flags.data_dir,
-                                    images_dir,
-                                    filename=f'Epoch_{self.epoch}',
-                                    frequency=self.flags.temporal_f,
-                                    stimuli_init_time=500,
-                                    stimuli_end_time=2500,
-                                    reverse=False,
-                                    plot_core_only=True,
-                                    )
-        graph(x[:, :2500, :].numpy(), spikes)
+    def variable_change_analysis(self, variable):
+        if 'rest_of_brain_weights' in variable or 'sparse_input_weights' in variable:
+            self.node_to_pop_weights_analysis(variable=variable)
+        elif 'sparse_recurrent_weights' in variable:
+            self.pop_to_pop_weights_analysis(self.network['synapses']['indices'], variable=variable)
         
-        boxplots_dir = os.path.join(self.logdir, 'Boxplots_OSI_DSI')
+
+    def node_to_pop_weights_analysis(self, variable=''):
+        pop_names = other_v1_utils.pop_names(self.network)
+        cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
+        # Create DataFrame with all the necessary data
+        df = pd.DataFrame({
+            'Cell type': cell_types * 2,  # Duplicate node names for initial and final weights
+            'Weight': self.model_variables_dict['Initial'][variable].tolist() + self.model_variables_dict['Best'][variable].tolist(),  # Combine initial and final weights
+            'State': ['Initial'] * len(self.model_variables_dict['Initial'][variable]) + ['Final'] * len(self.model_variables_dict['Best'][variable])  # Distinguish between initial and final weights
+        })
+
+        # Sort the dataframe by Node Name and then by Type to ensure consistent order
+        df = df.sort_values(['Cell type', 'State'])
+
+        # Plotting
+        boxplots_dir = os.path.join(self.logdir, f'Boxplots/{variable}')
         os.makedirs(boxplots_dir, exist_ok=True)
-        metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir,
-                                                drifting_gratings_init=500, drifting_gratings_end=2500,
-                                                analyze_core_only=True, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
-        metrics_analysis(spikes, DG_angles)
+        fig, axs = plt.subplots(2, 1, figsize=(12, 14))
+
+        fig = plt.figure(figsize=(12, 6))
+        hue_order = ['Initial', 'Final']
+        # sns.boxplot(x='Node Name', y='Weight Change', data=df)
+        sns.barplot(x='Cell type', y='Weight', hue='State', hue_order=hue_order, data=df)
+        # sns.boxplot(x='Node Name', y='Weight', hue='Type', hue_order=hue_order, data=df)
+        # plt.axhline(0, color='black', linewidth=1)  # include a horizontal black line at 0
+        plt.xticks(rotation=90)  # Rotate x-axis labels for better readability
+        plt.title(f'{variable}')
+        plt.tight_layout()
+        plt.savefig(os.path.join(boxplots_dir, f'{variable}.png'), dpi=300, transparent=False)
+        plt.close()
+
+    def pop_to_pop_weights_analysis(self, indices, variable=''):
+        pop_names = other_v1_utils.pop_names(self.network)
+        cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
+        post_cell_types = [cell_types[i] for i in indices[:, 0]]
+        pre_cell_types = [cell_types[i] for i in indices[:, 1]]
+
+        ### Initial Weight ###
+        weight_changes = self.model_variables_dict['Best'][variable] - self.model_variables_dict['Initial'][variable]
+        df = pd.DataFrame({'Post Name': post_cell_types, 'Pre_names':pre_cell_types, 
+                            'Initial weight': self.model_variables_dict['Initial'][variable], 'Final weight': self.model_variables_dict['Best'][variable], 
+                            'Weight Change': weight_changes})
+        
+        # Calculate global min and max for color normalization
+        global_grouped_df = df.groupby(['Pre_names', 'Post Name'])[['Initial weight', 'Final weight']].mean().reset_index()
+        global_min = global_grouped_df[['Initial weight', 'Final weight']].min().min()
+        global_max = global_grouped_df[['Initial weight', 'Final weight']].max().max()
+
+        # Plot for Initial Weight
+        grouped_df = df.groupby(['Pre_names', 'Post Name'])['Initial weight'].mean().reset_index()
+        # Create a pivot table to reshape the data for the heatmap
+        pivot_df = grouped_df.pivot(index='Pre_names', columns='Post Name', values='Initial weight')
+        # Plot heatmap
+        boxplots_dir = os.path.join(self.logdir, f'Boxplots/{variable}')
+        os.makedirs(boxplots_dir, exist_ok=True)
+        fig = plt.figure(figsize=(12, 6))
+        heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=global_min, vmax=global_max)
+        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-0.5, vmax=0.5)
+        plt.xticks(rotation=90)
+        plt.gca().set_aspect('equal')
+        plt.title(f'{variable}')
+        # Create a separate color bar axis
+        cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
+        # Plot color bar
+        cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
+        cbar.set_label('Initial Weight')
+        plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=False)
+        plt.close()
+
+        ### Final Weight ###
+        grouped_df = df.groupby(['Pre_names', 'Post Name'])['Final weight'].mean().reset_index()
+        # Create a pivot table to reshape the data for the heatmap
+        pivot_df = grouped_df.pivot(index='Pre_names', columns='Post Name', values='Final weight')
+        # Plot heatmap
+        plt.figure(figsize=(12, 6))
+        heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=global_min, vmax=global_max)
+        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-0.5, vmax=0.5)
+        plt.xticks(rotation=90)
+        plt.gca().set_aspect('equal')
+        plt.title(f'{variable}')
+        # Create a separate color bar axis
+        cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
+        # Plot color bar
+        cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
+        cbar.set_label('Final Weight')
+        plt.savefig(os.path.join(boxplots_dir, f'Final_weight.png'), dpi=300, transparent=False)
+        plt.close()
+
+        ### Weight change ###
+        grouped_df = df.groupby(['Pre_names', 'Post Name'])['Weight Change'].mean().reset_index()
+        # Create a pivot table to reshape the data for the heatmap
+        pivot_df = grouped_df.pivot(index='Pre_names', columns='Post Name', values='Weight Change')
+        # Plot heatmap
+        plt.figure(figsize=(12, 6))
+        heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=global_min, vmax=global_max)
+        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False)
+        plt.xticks(rotation=90)
+        plt.gca().set_aspect('equal')
+        plt.title(f'{variable}')
+        # Create a separate color bar axis
+        cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
+        # Plot color bar
+        cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
+        cbar.set_label('Weight Change')
+        plt.savefig(os.path.join(boxplots_dir, f'Weight_change.png'), dpi=300, transparent=False)
+        plt.close()
+
+
+
+    def plot_osi_dsi(self, parallel=False):
+        print('Starting to plot OSI and DSI...')
+        # Save the checkpoint to reload weights in the osi_dsi_estimator
+        if parallel:
+            p = self.epoch_manager.save(checkpoint_number=self.epoch)
+            print(f'Checkpoint model saved in {p}\n')
+        else:              
+             # osi_dsi_data_set = self.strategy.distribute_datasets_from_function(self.get_osi_dsi_dataset_fn(regular=True))
+            DG_angles = np.arange(0, 360, 45)
+            osi_dataset_path = os.path.join('OSI_DSI_dataset', 'lgn_firing_rates.pkl')
+            if not os.path.exists(osi_dataset_path):
+                print('Creating OSI/DSI dataset...')
+                # Define OSI/DSI dataset
+                def get_osi_dsi_dataset_fn(regular=False):
+                    def _f(input_context):
+                        post_delay = self.flags.seq_len - (2500 % self.flags.seq_len)
+                        _lgn_firing_rates = stim_dataset.generate_drifting_grating_tuning(
+                            seq_len=2500+post_delay,
+                            pre_delay=500,
+                            post_delay = post_delay,
+                            n_input=self.flags.n_input,
+                            regular=regular,
+                            return_firing_rates=True
+                        ).batch(1)
+                                    
+                        return _lgn_firing_rates
+                    return _f
+            
+                osi_dsi_data_set = self.strategy.distribute_datasets_from_function(get_osi_dsi_dataset_fn(regular=True))
+                test_it = iter(osi_dsi_data_set)
+                lgn_firing_rates_dict = {}  # Dictionary to store firing rates
+                for angle_id, angle in enumerate(DG_angles):
+                    t0 = time()
+                    lgn_firing_rates = next(test_it)
+                    lgn_firing_rates_dict[angle] = lgn_firing_rates.numpy()
+                    print(f'Angle {angle} done.')
+                    print(f'    Trial running time: {time() - t0:.2f}s')
+                    mem_data = printgpu(verbose=1)
+                    print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB\n')
+
+                # Save the dataset      
+                results_dir = os.path.join("OSI_DSI_dataset")
+                os.makedirs(results_dir, exist_ok=True)
+                with open(osi_dataset_path, 'wb') as f:
+                    pkl.dump(lgn_firing_rates_dict, f)
+                print('OSI/DSI dataset created successfully!')
+
+            else:
+                # Load the LGN firing rates dataset
+                with open(osi_dataset_path, 'rb') as f:
+                    lgn_firing_rates_dict = pkl.load(f)
+
+            sim_duration = (2500//self.flags.seq_len + 1) * self.flags.seq_len
+            n_trials_per_angle = 1
+            spikes = np.zeros((8, sim_duration, self.flags.neurons), dtype=float)
+            DG_angles = np.arange(0, 360, 45)
+            for trial_id in range(n_trials_per_angle):
+                # test_it = iter(osi_dsi_data_set)
+                for angle_id, angle in enumerate(range(0, 360, 45)):
+                    t0 = time()
+                    # Reset the memory stats
+                    tf.config.experimental.reset_memory_stats('GPU:0')
+
+                    lgn_fr = lgn_firing_rates_dict[angle]
+                    lgn_fr = tf.constant(lgn_fr, dtype=tf.float32)
+                    _p = 1 - tf.exp(-lgn_fr / 1000.)
+                    x = tf.random.uniform(tf.shape(_p)) < _p
+                    y = tf.constant(angle, dtype=tf.float32, shape=(1,1))
+                    w = tf.constant(sim_duration, dtype=tf.float32, shape=(1,))
+
+                    # x, y, _, w = next(test_it)
+                    chunk_size = self.flags.seq_len
+                    num_chunks = (2500//chunk_size + 1)
+                    for i in range(num_chunks):
+                        chunk = x[:, i * chunk_size : (i + 1) * chunk_size, :]
+                        z_chunk = self.distributed_roll_out(chunk, y, w, output_spikes=True)
+                        spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += z_chunk.numpy()[0, :, :].astype(float)
+
+                    if trial_id == 0 and angle_id == 0:
+                        # Raster plot for 0 degree orientation
+                        lgn_spikes = x[:, :2500, :].numpy()
+                        z = spikes[:, :2500, :]
+                        images_dir = os.path.join(self.logdir, 'Raster_plots_OSI_DSI')
+                        os.makedirs(images_dir, exist_ok=True)
+
+                        graph = InputActivityFigure(
+                                        self.network,
+                                        self.flags.data_dir,
+                                        images_dir,
+                                        filename=f'Epoch_{self.epoch}',
+                                        frequency=self.flags.temporal_f,
+                                        stimuli_init_time=500,
+                                        stimuli_end_time=2500,
+                                        reverse=False,
+                                        plot_core_only=True,
+                                        )
+                        graph(lgn_spikes, z)
+
+                    print(f'Trial {trial_id}/{n_trials_per_angle} - Angle {angle} done.')
+                    print(f'    Trial running time: {time() - t0:.2f}s')
+                    mem_data = printgpu(verbose=1)
+                    print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB\n')
+        
+        	# Average the spikes over the number of trials
+            spikes = spikes/n_trials_per_angle
+            # Slice only the first 2500 ms
+            spikes = spikes[:, :2500, :]
+
+            # Do the OSI/DSI analysis 
+            boxplots_dir = os.path.join(self.logdir, 'Boxplots_OSI_DSI')
+            os.makedirs(boxplots_dir, exist_ok=True)
+            metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir,
+                                                    drifting_gratings_init=500, drifting_gratings_end=2500,
+                                                    analyze_core_only=True, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
+            metrics_analysis(spikes, DG_angles)
