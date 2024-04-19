@@ -70,7 +70,7 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
     edges_h5_path = os.path.join(data_dir, edge_file)
     edges_type_df = pd.read_csv(os.path.join(data_dir, edge_types_file), delimiter=" ")
     synaptic_models_path = os.path.join('GLIF_network', 'components', "synaptic_models")
-    basis_function_weights_df = pd.read_csv('GLIF_network/synaptic_data/basis_function_weights.csv', index_col=0)
+    basis_function_weights_df = pd.read_csv('synaptic_data/basis_function_weights.csv', index_col=0)
     print(f'Saving basis function weights for {source}-{target}')
     # Map the synaptic model to a given id using a dictionary
     path = os.path.join('GLIF_network', 'synaptic_models_to_syn_id_dict.pkl')
