@@ -296,7 +296,7 @@ class OrientationSelectivityLoss:
         self._core_mask = core_mask
         self._method = method
         self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
-        if (self._core_mask is not None) and (self._method == "crowd_spikes"):
+        if (self._core_mask is not None) and (self._method == "crowd_spikes" or self._method == "crowd_osi"):
             self._tuning_angles = tf.boolean_mask(self._tuning_angles, self._core_mask)
         
         if self._method == "neuropixels_fr":

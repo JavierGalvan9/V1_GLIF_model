@@ -5,7 +5,7 @@ import os
 # Define the environment variables for optimal GPU performance
 # os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # before import tensorflow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # before import tensorflow
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
@@ -185,12 +185,25 @@ def main(_):
 
         ### BUILD THE LOSS AND REGULARIZER FUNCTIONS ###
         # Create rate and voltage regularizers
-        if flags.core_loss and flags.neurons > 65871:
-            core_radius = 400
-            core_mask = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
+        if flags.loss_core_radius > 0:
+            core_mask = other_v1_utils.isolate_core_neurons(network, radius=flags.loss_core_radius, data_dir=flags.data_dir)
+            # if core_mask is all True, set it to None.
+            if core_mask.all():
+                core_mask = None
+                print("All neurons are in the core region. Core mask is set to None.")
+            else:
+                # report how many neurons are selected.
+                print(f"Core mask is set to {core_mask.sum()} neurons.")
             core_mask = tf.constant(core_mask, dtype=tf.bool)
         else:
             core_mask = None
+            
+        # if flags.core_loss and flags.neurons > 65871:
+        #     core_radius = 400
+        #     core_mask = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
+        #     core_mask = tf.constant(core_mask, dtype=tf.bool)
+        # else:
+        #     core_mask = None
 
         # Extract outputs of intermediate keras layers to get access to
         # spikes and membrane voltages of the model
@@ -665,6 +678,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('caching', True, '') # if one wants to use caching, remember to update the caching function
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     absl.app.flags.DEFINE_boolean('core_loss', False, '')
+    absl.app.flags.DEFINE_float('loss_core_radius', 400.0, '') # 0 is not using core loss
+    absl.app.flags.DEFINE_float('plot_core_radius', 400.0, '') # 0 is not using core plot
+
     # absl.app.flags.DEFINE_boolean('train_input', True, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', False, '')
