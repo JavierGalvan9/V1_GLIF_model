@@ -39,7 +39,7 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), n_selected_
     # Get the pop names of the neurons
     if n_selected_neurons is not None:
         pop_names = other_v1_utils.pop_names(network, n_selected_neurons=n_selected_neurons) 
-    elif core_radius is not None:
+    elif core_radius is not None and core_radius > 0:
         pop_names = other_v1_utils.pop_names(network, core_radius=core_radius)
     else:
         pop_names = other_v1_utils.pop_names(network)
@@ -142,7 +142,7 @@ class ModelMetricsAnalysis:
 
         # Calculate the orientation and direction selectivity indices
         metrics_df = calculate_OSI_DSI(firing_rates_df, self.network, DG_angles=DG_angles, n_selected_neurons=n_neurons_plot,
-                                        remove_zero_rate_neurons=True)
+                                        remove_zero_rate_neurons=True, core_radius=self.core_radius)
         # metrics_df.to_csv(os.path.join(self.directory, f"V1_OSI_DSI_DF.csv"), sep=" ", index=False)
 
         # Make the boxplots to compare with the neuropixels data
