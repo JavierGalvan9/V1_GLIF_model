@@ -109,7 +109,7 @@ class ModelMetricsAnalysis:
             # core_radius = 400
             # n_neurons_plot = 65871
             self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
-            n_neurons_plot = len(self.core_mask)
+            n_neurons_plot = np.sum(self.core_mask)
 
             # Calculate the core_neurons mask
             # if self.n_neurons > core_neurons:
@@ -408,7 +408,7 @@ class OneShotTuningAnalysis:
             # core_radius = 400
             # n_neurons_plot = 65871
             self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
-            n_neurons_plot = len(self.core_mask)
+            n_neurons_plot = np.sum(self.core_mask)
 
             # Calculate the core_neurons mask
             # if self.n_neurons > core_neurons:
