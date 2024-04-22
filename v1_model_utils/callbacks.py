@@ -261,6 +261,7 @@ class Callbacks:
                                     stimuli_end_time=self.flags.seq_len-self.post_delay,
                                     reverse=False,
                                     plot_core_only=True,
+                                    core_radius=self.flags.plot_core_radius,
                                     )
         graph(x, z)
 
@@ -507,6 +508,7 @@ class Callbacks:
                                         stimuli_end_time=2500,
                                         reverse=False,
                                         plot_core_only=True,
+                                        core_radius=self.flags.plot_core_radius,
                                         )
                         graph(lgn_spikes, z)
 

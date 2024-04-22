@@ -23,6 +23,7 @@ class InputActivityFigure:
         stimuli_end_time=1500,
         reverse=False,
         plot_core_only=True,
+        core_radius=400,
     ):
         self.figure = plt.figure(
             figsize=toolkit.cm2inch((15 * scale, 11 * scale)))
@@ -48,6 +49,7 @@ class InputActivityFigure:
             scale=scale,
             alpha=0.4,
             plot_core_only=plot_core_only,
+            core_radius=core_radius,
         )
         self.drifting_grating_plot = DriftingGrating(
             frequency=frequency,
