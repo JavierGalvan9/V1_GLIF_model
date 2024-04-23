@@ -224,8 +224,9 @@ def main(_):
         # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
         # rec_weight_l2_regularizer = losses.L2Regularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
 
+        rate_core_mask = None if flags.all_neuron_rate_loss else core_mask
         rate_distribution_regularizer = losses.SpikeRateDistributionTarget(network, flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
-                                                                            data_dir=flags.data_dir, core_mask=core_mask, seed=flags.seed, dtype=dtype)
+                                                                            data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=dtype)
         # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
         rate_loss = rate_distribution_regularizer(rsnn_layer.output[0][0])
 
@@ -676,8 +677,9 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean('use_only_one_type', False, '')
     # absl.app.flags.DEFINE_boolean('use_dale_law', True, '')
     absl.app.flags.DEFINE_boolean('caching', True, '') # if one wants to use caching, remember to update the caching function
-    absl.app.flags.DEFINE_boolean('core_only', False, '')
-    absl.app.flags.DEFINE_boolean('core_loss', False, '')
+    absl.app.flags.DEFINE_boolean('core_only', False, '')  # a little confusing.
+    absl.app.flags.DEFINE_boolean('core_loss', False, '')  # not used. should be retired.
+    absl.app.flags.DEFINE_boolean('all_neuron_rate_loss', False, '')  # whethre you want to enforce rate loss to all neurons
     absl.app.flags.DEFINE_float('loss_core_radius', 400.0, '') # 0 is not using core loss
     absl.app.flags.DEFINE_float('plot_core_radius', 400.0, '') # 0 is not using core plot
 
