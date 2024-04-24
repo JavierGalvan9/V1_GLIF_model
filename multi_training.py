@@ -417,6 +417,7 @@ def main(_):
                 n_input=flags.n_input,
                 regular=regular,
                 bmtk_compat=flags.bmtk_compat_lgn,
+                rotation=flags.rotation,
             ).batch(per_replica_batch_size)
                         
             return _data_set
@@ -429,6 +430,7 @@ def main(_):
                 pre_delay=flags.seq_len,
                 post_delay=0,
                 n_input=flags.n_input,
+                rotation=flags.rotation,
             ).batch(per_replica_batch_size)
                         
             return _gray_data_set
@@ -636,6 +638,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
+    absl.app.flags.DEFINE_string('rotation', 'cw', '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
