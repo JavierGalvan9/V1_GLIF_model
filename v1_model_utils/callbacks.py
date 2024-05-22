@@ -261,6 +261,7 @@ class Callbacks:
                                     stimuli_end_time=self.flags.seq_len-self.post_delay,
                                     reverse=False,
                                     plot_core_only=True,
+                                    core_radius=self.flags.plot_core_radius,
                                     )
         graph(x, z)
 
@@ -281,7 +282,8 @@ class Callbacks:
         filename = f'Epoch_{self.epoch}'
         Population_activity = PopulationActivity(n_neurons=self.n_neurons, network=self.network, 
                                                 stimuli_init_time=self.pre_delay, stimuli_end_time=self.flags.seq_len-self.post_delay, 
-                                                image_path=self.logdir, filename=filename, data_dir=self.flags.data_dir)
+                                                image_path=self.logdir, filename=filename, data_dir=self.flags.data_dir,
+                                                core_radius=self.flags.plot_core_radius)
         Population_activity(z, plot_core_only=True, bin_size=10)
 
 
@@ -291,7 +293,7 @@ class Callbacks:
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/{self.neuropixels_feature}')
         os.makedirs(boxplots_dir, exist_ok=True)
         metrics_analysis = ModelMetricsAnalysis(self.network, neuropixels_feature="Ave_Rate(Hz)", data_dir=self.flags.data_dir, n_trials=1,
-                                                analyze_core_only=True, drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay, 
+                                                core_radius=self.flags.plot_core_radius, drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay, 
                                                 directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
         metrics_analysis(z, y)    
 
@@ -506,6 +508,7 @@ class Callbacks:
                                         stimuli_end_time=2500,
                                         reverse=False,
                                         plot_core_only=True,
+                                        core_radius=self.flags.plot_core_radius,
                                         )
                         graph(lgn_spikes, z)
 
@@ -524,5 +527,5 @@ class Callbacks:
             os.makedirs(boxplots_dir, exist_ok=True)
             metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir,
                                                     drifting_gratings_init=500, drifting_gratings_end=2500,
-                                                    analyze_core_only=True, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
+                                                    core_radius=self.flags.plot_core_radius, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
             metrics_analysis(spikes, DG_angles)

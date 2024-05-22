@@ -70,7 +70,7 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
     edges_h5_path = os.path.join(data_dir, edge_file)
     edges_type_df = pd.read_csv(os.path.join(data_dir, edge_types_file), delimiter=" ")
     synaptic_models_path = os.path.join('GLIF_network', 'components', "synaptic_models")
-    basis_function_weights_df = pd.read_csv('GLIF_network/synaptic_data/basis_function_weights.csv', index_col=0)
+    basis_function_weights_df = pd.read_csv('synaptic_data/basis_function_weights.csv', index_col=0)
     print(f'Saving basis function weights for {source}-{target}')
     # Map the synaptic model to a given id using a dictionary
     path = os.path.join('GLIF_network', 'synaptic_models_to_syn_id_dict.pkl')
@@ -206,8 +206,8 @@ def load_network(
         r = np.sqrt(x**2 + z**2)  # the maximum radius is 845
 
     ### CHOOSE THE NETWORK NODES ###
-    if n_neurons > 296991:
-        raise ValueError("There are only 296991 neurons in the network")
+    if n_neurons > n_nodes:  # used to be an explicit number: 296991
+        raise ValueError(f"There are only {n_nodes} neurons in the network")
     
     elif connected_selection: # this condition takes the n_neurons closest neurons to the origin
         sorted_ind = np.argsort(r)
@@ -217,15 +217,16 @@ def load_network(
     
     elif core_only: # this condition takes the n_neurons closest neurons to the origin (core)
         sel = r < 400
-        if n_neurons > 65871:
-            raise ValueError("There are only 65871 neurons in the network core")
-        elif n_neurons > 0 and n_neurons <= 65871:
+        n_core = np.sum(sel)
+        if n_neurons > n_core:
+            raise ValueError(f"There are only {n_core} neurons in the network core")
+        elif n_neurons > 0 and n_neurons <= n_core:
             (inds,) = np.where(sel)
             take_inds = rd.choice(inds, size=n_neurons, replace=False)
             sel[:] = False
             sel[take_inds] = True
     
-    elif n_neurons > 0 and n_neurons <= 296991: # this condition randomly selects neurons from the whole V1
+    elif n_neurons > 0 and n_neurons <= n_nodes: # this condition randomly selects neurons from the whole V1
         legit_neurons = np.arange(n_nodes)
         take_inds = rd.choice(legit_neurons, size=n_neurons, replace=False)
         sel = np.empty(n_nodes, dtype=np.bool_)

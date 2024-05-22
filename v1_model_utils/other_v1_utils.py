@@ -131,7 +131,7 @@ def angle_tunning(network, data_dir='GLIF_network'):
     
     return angle_tunning
 
-def isolate_core_neurons(network, radius=400, n_selected_neurons=None, data_dir='GLIF_network'):
+def isolate_core_neurons(network, radius=None, n_selected_neurons=None, data_dir='GLIF_network'):
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
     node_h5 = h5py.File(path_to_h5, mode='r')
     x = node_h5['nodes']['v1']['0']['x'][()][network['tf_id_to_bmtk_id']]

@@ -39,7 +39,7 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), n_selected_
     # Get the pop names of the neurons
     if n_selected_neurons is not None:
         pop_names = other_v1_utils.pop_names(network, n_selected_neurons=n_selected_neurons) 
-    elif core_radius is not None:
+    elif core_radius is not None and core_radius > 0:
         pop_names = other_v1_utils.pop_names(network, core_radius=core_radius)
     else:
         pop_names = other_v1_utils.pop_names(network)
@@ -87,14 +87,15 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), n_selected_
 class ModelMetricsAnalysis:    
 
     def __init__(self, network, neuropixels_feature="Ave_Rate(Hz)", data_dir='GLIF_network', directory='', filename='', n_trials=1, drifting_gratings_init=50, 
-                 drifting_gratings_end=550, analyze_core_only=True):
+                 drifting_gratings_end=550, core_radius=400):
         self.n_neurons = network['n_nodes']
         self.network = network
         self.data_dir = data_dir 
         self.n_trials = n_trials
         self.drifting_gratings_init = drifting_gratings_init
         self.drifting_gratings_end = drifting_gratings_end
-        self.analyze_core_only = analyze_core_only
+        # self.analyze_core_only = analyze_core_only
+        self.core_radius = core_radius
         self.neuropixels_feature = neuropixels_feature
         self.directory = os.path.join(directory)
         self.filename = filename
@@ -102,21 +103,24 @@ class ModelMetricsAnalysis:
     def __call__(self, spikes, DG_angles, axis=None):
 
         # Isolate the core neurons if necessary
-        if self.analyze_core_only:
-            core_neurons = 65871
-            core_radius = 400
+        # if self.analyze_core_only:
+        if self.core_radius > 0:
+            # core_neurons = 65871
+            # core_radius = 400
             # n_neurons_plot = 65871
+            self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
+            n_neurons_plot = np.sum(self.core_mask)
 
             # Calculate the core_neurons mask
-            if self.n_neurons > core_neurons:
-                self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
-                # self.core_mask = other_v1_utils.isolate_core_neurons(self.network, n_selected_neurons=core_neurons, data_dir=self.data_dir) 
-                # self.n_neurons = core_neurons
-                # if n_neurons is overridden, it won't run for the second time...
-                n_neurons_plot = core_neurons
-            else:
-                self.core_mask = np.full(self.n_neurons, True)
-                n_neurons_plot = self.n_neurons
+            # if self.n_neurons > core_neurons:
+            #     self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
+            #     # self.core_mask = other_v1_utils.isolate_core_neurons(self.network, n_selected_neurons=core_neurons, data_dir=self.data_dir) 
+            #     # self.n_neurons = core_neurons
+            #     # if n_neurons is overridden, it won't run for the second time...
+            #     n_neurons_plot = core_neurons
+            # else:
+            #     self.core_mask = np.full(self.n_neurons, True)
+            #     n_neurons_plot = self.n_neurons
         else:
             self.core_mask = np.full(self.n_neurons, True)
             # core_radius = None
@@ -138,7 +142,7 @@ class ModelMetricsAnalysis:
 
         # Calculate the orientation and direction selectivity indices
         metrics_df = calculate_OSI_DSI(firing_rates_df, self.network, DG_angles=DG_angles, n_selected_neurons=n_neurons_plot,
-                                        remove_zero_rate_neurons=True)
+                                        remove_zero_rate_neurons=True, core_radius=self.core_radius)
         # metrics_df.to_csv(os.path.join(self.directory, f"V1_OSI_DSI_DF.csv"), sep=" ", index=False)
 
         # Make the boxplots to compare with the neuropixels data
@@ -383,13 +387,14 @@ def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None):
 
 class OneShotTuningAnalysis:
     def __init__(self, network, data_dir='GLIF_network', directory='', drifting_gratings_init=50, 
-                 drifting_gratings_end=550, analyze_core_only=True):
+                 drifting_gratings_end=550, core_radius=400):
         self.n_neurons = network['n_nodes']
         self.network = network
         self.data_dir = data_dir 
         self.drifting_gratings_init = drifting_gratings_init
         self.drifting_gratings_end = drifting_gratings_end
-        self.analyze_core_only = analyze_core_only
+        # self.analyze_core_only = analyze_core_only
+        self.core_radius = core_radius
         self.directory = os.path.join(directory)
         os.makedirs(self.directory, exist_ok=True)
 
@@ -397,21 +402,24 @@ class OneShotTuningAnalysis:
         self.current_orientation = current_orientation[0][0]
         
         # Isolate the core neurons if necessary
-        if self.analyze_core_only:
-            core_neurons = 65871
-            core_radius = 400
+        # if self.analyze_core_only:
+        if self.core_radius > 0:
+            # core_neurons = 65871
+            # core_radius = 400
             # n_neurons_plot = 65871
+            self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
+            n_neurons_plot = np.sum(self.core_mask)
 
             # Calculate the core_neurons mask
-            if self.n_neurons > core_neurons:
-                self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
-                # self.core_mask = other_v1_utils.isolate_core_neurons(self.network, n_selected_neurons=core_neurons, data_dir=self.data_dir) 
-                # self.n_neurons = core_neurons
-                # if n_neurons is overridden, it won't run for the second time...
-                n_neurons_plot = core_neurons
-            else:
-                self.core_mask = np.full(self.n_neurons, True)
-                n_neurons_plot = self.n_neurons
+            # if self.n_neurons > core_neurons:
+            #     self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
+            #     # self.core_mask = other_v1_utils.isolate_core_neurons(self.network, n_selected_neurons=core_neurons, data_dir=self.data_dir) 
+            #     # self.n_neurons = core_neurons
+            #     # if n_neurons is overridden, it won't run for the second time...
+            #     n_neurons_plot = core_neurons
+            # else:
+            #     self.core_mask = np.full(self.n_neurons, True)
+            #     n_neurons_plot = self.n_neurons
         else:
             self.core_mask = np.full(self.n_neurons, True)
             # core_radius = None

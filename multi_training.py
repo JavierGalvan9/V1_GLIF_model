@@ -5,7 +5,7 @@ import os
 # Define the environment variables for optimal GPU performance
 # os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # before import tensorflow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # before import tensorflow
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
@@ -185,12 +185,25 @@ def main(_):
 
         ### BUILD THE LOSS AND REGULARIZER FUNCTIONS ###
         # Create rate and voltage regularizers
-        if flags.core_loss and flags.neurons > 65871:
-            core_radius = 400
-            core_mask = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
+        if flags.loss_core_radius > 0:
+            core_mask = other_v1_utils.isolate_core_neurons(network, radius=flags.loss_core_radius, data_dir=flags.data_dir)
+            # if core_mask is all True, set it to None.
+            if core_mask.all():
+                core_mask = None
+                print("All neurons are in the core region. Core mask is set to None.")
+            else:
+                # report how many neurons are selected.
+                print(f"Core mask is set to {core_mask.sum()} neurons.")
             core_mask = tf.constant(core_mask, dtype=tf.bool)
         else:
             core_mask = None
+            
+        # if flags.core_loss and flags.neurons > 65871:
+        #     core_radius = 400
+        #     core_mask = other_v1_utils.isolate_core_neurons(network, radius=core_radius, data_dir=flags.data_dir)
+        #     core_mask = tf.constant(core_mask, dtype=tf.bool)
+        # else:
+        #     core_mask = None
 
         # Extract outputs of intermediate keras layers to get access to
         # spikes and membrane voltages of the model
@@ -211,8 +224,9 @@ def main(_):
         # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
         # rec_weight_l2_regularizer = losses.L2Regularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
 
+        rate_core_mask = None if flags.all_neuron_rate_loss else core_mask
         rate_distribution_regularizer = losses.SpikeRateDistributionTarget(network, flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
-                                                                            data_dir=flags.data_dir, core_mask=core_mask, seed=flags.seed, dtype=dtype)
+                                                                            data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=dtype)
         # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
         rate_loss = rate_distribution_regularizer(rsnn_layer.output[0][0])
 
@@ -403,6 +417,7 @@ def main(_):
                 n_input=flags.n_input,
                 regular=regular,
                 bmtk_compat=flags.bmtk_compat_lgn,
+                rotation=flags.rotation,
             ).batch(per_replica_batch_size)
                         
             return _data_set
@@ -415,6 +430,7 @@ def main(_):
                 pre_delay=flags.seq_len,
                 post_delay=0,
                 n_input=flags.n_input,
+                rotation=flags.rotation,
             ).batch(per_replica_batch_size)
                         
             return _gray_data_set
@@ -622,6 +638,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
+    absl.app.flags.DEFINE_string('rotation', 'cw', '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
@@ -663,8 +680,12 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean('use_only_one_type', False, '')
     # absl.app.flags.DEFINE_boolean('use_dale_law', True, '')
     absl.app.flags.DEFINE_boolean('caching', True, '') # if one wants to use caching, remember to update the caching function
-    absl.app.flags.DEFINE_boolean('core_only', False, '')
-    absl.app.flags.DEFINE_boolean('core_loss', False, '')
+    absl.app.flags.DEFINE_boolean('core_only', False, '')  # a little confusing.
+    absl.app.flags.DEFINE_boolean('core_loss', False, '')  # not used. should be retired.
+    absl.app.flags.DEFINE_boolean('all_neuron_rate_loss', False, '')  # whethre you want to enforce rate loss to all neurons
+    absl.app.flags.DEFINE_float('loss_core_radius', 400.0, '') # 0 is not using core loss
+    absl.app.flags.DEFINE_float('plot_core_radius', 400.0, '') # 0 is not using core plot
+
     # absl.app.flags.DEFINE_boolean('train_input', True, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', False, '')

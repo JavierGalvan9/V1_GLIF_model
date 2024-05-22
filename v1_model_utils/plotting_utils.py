@@ -23,6 +23,7 @@ class InputActivityFigure:
         stimuli_end_time=1500,
         reverse=False,
         plot_core_only=True,
+        core_radius=400,
     ):
         self.figure = plt.figure(
             figsize=toolkit.cm2inch((15 * scale, 11 * scale)))
@@ -48,6 +49,7 @@ class InputActivityFigure:
             scale=scale,
             alpha=0.4,
             plot_core_only=plot_core_only,
+            core_radius=core_radius,
         )
         self.drifting_grating_plot = DriftingGrating(
             frequency=frequency,
@@ -106,6 +108,7 @@ class InputActivityFigureWithoutStimulus:
         stimuli_init_time=500,
         stimuli_end_time=1500,
         plot_core_only=True,
+        core_radius=400,
     ):
         self.figure = plt.figure(
             figsize=toolkit.cm2inch((15 * scale, 11 * scale)))
@@ -130,6 +133,7 @@ class InputActivityFigureWithoutStimulus:
             scale=scale,
             alpha=0.2,
             plot_core_only=plot_core_only,
+            core_radius=core_radius,
         )
 
         self.tightened = True  # False
@@ -277,6 +281,7 @@ class LaminarPlot:
         marker_size=1.0,
         alpha=0.2,
         plot_core_only=True,
+        core_radius=400,
     ):
         self.batch_ind = batch_ind
         self.stimuli_init_time = stimuli_init_time
@@ -287,17 +292,18 @@ class LaminarPlot:
         self.data_dir = data_dir
         self.network = network
         self.n_neurons = network["n_nodes"]
-        self.core_neurons = 65871
+        # self.core_neurons = 65871
 
         if plot_core_only:
-            if self.n_neurons > self.core_neurons:
-                self.n_neurons = self.core_neurons
+            # if self.n_neurons > self.core_neurons:
+                # self.n_neurons = self.core_neurons
             # core_neurons = 16679 #65871 
-            core_radius = 400 #200
+            # core_radius = 400 #200
             self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, radius=core_radius, data_dir=self.data_dir
             )
-            # core_neurons = np.sum(self.core_mask)
+            core_neurons = np.sum(self.core_mask)
+            self.n_neurons = core_neurons
         else:
             self.core_mask = np.full(self.n_neurons, True)
 
@@ -627,7 +633,7 @@ class LGN_sample_plot:
 
 class PopulationActivity:
     def __init__(self, n_neurons, network, stimuli_init_time=500, stimuli_end_time=1500,
-                image_path="", data_dir="", filename=''):
+                image_path="", data_dir="", filename='', core_radius=400):
         self.data_dir = data_dir
         self.n_neurons = n_neurons
         self.network = network
@@ -635,16 +641,20 @@ class PopulationActivity:
         self.stimuli_end_time = stimuli_end_time
         self.filename = filename
         self.images_path = image_path
+        self.core_radius = core_radius
         os.makedirs(self.images_path, exist_ok=True)
 
     def __call__(self, spikes, plot_core_only=True, bin_size=10):
         if plot_core_only:
-            if self.n_neurons > 65871:
-                self.n_neurons = 65871
-                core_radius = 400
-                self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
-            else:
-                self.core_mask = np.full(self.n_neurons, True)
+            self.core_mask = other_v1_utils.isolate_core_neurons(
+                self.network, radius=self.core_radius, data_dir=self.data_dir
+            )
+            # if self.n_neurons > 65871:
+            #     self.n_neurons = 65871
+            #     core_radius = 400
+            #     self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
+            # else:
+            #     self.core_mask = np.full(self.n_neurons, True)
         else:
             self.core_mask = np.full(self.n_neurons, True)
 
