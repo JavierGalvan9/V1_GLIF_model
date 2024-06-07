@@ -83,11 +83,11 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
 
 def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
     # tf.print(f"target_rate: {target_rate}")
-    # ind = tf.range(target_rate.shape[0])
-    # rand_ind = tf.random.shuffle(ind)
-    # _rate = tf.gather(_rates, rand_ind)
-    # sorted_rate = tf.sort(_rate)
-    sorted_rate = tf.sort(_rates)
+    ind = tf.range(target_rate.shape[0])
+    rand_ind = tf.random.shuffle(ind)
+    _rate = tf.gather(_rates, rand_ind)
+    sorted_rate = tf.sort(_rate)
+    # sorted_rate = tf.sort(_rates)
     # u = target_rate - sorted_rate
     u = sorted_rate - target_rate
     # tau = (tf.range(target_rate.shape[0]), dtype) + 1) / target_rate.shape[0]
@@ -174,19 +174,19 @@ class SpikeRateDistributionTarget:
             "e23": 'EXC_L23',
             "i23P": 'PV_L23',
             "i23S": 'SST_L23',
-            "i23H": 'VIP_L23',
+            "i23V": 'VIP_L23',
             "e4": 'EXC_L4',
             "i4P": 'PV_L4',
             "i4S": 'SST_L4',
-            "i4H": 'VIP_L4',
+            "i4V": 'VIP_L4',
             "e5": 'EXC_L5',
             "i5P": 'PV_L5',
             "i5S": 'SST_L5',
-            "i5H": 'VIP_L5',
+            "i5V": 'VIP_L5',
             "e6": 'EXC_L6',
             "i6P": 'PV_L6',
             "i6S": 'SST_L6',
-            "i6H": 'VIP_L6'
+            "i6V": 'VIP_L6'
         }
 
         # define the reverse mapping
@@ -226,8 +226,8 @@ class SpikeRateDistributionTarget:
             if self._post_delay is not None and self._post_delay != 0:
                 spikes = spikes[:, :-self._post_delay, :]
         
-        if self._core_mask is not None:
-            spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
+        # if self._core_mask is not None:
+            # spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
         
         reg_loss = compute_spike_rate_target_loss(spikes, self._target_rates, dtype=self._dtype)
         
@@ -366,7 +366,7 @@ class OrientationSelectivityLoss:
         if self._core_mask is not None:
             original_pop_names = original_pop_names[self._core_mask] 
 
-        cell_types = np.array([other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in original_pop_names])
+        cell_types = np.array([other_v1_utils.pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=True) for pop_name in original_pop_names])
         node_ids = np.arange(len(cell_types))
         cell_ids = {key: node_ids[cell_types == key] for key in set(osi_df['cell_type'])}
 
@@ -473,7 +473,7 @@ class OrientationSelectivityLoss:
         
         angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle * self._subtraction_ratio
         
-        return tf.abs(angle_loss) * self._osi_cost
+        return angle_loss * self._osi_cost
 
     def crowd_osi_loss(self, spikes, angle, trim=True):
         # Calculate the angle deltas between current angle and tuning angle
@@ -485,7 +485,7 @@ class OrientationSelectivityLoss:
         radians_delta_angle = clipped_delta_angle * (np.pi / 180)
         # Instead of complex numbers, use cosine and sine separately
         cos_component = tf.math.cos(2.0 * radians_delta_angle)
-        sin_component = tf.math.sin(2.0 * radians_delta_angle)
+        # sin_component = tf.math.sin(2.0 * radians_delta_angle)
 
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
@@ -496,27 +496,29 @@ class OrientationSelectivityLoss:
 
         # For weighted responses, we separately consider the contributions from cosine and sine
         weighted_cos_responses = rates * cos_component
-        weighted_sin_responses = rates * sin_component
+        # weighted_sin_responses = rates * sin_component
 
         total_osi_loss = tf.constant(0.0, dtype=self._dtype)
         for i, (key, value) in enumerate(self._target_osi.items()):
             if tf.size(value["ids"]) != 0:
                 _rates_type = tf.gather(rates[0], value['ids'])
                 _weighted_cos_responses_type = tf.gather(weighted_cos_responses[0], value['ids'])
-                _weighted_sin_responses_type = tf.gather(weighted_sin_responses[0], value['ids'])
+                # _weighted_sin_responses_type = tf.gather(weighted_sin_responses[0], value['ids'])
 
                 # Define small epsilon values to avoid differentiability issues when 0 spikes are recorded within the population
-                epsilon1 = 1e-12
+                # epsilon1 = 1e-12
                 epsilon2 = 1e-3
                 # Calculate the approximated OSI for the population
-                approximated_numerator = tf.sqrt(tf.maximum(tf.square(tf.reduce_sum(_weighted_cos_responses_type)) +
-                                                            tf.square(tf.reduce_sum(_weighted_sin_responses_type))
-                                                            , epsilon1))
+                # approximated_numerator = tf.sqrt(tf.maximum(tf.square(tf.reduce_sum(_weighted_cos_responses_type)) +
+                #                                             tf.square(tf.reduce_sum(_weighted_sin_responses_type))
+                #                                             , epsilon1))
+                approximated_numerator = tf.reduce_sum(_weighted_cos_responses_type)
                 approximated_denominator = tf.maximum(tf.reduce_sum(_rates_type), epsilon2)
                 osi_approx_type = approximated_numerator / approximated_denominator
                 
                 # Calculate the OSI loss
                 osi_loss_type = tf.math.square(osi_approx_type - value['OSI'])
+                # osi_loss_type = tf.math.square(osi_approx_type - 0.99)
                 total_osi_loss += osi_loss_type
             else:
                 pass

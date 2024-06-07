@@ -180,6 +180,12 @@ def main(_):
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
             checkpoint.restore(checkpoint_directory).assert_consumed()
             print('Checkpoint restored!')
+        elif flags.restore_from != '' and os.path.exists(flags.restore_from):
+            print(f'Restoring checkpoint from {flags.restore_from} with the restore_from option...')
+            checkpoint_directory = tf.train.latest_checkpoint(flags.restore_from)
+            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint.restore(checkpoint_directory).assert_consumed()
+            print('Checkpoint restored!')
         else:
             checkpoint = None
 
@@ -194,7 +200,7 @@ def main(_):
             else:
                 # report how many neurons are selected.
                 print(f"Core mask is set to {core_mask.sum()} neurons.")
-            core_mask = tf.constant(core_mask, dtype=tf.bool)
+                core_mask = tf.constant(core_mask, dtype=tf.bool)
         else:
             core_mask = None
             
