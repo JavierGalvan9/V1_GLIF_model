@@ -3,13 +3,11 @@ matplotlib.use('agg')# to avoid GUI request on clusters
 import os
 
 # Define the environment variables for optimal GPU performance
-# os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # before import tensorflow
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # before import tensorflow
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-import sys
 import absl
 import numpy as np
 import tensorflow as tf
@@ -215,7 +213,6 @@ def main(_):
         
         # LGN firing rates to the different angles
         DG_angles = np.arange(0, 360, 45)
-
         osi_dataset_path = os.path.join('OSI_DSI_dataset', 'lgn_firing_rates.pkl')
         if not os.path.exists(osi_dataset_path):
             print('Creating OSI/DSI dataset...')
@@ -229,7 +226,8 @@ def main(_):
                         post_delay = post_delay,
                         n_input=flags.n_input,
                         regular=regular,
-                        return_firing_rates=True
+                        return_firing_rates=True,
+                        rotation=flags.rotation,
                     ).batch(1)
                                 
                     return _lgn_firing_rates
@@ -262,15 +260,18 @@ def main(_):
         print('Starting to plot OSI and DSI...')
         sim_duration = (2500//flags.seq_len + 1) * flags.seq_len
         spikes = np.zeros((8, sim_duration, network['n_nodes']), dtype=float)
-        for trial_id in range(flags.n_trials_per_angle):
-            for angle_id, angle in enumerate(range(0, 360, 45)):
+
+        for angle_id, angle in enumerate(range(0, 360, 45)):
+            # load LGN firign rates for the given angle and calculate spiking probability
+            lgn_fr = lgn_firing_rates_dict[angle]
+            lgn_fr = tf.constant(lgn_fr, dtype=tf.float32)
+            _p = 1 - tf.exp(-lgn_fr / 1000.)
+
+            for trial_id in range(flags.n_trials_per_angle):
                 t0 = time()
                 # Reset the memory stats
                 tf.config.experimental.reset_memory_stats('GPU:0')
 
-                lgn_fr = lgn_firing_rates_dict[angle]
-                lgn_fr = tf.constant(lgn_fr, dtype=tf.float32)
-                _p = 1 - tf.exp(-lgn_fr / 1000.)
                 x = tf.random.uniform(tf.shape(_p)) < _p
 
                 chunk_size = flags.seq_len
@@ -312,10 +313,11 @@ def main(_):
         # Do the OSI/DSI analysis       
         boxplots_dir = os.path.join(logdir, 'Boxplots_OSI_DSI')
         os.makedirs(boxplots_dir, exist_ok=True)
-        metrics_analysis = ModelMetricsAnalysis(network, flags.neurons, data_dir=flags.data_dir,
+        metrics_analysis = ModelMetricsAnalysis(network, data_dir=flags.data_dir,
                                                 drifting_gratings_init=500, drifting_gratings_end=2500,
-                                                analyze_core_only=True, directory=boxplots_dir, filename=f'Epoch_{current_epoch}')
-        metrics_analysis(spikes, DG_angles)
+                                                core_radius=flags.plot_core_radius)
+        metrics_analysis(spikes, DG_angles, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], 
+                        directory=boxplots_dir, filename=f'Epoch_{current_epoch}')
 
 
 if __name__ == '__main__':
@@ -372,6 +374,8 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('caching', True, '')
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     absl.app.flags.DEFINE_boolean('core_loss', False, '')
+    absl.app.flags.DEFINE_float('plot_core_radius', 400.0, '') # 0 is not using core plot
+
     absl.app.flags.DEFINE_boolean('hard_reset', False, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', False, '')
@@ -385,6 +389,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
     absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
 
+    absl.app.flags.DEFINE_string("rotation", "ccw", "")
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
 
     absl.app.run(main)

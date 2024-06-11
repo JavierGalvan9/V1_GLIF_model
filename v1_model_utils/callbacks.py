@@ -1,5 +1,4 @@
 import os
-import sys
 import json
 import numpy as np
 import pandas as pd
@@ -13,7 +12,7 @@ import seaborn as sns
 import stim_dataset
 from v1_model_utils import other_v1_utils, load_sparse
 from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivity
-from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
+from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis, OneShotTuningAnalysis
 
 
 def printgpu(verbose=0):
@@ -27,11 +26,11 @@ def printgpu(verbose=0):
             return current, peak
 
 def compose_str(metrics_values):
-        _acc, _loss, _rate, _rate_loss, _voltage_loss, _osi_loss = metrics_values
+        _acc, _loss, _rate, _rate_loss, _voltage_loss, _osi_dsi_loss = metrics_values
         _s = f'Loss {_loss:.4f}, '
         _s += f'RLoss {_rate_loss:.4f}, '
         _s += f'VLoss {_voltage_loss:.4f}, '
-        _s += f'OLoss {_osi_loss:.4f}, '
+        _s += f'OLoss {_osi_dsi_loss:.4f}, '
         _s += f'Accuracy {_acc:.4f}, '
         _s += f'Rate {_rate:.4f}'
         return _s
@@ -47,7 +46,7 @@ class Callbacks:
             load_fn = load_sparse.cached_load_v1
         else:
             load_fn = load_sparse.load_v1
-        self.network, _, _ = load_fn(flags, self.n_neurons, flag_str=flag_str)      
+        self.network, self.lgn_input, self.bkg_input = load_fn(flags, self.n_neurons, flag_str=flag_str)      
 
         self.neuropixels_feature = 'Ave_Rate(Hz)'  
         self.model = model
@@ -100,7 +99,7 @@ class Callbacks:
         self.train_start_time = time()
         self.epoch = self.flags.run_session * self.flags.n_epochs
 
-    def on_train_end(self, metric_values):
+    def on_train_end(self, metric_values, normalizers=None):
         self.train_end_time = time()
         self.final_metric_values = metric_values
         print("\n ---------- Training ended at ", dt.datetime.now().strftime('%d-%m-%Y %H:%M'), ' ----------\n')
@@ -113,7 +112,6 @@ class Callbacks:
         print(f"| {'Metric':<{max_key_length}} | {'Initial Value':<{max_key_length}} | {'Final Value':<{max_key_length}} |")
         print(f"|{'-' * (max_key_length + 2)}|{'-' * (max_key_length + 2)}|{'-' * (max_key_length + 2)}|")
 
-
         n_metrics = len(self.initial_metric_values)//2
         for initial, final, key in zip(self.initial_metric_values[n_metrics:], self.final_metric_values[n_metrics:], self.metrics_keys[n_metrics:]):
             print(f"| {key:<{max_key_length}} | {initial:<{max_key_length}.3f} | {final:<{max_key_length}.3f} |")
@@ -124,6 +122,9 @@ class Callbacks:
             'min_val_loss': self.min_val_loss,
             'no_improve_epochs': self.no_improve_epochs
         }
+        if normalizers is not None:
+            data_to_save['v1_ema'] = normalizers['v1_ema']
+
         with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'wb') as f:
             pkl.dump(data_to_save, f)
 
@@ -168,24 +169,23 @@ class Callbacks:
         # if True:
             self.min_val_loss = val_loss_value
             self.no_improve_epochs = 0
-
+            # self.plot_lgn_activity(x)
             self.save_best_model()
             self.plot_raster(x, z, y)
             self.plot_mean_firing_rate_boxplot(z, y)
-            # self.plot_lgn_activity(x)
+            # self.plot_populations_activity(z)
 
             self.model_variables_dict['Best'] = {var.name: var.numpy() for var in self.model.trainable_variables}
             for var in self.model_variables_dict['Best'].keys():
                 t0 = time()
                 self.variable_change_analysis(var)
                 print(f'Time spent in {var}: {time()-t0}')
-
         else:
             self.no_improve_epochs += 1
 
-        # Plot osi_dsi if only 1 run and the osi/dsi period is reached
-        if self.flags.n_runs == 1 and (self.epoch % self.flags.osi_dsi_eval_period == 0 or self.epoch==1):
-            self.plot_osi_dsi(parallel=False)
+        # # Plot osi_dsi if only 1 run and the osi/dsi period is reached
+        # if self.flags.n_runs == 1 and (self.epoch % self.flags.osi_dsi_eval_period == 0 or self.epoch==1):
+        #     self.plot_osi_dsi(parallel=False)
            
         with self.summary_writer.as_default():
             for k, v in zip(self.metrics_keys, metric_values):
@@ -219,7 +219,6 @@ class Callbacks:
             mem_data = printgpu(verbose=1)
             print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
         
-
     def save_best_model(self):
         # self.step_counter.assign_add(1)
         print(f'[ Saving the model at epoch {self.epoch} ]')
@@ -231,7 +230,7 @@ class Callbacks:
 
     def plot_losses_curves(self):
         # plotting_metrics = ['val_loss', 'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
-        plotting_metrics = ['val_loss', 'val_osi_loss', 'val_rate_loss', 'val_voltage_loss']
+        plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss']
         images_dir = os.path.join(self.logdir, 'Loss_curves')
         os.makedirs(images_dir, exist_ok=True)
 
@@ -265,15 +264,16 @@ class Callbacks:
                                     )
         graph(x, z)
 
-    # def plot_lgn_activity(self, x):
-    #     x = x.numpy()[0, :, :]
-    #     x_mean = np.mean(x, axis=1)
-    #     plt.figure(figsize=(10, 5))
-    #     plt.plot(x_mean)
-    #     plt.title('Mean input activity')
-    #     plt.xlabel('Time (ms)')
-    #     plt.ylabel('Mean input activity')
-    #     plt.savefig(os.path.join(self.logdir, 'Mean_input_activity.png'))
+    def plot_lgn_activity(self, x):
+        x = x.numpy()[0, :, :]
+        x_mean = np.mean(x, axis=1)
+        plt.figure(figsize=(10, 5))
+        plt.plot(x_mean)
+        plt.title('Mean input activity')
+        plt.xlabel('Time (ms)')
+        plt.ylabel('Mean input activity')
+        os.makedirs(os.path.join(self.logdir, 'Populations activity'), exist_ok=True)
+        plt.savefig(os.path.join(self.logdir, 'Populations activity', f'LGN_population_activity_epoch_{self.epoch}.png'))
 
     def plot_populations_activity(self, z):
         z = z.numpy()
@@ -292,25 +292,34 @@ class Callbacks:
         y = y.numpy()
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/{self.neuropixels_feature}')
         os.makedirs(boxplots_dir, exist_ok=True)
-        metrics_analysis = ModelMetricsAnalysis(self.network, neuropixels_feature="Ave_Rate(Hz)", data_dir=self.flags.data_dir, n_trials=1,
+        metrics_analysis = ModelMetricsAnalysis(self.network, data_dir=self.flags.data_dir, n_trials=1,
                                                 core_radius=self.flags.plot_core_radius, drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay, 
-                                                directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
-        metrics_analysis(z, y)    
+                                                )
+        metrics_analysis(z, y, metrics=[self.neuropixels_feature], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')    
 
 
     def variable_change_analysis(self, variable):
-        if 'rest_of_brain_weights' in variable or 'sparse_input_weights' in variable:
-            self.node_to_pop_weights_analysis(variable=variable)
+        print(variable)
+        if 'rest_of_brain_weights' in variable:
+            self.node_to_pop_weights_analysis(self.bkg_input['indices'], variable=variable)
+        elif 'sparse_input_weights' in variable:
+            self.node_to_pop_weights_analysis(self.lgn_input['indices'], variable=variable)
         elif 'sparse_recurrent_weights' in variable:
             self.pop_to_pop_weights_analysis(self.network['synapses']['indices'], variable=variable)
         
 
-    def node_to_pop_weights_analysis(self, variable=''):
+    def node_to_pop_weights_analysis(self, indices, variable=''):
         pop_names = other_v1_utils.pop_names(self.network)
-        cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
+        target_cell_types = [other_billeh_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
+        if 'rest_of_brain_weights' in variable:
+            post_indices =  np.repeat(indices[:, 0], 4)
+        else:
+            post_indices = indices[:, 0]
+
+        post_cell_types = [target_cell_types[i] for i in post_indices]
         # Create DataFrame with all the necessary data
         df = pd.DataFrame({
-            'Cell type': cell_types * 2,  # Duplicate node names for initial and final weights
+            'Cell type': post_cell_types * 2,  # Duplicate node names for initial and final weights
             'Weight': self.model_variables_dict['Initial'][variable].tolist() + self.model_variables_dict['Best'][variable].tolist(),  # Combine initial and final weights
             'State': ['Initial'] * len(self.model_variables_dict['Initial'][variable]) + ['Final'] * len(self.model_variables_dict['Best'][variable])  # Distinguish between initial and final weights
         })
@@ -435,7 +444,8 @@ class Callbacks:
                             post_delay = post_delay,
                             n_input=self.flags.n_input,
                             regular=regular,
-                            return_firing_rates=True
+                            return_firing_rates=True,
+                            rotation=self.flags.rotation,
                         ).batch(1)
                                     
                         return _lgn_firing_rates
@@ -469,16 +479,19 @@ class Callbacks:
             n_trials_per_angle = 1
             spikes = np.zeros((8, sim_duration, self.flags.neurons), dtype=float)
             DG_angles = np.arange(0, 360, 45)
-            for trial_id in range(n_trials_per_angle):
+
+            for angle_id, angle in enumerate(range(0, 360, 45)):
+                # load LGN firign rates for the given angle and calculate spiking probability
+                lgn_fr = lgn_firing_rates_dict[angle]
+                lgn_fr = tf.constant(lgn_fr, dtype=tf.float32)
+                _p = 1 - tf.exp(-lgn_fr / 1000.)
+
                 # test_it = iter(osi_dsi_data_set)
-                for angle_id, angle in enumerate(range(0, 360, 45)):
+                for trial_id in range(n_trials_per_angle):
                     t0 = time()
                     # Reset the memory stats
                     tf.config.experimental.reset_memory_stats('GPU:0')
-
-                    lgn_fr = lgn_firing_rates_dict[angle]
-                    lgn_fr = tf.constant(lgn_fr, dtype=tf.float32)
-                    _p = 1 - tf.exp(-lgn_fr / 1000.)
+                    # Generate LGN spikes
                     x = tf.random.uniform(tf.shape(_p)) < _p
                     y = tf.constant(angle, dtype=tf.float32, shape=(1,1))
                     w = tf.constant(sim_duration, dtype=tf.float32, shape=(1,))
@@ -525,7 +538,7 @@ class Callbacks:
             # Do the OSI/DSI analysis 
             boxplots_dir = os.path.join(self.logdir, 'Boxplots_OSI_DSI')
             os.makedirs(boxplots_dir, exist_ok=True)
-            metrics_analysis = ModelMetricsAnalysis(self.network, self.flags.neurons, data_dir=self.flags.data_dir,
+            metrics_analysis = ModelMetricsAnalysis(self.network, data_dir=self.flags.data_dir,
                                                     drifting_gratings_init=500, drifting_gratings_end=2500,
-                                                    core_radius=self.flags.plot_core_radius, directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
-            metrics_analysis(spikes, DG_angles)
+                                                    core_radius=self.flags.plot_core_radius)
+            metrics_analysis(spikes, DG_angles, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
