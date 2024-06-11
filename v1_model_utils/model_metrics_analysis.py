@@ -7,10 +7,8 @@ Created on Thu Dec  8 17:28:39 2022
 
 import os
 import sys
-import absl
 import pandas as pd
 import numpy as np
-import math
 import tensorflow as tf
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -18,7 +16,7 @@ import seaborn as sns
 from matplotlib.patches import Rectangle
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
 import other_v1_utils
-import load_sparse
+from scipy.stats import ks_2samp
 
 mpl.style.use('default')
 # rd = np.random.RandomState(seed=42)
@@ -68,25 +66,60 @@ def calculate_OSI_DSI(rates_df, network, DG_angles=range(0,360, 45), n_selected_
                 np.nan)
 
     # Save the results in a dataframe
-    osi_df = pd.DataFrame()
-    osi_df["node_id"] = node_ids
-    osi_df["pop_name"] = pop_names
-    osi_df["DSI"] = dsi
-    osi_df["OSI"] = osi
-    osi_df["preferred_angle"] = preferred_DG_angle
-    osi_df["max_mean_rate(Hz)"] = preferred_rates
-    osi_df["Ave_Rate(Hz)"] = average_rates
-    # osi_df['firing_rate_sp'] = average_rates
+    osi_dsi_df = pd.DataFrame()
+    osi_dsi_df["node_id"] = node_ids
+    osi_dsi_df["pop_name"] = pop_names
+    osi_dsi_df["DSI"] = dsi
+    osi_dsi_df["OSI"] = osi
+    osi_dsi_df["preferred_angle"] = preferred_DG_angle
+    osi_dsi_df["max_mean_rate(Hz)"] = preferred_rates
+    osi_dsi_df["Ave_Rate(Hz)"] = average_rates
+    # osi_dsi_df['firing_rate_sp'] = average_rates
 
     if remove_zero_rate_neurons:
-        osi_df = osi_df[osi_df["Ave_Rate(Hz)"] != 0]
+        osi_dsi_df = osi_dsi_df[osi_dsi_df["Ave_Rate(Hz)"] != 0]
 
-    return osi_df
+    return osi_dsi_df
+
+
+def compute_ks_statistics(df, metric='Ave_Rate(Hz)', min_n_sample=15):
+    """
+    Compute the Kolmogorov-Smirnov statistic and similarity scores for each cell type in the dataframe.
+    Parameters:
+    - df: pd.DataFrame, contains data with columns 'data_type' and 'Ave_Rate(Hz)', and indexed by cell type.
+    Returns:
+    - mean_similarity_score: float, the mean of the similarity scores computed across all cell types.
+    """
+    # Get unique cell types
+    # cell_types = df.index.unique()
+    cell_types = df['cell_type'].unique()
+    # Initialize a dictionary to store the results
+    ks_results = {}
+    similarity_scores = {}
+    # Iterate over cell types
+    for cell_type in cell_types:
+        # Filter data for current cell type from two different data types
+        # df1 = df.loc[(df.index == cell_type) & (df['data_type'] == 'V1/LM GLIF model'), metric]
+        # df2 = df.loc[(df.index == cell_type) & (df['data_type'] == 'Neuropixels'), metric]
+        df1 = df.loc[(df['cell_type'] == cell_type) & (df['data_type'] == 'V1 GLIF model'), metric]
+        df2 = df.loc[(df['cell_type'] == cell_type) & (df['data_type'] == 'Neuropixels'), metric]
+        # Drop NA values
+        df1.dropna(inplace=True)
+        df2.dropna(inplace=True)
+        # Calculate the Kolmogorov-Smirnov statistic
+        if len(df1) >= min_n_sample and len(df2) >= min_n_sample:
+            ks_stat, p_value = ks_2samp(df1, df2)
+            ks_results[cell_type] = (ks_stat, p_value)
+            similarity_scores[cell_type] = 1 - ks_stat
+
+    # Calculate the mean of the similarity scores and return it
+    mean_similarity_score = np.mean(list(similarity_scores.values()))
+    return mean_similarity_score
 
 
 class ModelMetricsAnalysis:    
 
-    def __init__(self, network, neuropixels_feature="Ave_Rate(Hz)", data_dir='GLIF_network', directory='', filename='', n_trials=1, drifting_gratings_init=50, 
+    def __init__(self, network, data_dir='GLIF_network', n_trials=1, drifting_gratings_init=50, 
                  drifting_gratings_end=550, core_radius=400):
         self.n_neurons = network['n_nodes']
         self.network = network
@@ -96,11 +129,9 @@ class ModelMetricsAnalysis:
         self.drifting_gratings_end = drifting_gratings_end
         # self.analyze_core_only = analyze_core_only
         self.core_radius = core_radius
-        self.neuropixels_feature = neuropixels_feature
-        self.directory = os.path.join(directory)
-        self.filename = filename
     
-    def __call__(self, spikes, DG_angles, axis=None):
+    def __call__(self, spikes, DG_angles, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], axis=None, 
+                 directory='', filename=''):
 
         # Isolate the core neurons if necessary
         # if self.analyze_core_only:
@@ -142,16 +173,10 @@ class ModelMetricsAnalysis:
 
         # Calculate the orientation and direction selectivity indices
         metrics_df = calculate_OSI_DSI(firing_rates_df, self.network, DG_angles=DG_angles, n_selected_neurons=n_neurons_plot,
-                                        remove_zero_rate_neurons=True, core_radius=self.core_radius)
+                                        remove_zero_rate_neurons=False, core_radius=self.core_radius)
         # metrics_df.to_csv(os.path.join(self.directory, f"V1_OSI_DSI_DF.csv"), sep=" ", index=False)
 
-        # Make the boxplots to compare with the neuropixels data
-        if len(DG_angles) == 1:
-            metrics = [self.neuropixels_feature]
-        else:
-            metrics = ["Rate at preferred direction (Hz)", "OSI", "DSI"]
-
-        boxplot = MetricsBoxplot(save_dir=self.directory, filename=self.filename)
+        boxplot = MetricsBoxplot(save_dir=directory, filename=filename)
         boxplot.plot(metrics=metrics, metrics_df=metrics_df, axis=axis)
 
     def create_firing_rates_df(self, n_neurons, spikes, n_trials=10, drifting_gratings_init=50, 
@@ -183,7 +208,7 @@ class MetricsBoxplot:
     def __init__(self, save_dir='Metrics_analysis', filename=''):
         self.save_dir = save_dir
         self.filename = filename
-        self.osi_dfs = []
+        self.osi_dsi_dfs = []
 
     @staticmethod
     def pop_name_to_cell_type(pop_name):
@@ -296,12 +321,12 @@ class MetricsBoxplot:
         if metrics_df is None:
             metrics_df = f"v1_OSI_DSI_DF.csv"
 
-        self.osi_dfs.append(self.get_osi_dsi_df(metric_file=metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
-        self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"v1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
-        # self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
-        # self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"v1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
-        self.osi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
-        df = pd.concat(self.osi_dfs, ignore_index=True)
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(metric_file=metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(metric_file=f"v1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
+        # self.osi_dsi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
+        # self.osi_dsi_dfs.append(self.get_osi_dsi_df(metric_file=f"v1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(metric_file=f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
+        df = pd.concat(self.osi_dsi_dfs, ignore_index=True)
         # df.to_csv(os.path.join('Borrar', f"help_DG_firing_rates_df.csv"), sep=" ", index=False)
 
         # Create a figure to compare several model metrics against Neuropixels data
@@ -332,7 +357,8 @@ class MetricsBoxplot:
             else:
                 ylims = [0, 1]
 
-            plot_one_metric(axs[idx], df, metric, ylims, color_pal, hue_order=cell_type_order)
+            average_similarity_score = compute_ks_statistics(df, metric=metric)
+            plot_one_metric(axs[idx], df, metric, ylims, color_pal, hue_order=cell_type_order, similarity_score=average_similarity_score)
 
         axs[0].legend(loc="upper right", fontsize=16)
         # axs[0].set_title(f"V1", fontsize=20)
@@ -352,7 +378,7 @@ class MetricsBoxplot:
             plt.close()
 
 
-def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None):
+def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None, similarity_score=None):
 
     sns.boxplot(
         x="cell_type",
@@ -364,6 +390,23 @@ def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None):
         width=0.7,
         palette=cpal,
     )
+    # # Add pointplot for averages
+    # sns.pointplot(
+    #     x="cell_type",
+    #     y=metric_name,
+    #     hue="data_type",
+    #     order=hue_order,
+    #     data=df,
+    #     ax=ax,
+    #     dodge=0.4,  # adjust depending on the width of the boxplots
+    #     linestyle='none',  # don't join the points with a line
+    #     palette='dark',  # make the points dark
+    #     markers='d',  # diamond-shaped markers
+    #     markersize=0.75,  # adjust size of the points
+    #     errorbar=None,  # no error bars
+    #     legend=False
+    # )
+
     ax.tick_params(axis="x", labelrotation=90)
     ax.set_ylim(ylim)
     ax.set_xlabel("")
@@ -380,6 +423,10 @@ def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None):
 
     # Hide the legend
     ax.get_legend().remove()
+    # Add the average similarity score to the legend
+    if similarity_score is not None:
+        ax.text(0.05, 0.9, f'S: {similarity_score:.2f}', transform=ax.transAxes, fontsize=14,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
 
     return ax
 
@@ -523,7 +570,7 @@ class OneShotTuningAnalysis:
         plt.savefig(os.path.join(path, f'epoch_{epoch}.png'), dpi=300, transparent=False)
         plt.close()
 
-    def plot_max_rate_boxplots(self, epoch, remove_zero_rate_neurons=True, axis=None):
+    def plot_max_rate_boxplots(self, epoch, remove_zero_rate_neurons=False, axis=None):
         # Create a DataFrame to store firing rates, preferred angles, and cell types.
         firing_rates_df = pd.DataFrame({'pop_name': self.pop_names, 'Rate at preferred direction (Hz)': np.full(len(self.firing_rate), np.nan)})
         circular_diff = (self.tuning_angles - self.current_orientation) % 360
@@ -556,32 +603,3 @@ class OneShotTuningAnalysis:
         metrics = ["Rate at preferred direction (Hz)"]
         boxplot.plot(metrics=metrics, metrics_df=firing_rates_df, axis=axis)
 
-
-# def main(_):
-#     flags = absl.app.flags.FLAGS    
-#     model_analysis = ModelMetricsAnalysis(flags)
-#     model_analysis('v1')
-#     model_analysis('lm')
-    
-# if __name__ == '__main__':
-    
-#     absl.app.flags.DEFINE_integer('v1_neurons', 230924, '')
-#     absl.app.flags.DEFINE_integer('lm_neurons', 32940, '')
-#     absl.app.flags.DEFINE_integer('gratings_frequency', 2, '')
-#     absl.app.flags.DEFINE_integer('n_simulations', None, '')
-#     absl.app.flags.DEFINE_integer('seed', 3000, '')
-#     absl.app.flags.DEFINE_boolean('skip_first_simulation', False, '')
-#     absl.app.flags.DEFINE_boolean('connected_selection', True, '')
-#     absl.app.flags.DEFINE_boolean('caching', True, '')
-#     absl.app.flags.DEFINE_boolean('core_only', False, '')
-#     absl.app.flags.DEFINE_boolean('hard_reset', False, '')
-#     absl.app.flags.DEFINE_string('interarea_weight_distribution', 'billeh_like', '')
-#     absl.app.flags.DEFINE_boolean('analyze_core_only', True, '')
-#     absl.app.flags.DEFINE_float('E4_weight_factor', 1., '')
-#     absl.app.flags.DEFINE_boolean('disconnect_lm_L6_inhibition', False, '')
-#     absl.app.flags.DEFINE_integer('n_input', 17400, '')
-#     absl.app.flags.DEFINE_integer('seq_len', 3000, '')
-#     absl.app.flags.DEFINE_string('data_dir', 'GLIF_network', '')
-    
-    
-#     absl.app.run(main)  
