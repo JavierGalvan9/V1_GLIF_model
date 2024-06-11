@@ -10,7 +10,7 @@ from pympler.asizeof import asizeof, asized
 
 from time import time
 
-@tf.function # Sometimes this function is called with different phase, causing 
+@tf.function(jit_compile=True) 
 def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True, image_duration=100, cpd=0.05,
                                    temporal_f=2, theta=None, phase=0, contrast=1.0):
     '''
@@ -63,7 +63,7 @@ def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True,
     else:
         return tf.tile(data[0][tf.newaxis, ...], (image_duration, 1, 1))
 
-@tf.function
+@tf.function(jit_compile=True)
 def movies_concat(movie, pre_delay, post_delay):
     movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
     # add an empty period before a period of gray image
