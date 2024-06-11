@@ -28,10 +28,10 @@ parser.add_argument('--rate_cost', default=100., type=float) #100
 parser.add_argument('--voltage_cost', default=1., type=float)
 parser.add_argument('--osi_cost', default=1., type=float)
 parser.add_argument('--osi_loss_subtraction_ratio', default=0., type=float)
-parser.add_argument('--osi_loss_method', default='crowd_spikes', type=str)
+parser.add_argument('--osi_loss_method', default='crowd_osi', type=str)
 
 parser.add_argument('--dampening_factor', default=0.1, type=float)
-parser.add_argument('--recurrent_dampening_factor', default=0.5, type=float)
+parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
 parser.add_argument('--input_weight_scale', default=1.0, type=float)
 parser.add_argument('--gauss_std', default=0.3, type=float)
 parser.add_argument('--recurrent_weight_regularization', default=0.0, type=float)
