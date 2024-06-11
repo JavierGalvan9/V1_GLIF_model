@@ -19,7 +19,7 @@ sys.path.append(os.path.join(parentDir, "general_utils"))
 import file_management
 
 
-def pop_name_to_cell_type(pop_name):
+def pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=False):
     """convert pop_name in the old format to cell types.
     for example,
     'e4Rorb' -> 'L4 Exc'
@@ -43,7 +43,7 @@ def pop_name_to_cell_type(pop_name):
     elif (class_name == "Vip") or (class_name == "Htr3a"):
         subclass = "VIP"
     else:  # excitatory
-        if layer == "5":
+        if layer == "5" and not ignore_l5e_subtypes:
             subclass = class_name
         else:
             subclass = "Exc"
