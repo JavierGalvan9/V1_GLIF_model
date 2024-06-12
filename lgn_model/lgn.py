@@ -347,7 +347,7 @@ class LGN(object):
             self.model_id = self.model_id[:n_input]
             self.is_composite = self.is_composite[:n_input]
 
-    @tf.function
+    @tf.function(jit_compile=True)
     def spatial_response(self, movie, bmtk_compat=True):
         d_spatial = 1
         spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
@@ -408,7 +408,7 @@ class LGN(object):
 
         return all_spatial_responses, all_non_dom_spatial_responses
 
-    @tf.function
+    @tf.function(jit_compile=True)
     def firing_rates_from_spatial(self, all_spatial_responses, all_non_dom_spatial_responses):
         dom_filtered_output = temporal_filter(all_spatial_responses, self.dom_temporal_kernels)
         non_dom_filtered_output = temporal_filter(all_non_dom_spatial_responses, self.non_dom_temporal_kernels)

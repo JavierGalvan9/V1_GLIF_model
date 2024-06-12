@@ -3,8 +3,7 @@ matplotlib.use('agg')# to avoid GUI request on clusters
 import os
 
 # Define the environment variables for optimal GPU performance
-# os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # before import tensorflow
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
@@ -12,7 +11,6 @@ os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 import socket
 import re
 import absl
-import json
 import numpy as np
 import tensorflow as tf
 import pickle as pkl
@@ -60,13 +58,6 @@ def main(_):
     # Set the seeds for reproducibility
     np.random.seed(flags.seed)
     tf.random.set_seed(flags.seed) 
-
-    # Choose optimized version for training depending on whether the user wants to 
-    # train the input or the recurrent
-    # if flags.train_input or flags.train_noise:
-    #     import v1_model_utils.models_train_input as models
-    # else:
-    #     import v1_model_utils.models as models
 
     logdir = flags.ckpt_dir
     if logdir == '':
@@ -137,7 +128,7 @@ def main(_):
             dampening_factor=flags.dampening_factor,
             recurrent_dampening_factor=flags.recurrent_dampening_factor,
             gauss_std=flags.gauss_std,
-            lr_scale=flags.learning_rate,
+            lr_scale=flags.lr_scale,
             train_input=flags.train_input,
             train_noise=flags.train_noise,
             train_recurrent=flags.train_recurrent,
@@ -171,7 +162,7 @@ def main(_):
         optimizer.build(model.trainable_variables)
 
         # Store the initial model variables that are going to be trained
-        model_variables_dict = {'Initial': {var.name: var.numpy() for var in model.trainable_variables}}
+        model_variables_dict = {'Initial': {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}}
 
         # Restore model and optimizer from a checkpoint if it exists
         if flags.ckpt_dir != '' and os.path.exists(os.path.join(flags.ckpt_dir, "OSI_DSI_checkpoints")):
@@ -239,6 +230,17 @@ def main(_):
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype, core_mask=core_mask)
         voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
 
+        # Create an ExponentialMovingAverage object
+        # Define the decay factor for the exponential moving average
+        ema_decay = 0.95
+        # Initialize exponential moving averages for V1 and LM firing rates
+        if os.path.exists(os.path.join(logdir, 'train_end_data.pkl')):
+            with open(os.path.join(logdir, 'train_end_data.pkl'), 'rb') as f:
+                data_loaded = pkl.load(f)
+                v1_ema = tf.Variable(data_loaded['v1_ema'], trainable=False, name='V1_EMA')
+        else:
+            v1_ema = tf.Variable(tf.ones(shape=(flags.neurons,)), trainable=False, name='V1_EMA')
+
         # here we need information of the layer mask for the OSI loss
         if flags.osi_loss_method == 'neuropixels_fr':
             layer_info = other_v1_utils.get_layer_info(network)
@@ -246,21 +248,21 @@ def main(_):
             layer_info = None
 
         tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)                                                  
-        OSI_Loss = losses.OrientationSelectivityLoss(tuning_angles, network=network, osi_cost=flags.osi_cost, 
+        OSI_DSI_Loss = losses.OrientationSelectivityLoss(network=network, osi_cost=flags.osi_cost, 
                                                     pre_delay=delays[0], post_delay=delays[1], 
                                                     dtype=dtype, core_mask=core_mask,
                                                     method=flags.osi_loss_method,
                                                     subtraction_ratio=flags.osi_loss_subtraction_ratio,
                                                     layer_info=layer_info)
-        osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,)), trim=True) # this is just a placeholder
-        # osi_loss = OSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,1)), trim=True) 
+        osi_dsi_loss = OSI_DSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,1)), trim=True, normalizer=v1_ema)[0] # this is just a placeholder
+        # osi_dsi_loss = OSI_DSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,1)), trim=True) 
 
         model.add_loss(rate_loss)
         model.add_loss(voltage_loss)
-        model.add_loss(osi_loss)
+        model.add_loss(osi_dsi_loss)
         model.add_metric(rate_loss, name='rate_loss')
         model.add_metric(voltage_loss, name='voltage_loss')
-        model.add_metric(osi_loss, name='osi_loss')
+        model.add_metric(osi_dsi_loss, name='osi_dsi_loss')
 
         prediction_layer = model.get_layer('prediction')
         extractor_model = tf.keras.Model(inputs=model.inputs,
@@ -293,16 +295,16 @@ def main(_):
         val_rate_loss = tf.keras.metrics.Mean()
         train_voltage_loss = tf.keras.metrics.Mean()
         val_voltage_loss = tf.keras.metrics.Mean()
-        train_osi_loss = tf.keras.metrics.Mean()
-        val_osi_loss = tf.keras.metrics.Mean()
+        train_osi_dsi_loss = tf.keras.metrics.Mean()
+        val_osi_dsi_loss = tf.keras.metrics.Mean()
 
         def reset_train_metrics():
             train_loss.reset_states(), train_accuracy.reset_states(), train_firing_rate.reset_states()
-            train_rate_loss.reset_states(), train_voltage_loss.reset_states(), train_osi_loss.reset_states()
+            train_rate_loss.reset_states(), train_voltage_loss.reset_states(), train_osi_dsi_loss.reset_states()
 
         def reset_validation_metrics():
             val_loss.reset_states(), val_accuracy.reset_states(), val_firing_rate.reset_states()
-            val_rate_loss.reset_states(), val_voltage_loss.reset_states(), val_osi_loss.reset_states()
+            val_rate_loss.reset_states(), val_voltage_loss.reset_states(), val_osi_dsi_loss.reset_states()
 
 
     def roll_out(_x, _y, _w, trim=True):
@@ -311,20 +313,28 @@ def main(_):
         dummy_zeros = tf.zeros((flags.batch_size, seq_len, flags.neurons), dtype)
         _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
 
-        _z, _v, _input_current = _out[0]
+        _z, _v, _ = _out[0]
         # update state_variables with the new model state
         new_state = tuple(_out[1:])
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
+        # update the exponential moving average of the firing rates
+        v1_evoked_rates = _z[:, delays[0]:seq_len-delays[1], :]
+        v1_evoked_rates = tf.reduce_mean(v1_evoked_rates, (0, 1))
+        # Update the EMAs
+        v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
+        tf.print('V1_ema: ', tf.reduce_mean(v1_ema), tf.reduce_mean(v1_evoked_rates), v1_ema)
 
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
         rate_loss = rate_distribution_regularizer(_z, trim)
-        osi_loss = OSI_Loss(_z, _y, trim)
+        osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
+        tf.print('V1 OSI losses: ')
+        tf.print(osi_dsi_loss[1])
         # weights_l2_regularizer = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
 
-        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_loss=osi_loss)
-        _loss = osi_loss + rate_loss + voltage_loss #+ weights_l2_regularizer
+        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss[0])
+        _loss = osi_dsi_loss[0] + rate_loss + voltage_loss #+ weights_l2_regularizer
 
-        tf.print(osi_loss, rate_loss, voltage_loss) #, weights_l2_regularizer)
+        tf.print(osi_dsi_loss[0], rate_loss, voltage_loss) #, weights_l2_regularizer)
 
         return _out, _p, _loss, _aux
 
@@ -358,17 +368,17 @@ def main(_):
             _op = train_voltage_loss.update_state(_aux['voltage_loss'])
 
         with tf.control_dependencies([_op]):
-            _op = train_osi_loss.update_state(_aux['osi_loss'])
+            _op = train_osi_dsi_loss.update_state(_aux['osi_dsi_loss'])
         
         grad = tape.gradient(_loss, model.trainable_variables)
         for g, v in zip(grad, model.trainable_variables):
             tf.print(f'{v.name} optimization')
-            # tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
+            tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
             with tf.control_dependencies([_op]):
                 _op = optimizer.apply_gradients([(g, v)])
 
         if output_metrics:
-            return [0., _loss, _rate, _aux['rate_loss'], _aux['voltage_loss'], _aux['osi_loss']]
+            return [0., _loss, _rate, _aux['rate_loss'], _aux['voltage_loss'], _aux['osi_dsi_loss']]
 
 
     @tf.function
@@ -398,7 +408,7 @@ def main(_):
         with tf.control_dependencies([_op]):
             _op = val_voltage_loss.update_state(_aux['voltage_loss'])
         with tf.control_dependencies([_op]):
-            _op = val_osi_loss.update_state(_aux['osi_loss'])
+            _op = val_osi_dsi_loss.update_state(_aux['osi_dsi_loss'])
             
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
         if output_spikes:
@@ -463,7 +473,7 @@ def main(_):
         else:
             raise ValueError(f"Invalid reset_type: {reset_type}")
 
-
+    @tf.function
     def distributed_reset_state(reset_type, gray_state=None):
         if reset_type == 'gray':
             if gray_state is None:
@@ -505,8 +515,8 @@ def main(_):
     stop = False
     # Initialize your callbacks
     metric_keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss',
-            'train_voltage_loss', 'train_osi_loss', 'val_accuracy', 'val_loss',
-            'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_osi_loss']
+            'train_voltage_loss', 'train_osi_dsi_loss', 'val_accuracy', 'val_loss',
+            'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_osi_dsi_loss']
     
     callbacks = Callbacks(model, optimizer, distributed_roll_out, flags, logdir, flag_str, strategy, 
                         metric_keys, pre_delay=delays[0], post_delay=delays[1], model_variables_init=model_variables_dict,
@@ -590,10 +600,10 @@ def main(_):
             z = distributed_validation_step(x, y, w, output_spikes=True) 
 
         train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
-                                                    train_rate_loss, train_voltage_loss, train_osi_loss]]
+                                                    train_rate_loss, train_voltage_loss, train_osi_dsi_loss]]
         val_values = train_values
         # val_values = [a.result().numpy() for a in [val_accuracy, val_loss, val_firing_rate, 
-        #                                            val_rate_loss, val_voltage_loss, val_osi_loss]]
+        #                                            val_rate_loss, val_voltage_loss, val_osi_dsi_loss]]
         metric_values = train_values + val_values
 
         # if the model train loss is minimal, save the model.
@@ -606,7 +616,8 @@ def main(_):
         reset_train_metrics()
         reset_validation_metrics()
 
-    callbacks.on_train_end(metric_values)
+    normalizers = {'v1_ema': v1_ema.numpy()}
+    callbacks.on_train_end(metric_values, normalizers=normalizers)
 
  
 if __name__ == '__main__':
@@ -644,7 +655,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
-    absl.app.flags.DEFINE_string('rotation', 'cw', '')
+    absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_float('dampening_factor', .5, '')
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
