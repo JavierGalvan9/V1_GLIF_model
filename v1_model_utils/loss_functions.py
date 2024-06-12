@@ -521,6 +521,8 @@ class OrientationSelectivityLoss:
         individual_osi_loss = {}
         # individual_dsi_loss = {}
         # individual_penalization_loss = {}
+        
+        cell_count = 0
 
         for key, value in self._target_osi.items():
             if tf.size(value["ids"]) != 0:
