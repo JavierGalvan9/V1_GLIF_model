@@ -56,6 +56,7 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
     rates = tf.reduce_mean(_spikes, (0, 1))
     # if core_mask is not None:
     #     core_neurons_ids = np.where(core_mask)[0]
+    cell_count = 0
 
     for i, (key, value) in enumerate(target_rates.items()):
         if tf.size(value["neuron_ids"]) != 0:
@@ -71,13 +72,15 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
             #     target_rate = value["sorted_target_rates"]
 
             loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
-            mean_loss_type = tf.reduce_mean(loss_type)
+            mean_loss_type = tf.reduce_sum(loss_type)
+            cell_count += tf.size(value["neuron_ids"])
         else:
             mean_loss_type = tf.constant(0, dtype=dtype)
 
         # losses.append(mean_loss_type)
         total_loss += mean_loss_type
         
+    total_loss = total_loss / float(cell_count)
     # total_loss = tf.reduce_sum(losses, axis=0)
     return total_loss
 
@@ -497,6 +500,7 @@ class OrientationSelectivityLoss:
         # For weighted responses, we separately consider the contributions from cosine and sine
         weighted_cos_responses = rates * cos_component
         # weighted_sin_responses = rates * sin_component
+        cell_count = 0
 
         total_osi_loss = tf.constant(0.0, dtype=self._dtype)
         for i, (key, value) in enumerate(self._target_osi.items()):
@@ -518,11 +522,13 @@ class OrientationSelectivityLoss:
                 
                 # Calculate the OSI loss
                 osi_loss_type = tf.math.square(osi_approx_type - value['OSI'])
-                # osi_loss_type = tf.math.square(osi_approx_type - 0.99)
-                total_osi_loss += osi_loss_type
+                cell_count_type = tf.size(value["ids"])
+                total_osi_loss += osi_loss_type * float(cell_count_type)
+                cell_count += cell_count_type
             else:
                 pass
             
+        total_osi_loss = total_osi_loss / float(cell_count)
         return total_osi_loss * self._osi_cost
     
 
