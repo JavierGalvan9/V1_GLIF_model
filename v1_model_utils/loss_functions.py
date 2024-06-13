@@ -57,6 +57,7 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
     rates = tf.reduce_mean(_spikes, (0, 1))
     # if core_mask is not None:
     #     core_neurons_ids = np.where(core_mask)[0]
+    cell_count = 0
 
     for key, value in target_rates.items():
         if tf.size(value["neuron_ids"]) != 0:
@@ -72,13 +73,15 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
             #     target_rate = value["sorted_target_rates"]
 
             loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
-            mean_loss_type = tf.reduce_mean(loss_type)
+            mean_loss_type = tf.reduce_sum(loss_type)
+            cell_count += tf.size(value["neuron_ids"])
         else:
             mean_loss_type = tf.constant(0, dtype=dtype)
 
         # losses.append(mean_loss_type)
         total_loss += mean_loss_type
         
+    total_loss = total_loss / float(cell_count)
     # total_loss = tf.reduce_sum(losses, axis=0)
     return total_loss
 
@@ -475,7 +478,7 @@ class OrientationSelectivityLoss:
         
         angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle * self._subtraction_ratio
         
-        return tf.abs(angle_loss) * self._osi_cost
+        return angle_loss * self._osi_cost
 
     def crowd_osi_loss(self, spikes, angle, trim=True, normalizer=None):
         # Calculate the angle deltas between current angle and tuning angle
@@ -518,6 +521,8 @@ class OrientationSelectivityLoss:
         individual_osi_loss = {}
         # individual_dsi_loss = {}
         # individual_penalization_loss = {}
+        
+        cell_count = 0
 
         for key, value in self._target_osi.items():
             if tf.size(value["ids"]) != 0:
@@ -549,9 +554,11 @@ class OrientationSelectivityLoss:
                 # individual_dsi_loss[key] = dsi_loss_type
                 # individual_penalization_loss[key] = osi_penalization + dsi_penalization
 
-                total_osi_loss += osi_loss_type
-                total_dsi_loss += dsi_loss_type
+                cell_count_type = tf.size(value["ids"])
+                total_osi_loss += osi_loss_type * float(cell_count_type)
+                total_dsi_loss += dsi_loss_type * float(cell_count_type)
                 # penalization_terms += osi_penalization + dsi_penalization
+                cell_count += cell_count_type
             else:
                 individual_osi_loss[key] = 0.0
                 # individual_dsi_loss[key] = 0.0
@@ -560,6 +567,8 @@ class OrientationSelectivityLoss:
             
         # return (total_osi_loss + total_dsi_loss + penalization_terms) * self._osi_cost
         # return (total_osi_loss + total_dsi_loss) * self._osi_cost
+        total_osi_loss = total_osi_loss / float(cell_count)
+        total_dsi_loss = total_dsi_loss / float(cell_count)
         return (total_osi_loss + total_dsi_loss) * self._osi_cost, individual_osi_loss
     
 

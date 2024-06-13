@@ -78,15 +78,24 @@ class Callbacks:
             self.epoch_metric_values = {key: [] for key in self.metrics_keys}
         else:
             # Load epoch_metric_values and min_val_loss from the file
-            with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'rb') as f:
-                data_loaded = pkl.load(f)
-            self.epoch_metric_values = data_loaded['epoch_metric_values']
-            self.min_val_loss = data_loaded['min_val_loss']
-            self.no_improve_epochs = data_loaded['no_improve_epochs']
+            try:
+                with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'rb') as f:
+                    data_loaded = pkl.load(f)
+                self.epoch_metric_values = data_loaded['epoch_metric_values']
+                self.min_val_loss = data_loaded['min_val_loss']
+                self.no_improve_epochs = data_loaded['no_improve_epochs']
+            except FileNotFoundError:
+                print('No train_end_data.pkl file found. Initializing...')
+                self.min_val_loss = float('inf')
+                self.no_improve_epochs = 0
+                self.epoch_metric_values = {key: [] for key in self.metrics_keys}
 
         # Manager for the best model
         self.best_manager = tf.train.CheckpointManager(
             checkpoint, directory=self.logdir, max_to_keep=1
+        )
+        self.latest_manager = tf.train.CheckpointManager(
+            checkpoint, directory=self.logdir + '/latest', max_to_keep=1
         )
         # Manager for osi/dsi checkpoints 
         self.epoch_manager = tf.train.CheckpointManager(
@@ -164,6 +173,10 @@ class Callbacks:
             val_loss_value = metric_values[val_loss_index]
 
         self.plot_losses_curves()
+        
+        # save latest model every 10 epochs
+        if self.epoch % 10 == 0:
+            self.save_latest_model()    
 
         if val_loss_value < self.min_val_loss:
         # if True:
@@ -219,6 +232,13 @@ class Callbacks:
             mem_data = printgpu(verbose=1)
             print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
         
+    def save_latest_model(self):
+        try:
+            p = self.latest_manager.save(checkpoint_number=self.epoch)
+            print(f'Latest model saved in {p}\n')    
+        except:
+            print("Saving failed. Maybe next time?")    
+
     def save_best_model(self):
         # self.step_counter.assign_add(1)
         print(f'[ Saving the model at epoch {self.epoch} ]')
@@ -476,7 +496,7 @@ class Callbacks:
                     lgn_firing_rates_dict = pkl.load(f)
 
             sim_duration = (2500//self.flags.seq_len + 1) * self.flags.seq_len
-            n_trials_per_angle = 1
+            n_trials_per_angle = 10
             spikes = np.zeros((8, sim_duration, self.flags.neurons), dtype=float)
             DG_angles = np.arange(0, 360, 45)
 

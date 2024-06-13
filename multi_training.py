@@ -171,6 +171,12 @@ def main(_):
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
             checkpoint.restore(checkpoint_directory).assert_consumed()
             print('Checkpoint restored!')
+        elif flags.restore_from != '' and os.path.exists(flags.restore_from):
+            print(f'Restoring checkpoint from {flags.restore_from} with the restore_from option...')
+            checkpoint_directory = tf.train.latest_checkpoint(flags.restore_from)
+            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint.restore(checkpoint_directory).assert_consumed()
+            print('Checkpoint restored!')
         else:
             checkpoint = None
 
@@ -233,7 +239,8 @@ def main(_):
                 data_loaded = pkl.load(f)
                 v1_ema = tf.Variable(data_loaded['v1_ema'], trainable=False, name='V1_EMA')
         else:
-            v1_ema = tf.Variable(tf.ones(shape=(flags.neurons,)), trainable=False, name='V1_EMA')
+            # 3 Hz is near the average FR of cortex
+            v1_ema = tf.Variable(0.003 * tf.ones(shape=(flags.neurons,)), trainable=False, name='V1_EMA')
 
         # here we need information of the layer mask for the OSI loss
         if flags.osi_loss_method == 'neuropixels_fr':
