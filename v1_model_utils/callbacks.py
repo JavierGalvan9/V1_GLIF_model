@@ -10,9 +10,9 @@ from matplotlib import pyplot as plt
 import seaborn as sns
 # from scipy.signal import correlate
 import stim_dataset
-from v1_model_utils import other_v1_utils, load_sparse
+from v1_model_utils import other_v1_utils
 from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivity
-from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis, OneShotTuningAnalysis
+from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
 
 
 def printgpu(verbose=0):
@@ -37,17 +37,14 @@ def compose_str(metrics_values):
 
 
 class Callbacks:
-    def __init__(self, model, optimizer, distributed_roll_out, flags, logdir, flag_str, strategy, 
+    def __init__(self, network, lgn_input, bkg_input, model, optimizer, distributed_roll_out, flags, logdir, strategy, 
                 metrics_keys, pre_delay=50, post_delay=50, checkpoint=None, model_variables_init=None, 
                 save_optimizer=True):
         
         self.n_neurons = flags.neurons
-        if flags.caching:
-            load_fn = load_sparse.cached_load_v1
-        else:
-            load_fn = load_sparse.load_v1
-        self.network, self.lgn_input, self.bkg_input = load_fn(flags, self.n_neurons, flag_str=flag_str)      
-
+        self.network = network
+        self.lgn_input = lgn_input
+        self.bkg_input = bkg_input
         self.neuropixels_feature = 'Ave_Rate(Hz)'  
         self.model = model
         self.optimizer = optimizer
@@ -319,7 +316,6 @@ class Callbacks:
 
 
     def variable_change_analysis(self, variable):
-        print(variable)
         if 'rest_of_brain_weights' in variable:
             self.node_to_pop_weights_analysis(self.bkg_input['indices'], variable=variable)
         elif 'sparse_input_weights' in variable:

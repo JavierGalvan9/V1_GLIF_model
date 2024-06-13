@@ -370,7 +370,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('interval_duration', 40, '')
     absl.app.flags.DEFINE_integer('examples_in_epoch', 32, '')
     absl.app.flags.DEFINE_integer('validation_examples', 16, '')
-    absl.app.flags.DEFINE_integer('n_trials_per_angle', 1, '')
+    absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
 
     absl.app.flags.DEFINE_boolean('float16', False, '')
     absl.app.flags.DEFINE_boolean('caching', True, '')

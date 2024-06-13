@@ -57,7 +57,7 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
     rates = tf.reduce_mean(_spikes, (0, 1))
     # if core_mask is not None:
     #     core_neurons_ids = np.where(core_mask)[0]
-    cell_count = 0
+    cell_count = tf.constant(0, dtype=dtype)
 
     for key, value in target_rates.items():
         if tf.size(value["neuron_ids"]) != 0:
@@ -74,14 +74,14 @@ def compute_spike_rate_target_loss(_spikes, target_rates, dtype=tf.float32):
 
             loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
             mean_loss_type = tf.reduce_sum(loss_type)
-            cell_count += tf.size(value["neuron_ids"])
+            cell_count += tf.cast(tf.size(value["neuron_ids"]), dtype)
         else:
             mean_loss_type = tf.constant(0, dtype=dtype)
 
         # losses.append(mean_loss_type)
         total_loss += mean_loss_type
         
-    total_loss = total_loss / float(cell_count)
+    total_loss = total_loss / cell_count
     # total_loss = tf.reduce_sum(losses, axis=0)
     return total_loss
 
@@ -522,7 +522,7 @@ class OrientationSelectivityLoss:
         # individual_dsi_loss = {}
         # individual_penalization_loss = {}
         
-        cell_count = 0
+        cell_count = tf.constant(0, dtype=self._dtype)
 
         for key, value in self._target_osi.items():
             if tf.size(value["ids"]) != 0:
@@ -554,9 +554,9 @@ class OrientationSelectivityLoss:
                 # individual_dsi_loss[key] = dsi_loss_type
                 # individual_penalization_loss[key] = osi_penalization + dsi_penalization
 
-                cell_count_type = tf.size(value["ids"])
-                total_osi_loss += osi_loss_type * float(cell_count_type)
-                total_dsi_loss += dsi_loss_type * float(cell_count_type)
+                cell_count_type = tf.cast(tf.size(value["ids"]), dtype=self._dtype)
+                total_osi_loss += osi_loss_type * cell_count_type
+                total_dsi_loss += dsi_loss_type * cell_count_type
                 # penalization_terms += osi_penalization + dsi_penalization
                 cell_count += cell_count_type
             else:
@@ -567,8 +567,9 @@ class OrientationSelectivityLoss:
             
         # return (total_osi_loss + total_dsi_loss + penalization_terms) * self._osi_cost
         # return (total_osi_loss + total_dsi_loss) * self._osi_cost
-        total_osi_loss = total_osi_loss / float(cell_count)
-        total_dsi_loss = total_dsi_loss / float(cell_count)
+        total_osi_loss = total_osi_loss / cell_count
+        total_dsi_loss = total_dsi_loss / cell_count
+        # penalization_terms = penalization_terms / cell_count
         return (total_osi_loss + total_dsi_loss) * self._osi_cost, individual_osi_loss
     
 

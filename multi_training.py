@@ -143,8 +143,6 @@ def main(_):
             max_delay=5,
         )
         
-        del lgn_input, bkg_input
-
         # Initialize the weights of the model based on the specified input shape. It operates in eager mode.
         # It does not construct a computational graph of the model operations, but prepares the model layers and weights
         model.build((flags.batch_size, flags.seq_len, flags.n_input))
@@ -334,7 +332,6 @@ def main(_):
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss[0])
         _loss = osi_dsi_loss[0] + rate_loss + voltage_loss #+ weights_l2_regularizer
-
         tf.print(osi_dsi_loss[0], rate_loss, voltage_loss) #, weights_l2_regularizer)
 
         return _out, _p, _loss, _aux
@@ -519,7 +516,7 @@ def main(_):
             'train_voltage_loss', 'train_osi_dsi_loss', 'val_accuracy', 'val_loss',
             'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_osi_dsi_loss']
     
-    callbacks = Callbacks(model, optimizer, distributed_roll_out, flags, logdir, flag_str, strategy, 
+    callbacks = Callbacks(network, lgn_input, bkg_input, model, optimizer, distributed_roll_out, flags, logdir, strategy, 
                         metric_keys, pre_delay=delays[0], post_delay=delays[1], model_variables_init=model_variables_dict,
                         checkpoint=checkpoint)
     

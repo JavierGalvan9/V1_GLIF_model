@@ -469,13 +469,12 @@ class V1Column(tf.keras.layers.Layer):
         self.synaptic_weights = tf.constant(self.synaptic_weights, dtype=self._compute_dtype)
 
         ### Network recurrent connectivity ###
-        indices, weights, dense_shape, syn_ids, delays = (
-            network["synapses"]["indices"],
-            network["synapses"]["weights"],
-            network["synapses"]["dense_shape"],
-            network["synapses"]["syn_ids"],
-            network["synapses"]["delays"]
-        )
+        indices = np.array(network["synapses"]["indices"])
+        weights = np.array(network["synapses"]["weights"])
+        dense_shape = np.array(network["synapses"]["dense_shape"])
+        syn_ids = np.array(network["synapses"]["syn_ids"])
+        delays = np.array(network["synapses"]["delays"])
+
         # Scale down the recurrent weights
         weights = (weights/voltage_scale[self._node_type_ids[indices[:, 0]]])      
 
@@ -542,8 +541,6 @@ class V1Column(tf.keras.layers.Layer):
         else:
             self.per_type_training = False
             
-
-
         self.recurrent_weights_factors = tf.gather(self.synaptic_weights, syn_ids, axis=0)
         print(f"    > # Recurrent synapses: {len(indices)}")
 
@@ -551,12 +548,10 @@ class V1Column(tf.keras.layers.Layer):
 
         ### LGN input connectivity ###
         self.lgn_input_dense_shape = (self._n_neurons, lgn_input["n_inputs"],)
-        input_indices, input_weights, input_syn_ids, input_delays = (
-            lgn_input["indices"],
-            lgn_input["weights"],
-            lgn_input["syn_ids"],
-            lgn_input["delays"]
-        )
+        input_indices = np.array(lgn_input["indices"])
+        input_weights = np.array(lgn_input["weights"])
+        input_syn_ids = np.array(lgn_input["syn_ids"])
+        input_delays = np.array(lgn_input["delays"])
 
         # Scale down the input weights
         input_weights = (input_weights/ voltage_scale[self._node_type_ids[input_indices[:, 0]]])
@@ -584,12 +579,10 @@ class V1Column(tf.keras.layers.Layer):
 
         ### BKG input connectivity ###
         self.bkg_input_dense_shape = (self._n_neurons, bkg_input["n_inputs"],)
-        bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, bkg_input_delays = (
-            bkg_input["indices"],
-            bkg_input["weights"],
-            bkg_input["syn_ids"],
-            bkg_input["delays"]
-        )
+        bkg_input_indices = np.array(bkg_input['indices'])
+        bkg_input_weights = np.array(bkg_input['weights'])
+        bkg_input_syn_ids = np.array(bkg_input['syn_ids'])
+        bkg_input_delays = np.array(bkg_input['delays'])
 
         bkg_input_weights = (bkg_input_weights/voltage_scale[self._node_type_ids[bkg_input_indices[:, 0]]])
         bkg_input_delays = np.round(np.clip(bkg_input_delays, dt, self.max_delay)/dt).astype(np.int32)
