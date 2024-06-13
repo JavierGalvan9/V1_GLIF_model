@@ -92,7 +92,7 @@ class Callbacks:
 
         # Manager for the best model
         self.best_manager = tf.train.CheckpointManager(
-            checkpoint, directory=self.logdir, max_to_keep=1
+            checkpoint, directory=self.logdir + '/Best_model', max_to_keep=1
         )
         self.latest_manager = tf.train.CheckpointManager(
             checkpoint, directory=self.logdir + '/latest', max_to_keep=1

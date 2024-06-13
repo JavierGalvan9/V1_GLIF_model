@@ -115,7 +115,7 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    training_commands = ["run", "-g", "1", "-m", "24", "-t", "2:00"]
+    training_commands = ["run", "-g", "1", "-m", "24", "-t", "3:00"]
     evaluation_commands = ["run", "-g", "1", "-m", "60", "-t", "1:00"]
 
     # Define the training and evaluation script calls
@@ -166,10 +166,17 @@ def main():
             continue
         else:
             new_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-j", f"{sim_name}_test_{i}"]
-            new_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
+            new_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'OSI_DSI_checkpoints' --run_session {i}"
             new_evaluation_command = new_evaluation_command + [new_evaluation_script]
             eval_job_id = submit_job(new_evaluation_command)
             eval_job_ids.append(eval_job_id)
+
+    # Final evaluation with the best model
+    final_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_final.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_final.err", "-j", f"{sim_name}_test_final"]
+    final_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
+    final_evaluation_command = final_evaluation_command + [final_evaluation_script]
+    eval_job_id = submit_job(final_evaluation_command)
+    eval_job_ids.append(eval_job_id)
 
     print("Submitted training jobs with the following JOBIDs:", job_ids)
     print("Submitted evaluation jobs with the following JOBIDs:", eval_job_ids)

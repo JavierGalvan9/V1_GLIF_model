@@ -174,9 +174,11 @@ def main(_):
         # Restore model and optimizer from a checkpoint if it exists
         if flags.ckpt_dir != '' and os.path.exists(flags.ckpt_dir):
             print(f'Restoring checkpoint from {flags.ckpt_dir}...')
-            checkpoint_directory = tf.train.latest_checkpoint(os.path.join(flags.ckpt_dir, "OSI_DSI_checkpoints"))
+            checkpoint_directory = tf.train.latest_checkpoint(os.path.join(flags.ckpt_dir, flags.restore_from))
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
             checkpoint.restore(checkpoint_directory).assert_consumed()
+            if flags.restore_from == "Best_model":
+                logdir = checkpoint_directory
             print('Checkpoint restored!')
             print(f'OSI/DSI results for epoch {current_epoch} will be saved in: {checkpoint_directory}\n')
         else:
@@ -368,7 +370,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('interval_duration', 40, '')
     absl.app.flags.DEFINE_integer('examples_in_epoch', 32, '')
     absl.app.flags.DEFINE_integer('validation_examples', 16, '')
-    absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
+    absl.app.flags.DEFINE_integer('n_trials_per_angle', 1, '')
 
     absl.app.flags.DEFINE_boolean('float16', False, '')
     absl.app.flags.DEFINE_boolean('caching', True, '')
