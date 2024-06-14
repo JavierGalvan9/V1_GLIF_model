@@ -117,7 +117,7 @@ def process_neuropixels_data(path=''):
 
     # Save the processed table
     df.to_csv(f'Neuropixels_data/v1_OSI_DSI_DF.csv', sep=" ", index=False)
-    return df
+    # return df
 
 
 def neuropixels_cell_type_to_cell_type(pop_name):
@@ -165,10 +165,10 @@ class SpikeRateDistributionTarget:
         # Load data
         neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
         if not os.path.exists(neuropixels_data_path):
-            np_df = process_neuropixels_data(path=neuropixels_data_path)
-        else:
-            np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ")
+            process_neuropixels_data(path=neuropixels_data_path)
 
+        features_to_load = ['ecephys_unit_id', 'cell_type', 'firing_rate_sp', 'Ave_Rate(Hz)']
+        np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
         area_node_types = pd.read_csv(os.path.join(self._data_dir, f'network/v1_node_types.csv'), sep=" ")
 
         # Define population queries
@@ -351,11 +351,10 @@ class OrientationSelectivityLoss:
         # Load data
         neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
         if not os.path.exists(neuropixels_data_path):
-            np_df = process_neuropixels_data(path=neuropixels_data_path)
-        else:
-            np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ")
+            process_neuropixels_data(path=neuropixels_data_path)
 
-        osi_dsi_df = np_df[['cell_type', 'OSI', 'DSI', "Ave_Rate(Hz)", "max_mean_rate(Hz)"]]
+        features_to_load = ['ecephys_unit_id', 'cell_type', 'OSI', 'DSI', "Ave_Rate(Hz)", "max_mean_rate(Hz)"]
+        osi_dsi_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
         nonresponding = osi_dsi_df["max_mean_rate(Hz)"] < 0.5
         osi_dsi_df.loc[nonresponding, "OSI"] = np.nan
         osi_dsi_df.loc[nonresponding, "DSI"] = np.nan

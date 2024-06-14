@@ -246,7 +246,6 @@ def main(_):
         else:
             layer_info = None
 
-        tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)                                                  
         OSI_DSI_Loss = losses.OrientationSelectivityLoss(network=network, osi_cost=flags.osi_cost, 
                                                     pre_delay=delays[0], post_delay=delays[1], 
                                                     dtype=dtype, core_mask=core_mask,

@@ -273,22 +273,21 @@ class MetricsBoxplot:
     def get_osi_dsi_df(self, metric_file="v1_OSI_DSI_DF.csv", data_source_name="", feature='', data_dir=""):
         # Load the data csv file and remove rows with empty cell type
         # if metric_file is a dataframe, then do not load it
-        if isinstance(metric_file, pd.DataFrame):
-            df = metric_file
-        else:
-            df = pd.read_csv(f"{data_dir}/{metric_file}", sep=" ")
-
-        # Rename the cell types
         if data_dir == "Neuropixels_data":
+            features_to_load = ['ecephys_unit_id', 'cell_type', 'firing_rate_sp', 'Ave_Rate(Hz)', "max_mean_rate(Hz)", "OSI", "DSI"]
+            df = pd.read_csv(f"{data_dir}/{metric_file}", index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
             df = df[df['cell_type'].notna()]
             df["cell_type"] = df["cell_type"].apply(self.neuropixels_cell_type_to_cell_type)
         elif data_dir == 'Billeh_column_metrics':
+            df = pd.read_csv(f"{data_dir}/{metric_file}", sep=" ")
             df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
         elif data_dir == "NEST_metrics":
+            df = pd.read_csv(f"{data_dir}/{metric_file}", sep=" ")
             df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
             # plot only neurons within 200 um.
             df = df[(df["x"] ** 2 + df["z"] ** 2) < (200 ** 2)]
-        else:
+        elif isinstance(metric_file, pd.DataFrame):
+            df = metric_file
             df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
 
         # Rename the maximum rate column
