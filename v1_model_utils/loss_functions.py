@@ -3,31 +3,115 @@ import tensorflow as tf
 from tensorflow.keras.layers import Layer
 import pandas as pd
 import pickle as pkl
+from math import pi
 import os
 import sys
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
 import other_v1_utils
 
 
-class StiffRegularizer(tf.keras.regularizers.Regularizer):
-    def __init__(self, strength, initial_value):
-        super().__init__()
-        self._strength = strength
-        self._initial_value = tf.Variable(initial_value, trainable=False)
+# class StiffRegularizer(tf.keras.regularizers.Regularizer):
+#     def __init__(self, strength, initial_value):
+#         super().__init__()
+#         self._strength = strength
+#         self._initial_value = tf.Variable(initial_value, trainable=False)
 
-    def __call__(self, x):
-        return self._strength * tf.reduce_mean(tf.square(x - self._initial_value))
+#     def __call__(self, x):
+#         return self._strength * tf.reduce_mean(tf.square(x - self._initial_value))
     
-class L2Regularizer(tf.keras.regularizers.Regularizer):
-    def __init__(self, strength, initial_value):
-        super().__init__()
-        self._strength = strength
-        self._initial_value = tf.Variable(initial_value, trainable=False)
+# class L2Regularizer(tf.keras.regularizers.Regularizer):
+#     def __init__(self, strength, initial_value):
+#         super().__init__()
+#         self._strength = strength
+#         self._initial_value = tf.Variable(initial_value, trainable=False)
+
+#     def __call__(self, x):
+#         return self._strength * tf.reduce_mean(tf.square(x))
+
+class StiffRegularizer(Layer):
+    def __init__(self, strength, network, penalize_relative_change=False, dtype=tf.float32):
+        self._strength = tf.cast(strength, dtype)
+        self._dtype = dtype
+        self._penalize_relative_change = penalize_relative_change
+        # Compute voltage scale
+        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float16)
+        # Get the initial weights and properly scale them down
+        indices = network["synapses"]["indices"]
+        initial_value = np.array(network["synapses"]["weights"], dtype=np.float16)
+        edge_type_ids = network['synapses']['edge_type_ids']
+
+        # Scale initial values by the voltage scale of the node IDs
+        voltage_scale_node_ids = voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        initial_value /= voltage_scale_node_ids
+        # Find unique values and their first occurrence indices
+        unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
+        # Sort first_occurrence_indices to maintain the order of first appearances
+        self.num_unique = unique_edge_types.shape[0]
+        sum_weights = np.bincount(self.idx, weights=initial_value, minlength=self.num_unique)
+        count_weights = np.bincount(self.idx, minlength=self.num_unique)
+        initial_mean_weights = sum_weights / count_weights
+        # Determine target mean weights
+        if self._penalize_relative_change:
+            epsilon = np.float16(1e-3)
+            target_mean_weights = np.maximum(np.abs(initial_mean_weights), epsilon)
+        else:
+            target_mean_weights = initial_mean_weights
+
+        self.idx = tf.constant(self.idx, dtype=tf.int32)
+        self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
+        self._target_mean_weights = tf.constant(target_mean_weights, dtype=dtype)
 
     def __call__(self, x):
-        return self._strength * tf.reduce_mean(tf.square(x))
-
+        # if x.dtype != self._dtype:
+        #     x = tf.cast(x, self._dtype)
+        mean_edge_type_weights = tf.math.unsorted_segment_mean(x, self.idx, self.num_unique)
+        if self._penalize_relative_change:
+            # return self._strength * tf.reduce_mean(tf.abs(x - self._initial_value))
+            relative_deviation = (mean_edge_type_weights - self._target_mean_weights) / self._target_mean_weights
+            # Penalize the relative deviation
+            reg_loss = tf.sqrt(tf.reduce_mean(tf.square(relative_deviation)))
+        else:
+            reg_loss = tf.reduce_mean(tf.square(mean_edge_type_weights - self._target_mean_weights))
         
+        return reg_loss * self._strength
+    
+
+class L2Regularizer(tf.keras.regularizers.Regularizer):
+    def __init__(self, strength, network, flags, penalize_relative_change=False, dtype=tf.float32):
+        super().__init__()
+        self._strength = strength
+        # Compute voltage scale
+        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float16)
+        # Get the initial weights and properly scale them down
+        indices = np.array(network["synapses"]["indices"], dtype=tf.int32)
+        weights = np.array(network["synapses"]["weights"], dtype=dtype)
+        # Scale initial values by the voltage scale of the node IDs
+        voltage_scale_node_ids = voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        initial_value = weights / voltage_scale_node_ids
+        self._initial_value = tf.constant(initial_value, dtype=dtype)
+
+        if penalize_relative_change:
+            # using the edge_type ids group calculate the mean weight of each type of edge in the network and then create a constant with same shape as weights and with each value corresponding to the populations mean
+            # Calculate mean weights for each edge type
+            edge_type_ids = np.array(network['synapses']['edge_type_ids'])
+            unique_edge_type_ids, inverse_indices = np.unique(edge_type_ids, return_inverse=True)
+            mean_weights = np.array([np.mean(initial_value[edge_type_ids == edge_type_id]) for edge_type_id in unique_edge_type_ids])
+            # Create target mean weights array based on the edge type indices
+            self._target_mean_weights = tf.constant(mean_weights[inverse_indices], dtype=dtype)
+            epsilon = tf.constant(1e-2, dtype=tf.float32)  # A small constant to avoid division by zero
+            self._target_mean_weights = tf.maximum(tf.abs(self._target_mean_weights), epsilon)
+        else:
+            self._target_mean_weights = None
+
+    def __call__(self, x):
+        if self._target_mean_weights is None:
+            return self._strength * tf.reduce_mean(tf.square(x))
+        else:
+            relative_deviation = x / self._target_mean_weights
+            mse = self._strength * tf.reduce_mean(tf.square(relative_deviation))
+            return mse
+
+
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     sorted_firing_rates = np.sort(firing_rates)
     # percentiles = (np.arange(firing_rates.shape[-1])).astype(np.float32) / (firing_rates.shape[-1] - 1)
@@ -549,7 +633,6 @@ class OrientationSelectivityLoss:
                 osi_loss_type = tf.math.square(osi_approx_type - value['OSI'])
                 dsi_loss_type = tf.math.square(dsi_approx_type - value['DSI'])
 
-                individual_osi_loss[key] = osi_loss_type
                 # individual_dsi_loss[key] = dsi_loss_type
                 # individual_penalization_loss[key] = osi_penalization + dsi_penalization
 
@@ -558,6 +641,8 @@ class OrientationSelectivityLoss:
                 total_dsi_loss += dsi_loss_type * cell_count_type
                 # penalization_terms += osi_penalization + dsi_penalization
                 cell_count += cell_count_type
+
+                individual_osi_loss[key] = osi_loss_type * cell_count_type
             else:
                 individual_osi_loss[key] = 0.0
                 # individual_dsi_loss[key] = 0.0

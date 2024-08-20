@@ -231,17 +231,17 @@ def main(_):
         rsnn_layer = model.get_layer("rsnn")
 
         ### RECURRENT REGULARIZERS ###
-        # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, network, penalize_relative_change=True, dtype=dtype)
-        # model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
+        rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, network, penalize_relative_change=True, dtype=dtype)
+        model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
 
         # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
         # rec_weight_l2_regularizer = losses.L2Regularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
 
         rate_core_mask = None if flags.all_neuron_rate_loss else core_mask
-        rate_distribution_regularizer = losses.SpikeRateDistributionTarget(network, flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
-                                                                            data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=dtype)
-        # rate_distribution_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
-        rate_loss = rate_distribution_regularizer(rsnn_layer.output[0][0])
+        evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
+                                                                    data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=dtype)
+        # evoked_rate_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
+        rate_loss = evoked_rate_regularizer(rsnn_layer.output[0][0])
 
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, flags.voltage_cost, dtype=dtype, core_mask=core_mask)
         voltage_loss = voltage_regularizer(rsnn_layer.output[0][1]) 
@@ -341,15 +341,15 @@ def main(_):
         # tf.print('V1_ema: ', tf.reduce_mean(v1_ema), tf.reduce_mean(v1_evoked_rates), v1_ema)
 
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
-        rate_loss = rate_distribution_regularizer(_z, trim)
+        rate_loss = evoked_rate_regularizer(_z, trim)
         osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
         # tf.print(flags.osi_cost, osi_dsi_loss[0])
         # tf.print('V1 OSI losses: ')
         # tf.print(osi_dsi_loss)
-        # weights_l2_regularizer = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+        regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
 
-        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss[0])
-        _loss = osi_dsi_loss[0] + rate_loss + voltage_loss #+ weights_l2_regularizer
+        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss[0], regularizer_loss=regularizers_loss)
+        _loss = osi_dsi_loss[0] + rate_loss + voltage_loss + regularizers_loss
         # tf.print(osi_dsi_loss[0], rate_loss, voltage_loss) #, weights_l2_regularizer)
 
         return _out, _p, _loss, _aux

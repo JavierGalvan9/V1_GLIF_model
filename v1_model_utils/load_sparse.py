@@ -9,7 +9,6 @@ from numba import njit
 from time import time
 # from memory_profiler import profile
 
-
 def sort_indices(indices, *arrays):
     max_ind = np.max(indices) + 1
     if np.iinfo(indices.dtype).max < max_ind * (max_ind + 1) :
@@ -119,6 +118,7 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
 
         syn_id = synaptic_models_to_syn_id_dict[synaptic_model]
         new_pop_dict = {
+            "edge_type_id": edge_type_id,
             "source": source_node_ids[mask],
             "target": target_node_ids[mask],
             "params": {
@@ -147,7 +147,7 @@ def load_network(
     core_only=True,
     n_neurons=296991,
     seed=3000,
-    connected_selection=False,
+    connected_selection=True,
     n_syn_basis=5,
     tensorflow_speed_up=False):
 
@@ -287,11 +287,11 @@ def load_network(
     weights = []
     delays = []
     syn_ids = []
+    edge_type_ids = []
 
     for edge in edges:
         # Identify which of the 10 types of inputs we have
-        # r = edge["params"]["receptor_type"] - 1
-        # r takes values within 0 - 9
+        edge_type_id = edge["edge_type_id"]
         target_tf_ids = bmtk_id_to_tf_id[edge["target"]]
         source_tf_ids = bmtk_id_to_tf_id[edge["source"]]
         edge_exists = np.logical_and(target_tf_ids != -1, source_tf_ids != -1)
@@ -311,12 +311,14 @@ def load_network(
         weights.append(weights_tf)
         delays.append(delays_tf)
         syn_ids.append(syn_id)
+        edge_type_ids.append(np.full(n_new_edge, edge_type_id, dtype=np.uint16))
 
     print(f"> Number of Synapses: {n_edges}")
     indices = np.concatenate(indices, axis=0, dtype=np.int32)
     weights = np.concatenate(weights, axis=0, dtype=np.float32)
     delays = np.concatenate(delays, axis=0, dtype=np.float16)
     syn_ids = np.concatenate(syn_ids, axis=0, dtype=np.uint8)
+    edge_type_ids = np.concatenate(edge_type_ids, axis=0, dtype=np.uint16)
 
     # sort indices by considering first all the targets of node 0, then all of node 1, ...
     # indices, weights, delays, tau_syn_weights_array, syn_ids = sort_indices(indices, weights, delays, tau_syn_weights_array, syn_ids)
@@ -324,9 +326,9 @@ def load_network(
     # indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
 
     if tensorflow_speed_up:
-        indices, weights, delays, syn_ids = sort_indices_tf(indices, weights, delays, syn_ids)
+        indices, weights, delays, syn_ids, edge_type_ids = sort_indices_tf(indices, weights, delays, syn_ids, edge_type_ids)
     else:
-        indices, weights, delays, syn_ids = sort_indices(indices, weights, delays, syn_ids)
+        indices, weights, delays, syn_ids, edge_type_ids = sort_indices(indices, weights, delays, syn_ids, edge_type_ids)
 
     network = dict(
         x=x, y=y, z=z,
@@ -337,7 +339,7 @@ def load_network(
         node_params=node_params,
         node_type_ids=node_type_ids,
         synapses=dict(indices=indices, weights=weights, delays=delays, 
-                      syn_ids=syn_ids,
+                      syn_ids=syn_ids, edge_type_ids=edge_type_ids,
                       dense_shape=dense_shape),
         tf_id_to_bmtk_id=tf_id_to_bmtk_id,
         bmtk_id_to_tf_id=bmtk_id_to_tf_id,
