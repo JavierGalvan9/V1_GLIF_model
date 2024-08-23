@@ -649,6 +649,7 @@ class PopulationActivity:
             self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, radius=self.core_radius, data_dir=self.data_dir
             )
+            self.n_neurons = np.sum(self.core_mask)
             # if self.n_neurons > 65871:
             #     self.n_neurons = 65871
             #     core_radius = 400
@@ -824,7 +825,13 @@ class PopulationActivity:
                     linewidth=1,
                     zorder=10,
                 )
-                plt.axvline(1500, linestyle="dashed", color="gray", linewidth=1, zorder=10)
+                plt.axvline(
+                    self.stimuli_end_time,
+                    linestyle="dashed",
+                    color="gray",
+                    linewidth=1,
+                    zorder=10,
+                )
             else:
                 if ax2 == None:
                     ax2 = plt.subplot(5, 2, i, sharex=ax1)

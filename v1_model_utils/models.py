@@ -489,7 +489,7 @@ class V1Column(tf.keras.layers.Layer):
 
         # Define the Tensorflow variables
         self.recurrent_indices = tf.Variable(indices, dtype=tf.int64, trainable=False)
-        self.pre_ind_table = self.make_pre_ind_table(indices)
+        self.pre_ind_table = self.make_pre_ind_table(indices, n_source_neurons=dense_shape[1])
 
         # Set the sign of the connections (exc or inh)
         self.recurrent_weight_positive = tf.Variable(
@@ -607,7 +607,7 @@ class V1Column(tf.keras.layers.Layer):
         print(f"    > # BKG input synapses {len(bkg_input_indices)}")
         del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, bkg_input_delays
     
-    def make_pre_ind_table(self, indices):
+    def make_pre_ind_table(self, indices, n_source_neurons=10000):
         """ This function creates a table that maps the presynaptyc index to 
         the indices of the recurrent_indices tensor. it takes a dimension of
         (number_of_neurons * max_delay) x (largest out-degree)
@@ -616,9 +616,9 @@ class V1Column(tf.keras.layers.Layer):
         
         """
         pre_inds = indices[:, 1]
-        uni, counts = np.unique(pre_inds, return_counts=True)
+        _, counts = np.unique(pre_inds, return_counts=True)
         max_elem = np.max(counts)
-        n_elem = self._n_neurons * self.max_delay
+        n_elem = n_source_neurons * self.max_delay
         n_syn = pre_inds.shape[0]
         
         # checking the possibility of address overflow
@@ -647,15 +647,15 @@ class V1Column(tf.keras.layers.Layer):
         table = tf.constant(table, dtype=tf.int64)
         return table
 
-    def get_new_inds_table(self, non_zero_cols):
+    def get_new_inds_table(self, indices, non_zero_cols, pre_ind_table):
         """ a new function that prepares new sparse indices tensor.
         This effectively does 'gather' operation for the sparse tensor.
         It utilizes the pre_ind_table to find the indices of the recurrent_indices
 
         """
-        pre_inds = self.recurrent_indices[:, 1]
-        post_inds = self.recurrent_indices[:, 0]
-        all_inds = tf.gather(self.pre_ind_table, non_zero_cols)
+        # pre_inds = indices[:, 1]
+        # post_inds = indices[:, 0]
+        all_inds = tf.gather(pre_ind_table, non_zero_cols)
         all_inds = tf.reshape(all_inds, [-1])  # flatten the tensor
         # remove unecessary -1's
         all_inds = tf.boolean_mask(all_inds, all_inds != -1)
@@ -664,10 +664,10 @@ class V1Column(tf.keras.layers.Layer):
         else:
             # sort to make it compatible with sparse tensor creation
             inds = tf.sort(all_inds)
-            remaining_pre = tf.gather(pre_inds, inds)
+            remaining_pre = tf.gather(indices[:, 1], inds)
             _, idx = tf.unique(remaining_pre, out_idx=tf.int64)
             new_pre = tf.gather(idx, tf.range(tf.size(inds)))
-            new_post = tf.gather(post_inds, inds)
+            new_post = tf.gather(indices[:, 0], inds)
             new_indices = tf.stack((new_post, new_pre), axis=1)
 
             return new_indices, inds
@@ -692,7 +692,7 @@ class V1Column(tf.keras.layers.Layer):
             # let's make sparse arrays for multiplication
             # new_indices will be a version of indices that only contains the non-zero columns
             # in the non_zero_cols, and changes the indices accordingly.
-            new_indices, inds = self.get_new_inds_table(non_zero_cols)
+            new_indices, inds = self.get_new_inds_table(self.recurrent_indices, non_zero_cols, self.pre_ind_table)
 
             if tf.size(inds) == 0:  # if firing cells do not have any outputs
                 i_rec = tf.zeros((self._n_syn_basis * self._n_neurons, 1), dtype=self._compute_dtype)

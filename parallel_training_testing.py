@@ -22,16 +22,18 @@ parser.add_argument('--delays', default='100,0', type=str)
 parser.add_argument('--scale', default='2,2', type=str)
 
 parser.add_argument('--optimizer', default='adam', type=str)
-parser.add_argument('--learning_rate', default=0.01, type=float)
+parser.add_argument('--learning_rate', default=0.001, type=float)
 parser.add_argument('--rate_cost', default=100., type=float) #100
-# parser.add_argument('--voltage_cost', default=.00001, type=float)
 parser.add_argument('--voltage_cost', default=1., type=float)
+# parser.add_argument('--sync_cost', default=1., type=float)
 parser.add_argument('--osi_cost', default=1., type=float)
 parser.add_argument('--osi_loss_subtraction_ratio', default=0., type=float)
 parser.add_argument('--osi_loss_method', default='crowd_osi', type=str)
 
 parser.add_argument('--dampening_factor', default=0.1, type=float)
 parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
+# parser.add_argument('--dampening_factor', default=0.5, type=float)
+# parser.add_argument('--recurrent_dampening_factor', default=0.5, type=float)
 parser.add_argument('--input_weight_scale', default=1.0, type=float)
 parser.add_argument('--gauss_std', default=0.3, type=float)
 parser.add_argument('--recurrent_weight_regularization', default=0.0, type=float)
@@ -39,6 +41,8 @@ parser.add_argument('--lr_scale', default=1.0, type=float)
 # parser.add_argument('--input_f0', default=0.2, type=float)
 parser.add_argument('--temporal_f', default=2.0, type=float)
 parser.add_argument('--max_time', default=-1, type=float)
+parser.add_argument('--loss_core_radius', default=400.0, type=float)
+parser.add_argument('--plot_core_radius', default=400.0, type=float)
 
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=50, type=int)
@@ -76,6 +80,8 @@ parser.add_argument('--neuron_output', default=False, action='store_true')
 parser.add_argument('--pseudo_gauss', default=False, action='store_true')
 parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
 parser.add_argument('--reset_every_step', default=False, action='store_true')
+parser.add_argument('--spontaneous_training', default=False, action='store_true')
+parser.add_argument('--rotation', default='ccw', type=str)
 
 
 def submit_job(command):
@@ -115,12 +121,16 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    training_commands = ["run", "-g", "1", "-m", "24", "-t", "3:00"]
-    evaluation_commands = ["run", "-g", "1", "-m", "60", "-t", "1:00"]
+    training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "48", "-t", "1:30"] # choose the L40S GPU with 48GB of memory 
+    evaluation_commands = ["run", "-g", "1", "-m", "65", "-t", "2:00"]
 
     # Define the training and evaluation script calls
-    training_script = "python multi_training.py " 
+    # training_script = "python multi_training.py " 
+    training_script = "python multi_training_single_gpu_split.py " 
     evaluation_script = "python osi_dsi_estimator.py " 
+
+    # initial_benchmark_model = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_30000/b_3jo7/Best_model'
+    initial_benchmark_model = ''
 
     # Append each flag to the string
     for name, value in vars(flags).items():
@@ -140,9 +150,13 @@ def main():
     job_ids = []
     eval_job_ids = []
 
-    # Initial OSI/DSI test
+    # # Initial OSI/DSI test
     initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
-    initial_evaluation_script = evaluation_script + f"--seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
+    if initial_benchmark_model:
+        initial_evaluation_script = evaluation_script + f"--seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
+    else:
+        initial_evaluation_script = evaluation_script + f"--seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
+
     initial_evaluation_command = initial_evaluation_command + [initial_evaluation_script]
     eval_job_id = submit_job(initial_evaluation_command)
     eval_job_ids.append(eval_job_id)
@@ -151,7 +165,10 @@ def main():
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...
         if i == 0:
             new_training_command = training_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-j", f"{sim_name}_train_{i}"]
-            new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
+            if initial_benchmark_model:
+                new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i} --restore_from {initial_benchmark_model} "
+            else:
+                new_training_script = training_script + f" --seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
             new_training_command = new_training_command + [new_training_script]
             job_id = submit_job(new_training_command)
         else:

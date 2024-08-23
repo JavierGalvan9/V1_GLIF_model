@@ -6,18 +6,22 @@ import tensorflow as tf
 import datetime as dt
 from time import time
 import pickle as pkl
+from numba import njit
 from matplotlib import pyplot as plt
 import seaborn as sns
 # from scipy.signal import correlate
+from scipy.signal import welch
+from scipy.stats import ks_2samp
 import stim_dataset
 from v1_model_utils import other_v1_utils
 from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivity
 from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
+from v1_model_utils.model_metrics_analysis import calculate_Firing_Rate, get_borders, draw_borders
 
 
-def printgpu(verbose=0):
+def printgpu(gpu_id=0, verbose=0):
     if tf.config.list_physical_devices('GPU'):
-        meminfo = tf.config.experimental.get_memory_info('GPU:0')
+        meminfo = tf.config.experimental.get_memory_info(f'GPU:{gpu_id}')
         current = meminfo['current'] / 1024**3
         peak = meminfo['peak'] / 1024**3
         if verbose == 0:
@@ -26,26 +30,665 @@ def printgpu(verbose=0):
             return current, peak
 
 def compose_str(metrics_values):
-        _acc, _loss, _rate, _rate_loss, _voltage_loss, _osi_dsi_loss = metrics_values
+        _acc, _loss, _rate, _rate_loss, _voltage_loss, _regularizers_loss, _osi_dsi_loss = metrics_values
         _s = f'Loss {_loss:.4f}, '
         _s += f'RLoss {_rate_loss:.4f}, '
         _s += f'VLoss {_voltage_loss:.4f}, '
+        _s += f'RegLoss {_regularizers_loss:.4f}, '
         _s += f'OLoss {_osi_dsi_loss:.4f}, '
         _s += f'Accuracy {_acc:.4f}, '
         _s += f'Rate {_rate:.4f}'
         return _s
 
+def compute_ks_statistics(df, metric='Weight', min_n_sample=15):
+    """
+    Compute the Kolmogorov-Smirnov statistic and similarity scores for each cell type in the dataframe.
+    Parameters:
+    - df: pd.DataFrame, contains data with columns 'data_type' and 'Ave_Rate(Hz)', and indexed by cell type.
+    Returns:
+    - mean_similarity_score: float, the mean of the similarity scores computed across all cell types.
+    """
+    # Get unique cell types
+    # cell_types = df.index.unique()
+    cell_types = df['Post_names'].unique()
+    # Initialize a dictionary to store the results
+    ks_results = {}
+    similarity_scores = {}
+    # Iterate over cell types
+    for cell_type in cell_types:
+        # Filter data for current cell type from two different data types
+        # df1 = df.loc[(df.index == cell_type) & (df['data_type'] == 'V1/LM GLIF model'), metric]
+        # df2 = df.loc[(df.index == cell_type) & (df['data_type'] == 'Neuropixels'), metric]
+        df1 = df.loc[(df['Post_names'] == cell_type) & (df['Weight Type'] == 'Initial weight'), metric]
+        df2 = df.loc[(df['Post_names'] == cell_type) & (df['Weight Type'] == 'Final weight'), metric]
+        # Drop NA values
+        df1.dropna(inplace=True)
+        df2.dropna(inplace=True)
+        # Calculate the Kolmogorov-Smirnov statistic
+        if len(df1) >= min_n_sample and len(df2) >= min_n_sample:
+            ks_stat, p_value = ks_2samp(df1, df2)
+            ks_results[cell_type] = (ks_stat, p_value)
+            similarity_scores[cell_type] = 1 - ks_stat
+
+    # Calculate the mean of the similarity scores and return it
+    mean_similarity_score = np.mean(list(similarity_scores.values()))
+    return mean_similarity_score
+
+# Define a function to compute the exponential decay of a spike train
+def exponential_decay_filter(spike_train, tau=20):
+    decay_factor = np.exp(-1/tau)
+    continuous_signal = np.zeros_like(spike_train, dtype=float)
+    continuous_signal[0] = spike_train[0]
+    for i in range(1, len(spike_train)):
+        continuous_signal[i] = decay_factor * continuous_signal[i-1] + spike_train[i]
+    return continuous_signal
+
+# Define a function to calculate the power spectrum
+def calculate_power_spectrum(signal, fs=1000):
+    f, Pxx = welch(signal, fs, nperseg=100)
+    return f, Pxx
+
+@njit
+def pop_fano(spikes, bin_sizes, t_start=0.2, t_end=2.0):
+    fanos = np.zeros(len(bin_sizes))
+    bin_edges = [np.arange(t_start, t_end, bin_size) for bin_size in bin_sizes]
+    # handle the case where a bin_edge is [0]
+    # bin_edges = [bin_edge if len(bin_edge) > 1 else np.array([t_start, t_end]) for bin_edge in bin_edges]
+    # spikes = spikes[(spikes >= t_start) & (spikes < t_end)]
+    for i, bin_edge in enumerate(bin_edges):
+        sp_counts = np.histogram(spikes, bins=bin_edge)[0]
+        mean_count = np.mean(sp_counts)
+        if mean_count > 0:
+            fanos[i] = np.var(sp_counts) / mean_count
+                
+    return fanos
+
+# # create a class for callbacks in other training sessions (e.g. validation, testing)
+class OsiDsiCallbacks:
+    def __init__(self, network, lgn_input, bkg_input, flags, logdir, current_epoch=0,
+                pre_delay=50, post_delay=50, model_variables_init=None):
+        self.n_neurons = flags.neurons
+        self.network = network
+        self.lgn_input = lgn_input
+        self.bkg_input = bkg_input
+        self.flags = flags
+        self.logdir = logdir
+        self.pre_delay = pre_delay
+        self.post_delay = post_delay
+        self.current_epoch = current_epoch
+        self.model_variables_dict = model_variables_init
+        # Analize changes in trainable variables.
+        if self.model_variables_dict is not None:
+            for var in self.model_variables_dict['Best'].keys():
+                t0 = time()
+                self.trainable_variable_change_heatmaps_and_distributions(var)
+                print(f'Time spent in {var}: {time()-t0}')
+
+    def trainable_variable_change_heatmaps_and_distributions(self, variable):
+        node_types_voltage_scale = (self.network['node_params']['V_th'] - self.network['node_params']['E_L']).astype(np.float16)
+        node_type_ids = self.network['node_type_ids']
+        if 'rest_of_brain_weights' in variable:
+            voltage_scale = node_types_voltage_scale[node_type_ids[self.bkg_input['indices'][:, 0]]]
+            self.node_to_pop_weights_analysis(self.bkg_input['indices'], variable=variable, voltage_scale=voltage_scale)
+        elif'sparse_input_weights' in variable:
+            voltage_scale = node_types_voltage_scale[node_type_ids[self.lgn_input['indices'][:, 0]]]
+            self.node_to_pop_weights_analysis(self.lgn_input['indices'], variable=variable, voltage_scale=voltage_scale)
+        elif 'sparse_recurrent_weights' in variable:
+            indices = self.network['synapses']['indices']
+            voltage_scale = node_types_voltage_scale[node_type_ids[indices[:, 0]]]
+            self.pop_to_pop_weights_analysis(indices, variable=variable, voltage_scale=voltage_scale)
+            self.pop_to_pop_weights_distribution(indices, variable=variable, voltage_scale=voltage_scale)
+
+    def node_to_pop_weights_analysis(self, indices, variable='', voltage_scale=None):
+        pop_names = other_v1_utils.pop_names(self.network)
+        target_cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
+        if 'rest_of_brain_weights' in variable:
+            post_indices =  np.repeat(indices[:, 0], 4)
+            voltage_scale = np.repeat(voltage_scale, 4)
+        else:
+            post_indices = indices[:, 0]
+
+        post_cell_types = [target_cell_types[i] for i in post_indices]
+
+        if voltage_scale is not None:
+            # Normalize the weights by the voltage scale
+            initial_weights = self.model_variables_dict['Initial'][variable] * voltage_scale
+            final_weights = self.model_variables_dict['Best'][variable] * voltage_scale
+        else:
+            initial_weights = self.model_variables_dict['Initial'][variable]
+            final_weights = self.model_variables_dict['Best'][variable]
+
+        # Create DataFrame with all the necessary data
+        df = pd.DataFrame({
+            'Post_names': post_cell_types * 2,  # Duplicate node names for initial and final weights
+            'Weight': initial_weights.tolist() + final_weights.tolist(),  # Combine initial and final weights
+            'Weight Type': ['Initial weight'] * len(initial_weights) + ['Final weight'] * len(final_weights)  # Distinguish between initial and final weights
+        })
+
+        # Count the number of cell_types fro each type
+        # cell_type_counts = df['Post_names'].value_counts()
+
+        # Sort the dataframe by Node Name and then by Type to ensure consistent order
+        df = df.sort_values(['Post_names', 'Weight Type'])
+
+        # Plotting
+        boxplots_dir = os.path.join(self.logdir, f'Boxplots/{variable}')
+        os.makedirs(boxplots_dir, exist_ok=True)
+        # fig, axs = plt.subplots(2, 1, figsize=(12, 14))
+        fig = plt.figure(figsize=(12, 6))
+        #get the axis of the figure
+        ax = fig.gca()
+        similarity_score = compute_ks_statistics(df, metric='Weight', min_n_sample=15)
+        hue_order = ['Initial weight', 'Final weight']
+        # sns.boxplot(x='Node Name', y='Weight Change', data=df)
+        # sns.barplot(x='Post_names', y='Weight', hue='State', hue_order=hue_order, data=df)
+        sns.boxplot(x='Post_names', y='Weight', hue='Weight Type', hue_order=hue_order, data=df, ax=ax, width=0.7, fliersize=1.)
+        # plt.axhline(0, color='black', linewidth=1)  # include a horizontal black line at 0
+        ax.set_yscale('log')
+        # ax.set_ylim(bottom=0)  # Set bottom limit of y-axis to 0
+        ax.tick_params(axis="x", labelrotation=90)
+        ax.set_title(f'{variable}')
+        ax.legend(loc='upper right')
+        if similarity_score is not None:
+            ax.text(0.9, 0.1, f'S: {similarity_score:.2f}', transform=ax.transAxes, fontsize=14,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        plt.tight_layout()
+        plt.savefig(os.path.join(boxplots_dir, f'{variable}.png'), dpi=300, transparent=False)
+        plt.close()
+
+    def pop_to_pop_weights_distribution(self, indices, variable='', voltage_scale=None):
+        source_pop_names = other_v1_utils.pop_names(self.network)
+        source_cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in source_pop_names]
+        target_pop_names = other_v1_utils.pop_names(self.network)
+        target_cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in target_pop_names]
+        post_cell_types = [target_cell_types[i] for i in indices[:, 0]]
+        pre_cell_types = [source_cell_types[i] for i in indices[:, 1]]
+
+        if voltage_scale is not None:
+            # Normalize the weights by the voltage scale
+            initial_weights = self.model_variables_dict['Initial'][variable] * voltage_scale
+            final_weights = self.model_variables_dict['Best'][variable] * voltage_scale
+        else:
+            initial_weights = self.model_variables_dict['Initial'][variable]
+            final_weights = self.model_variables_dict['Best'][variable]
+
+        df = pd.DataFrame({
+            'Post_names': post_cell_types,
+            'Pre_names': pre_cell_types,
+            'Initial weight': initial_weights,
+            'Final weight': final_weights,
+        })
+
+        # Melt DataFrame to long format
+        df_melted = df.melt(id_vars=['Post_names', 'Pre_names'], value_vars=['Initial weight', 'Final weight'], 
+                            var_name='Weight Type', value_name='Weight')
+        df_melted['Weight'] = np.abs(df_melted['Weight'])
+        # Create directory for saving plots
+        boxplots_dir = os.path.join(self.logdir, f'Boxplots/{variable}_distribution')
+        os.makedirs(boxplots_dir, exist_ok=True)
+        # Establish the order of the neuron types in the boxplots
+        cell_type_order = np.sort(df['Pre_names'].unique())
+        target_type_order = np.sort(df['Post_names'].unique())
+
+        # Define the palette
+        palette = {"Initial weight": "#87CEEB", "Final weight": "#FFA500"}
+        # Create subplots
+        num_pre_names = len(cell_type_order)
+
+        num_columns = 4
+        num_rows = (num_pre_names + num_columns - 1) // num_columns
+        fig, axes = plt.subplots(num_rows, num_columns, figsize=(24, 6 * num_rows))
+        # Flatten the axes array and handle the first row separately
+        axes = axes.flatten()
+        for i, pre_name in enumerate(cell_type_order):
+            if num_pre_names == 17 and i == 0:
+                i = 1
+            elif num_pre_names == 17 and i != 0:
+                i += 3
+            
+            ax = axes[i] 
+            subset_df = df_melted[df_melted['Pre_names'] == pre_name]
+            similarity_score = compute_ks_statistics(subset_df, metric='Weight', min_n_sample=15)
+            # subset_cell_type_order = np.sort(subset_df['Post_names'].unique())
+            # Create boxplot for Initial and Final weights
+            sns.boxplot(data=subset_df, x='Post_names', y='Weight', hue='Weight Type', order=target_type_order, ax=ax, palette=palette, 
+                        width=0.7, fliersize=1.)
+            # sns.violinplot(data=subset_df, x='Post_names', y='Weight', hue='Weight Type', order=subset_cell_type_order, ax=ax, palette=palette, width=0.7,
+            #                split=True, inner="quart", gap=0.2)
+            ax.set_title(f'Source Cell Type: {pre_name}')
+            ax.set_ylabel(r'$\vert$ Synaptic Weight (pA)$\vert$', fontsize=12)
+            # ax.set_yscale('symlog', linthresh=0.001)
+            ax.set_yscale('log')
+            if i % num_columns == 0 or i == 1:  # First column
+                ax.set_ylabel(r'$\vert$ Synaptic Weight (pA)$\vert$', fontsize=12)
+            else:
+                ax.set_ylabel('')
+            if i >= (num_rows - 1) * num_columns:
+                ax.set_xlabel('Target Cell Type')
+            else:
+                ax.set_xlabel('')
+            ax.tick_params(axis="x", labelrotation=90)
+            # Apply shadings to each layer
+            xticklabel = ax.get_xticklabels()
+            borders = get_borders(xticklabel)
+            # change y limit
+            # if 'E' in pre_name:
+            #     bottom_limit = 0
+            #     upper_limit = 1000
+            # else:
+            #     bottom_limit = -500
+            #     upper_limit = 0
+            bottom_limit = 0.01
+            upper_limit = 100
+            ax.set_ylim(bottom=bottom_limit, top=upper_limit)
+            # get the current ylim
+            ylim = ax.get_ylim()
+            draw_borders(ax, borders, ylim)
+            # ax.legend(loc='best')
+            if i == 1 and num_pre_names == 17:
+                ax.legend(loc='upper right')
+            elif i==0 and num_pre_names != 17:
+                ax.legend(loc='upper left')
+            else:
+                ax.get_legend().remove()
+
+            if similarity_score is not None:
+                ax.text(0.82, 0.95, f'S: {similarity_score:.2f}', transform=ax.transAxes, fontsize=14,
+                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        
+        # Remove any empty subplots
+        if num_pre_names == 17:
+            for j in [0, 2, 3]:
+                fig.delaxes(axes[j])
+
+        # Adjust layout
+        plt.tight_layout()
+        plt.savefig(os.path.join(boxplots_dir, f'{variable}.png'), dpi=300, transparent=False)
+        plt.close()
+
+    def pop_to_pop_weights_analysis(self, indices, variable='', voltage_scale=None):
+        source_pop_names = other_v1_utils.pop_names(self.network)
+        source_cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in source_pop_names]
+        target_pop_names = other_v1_utils.pop_names(self.network)
+        target_cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in target_pop_names]
+        post_cell_types = [target_cell_types[i] for i in indices[:, 0]]
+        pre_cell_types = [source_cell_types[i] for i in indices[:, 1]]
+
+        ### Initial Weight ###
+        if voltage_scale is not None:
+            # Normalize the weights by the voltage scale
+            initial_weights = self.model_variables_dict['Initial'][variable] * voltage_scale
+            final_weights = self.model_variables_dict['Best'][variable] * voltage_scale
+        else:
+            initial_weights = self.model_variables_dict['Initial'][variable]
+            final_weights = self.model_variables_dict['Best'][variable]
+
+        weight_changes = final_weights - initial_weights
+        df = pd.DataFrame({'Post_names': post_cell_types, 
+                            'Pre_names':pre_cell_types, 
+                            'Initial weight': initial_weights, 
+                            'Final weight': final_weights, 
+                            'Weight Change': weight_changes})
+        
+        # Calculate global min and max for color normalization
+        # global_grouped_df = df.groupby(['Pre_names', 'Post_names'])[['Initial weight', 'Final weight']].mean().reset_index()
+        # global_min = global_grouped_df[['Initial weight', 'Final weight']].min().min()
+        # global_max = global_grouped_df[['Initial weight', 'Final weight']].max().max()
+        # global_min = df[['Initial weight', 'Final weight']].min().min()
+        # global_max = df[['Initial weight', 'Final weight']].max().max()
+
+        # Plot for Initial Weight
+        grouped_df = df.groupby(['Pre_names', 'Post_names'])['Initial weight'].mean().reset_index()
+        # Create a pivot table to reshape the data for the heatmap
+        pivot_df = grouped_df.pivot(index='Pre_names', columns='Post_names', values='Initial weight')
+        # Plot heatmap
+        boxplots_dir = os.path.join(self.logdir, f'Boxplots/{variable}')
+        os.makedirs(boxplots_dir, exist_ok=True)
+        fig = plt.figure(figsize=(12, 6))
+        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=global_min, vmax=global_max)
+        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-0.5, vmax=0.5)
+        heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-1, vmax=1)
+        # plt.xlabel(f'V1')
+        # plt.ylabel(f'V1')
+        plt.xticks(rotation=90)
+        plt.gca().set_aspect('equal')
+        plt.title(f'{variable}')
+        # Create a separate color bar axis
+        cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
+        # Plot color bar
+        cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
+        cbar.set_label('Initial Weight (pA)')
+        plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=False)
+        plt.close()
+
+        ### Final Weight ###
+        grouped_df = df.groupby(['Pre_names', 'Post_names'])['Final weight'].mean().reset_index()
+        # Create a pivot table to reshape the data for the heatmap
+        pivot_df = grouped_df.pivot(index='Pre_names', columns='Post_names', values='Final weight')
+        # Plot heatmap
+        plt.figure(figsize=(12, 6))
+        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=global_min, vmax=global_max)
+        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-0.5, vmax=0.5)
+        heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-1, vmax=1)
+        # plt.xlabel(f'V1')
+        # plt.ylabel(f'V1')
+        plt.xticks(rotation=90)
+        plt.gca().set_aspect('equal')
+        plt.title(f'{variable}')
+        # Create a separate color bar axis
+        cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
+        # Plot color bar
+        cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
+        cbar.set_label('Final Weight (pA)')
+        plt.savefig(os.path.join(boxplots_dir, f'Final_weight.png'), dpi=300, transparent=False)
+        plt.close()
+
+        ### Weight change ###
+        grouped_df = df.groupby(['Pre_names', 'Post_names'])['Weight Change'].mean().reset_index()
+        # Create a pivot table to reshape the data for the heatmap
+        try:
+            pivot_df = grouped_df.pivot(index='Pre_names', columns='Post_names', values='Weight Change')
+            # Plot heatmap
+            plt.figure(figsize=(12, 6))
+            # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0)
+            # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-0.5, vmax=0.5)
+            heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-1, vmax=1)
+            # plt.xlabel(f'V1')
+            # plt.ylabel(f'V1')
+            plt.xticks(rotation=90)
+            plt.gca().set_aspect('equal')
+            plt.title(f'{variable}')
+            # Create a separate color bar axis
+            cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
+            # Plot color bar
+            cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
+            cbar.set_label('Weight Change (pA)')
+            plt.savefig(os.path.join(boxplots_dir, f'Weight_change.png'), dpi=300, transparent=False)
+            plt.close()
+        except:
+            print('Skipping the plot for the weight change heatmap...')
+            # raise the actual error
+            print(grouped_df)
+        
+    def fano_factor(self, spikes, t_start=0.7, t_end=2.5, n_samples=100, isolate_core=True):
+        # Calculate the Fano Factor for the spikes
+        pop_names = other_v1_utils.pop_names(self.network)
+        node_ei = np.array([pop_name[0] for pop_name in pop_names])
+        node_id = np.arange(self.network['n_nodes'])
+        # Get the IDs for excitatory neurons
+        node_id_e = node_id[node_ei == 'e']
+        # Reshape spikes data 
+        new_spikes = spikes[:, :, int(1000*t_start):int(1000*t_end), :].astype(bool) # Convert to boolean
+        new_spikes = new_spikes.reshape(-1, new_spikes.shape[2], new_spikes.shape[3])
+        n_trials, seq_len, n_neurons = new_spikes.shape
+        # Prepare timestamps (avoiding unnecessary memory allocation)
+        time = np.arange(t_start, t_end, 0.001).astype(np.float32)
+        most_single_neuron_spikes_in_trial = np.max(np.sum(new_spikes, axis=1))
+        # Preallocate using the known shape
+        spikes_timestamps = np.full((n_trials, n_neurons, most_single_neuron_spikes_in_trial), np.nan)
+        for i in range(n_trials):
+            for j in range(n_neurons):
+                timestamps = time[new_spikes[i, :, j]]
+                spikes_timestamps[i, j, :len(timestamps)] = timestamps
+
+        # Generate Fano factors across random samples
+        fanos = []
+        # Pre-define bin sizes
+        bin_sizes = np.logspace(-3, 0, 20)
+        # using the simulation length, limit bin_sizes to define at least 2 bins
+        bin_sizes_mask = bin_sizes < (t_end - t_start)/5
+        bin_sizes = bin_sizes[bin_sizes_mask]
+        # Vectorize the sampling process
+        sample_counts = np.random.normal(68, 10, n_samples).astype(int)
+        sample_counts = np.maximum(sample_counts, 1)
+        # trial_ids =np.random.choice(np.arange(n_trials), n_samples, replace=False)
+        trial_ids = np.random.randint(n_trials, size=n_samples)
+
+        for i in range(n_samples):
+            random_trial_id = trial_ids[i]
+            sample_num = sample_counts[i]
+            sample_ids = np.random.choice(node_id_e, sample_num, replace=False)
+            selected_spikes = np.concatenate([spikes_timestamps[random_trial_id][np.isin(node_id, sample_ids), :]])
+            selected_spikes = selected_spikes[~np.isnan(selected_spikes)]
+            # if there are spikes use pop_fano
+            if len(selected_spikes) > 0:
+                fano = pop_fano(selected_spikes, bin_sizes, t_start=t_start, t_end=t_end)
+            else:
+                fano = np.zeros(len(bin_sizes))
+            fanos.append(fano)
+
+        fanos = np.array(fanos)
+        return fanos
+        
+    def fanos_figure(self, spikes, n_samples=100):
+        # Calculate fano factors for both sessions
+        evoked_fanos = self.fano_factor(spikes, t_start=0.7, t_end=2.5, n_samples=n_samples)
+        spontaneous_fanos = self.fano_factor(spikes, t_start=0, t_end=0.5, n_samples=n_samples)
+
+        # Calculate mean, standard deviation, and SEM of the Fano factors
+        evoked_fanos_mean = np.nanmean(evoked_fanos, axis=0)
+        evoked_fanos_std = np.nanstd(evoked_fanos, axis=0)
+        evoked_fanos_sem = evoked_fanos_std / np.sqrt(n_samples)
+
+        spontaneous_fanos_mean = np.nanmean(spontaneous_fanos, axis=0)
+        spontaneous_fanos_std = np.nanstd(spontaneous_fanos, axis=0)
+        spontaneous_fanos_sem = spontaneous_fanos_std / np.sqrt(n_samples)
+
+        # find the frequency of the maximum
+        bin_sizes = np.logspace(-3, 0, 20)
+        evoked_max_fano = np.nanmax(evoked_fanos_mean)
+        evoked_max_fano_freq = 1/bin_sizes[np.nanargmax(evoked_fanos_mean)]
+        spontaneous_max_fano = np.nanmax(spontaneous_fanos_mean)
+        spontaneous_max_fano_freq = 1/bin_sizes[np.nanargmax(spontaneous_fanos_mean)]
+
+        # Calculate the evoked experimental error committed
+        evoked_exp_data_path = 'Synchronization_data/all_fano_300ms_evoked.npy'
+        # load the experimental data
+        evoked_exp_fanos = np.load(evoked_exp_data_path, allow_pickle=True)
+        n_experimental_samples = evoked_exp_fanos.shape[0]
+        # Calculate mean, standard deviation, and SEM of the Fano factors
+        evoked_exp_fanos_mean = np.nanmean(evoked_exp_fanos, axis=0)
+        # filter bin_sizes where the experimental data is not nan or zero
+        # evoked_exp_fanos_mean = evoked_exp_fanos_mean[bin_sizes_mask]
+        evoked_exp_fanos_std = np.nanstd(evoked_exp_fanos, axis=0)
+        evoked_exp_fanos_sem = evoked_exp_fanos_std / np.sqrt(n_experimental_samples)
+
+        # Calculate the spontaneous experimental error committed
+        spont_exp_data_path = 'Synchronization_data/all_fano_300ms_spont.npy'
+        # load the experimental data
+        spont_exp_fanos = np.load(spont_exp_data_path, allow_pickle=True)
+        n_experimental_samples = spont_exp_fanos.shape[0]
+        # Calculate mean, standard deviation, and SEM of the Fano factors
+        spont_exp_fanos_mean = np.nanmean(spont_exp_fanos, axis=0)
+        # filter bin_sizes where the experimental data is not nan or zero
+        # spont_exp_fanos_mean = spont_exp_fanos_mean[bin_sizes_mask]
+        spont_exp_fanos_std = np.nanstd(spont_exp_fanos, axis=0)
+        spont_exp_fanos_sem = spont_exp_fanos_std / np.sqrt(n_experimental_samples)
+        
+        # Plot the Fano Factor
+        fig, axs = plt.subplots(1, 2, figsize=(12, 6), sharex=True, sharey=True)
+        # plot fanos with error bars
+        axs[0].errorbar(bin_sizes[:len(evoked_fanos_mean)], evoked_fanos_mean, yerr=evoked_fanos_sem, fmt='o-', label='Evoked Model', color='blue')
+        axs[0].errorbar(bin_sizes[:len(evoked_fanos_mean)], evoked_exp_fanos_mean[:len(evoked_fanos_mean)], yerr=evoked_exp_fanos_sem[:len(evoked_fanos_mean)], fmt='o-', label='Evoked Experimental', color='k')
+        axs[0].set_xscale("log")
+        axs[0].set_title(f'V1 - Max: {evoked_max_fano:.2f}, Freq: {evoked_max_fano_freq:.1f} Hz', fontsize=16)
+        axs[0].set_xlabel('Bin Size (s)', fontsize=14)
+        axs[0].set_ylabel('Fano Factor', fontsize=14)
+        axs[0].legend(fontsize=14)
+
+        axs[1].errorbar(bin_sizes[:len(spontaneous_fanos_mean)], spontaneous_fanos_mean, yerr=spontaneous_fanos_sem, fmt='o-', label='Spontaneous Model', color='orange')
+        axs[1].errorbar(bin_sizes[:len(spontaneous_fanos_mean)], spont_exp_fanos_mean[:len(spontaneous_fanos_mean)], yerr=spont_exp_fanos_sem[:len(spontaneous_fanos_mean)], fmt='o-', label='Spontaneous Experimental', color='k')
+        axs[1].set_xscale("log")
+        axs[1].set_title(f'V1 - Max: {spontaneous_max_fano:.2f}, Freq: {spontaneous_max_fano_freq:.1f} Hz', fontsize=16)
+        axs[1].set_xlabel('Bin Size (s)', fontsize=14)
+        axs[1].legend(fontsize=14)
+
+        plt.tight_layout()
+        os.makedirs(os.path.join(self.logdir, 'Fano_Factor'), exist_ok=True)
+        plt.savefig(os.path.join(self.logdir, 'Fano_Factor', f'V1_epoch_{self.current_epoch}.png'), dpi=300, transparent=False)
+        plt.close()
+    
+    def power_spectrum(self, v1_spikes, v1_spikes_spont=None, fs=1000, directory=''):
+        # Sum the spikes over the batch size and all neurons to get a single spiking activity signal for each area
+        combined_spiking_activity_v1 = v1_spikes.mean(axis=1)
+        v1_signal = exponential_decay_filter(combined_spiking_activity_v1)
+        # # Compute the power spectrum for the combined signal for each area
+        # seq_len = combined_spiking_activity_v1.shape[0]
+        # fs = 1000.0
+        # frequencies = np.fft.fftfreq(seq_len, d=1/fs)
+        # fft_values_v1 = np.fft.fft(combined_spiking_activity_v1)
+        # fft_values_lm = np.fft.fft(combined_spiking_activity_lm)
+        # power_spectrum_v1 = np.abs(fft_values_v1) ** 2 / seq_len
+        # power_spectrum_lm = np.abs(fft_values_lm) ** 2 / seq_len
+
+        # Calculate the power spectrum
+        # Sampling frequency (1 kHz)
+        f_v1, power_spectrum_v1 = calculate_power_spectrum(v1_signal, fs)
+
+        # Plot the power spectrum
+        plt.figure(figsize=(12, 8))
+        sns.lineplot(x=f_v1, y=power_spectrum_v1, label='V1', color='blue')
+
+        if v1_spikes_spont is not None:
+            combined_spiking_activity_v1_spont = v1_spikes_spont.mean(axis=1)
+            v1_signal_spont = exponential_decay_filter(combined_spiking_activity_v1_spont)
+            f_v1_spont, power_spectrum_v1_spont = calculate_power_spectrum(v1_signal_spont, fs)
+            sns.lineplot(x=f_v1_spont, y=power_spectrum_v1_spont, label='V1 Spontaneous', linestyle='--', color='blue')
+
+        # Remove the 0 Hz component for plotting
+        # positive_frequencies = frequencies[:seq_len // 2]
+        # positive_power_spectrum_v1 = power_spectrum_v1[:seq_len // 2]
+        # positive_power_spectrum_lm = power_spectrum_lm[:seq_len // 2]
+        # # # Set up the Seaborn style
+        # sns.set(style="ticks")
+        # plt.semilogy()
+        plt.xlim([0, 50])
+        plt.title('Power Spectral Density of Neuronal Spiking Activity in V1', fontsize=16)
+        plt.xlabel('Frequency (Hz)', fontsize=14)
+        plt.ylabel('Power Spectral Density [1/Hz]', fontsize=14)
+        plt.legend()
+        # plt.grid(True)
+        plt.tight_layout()
+        os.makedirs(directory, exist_ok=True)
+        plt.savefig(os.path.join(directory, f'epoch_{self.current_epoch}.png'), dpi=300, transparent=False)
+        plt.close()
+
+    def plot_populations_activity(self, v1_spikes):
+        # Plot the mean firing rate of the population of neurons
+        filename = f'Epoch_{self.current_epoch}'
+        Population_activity = PopulationActivity(n_neurons=self.n_neurons, network=self.network, 
+                                                stimuli_init_time=500, stimuli_end_time=2500, 
+                                                image_path=self.logdir, filename=filename, data_dir=self.flags.data_dir,
+                                                core_radius=self.flags.plot_core_radius)
+        Population_activity(v1_spikes, plot_core_only=True, bin_size=10)
+
+    def plot_raster(self, x, v1_spikes, angle=0):
+        seq_len = v1_spikes.shape[1]
+        images_dir = os.path.join(self.logdir, 'Raster_plots_OSI_DSI')
+        os.makedirs(images_dir, exist_ok=True)
+        graph = InputActivityFigure(
+                                    self.network,
+                                    self.flags.data_dir,
+                                    images_dir,
+                                    filename=f'Epoch_{self.current_epoch}_orientation_{angle}_degrees',
+                                    frequency=self.flags.temporal_f,
+                                    stimuli_init_time=self.pre_delay,
+                                    stimuli_end_time=seq_len-self.post_delay,
+                                    reverse=False,
+                                    plot_core_only=True,
+                                    core_radius=self.flags.plot_core_radius,
+                                    )
+        graph(x, v1_spikes)
+
+    def plot_population_firing_rates_vs_tuning_angle(self, spikes, DG_angles, core_radius=400):
+        # Save the spikes
+        spikes_dir = os.path.join(self.logdir, 'Spikes_OSI_DSI')
+        os.makedirs(spikes_dir, exist_ok=True)
+
+        # Isolate the core neurons
+        core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.plot_core_radius, data_dir=self.flags.data_dir)
+        spikes = spikes[:, :, :, core_mask]
+        spikes = np.sum(spikes, axis=0).astype(np.float32)/self.flags.n_trials_per_angle
+        seq_len = spikes.shape[1]
+
+        tuning_angles = self.network['tuning_angle'][core_mask]
+        for angle_id, angle in enumerate(DG_angles):
+            firingRates = calculate_Firing_Rate(spikes[angle_id, :, :], stimulus_init=self.pre_delay, stimulus_end=seq_len-self.post_delay, temporal_axis=0)
+            x = tuning_angles
+            y = firingRates
+            # Define bins for delta_angle
+            bins = np.linspace(np.min(x), np.max(x), 50)
+            # Compute average rates for each bin
+            average_rates = []
+            for i in range(len(bins)-1):
+                mask = (x >= bins[i]) & (x < bins[i+1])
+                average_rates.append(np.mean(y[mask]))
+            # Create bar plot
+            plt.figure(figsize=(10, 6))
+            plt.bar(bins[:-1], average_rates, width=np.diff(bins))
+            plt.xlabel('Tuning Angle')
+            plt.ylabel('Average Rates')
+            plt.title(f'Gratings Angle: {angle}')
+            plt.savefig(os.path.join(spikes_dir, f'v1_spikes_angle_{angle}.png'))
+            plt.close()
+
+    def single_trial_callbacks(self, x, v1_spikes, y, bkg_noise=None):
+        # Separate the spontaneous and evoked spikes for the power spectrum
+        # x_spont_spikes = x[0, :self.pre_delay, :]
+        # x_evoked_spikes = x[0, self.pre_delay:-self.post_delay, :]
+        v1_spont_spikes = v1_spikes[0, :self.pre_delay, :].astype(np.float32)
+        v1_evoked_spikes = v1_spikes[0, self.pre_delay:-self.post_delay, :].astype(np.float32)
+        # Plot the power spectrum of the neuronal activity
+        self.power_spectrum(v1_evoked_spikes, v1_spikes_spont=v1_spont_spikes,
+                            directory=os.path.join(self.logdir, 'Power_spectrum_OSI_DSI'))
+        # Plot the population activity
+        self.plot_populations_activity(v1_spikes)
+        # Plot the raster plot
+        self.plot_raster(x, v1_spikes, angle=y)
+
+    def osi_dsi_analysis(self, v1_spikes, DG_angles):
+        # # Average the spikes over the number of trials
+        # v1_spikes = np.sum(v1_spikes, axis=0).astype(np.float32)/self.flags.n_trials_per_angle
+        # lm_spikes = np.sum(lm_spikes, axis=0).astype(np.float32)/self.flags.n_trials_per_angle
+
+        # Do the OSI/DSI analysis       
+        boxplots_dir = os.path.join(self.logdir, 'Boxplots_OSI_DSI')
+        os.makedirs(boxplots_dir, exist_ok=True)
+        fr_boxplots_dir = os.path.join(self.logdir, f'Boxplots_OSI_DSI/Ave_Rate(Hz)')
+        os.makedirs(fr_boxplots_dir, exist_ok=True)
+        spontaneous_boxplots_dir = os.path.join(self.logdir, 'Boxplots_OSI_DSI/Spontaneous rate (Hz)')
+        os.makedirs(spontaneous_boxplots_dir, exist_ok=True)
+         
+        # Fano factor analysis
+        self.fanos_figure(v1_spikes, n_samples=100)
+        # Plot the tuning angle analysis
+        self.plot_population_firing_rates_vs_tuning_angle(v1_spikes, DG_angles)
+        # Estimate tuning parameters from the model neurons
+        metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir,
+                                                drifting_gratings_init=500, drifting_gratings_end=2500,
+                                                spontaneous_init=0, spontaneous_end=500,
+                                                core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=True)
+        # Figure for OSI/DSI boxplots
+        metrics_analysis(metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], directory=boxplots_dir, filename=f'Epoch_{self.current_epoch}')
+        # Figure for Average firing rate boxplots
+        metrics_analysis(metrics=["Ave_Rate(Hz)"], directory=fr_boxplots_dir, filename=f'Epoch_{self.current_epoch}')   
+        # Spontaneous rates figure
+        metrics_analysis(metrics=['Spontaneous rate (Hz)'], directory=spontaneous_boxplots_dir, filename=f'Epoch_{self.current_epoch}') 
+
 
 class Callbacks:
     def __init__(self, network, lgn_input, bkg_input, model, optimizer, distributed_roll_out, flags, logdir, strategy, 
                 metrics_keys, pre_delay=50, post_delay=50, checkpoint=None, model_variables_init=None, 
-                save_optimizer=True):
+                save_optimizer=True, spontaneous_training=False):
         
         self.n_neurons = flags.neurons
         self.network = network
         self.lgn_input = lgn_input
         self.bkg_input = bkg_input
-        self.neuropixels_feature = 'Ave_Rate(Hz)'  
+        if spontaneous_training:
+            self.neuropixels_feature = 'Spontaneous rate (Hz)'
+        else:
+            self.neuropixels_feature = 'Ave_Rate(Hz)'  
         self.model = model
         self.optimizer = optimizer
         self.flags = flags
@@ -56,7 +699,6 @@ class Callbacks:
         self.pre_delay = pre_delay
         self.post_delay = post_delay
         self.step = 0
-        self.total_epochs = flags.n_runs * flags.n_epochs
         self.step_running_time = []
         self.model_variables_dict = model_variables_init
         self.initial_metric_values = None
@@ -71,22 +713,35 @@ class Callbacks:
                 checkpoint = tf.train.Checkpoint(model=model)
             self.min_val_loss = float('inf')
             self.no_improve_epochs = 0
+            self.checkpoint_epochs = 0
             # create a dictionary to save the values of the metric keys after each epoch
             self.epoch_metric_values = {key: [] for key in self.metrics_keys}
+            self.epoch_metric_values['sync'] = []
         else:
             # Load epoch_metric_values and min_val_loss from the file
-            try:
+            if os.path.exists(os.path.join(self.logdir, 'train_end_data.pkl')):
                 with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'rb') as f:
                     data_loaded = pkl.load(f)
                 self.epoch_metric_values = data_loaded['epoch_metric_values']
                 self.min_val_loss = data_loaded['min_val_loss']
                 self.no_improve_epochs = data_loaded['no_improve_epochs']
-            except FileNotFoundError:
+                self.checkpoint_epochs = len(data_loaded['epoch_metric_values']['train_loss'])
+            elif os.path.exists(os.path.join(os.path.dirname(flags.restore_from), 'train_end_data.pkl')):
+                with open(os.path.join(os.path.dirname(flags.restore_from), 'train_end_data.pkl'), 'rb') as f:
+                    data_loaded = pkl.load(f)
+                self.epoch_metric_values = data_loaded['epoch_metric_values']
+                self.min_val_loss = data_loaded['min_val_loss']
+                self.no_improve_epochs = data_loaded['no_improve_epochs']
+                self.checkpoint_epochs = len(data_loaded['epoch_metric_values']['train_loss'])
+            else:
                 print('No train_end_data.pkl file found. Initializing...')
+                self.epoch_metric_values = {key: [] for key in self.metrics_keys}
+                self.epoch_metric_values['sync'] = []
                 self.min_val_loss = float('inf')
                 self.no_improve_epochs = 0
-                self.epoch_metric_values = {key: [] for key in self.metrics_keys}
+                self.checkpoint_epochs = 0
 
+        self.total_epochs = flags.n_runs * flags.n_epochs + self.checkpoint_epochs
         # Manager for the best model
         self.best_manager = tf.train.CheckpointManager(
             checkpoint, directory=self.logdir + '/Best_model', max_to_keep=1
@@ -96,14 +751,14 @@ class Callbacks:
         )
         # Manager for osi/dsi checkpoints 
         self.epoch_manager = tf.train.CheckpointManager(
-            checkpoint, directory=self.logdir + '/OSI_DSI_checkpoints', max_to_keep=None
+            checkpoint, directory=self.logdir + '/OSI_DSI_checkpoints', max_to_keep=5
         )
-
 
     def on_train_begin(self):
         print("---------- Training started at ", dt.datetime.now().strftime('%d-%m-%Y %H:%M'), ' ----------\n')
         self.train_start_time = time()
-        self.epoch = self.flags.run_session * self.flags.n_epochs
+        # self.epoch = self.flags.run_session * self.flags.n_epochs
+        self.epoch = self.checkpoint_epochs
 
     def on_train_end(self, metric_values, normalizers=None):
         self.train_end_time = time()
@@ -134,6 +789,12 @@ class Callbacks:
         with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'wb') as f:
             pkl.dump(data_to_save, f)
 
+        # # Analize changes in trainable variables.
+        # for var in self.model_variables_dict['Best'].keys():
+        #     t0 = time()
+        #     self.variable_change_analysis(var)
+        #     print(f'Time spent in {var}: {time()-t0}')
+
         if self.flags.n_runs > 1:
             self.plot_osi_dsi(parallel=True)
 
@@ -145,7 +806,8 @@ class Callbacks:
         print(f'Epoch {self.epoch:2d}/{self.total_epochs} @ {date_str}')
         tf.print(f'\nEpoch {self.epoch:2d}/{self.total_epochs} @ {date_str}')
 
-    def on_epoch_end(self, x, z, y, metric_values, verbose=True):
+    def on_epoch_end(self, x, v1_spikes, y, metric_values, bkg_noise=None, verbose=True,
+                    x_spont=None, v1_spikes_spont=None):
         self.step = 0
         if self.initial_metric_values is None:
             self.initial_metric_values = metric_values
@@ -155,12 +817,16 @@ class Callbacks:
             val_values = metric_values[len(metric_values)//2:]
             print_str += '    ' + compose_str(val_values) 
             print(print_str)
-            mem_data = printgpu(verbose=1)
-            print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB'+ '\n')
+            for gpu_id in range(len(self.strategy.extended.worker_devices)):
+                mem_data = printgpu(gpu_id=gpu_id, verbose=1)
+                print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
 
         # val_classification_loss = metric_values[6] - metric_values[8] - metric_values[9] 
         # metric_values.append(val_classification_loss)
-        self.epoch_metric_values = {key: value + [metric_values[i]] for i, (key, value) in enumerate(self.epoch_metric_values.items())}
+        # self.epoch_metric_values = {key: value + [metric_values[i]] for i, (key, value) in enumerate(self.epoch_metric_values.items())}
+        for i, (key, value) in enumerate(self.epoch_metric_values.items()):
+            if key not in ['sync']:
+                self.epoch_metric_values[key] = value + [metric_values[i]]
 
         if 'val_loss' in self.metrics_keys:
             val_loss_index = self.metrics_keys.index('val_loss')
@@ -171,29 +837,31 @@ class Callbacks:
 
         self.plot_losses_curves()
         
-        # save latest model every 10 epochs
-        if self.epoch % 10 == 0:
-            self.save_latest_model()    
+        # # save latest model every 10 epochs
+        # if self.epoch % 10 == 0:
+        #     self.save_latest_model()    
 
         if val_loss_value < self.min_val_loss:
         # if True:
             self.min_val_loss = val_loss_value
             self.no_improve_epochs = 0
-            # self.plot_lgn_activity(x)
             self.save_best_model()
-            self.plot_raster(x, z, y)
-            self.plot_mean_firing_rate_boxplot(z, y)
-            # self.plot_populations_activity(z)
+            self.plot_mean_firing_rate_boxplot(v1_spikes, y)
 
+            if v1_spikes_spont is not None:
+                self.plot_spontaneous_boxplot(v1_spikes_spont, y)
+                self.composed_raster(x, v1_spikes, x_spont, v1_spikes_spont, y)
+                self.composed_raster(x, v1_spikes, x_spont, v1_spikes_spont, y, plot_core_only=False)
+                # self.plot_lgn_activity(x, x_spont)
+                # self.plot_populations_activity(v1_spikes, v1_spikes_spont)
+            else:
+                self.plot_raster(x, v1_spikes, y)
+            
             self.model_variables_dict['Best'] = {var.name: var.numpy() for var in self.model.trainable_variables}
-            for var in self.model_variables_dict['Best'].keys():
-                t0 = time()
-                self.variable_change_analysis(var)
-                print(f'Time spent in {var}: {time()-t0}')
         else:
             self.no_improve_epochs += 1
 
-        # # Plot osi_dsi if only 1 run and the osi/dsi period is reached
+        # Plot osi_dsi if only 1 run and the osi/dsi period is reached
         # if self.flags.n_runs == 1 and (self.epoch % self.flags.osi_dsi_eval_period == 0 or self.epoch==1):
         #     self.plot_osi_dsi(parallel=False)
            
@@ -226,9 +894,10 @@ class Callbacks:
             print_str += '    ' + compose_str(train_values)
             print(print_str)
             print(f'    Step running time: {time() - self.step_init_time:.2f}s')
-            mem_data = printgpu(verbose=1)
-            print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
-        
+            for gpu_id in range(len(self.strategy.extended.worker_devices)):
+                mem_data = printgpu(gpu_id=gpu_id, verbose=1)
+                print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
+         
     def save_latest_model(self):
         try:
             p = self.latest_manager.save(checkpoint_number=self.epoch)
@@ -246,23 +915,32 @@ class Callbacks:
             print("Saving failed. Maybe next time?")
 
     def plot_losses_curves(self):
-        # plotting_metrics = ['val_loss', 'val_firing_rate', 'val_rate_loss', 'val_voltage_loss']
-        plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss']
+        # plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_sync_loss']
+        plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss']
         images_dir = os.path.join(self.logdir, 'Loss_curves')
         os.makedirs(images_dir, exist_ok=True)
 
-        fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+        # start_epoch = 6 if self.epoch > 5 else 1
+        start_epoch = 1
+        epochs = range(start_epoch, self.epoch + 1)
+
+        fig, axs = plt.subplots(3, 2, figsize=(12, 18))
+        axs = axs.ravel()  # Flatten the array for easy indexing
         for i, metric_key in enumerate(plotting_metrics):
-            ax = axs[i // 2, i % 2]
-            ax.plot(range(1, self.epoch + 1), self.epoch_metric_values[metric_key])
+            ax = axs[i]
+            if metric_key == 'val_loss':
+                color = 'red'
+            else:
+                color = 'blue'
+            ax.plot(epochs, self.epoch_metric_values[metric_key][start_epoch-1:], color=color)
             ax.set_xlabel('Epoch')
             ax.set_ylabel(metric_key)
         plt.tight_layout()
         plt.savefig(os.path.join(images_dir, f'losses_curves_epoch.png'), dpi=300, transparent=False)
         plt.close()
     
-    def plot_raster(self, x, z, y):
-        z = z.numpy()
+    def plot_raster(self, x, v1_spikes, y):
+        v1_spikes = v1_spikes.numpy()
         x = x.numpy()
         y = y.numpy()
         images_dir = os.path.join(self.logdir, 'Raster_plots')
@@ -279,10 +957,36 @@ class Callbacks:
                                     plot_core_only=True,
                                     core_radius=self.flags.plot_core_radius,
                                     )
-        graph(x, z)
+        graph(x, v1_spikes)
 
-    def plot_lgn_activity(self, x):
+    def composed_raster(self, x, v1_spikes, x_spont, v1_spikes_spont, y, plot_core_only=True):
+        # concatenate the normal and spontaneous arrays
+        x = np.concatenate((x_spont.numpy(), x.numpy()), axis=1)
+        v1_spikes = np.concatenate((v1_spikes_spont.numpy(), v1_spikes.numpy()), axis=1)
+        images_dir = os.path.join(self.logdir, 'Raster_plots')
+        if plot_core_only:
+            images_dir = os.path.join(images_dir, 'Core_only')
+        else:
+            images_dir = os.path.join(images_dir, 'Full')
+        os.makedirs(images_dir, exist_ok=True)
+        graph = InputActivityFigure(
+                                    self.network,
+                                    self.flags.data_dir,
+                                    images_dir,
+                                    filename=f'Epoch_{self.epoch}_complete',
+                                    frequency=self.flags.temporal_f,
+                                    stimuli_init_time=self.flags.seq_len+self.pre_delay,
+                                    stimuli_end_time=2*self.flags.seq_len-self.post_delay,
+                                    reverse=False,
+                                    plot_core_only=plot_core_only,
+                                    core_radius=self.flags.plot_core_radius,
+                                    )
+        graph(x, v1_spikes)
+
+    def plot_lgn_activity(self, x, x_spont):
         x = x.numpy()[0, :, :]
+        x_spont = x_spont.numpy()[0, :, :]
+        x = np.concatenate((x_spont, x), axis=0)
         x_mean = np.mean(x, axis=1)
         plt.figure(figsize=(10, 5))
         plt.plot(x_mean)
@@ -292,8 +996,8 @@ class Callbacks:
         os.makedirs(os.path.join(self.logdir, 'Populations activity'), exist_ok=True)
         plt.savefig(os.path.join(self.logdir, 'Populations activity', f'LGN_population_activity_epoch_{self.epoch}.png'))
 
-    def plot_populations_activity(self, z):
-        z = z.numpy()
+    def plot_populations_activity(self, v1_spikes, v1_spikes_spont):
+        v1_spikes = np.concatenate((v1_spikes_spont.numpy(), v1_spikes.numpy()), axis=1)
 
         # Plot the mean firing rate of the population of neurons
         filename = f'Epoch_{self.epoch}'
@@ -301,20 +1005,35 @@ class Callbacks:
                                                 stimuli_init_time=self.pre_delay, stimuli_end_time=self.flags.seq_len-self.post_delay, 
                                                 image_path=self.logdir, filename=filename, data_dir=self.flags.data_dir,
                                                 core_radius=self.flags.plot_core_radius)
-        Population_activity(z, plot_core_only=True, bin_size=10)
+        Population_activity(v1_spikes, plot_core_only=True, bin_size=10)
 
-
-    def plot_mean_firing_rate_boxplot(self, z, y):
-        z = z.numpy()
-        y = y.numpy()
+    def plot_mean_firing_rate_boxplot(self, v1_spikes, y):
+        v1_spikes = v1_spikes.numpy()
+        DG_angles = y.numpy()
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/{self.neuropixels_feature}')
+        os.makedirs(boxplots_dir, exist_ok=True)        
+        if self.neuropixels_feature == "Ave_Rate(Hz)":
+            metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
+                                                    drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay,
+                                                    core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
+        elif self.neuropixels_feature == 'Spontaneous rate (Hz)':
+            metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
+                                                    spontaneous_init=self.pre_delay, spontaneous_end=self.flags.seq_len-self.post_delay,
+                                                    core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
+        # Figure for Average firing rate boxplots      
+        metrics_analysis(metrics=[self.neuropixels_feature], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')    
+                
+    def plot_spontaneous_boxplot(self, v1_spikes, y):
+        v1_spikes = v1_spikes.numpy()
+        DG_angles = y.numpy()
+        boxplots_dir = os.path.join(self.logdir, f'Boxplots/Spontaneous')
         os.makedirs(boxplots_dir, exist_ok=True)
-        metrics_analysis = ModelMetricsAnalysis(self.network, data_dir=self.flags.data_dir, n_trials=1,
-                                                core_radius=self.flags.plot_core_radius, drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay, 
-                                                )
-        metrics_analysis(z, y, metrics=[self.neuropixels_feature], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')    
-
-
+        metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
+                                                spontaneous_init=self.pre_delay, spontaneous_end=self.flags.seq_len-self.post_delay,
+                                                core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
+        # Figure for Average firing rate boxplots
+        metrics_analysis(metrics=['Spontaneous rate (Hz)'], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')   
+                       
     def variable_change_analysis(self, variable):
         if 'rest_of_brain_weights' in variable:
             self.node_to_pop_weights_analysis(self.bkg_input['indices'], variable=variable)
@@ -323,16 +1042,12 @@ class Callbacks:
         elif 'sparse_recurrent_weights' in variable:
             self.pop_to_pop_weights_analysis(self.network['synapses']['indices'], variable=variable)
         
-
     def node_to_pop_weights_analysis(self, indices, variable=''):
         pop_names = other_v1_utils.pop_names(self.network)
-        target_cell_types = [other_billeh_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
-        if 'rest_of_brain_weights' in variable:
-            post_indices =  np.repeat(indices[:, 0], 4)
-        else:
-            post_indices = indices[:, 0]
-
+        target_cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
+        post_indices = indices[:, 0]
         post_cell_types = [target_cell_types[i] for i in post_indices]
+
         # Create DataFrame with all the necessary data
         df = pd.DataFrame({
             'Cell type': post_cell_types * 2,  # Duplicate node names for initial and final weights
@@ -436,8 +1151,6 @@ class Callbacks:
         plt.savefig(os.path.join(boxplots_dir, f'Weight_change.png'), dpi=300, transparent=False)
         plt.close()
 
-
-
     def plot_osi_dsi(self, parallel=False):
         print('Starting to plot OSI and DSI...')
         # Save the checkpoint to reload weights in the osi_dsi_estimator
@@ -476,8 +1189,9 @@ class Callbacks:
                     lgn_firing_rates_dict[angle] = lgn_firing_rates.numpy()
                     print(f'Angle {angle} done.')
                     print(f'    Trial running time: {time() - t0:.2f}s')
-                    mem_data = printgpu(verbose=1)
-                    print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB\n')
+                    for gpu_id in range(len(self.strategy.extended.worker_devices)):
+                        mem_data = printgpu(gpu_id=gpu_id, verbose=1)
+                        print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
 
                 # Save the dataset      
                 results_dir = os.path.join("OSI_DSI_dataset")
@@ -491,12 +1205,14 @@ class Callbacks:
                 with open(osi_dataset_path, 'rb') as f:
                     lgn_firing_rates_dict = pkl.load(f)
 
-            sim_duration = (2500//self.flags.seq_len + 1) * self.flags.seq_len
-            n_trials_per_angle = 10
-            spikes = np.zeros((8, sim_duration, self.flags.neurons), dtype=float)
-            DG_angles = np.arange(0, 360, 45)
+            callbacks = OsiDsiCallbacks(self.network, self.lgn_input, self.bkg_input, self.flags, self.logdir, current_epoch=self.epoch,
+                                        pre_delay=500, post_delay=500, model_variables_init=None)
 
-            for angle_id, angle in enumerate(range(0, 360, 45)):
+            sim_duration = (2500//self.flags.seq_len + 1) * self.flags.seq_len
+            n_trials_per_angle = 3
+            spikes = np.zeros((n_trials_per_angle, len(DG_angles), sim_duration, self.flags.neurons), dtype=float)
+            
+            for angle_id, angle in enumerate(DG_angles):
                 # load LGN firign rates for the given angle and calculate spiking probability
                 lgn_fr = lgn_firing_rates_dict[angle]
                 lgn_fr = tf.constant(lgn_fr, dtype=tf.float32)
@@ -517,44 +1233,19 @@ class Callbacks:
                     num_chunks = (2500//chunk_size + 1)
                     for i in range(num_chunks):
                         chunk = x[:, i * chunk_size : (i + 1) * chunk_size, :]
-                        z_chunk = self.distributed_roll_out(chunk, y, w, output_spikes=True)
-                        spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += z_chunk.numpy()[0, :, :].astype(float)
+                        _out, _, _, _, _  = self.distributed_roll_out(chunk, y, w)
+                        spikes_chunk = _out[0][0]
+                        spikes[trial_id, angle_id, i * chunk_size : (i + 1) * chunk_size, :] += spikes_chunk.numpy()[0, :, :].astype(np.uint8)
 
                     if trial_id == 0 and angle_id == 0:
                         # Raster plot for 0 degree orientation
-                        lgn_spikes = x[:, :2500, :].numpy()
-                        z = spikes[:, :2500, :]
-                        images_dir = os.path.join(self.logdir, 'Raster_plots_OSI_DSI')
-                        os.makedirs(images_dir, exist_ok=True)
-
-                        graph = InputActivityFigure(
-                                        self.network,
-                                        self.flags.data_dir,
-                                        images_dir,
-                                        filename=f'Epoch_{self.epoch}',
-                                        frequency=self.flags.temporal_f,
-                                        stimuli_init_time=500,
-                                        stimuli_end_time=2500,
-                                        reverse=False,
-                                        plot_core_only=True,
-                                        core_radius=self.flags.plot_core_radius,
-                                        )
-                        graph(lgn_spikes, z)
+                        callbacks.single_trial_callbacks(x.numpy(), spikes[0], y=angle)
 
                     print(f'Trial {trial_id}/{n_trials_per_angle} - Angle {angle} done.')
                     print(f'    Trial running time: {time() - t0:.2f}s')
-                    mem_data = printgpu(verbose=1)
-                    print(f'    Memory consumption (current - peak): {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB\n')
+                    for gpu_id in range(len(self.strategy.extended.worker_devices)):
+                        mem_data = printgpu(gpu_id=gpu_id, verbose=1)
+                        print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
         
-        	# Average the spikes over the number of trials
-            spikes = spikes/n_trials_per_angle
-            # Slice only the first 2500 ms
-            spikes = spikes[:, :2500, :]
-
-            # Do the OSI/DSI analysis 
-            boxplots_dir = os.path.join(self.logdir, 'Boxplots_OSI_DSI')
-            os.makedirs(boxplots_dir, exist_ok=True)
-            metrics_analysis = ModelMetricsAnalysis(self.network, data_dir=self.flags.data_dir,
-                                                    drifting_gratings_init=500, drifting_gratings_end=2500,
-                                                    core_radius=self.flags.plot_core_radius)
-            metrics_analysis(spikes, DG_angles, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')
+            # Do the OSI/DSI analysis    
+            callbacks.osi_dsi_analysis(spikes, DG_angles)   

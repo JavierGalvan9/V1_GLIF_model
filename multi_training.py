@@ -320,18 +320,19 @@ def main(_):
         v1_evoked_rates = tf.reduce_mean(v1_evoked_rates, (0, 1))
         # Update the EMAs
         v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
-        tf.print('V1_ema: ', tf.reduce_mean(v1_ema), tf.reduce_mean(v1_evoked_rates), v1_ema)
+        # tf.print('V1_ema: ', tf.reduce_mean(v1_ema), tf.reduce_mean(v1_evoked_rates), v1_ema)
 
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
         rate_loss = rate_distribution_regularizer(_z, trim)
         osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
-        tf.print('V1 OSI losses: ')
-        tf.print(osi_dsi_loss[1])
+        # tf.print(flags.osi_cost, osi_dsi_loss[0])
+        # tf.print('V1 OSI losses: ')
+        # tf.print(osi_dsi_loss)
         # weights_l2_regularizer = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss[0])
         _loss = osi_dsi_loss[0] + rate_loss + voltage_loss #+ weights_l2_regularizer
-        tf.print(osi_dsi_loss[0], rate_loss, voltage_loss) #, weights_l2_regularizer)
+        # tf.print(osi_dsi_loss[0], rate_loss, voltage_loss) #, weights_l2_regularizer)
 
         return _out, _p, _loss, _aux
 
@@ -369,8 +370,8 @@ def main(_):
         
         grad = tape.gradient(_loss, model.trainable_variables)
         for g, v in zip(grad, model.trainable_variables):
-            tf.print(f'{v.name} optimization')
-            tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
+            # tf.print(f'{v.name} optimization')
+            # tf.print('Loss, total_gradients : ', _loss, tf.reduce_sum(tf.math.abs(g)))
             with tf.control_dependencies([_op]):
                 _op = optimizer.apply_gradients([(g, v)])
 
