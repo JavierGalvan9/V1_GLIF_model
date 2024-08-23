@@ -862,8 +862,8 @@ class Callbacks:
             self.no_improve_epochs += 1
 
         # Plot osi_dsi if only 1 run and the osi/dsi period is reached
-        # if self.flags.n_runs == 1 and (self.epoch % self.flags.osi_dsi_eval_period == 0 or self.epoch==1):
-        #     self.plot_osi_dsi(parallel=False)
+        if self.flags.n_runs == 1 and (self.epoch % self.flags.osi_dsi_eval_period == 0 or self.epoch==1):
+            self.plot_osi_dsi(parallel=False)
            
         with self.summary_writer.as_default():
             for k, v in zip(self.metrics_keys, metric_values):
