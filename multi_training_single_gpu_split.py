@@ -214,7 +214,6 @@ def main(_):
 
         ### BUILD THE LOSS AND REGULARIZER FUNCTIONS ###
         # Create rate and voltage regularizers
-        print('Loss core radius: ', flags.loss_core_radius)
         if flags.loss_core_radius > 0:
             core_mask = other_v1_utils.isolate_core_neurons(network, radius=flags.loss_core_radius, data_dir=flags.data_dir)
             # if core_mask is all True, set it to None.
@@ -296,9 +295,12 @@ def main(_):
 
         ### ANNULUS REGULARIZERS ###
         if annulus_mask is not None:
-            annulus_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
-                                                                            data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=dtype)
-            model.add_loss(lambda: annulus_rate_regularizer(rsnn_layer.output[0][0]))
+            annulus_spont_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
+                                                                                data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=dtype)
+            model.add_loss(lambda: annulus_spont_rate_regularizer(rsnn_layer.output[0][0]))
+            annulus_evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=False, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
+                                                                                data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=dtype)
+            model.add_loss(lambda: annulus_evoked_rate_regularizer(rsnn_layer.output[0][0]))
 
             # Add OSI/DSI regularizer for the annulus
             annulus_OSI_DSI_Loss = losses.OrientationSelectivityLoss(network=network, osi_cost=0.1*flags.osi_cost,
@@ -386,7 +388,10 @@ def main(_):
             regularizers_loss = tf.constant(0.0, dtype=dtype)
 
         if annulus_mask is not None:
-            annulus_rate_loss = annulus_rate_regularizer(_z, trim)
+            if spontaneous:
+                annulus_rate_loss = annulus_spont_rate_regularizer(_z, trim)
+            else:
+                annulus_rate_loss = annulus_evoked_rate_regularizer(_z, trim)
             annulus_osi_dsi_loss = annulus_OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
             rate_loss += annulus_rate_loss
             osi_dsi_loss += annulus_osi_dsi_loss
