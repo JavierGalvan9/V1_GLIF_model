@@ -392,10 +392,11 @@ def main(_):
                 annulus_rate_loss = annulus_spont_rate_regularizer(_z, trim)
             else:
                 annulus_rate_loss = annulus_evoked_rate_regularizer(_z, trim)
-            annulus_osi_dsi_loss = annulus_OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
-            rate_loss += annulus_rate_loss
-            osi_dsi_loss += annulus_osi_dsi_loss
+                annulus_osi_dsi_loss = annulus_OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
+                osi_dsi_loss += annulus_osi_dsi_loss
 
+            rate_loss += annulus_rate_loss
+            
         # tf.print(flags.osi_cost, osi_dsi_loss[0])
         # tf.print('V1 OSI losses: ')
         # tf.print(osi_dsi_loss)
