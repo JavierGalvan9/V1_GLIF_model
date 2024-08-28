@@ -928,8 +928,8 @@ class Callbacks:
             print("Saving failed. Maybe next time?")
 
     def plot_losses_curves(self):
-        # plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_sync_loss']
-        plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss']
+        plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_sync_loss']
+        # plotting_metrics = ['val_loss', 'val_osi_dsi_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss']
         images_dir = os.path.join(self.logdir, 'Loss_curves')
         os.makedirs(images_dir, exist_ok=True)
 
