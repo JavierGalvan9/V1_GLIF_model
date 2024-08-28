@@ -365,6 +365,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('learning_rate', .01, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
     absl.app.flags.DEFINE_float('voltage_cost', 1., '')
+    absl.app.flags.DEFINE_float('sync_cost', 1., '')
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')

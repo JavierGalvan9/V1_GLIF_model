@@ -30,12 +30,13 @@ def printgpu(gpu_id=0, verbose=0):
             return current, peak
 
 def compose_str(metrics_values):
-        _acc, _loss, _rate, _rate_loss, _voltage_loss, _regularizers_loss, _osi_dsi_loss = metrics_values
+        _acc, _loss, _rate, _rate_loss, _voltage_loss, _regularizers_loss, _osi_dsi_loss, _sync_loss = metrics_values
         _s = f'Loss {_loss:.4f}, '
         _s += f'RLoss {_rate_loss:.4f}, '
         _s += f'VLoss {_voltage_loss:.4f}, '
         _s += f'RegLoss {_regularizers_loss:.4f}, '
         _s += f'OLoss {_osi_dsi_loss:.4f}, '
+        _s += f'SLoss {_sync_loss:.4f}, '
         _s += f'Accuracy {_acc:.4f}, '
         _s += f'Rate {_rate:.4f}'
         return _s
@@ -410,11 +411,21 @@ class OsiDsiCallbacks:
             # raise the actual error
             print(grouped_df)
         
-    def fano_factor(self, spikes, t_start=0.7, t_end=2.5, n_samples=100, isolate_core=True):
+    def fano_factor(self, spikes, t_start=0.7, t_end=2.5, n_samples=100, analyze_core_only=True):
+        
+        if analyze_core_only:
+            # Isolate the core neurons
+            pop_names = other_v1_utils.pop_names(self.network, core_radius=self.flags.loss_core_radius)
+            core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
+            n_core_neurons = np.sum(core_mask)
+            spikes = spikes[:, :, :, core_mask]
+        else:
+            n_core_neurons = spikes.shape[-1]
+            pop_names = other_v1_utils.pop_names(self.network)
+
         # Calculate the Fano Factor for the spikes
-        pop_names = other_v1_utils.pop_names(self.network)
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
-        node_id = np.arange(self.network['n_nodes'])
+        node_id = np.arange(n_core_neurons)
         # Get the IDs for excitatory neurons
         node_id_e = node_id[node_ei == 'e']
         # Reshape spikes data 
@@ -436,11 +447,14 @@ class OsiDsiCallbacks:
         # Pre-define bin sizes
         bin_sizes = np.logspace(-3, 0, 20)
         # using the simulation length, limit bin_sizes to define at least 2 bins
-        bin_sizes_mask = bin_sizes < (t_end - t_start)/5
+        bin_sizes_mask = bin_sizes < (t_end - t_start)/2
         bin_sizes = bin_sizes[bin_sizes_mask]
         # Vectorize the sampling process
         sample_counts = np.random.normal(68, 10, n_samples).astype(int)
+        # ensure that the sample counts are at least 1
         sample_counts = np.maximum(sample_counts, 1)
+        # ensure that the sample counts are less than the number of neurons
+        sample_counts = np.minimum(sample_counts, len(node_id_e))
         # trial_ids =np.random.choice(np.arange(n_trials), n_samples, replace=False)
         trial_ids = np.random.randint(n_trials, size=n_samples)
 
@@ -458,12 +472,12 @@ class OsiDsiCallbacks:
             fanos.append(fano)
 
         fanos = np.array(fanos)
-        return fanos
+        return fanos, bin_sizes
         
-    def fanos_figure(self, spikes, n_samples=100):
+    def fanos_figure(self, spikes, n_samples=100, analyze_core_only=True):
         # Calculate fano factors for both sessions
-        evoked_fanos = self.fano_factor(spikes, t_start=0.7, t_end=2.5, n_samples=n_samples)
-        spontaneous_fanos = self.fano_factor(spikes, t_start=0, t_end=0.5, n_samples=n_samples)
+        evoked_fanos, evoked_bin_sizes = self.fano_factor(spikes, t_start=0.7, t_end=2.5, n_samples=n_samples, analyze_core_only=analyze_core_only)
+        spontaneous_fanos, spont_bin_sizes = self.fano_factor(spikes, t_start=0, t_end=0.5, n_samples=n_samples, analyze_core_only=analyze_core_only)
 
         # Calculate mean, standard deviation, and SEM of the Fano factors
         evoked_fanos_mean = np.nanmean(evoked_fanos, axis=0)
@@ -475,11 +489,10 @@ class OsiDsiCallbacks:
         spontaneous_fanos_sem = spontaneous_fanos_std / np.sqrt(n_samples)
 
         # find the frequency of the maximum
-        bin_sizes = np.logspace(-3, 0, 20)
         evoked_max_fano = np.nanmax(evoked_fanos_mean)
-        evoked_max_fano_freq = 1/bin_sizes[np.nanargmax(evoked_fanos_mean)]
+        evoked_max_fano_freq = 1/(2*evoked_bin_sizes[np.nanargmax(evoked_fanos_mean)])
         spontaneous_max_fano = np.nanmax(spontaneous_fanos_mean)
-        spontaneous_max_fano_freq = 1/bin_sizes[np.nanargmax(spontaneous_fanos_mean)]
+        spontaneous_max_fano_freq = 1/(2*spont_bin_sizes[np.nanargmax(spontaneous_fanos_mean)])
 
         # Calculate the evoked experimental error committed
         evoked_exp_data_path = 'Synchronization_data/all_fano_300ms_evoked.npy'
@@ -508,16 +521,16 @@ class OsiDsiCallbacks:
         # Plot the Fano Factor
         fig, axs = plt.subplots(1, 2, figsize=(12, 6), sharex=True, sharey=True)
         # plot fanos with error bars
-        axs[0].errorbar(bin_sizes[:len(evoked_fanos_mean)], evoked_fanos_mean, yerr=evoked_fanos_sem, fmt='o-', label='Evoked Model', color='blue')
-        axs[0].errorbar(bin_sizes[:len(evoked_fanos_mean)], evoked_exp_fanos_mean[:len(evoked_fanos_mean)], yerr=evoked_exp_fanos_sem[:len(evoked_fanos_mean)], fmt='o-', label='Evoked Experimental', color='k')
+        axs[0].errorbar(evoked_bin_sizes, evoked_fanos_mean, yerr=evoked_fanos_sem, fmt='o-', label='Evoked Model', color='blue')
+        axs[0].errorbar(evoked_bin_sizes, evoked_exp_fanos_mean[:len(evoked_bin_sizes)], yerr=evoked_exp_fanos_sem[:len(evoked_bin_sizes)], fmt='o-', label='Evoked Experimental', color='k')
         axs[0].set_xscale("log")
         axs[0].set_title(f'V1 - Max: {evoked_max_fano:.2f}, Freq: {evoked_max_fano_freq:.1f} Hz', fontsize=16)
         axs[0].set_xlabel('Bin Size (s)', fontsize=14)
         axs[0].set_ylabel('Fano Factor', fontsize=14)
         axs[0].legend(fontsize=14)
 
-        axs[1].errorbar(bin_sizes[:len(spontaneous_fanos_mean)], spontaneous_fanos_mean, yerr=spontaneous_fanos_sem, fmt='o-', label='Spontaneous Model', color='orange')
-        axs[1].errorbar(bin_sizes[:len(spontaneous_fanos_mean)], spont_exp_fanos_mean[:len(spontaneous_fanos_mean)], yerr=spont_exp_fanos_sem[:len(spontaneous_fanos_mean)], fmt='o-', label='Spontaneous Experimental', color='k')
+        axs[1].errorbar(spont_bin_sizes, spontaneous_fanos_mean, yerr=spontaneous_fanos_sem, fmt='o-', label='Spontaneous Model', color='orange')
+        axs[1].errorbar(spont_bin_sizes, spont_exp_fanos_mean[:len(spont_bin_sizes)], yerr=spont_exp_fanos_sem[:len(spont_bin_sizes)], fmt='o-', label='Spontaneous Experimental', color='k')
         axs[1].set_xscale("log")
         axs[1].set_title(f'V1 - Max: {spontaneous_max_fano:.2f}, Freq: {spontaneous_max_fano_freq:.1f} Hz', fontsize=16)
         axs[1].set_xlabel('Bin Size (s)', fontsize=14)
@@ -660,7 +673,7 @@ class OsiDsiCallbacks:
         os.makedirs(spontaneous_boxplots_dir, exist_ok=True)
          
         # Fano factor analysis
-        self.fanos_figure(v1_spikes, n_samples=100)
+        self.fanos_figure(v1_spikes, n_samples=100, analyze_core_only=True)
         # Plot the tuning angle analysis
         self.plot_population_firing_rates_vs_tuning_angle(v1_spikes, DG_angles)
         # Estimate tuning parameters from the model neurons

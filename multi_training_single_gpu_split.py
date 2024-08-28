@@ -257,6 +257,14 @@ def main(_):
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=dtype)
         model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
 
+        ### SYNCHRONIZATION REGULARIZERS ###
+        evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=0.5, n_samples=500, dtype=dtype, session='evoked', data_dir='Synchronization_data')
+        model.add_loss(lambda: evoked_sync_loss(rsnn_layer.output[0][0]))
+
+        spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=0.5, n_samples=500, dtype=dtype, session='spont', data_dir='Synchronization_data')
+        model.add_loss(lambda: spont_sync_loss(rsnn_layer.output[0][0]))
+
+
         ### OSI / DSI LOSSES ###
         # Define the decay factor for the exponential moving average
         ema_decay = 0.95
@@ -312,7 +320,6 @@ def main(_):
             placeholder_angle = tf.constant(0, dtype=dtype, shape=(1, 1))
             model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
-
         extractor_model = tf.keras.Model(inputs=model.inputs,
                                          outputs=[rsnn_layer.output, model.output, prediction_layer.output])
 
@@ -347,8 +354,8 @@ def main(_):
         val_regularizer_loss = tf.keras.metrics.Mean()
         train_osi_dsi_loss = tf.keras.metrics.Mean()
         val_osi_dsi_loss = tf.keras.metrics.Mean()
-        # train_sync_loss = tf.keras.metrics.Mean()
-        # val_sync_loss = tf.keras.metrics.Mean()
+        train_sync_loss = tf.keras.metrics.Mean()
+        val_sync_loss = tf.keras.metrics.Mean()
 
         def reset_train_metrics():
             train_loss.reset_states(), train_accuracy.reset_states(), train_firing_rate.reset_states()
@@ -382,10 +389,12 @@ def main(_):
             rate_loss = spont_rate_regularizer(_z, trim)
             osi_dsi_loss = tf.constant(0.0, dtype=dtype)
             regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+            sync_loss = spont_sync_loss(_z, trim)
         else:
             rate_loss = evoked_rate_regularizer(_z, trim)
             osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
             regularizers_loss = tf.constant(0.0, dtype=dtype)
+            sync_loss = evoked_sync_loss(_z, trim)
 
         if annulus_mask is not None:
             if spontaneous:
@@ -401,8 +410,9 @@ def main(_):
         # tf.print('V1 OSI losses: ')
         # tf.print(osi_dsi_loss)
 
-        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss, regularizer_loss=regularizers_loss)
-        _loss = osi_dsi_loss + rate_loss + voltage_loss + regularizers_loss #+ sync_loss
+        _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss, 
+                    regularizer_loss=regularizers_loss, sync_loss=sync_loss)
+        _loss = osi_dsi_loss + rate_loss + voltage_loss + regularizers_loss + sync_loss
         # tf.print(osi_dsi_loss[0], rate_loss, voltage_loss) #, weights_l2_regularizer)
 
         return _out, _p, _loss, _aux, None
@@ -478,8 +488,8 @@ def main(_):
             _op = train_regularizer_loss.update_state(_aux_evoked['regularizer_loss'] + _aux_spontaneous['regularizer_loss'])
         with tf.control_dependencies([_op]):
             _op = train_osi_dsi_loss.update_state(_aux_evoked['osi_dsi_loss'] + _aux_spontaneous['osi_dsi_loss'])
-        # with tf.control_dependencies([_op]):
-        #     _op = train_sync_loss.update_state(_aux_evoked['sync_loss'] + _aux_spontaneous['sync_loss'])    
+        with tf.control_dependencies([_op]):
+            _op = train_sync_loss.update_state(_aux_evoked['sync_loss'] + _aux_spontaneous['sync_loss'])    
 
         # tf.print("Train Loss:", train_loss.result(), _loss, ' - ', _y, tf.reduce_sum(tf.cast(_x, tf.float32)))  
         # tf.print(model.trainable_variables)
@@ -488,10 +498,9 @@ def main(_):
         voltage_loss = _aux_evoked['voltage_loss'] + _aux_spontaneous['voltage_loss']
         regularizers_loss = _aux_evoked['regularizer_loss'] + _aux_spontaneous['regularizer_loss']
         osi_dsi_loss = _aux_evoked['osi_dsi_loss'] + _aux_spontaneous['osi_dsi_loss']
-        # sync_loss = _aux_evoked['sync_loss'] + _aux_spontaneous['sync_loss']
+        sync_loss = _aux_evoked['sync_loss'] + _aux_spontaneous['sync_loss']
 
-        # return model_spikes, [0., _loss, _rate, rate_loss, voltage_loss, regularizers_loss, osi_dsi_loss, sync_loss]
-        return model_spikes, [0., _loss, _rate, rate_loss, voltage_loss, regularizers_loss, osi_dsi_loss]
+        return model_spikes, [0., _loss, _rate, rate_loss, voltage_loss, regularizers_loss, osi_dsi_loss, sync_loss]
     
     @tf.function
     def distributed_split_train_step(x, y, weights, x_spontaneous, trim):
@@ -514,8 +523,8 @@ def main(_):
             _op = val_regularizer_loss.update_state(_aux['regularizer_loss'])
         with tf.control_dependencies([_op]):
             _op = val_osi_dsi_loss.update_state(_aux['osi_dsi_loss'])
-        # with tf.control_dependencies([_op]):
-        #     _op = val_sync_loss.update_state(_aux['sync_loss'])
+        with tf.control_dependencies([_op]):
+            _op = val_sync_loss.update_state(_aux['sync_loss'])
             
         # tf.nest.map_structure(lambda _a, _b: _a.assign(_b), list(state_variables), _out[1:])
         if output_spikes:
@@ -647,8 +656,8 @@ def main(_):
     #         'train_regularizer_loss', 'train_osi_dsi_loss', 'train_sync_loss', 'val_accuracy', 'val_loss',
     #         'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_osi_dsi_loss', 'val_sync_loss']
     metric_keys = ['train_accuracy', 'train_loss', 'train_firing_rate', 'train_rate_loss', 'train_voltage_loss',
-            'train_regularizer_loss', 'train_osi_dsi_loss', 'val_accuracy', 'val_loss',
-            'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_osi_dsi_loss']
+            'train_regularizer_loss', 'train_osi_dsi_loss', 'train_sync_loss', 'val_accuracy', 'val_loss',
+            'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_osi_dsi_loss', 'val_sync_loss']
     
     callbacks = Callbacks(network, lgn_input, bkg_input, model, optimizer, distributed_roll_out, flags, logdir, strategy, 
                         metric_keys, pre_delay=delays[0], post_delay=delays[1], model_variables_init=model_variables_dict,
@@ -751,15 +760,12 @@ def main(_):
         #     _out, _, _, _, _ = distributed_roll_out(x, y, w)
         #     v1_spikes, lm_spikes = _out[0][0], _out[0][2]
 
-        # train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
-        #                                             train_rate_loss, train_voltage_loss, train_regularizer_loss, 
-        #                                             train_osi_dsi_loss, train_sync_loss]]
         train_values = [a.result().numpy() for a in [train_accuracy, train_loss, train_firing_rate, 
                                                     train_rate_loss, train_voltage_loss, train_regularizer_loss, 
-                                                    train_osi_dsi_loss]]
+                                                    train_osi_dsi_loss, train_sync_loss]]
         val_values = train_values
         # val_values = [a.result().numpy() for a in [val_accuracy, val_loss, val_firing_rate, 
-        #                                            val_rate_loss, val_voltage_loss, val_osi_dsi_loss]]
+        #                                            val_rate_loss, val_voltage_loss, val_osi_dsi_loss, val_sync_loss]]
         metric_values = train_values + val_values
 
         v1_spikes = model_spikes[0]
@@ -811,7 +817,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('optimizer', 'adam', '')
     absl.app.flags.DEFINE_float('learning_rate', .001, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
-    # absl.app.flags.DEFINE_float('sync_cost', 1., '')
+    absl.app.flags.DEFINE_float('sync_cost', 1., '')
     absl.app.flags.DEFINE_float('voltage_cost', 1., '')
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')

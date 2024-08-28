@@ -25,7 +25,7 @@ parser.add_argument('--optimizer', default='adam', type=str)
 parser.add_argument('--learning_rate', default=0.001, type=float)
 parser.add_argument('--rate_cost', default=100., type=float) #100
 parser.add_argument('--voltage_cost', default=1., type=float)
-# parser.add_argument('--sync_cost', default=1., type=float)
+parser.add_argument('--sync_cost', default=1., type=float)
 parser.add_argument('--osi_cost', default=1., type=float)
 parser.add_argument('--osi_loss_subtraction_ratio', default=0., type=float)
 parser.add_argument('--osi_loss_method', default='crowd_osi', type=str)
