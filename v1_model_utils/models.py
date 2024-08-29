@@ -379,7 +379,7 @@ class V1Column(tf.keras.layers.Layer):
         hard_reset=True,
     ):
         super().__init__()
-        self._params = network["node_params"]
+        self._params = dict(network["node_params"])
         # Rescale the voltages to have them near 0, as we wanted the effective step size
         # for the weights to be normalized when learning (weights are scaled similarly)
         voltage_scale = self._params["V_th"] - self._params["E_L"]

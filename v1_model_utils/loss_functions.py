@@ -34,12 +34,11 @@ class StiffRegularizer(Layer):
         self._dtype = dtype
         self._penalize_relative_change = penalize_relative_change
         # Compute voltage scale
-        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float16)
+        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
         # Get the initial weights and properly scale them down
         indices = network["synapses"]["indices"]
-        initial_value = np.array(network["synapses"]["weights"], dtype=np.float16)
+        initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
         edge_type_ids = network['synapses']['edge_type_ids']
-
         # Scale initial values by the voltage scale of the node IDs
         voltage_scale_node_ids = voltage_scale[network['node_type_ids'][indices[:, 0]]]
         initial_value /= voltage_scale_node_ids
@@ -52,14 +51,13 @@ class StiffRegularizer(Layer):
         initial_mean_weights = sum_weights / count_weights
         # Determine target mean weights
         if self._penalize_relative_change:
-            epsilon = np.float16(1e-3)
-            target_mean_weights = np.maximum(np.abs(initial_mean_weights), epsilon)
-        else:
-            target_mean_weights = initial_mean_weights
+            epsilon = np.float32(1e-4)
+            denominator = np.maximum(np.abs(initial_mean_weights), epsilon)
+            self._denominator = tf.constant(denominator, dtype=dtype)
 
         self.idx = tf.constant(self.idx, dtype=tf.int32)
         self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
-        self._target_mean_weights = tf.constant(target_mean_weights, dtype=dtype)
+        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=dtype)
 
     def __call__(self, x):
         # if x.dtype != self._dtype:
@@ -67,7 +65,7 @@ class StiffRegularizer(Layer):
         mean_edge_type_weights = tf.math.unsorted_segment_mean(x, self.idx, self.num_unique)
         if self._penalize_relative_change:
             # return self._strength * tf.reduce_mean(tf.abs(x - self._initial_value))
-            relative_deviation = (mean_edge_type_weights - self._target_mean_weights) / self._target_mean_weights
+            relative_deviation = (mean_edge_type_weights - self._target_mean_weights) / self._denominator
             # Penalize the relative deviation
             reg_loss = tf.sqrt(tf.reduce_mean(tf.square(relative_deviation)))
         else:
