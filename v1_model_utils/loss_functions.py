@@ -77,26 +77,27 @@ class StiffRegularizer(Layer):
 class L2Regularizer(tf.keras.regularizers.Regularizer):
     def __init__(self, strength, network, flags, penalize_relative_change=False, dtype=tf.float32):
         super().__init__()
-        self._strength = strength
-        # Compute voltage scale
-        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float16)
-        # Get the initial weights and properly scale them down
-        indices = np.array(network["synapses"]["indices"], dtype=tf.int32)
-        weights = np.array(network["synapses"]["weights"], dtype=dtype)
-        # Scale initial values by the voltage scale of the node IDs
-        voltage_scale_node_ids = voltage_scale[network['node_type_ids'][indices[:, 0]]]
-        initial_value = weights / voltage_scale_node_ids
-        self._initial_value = tf.constant(initial_value, dtype=dtype)
+        self._strength = tf.cast(strength, dtype)
+        self._dtype = dtype
+        self._penalize_relative_change = penalize_relative_change
 
-        if penalize_relative_change:
+        if self._penalize_relative_change:
+            # Compute voltage scale
+            voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+            # Get the initial weights and properly scale them down
+            indices = network["synapses"]["indices"]
+            weights = np.array(network["synapses"]["weights"], dtype=np.float32)
+            # Scale initial values by the voltage scale of the node IDs
+            voltage_scale_node_ids = voltage_scale[network['node_type_ids'][indices[:, 0]]]
+            initial_value = weights / voltage_scale_node_ids
             # using the edge_type ids group calculate the mean weight of each type of edge in the network and then create a constant with same shape as weights and with each value corresponding to the populations mean
             # Calculate mean weights for each edge type
             edge_type_ids = np.array(network['synapses']['edge_type_ids'])
             unique_edge_type_ids, inverse_indices = np.unique(edge_type_ids, return_inverse=True)
             mean_weights = np.array([np.mean(initial_value[edge_type_ids == edge_type_id]) for edge_type_id in unique_edge_type_ids])
             # Create target mean weights array based on the edge type indices
-            self._target_mean_weights = tf.constant(mean_weights[inverse_indices], dtype=dtype)
-            epsilon = tf.constant(1e-2, dtype=tf.float32)  # A small constant to avoid division by zero
+            self._target_mean_weights = tf.constant(mean_weights[inverse_indices], dtype=self._dtype)
+            epsilon = tf.constant(1e-4, dtype=tf.float32)  # A small constant to avoid division by zero
             self._target_mean_weights = tf.maximum(tf.abs(self._target_mean_weights), epsilon)
         else:
             self._target_mean_weights = None
@@ -383,7 +384,7 @@ class SynchronizationLoss(Layer):
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean[bin_sizes_mask], dtype=self._dtype)
 
         # Set up Huber loss
-        self.huber_loss = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
+        # self.huber_loss = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
 
     def pop_fano_tf(self, spikes, t_start=0.2, t_end=2.0, bin_edges=None, bin_sizes=None):
         # Convert t_start and t_end to tensors
@@ -475,11 +476,11 @@ class SynchronizationLoss(Layer):
         # Calculate mean, standard deviation, and SEM of the Fano factors
         fanos_mean = tf.reduce_mean(fanos, axis=0)
         # Calculate MSE between the experimental and calculated Fano factors
-        # mse_loss = tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))
+        mse_loss = tf.sqrt(tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean)))
         # Calculate the huber loss 
-        huber_loss = self.huber_loss(experimental_fanos_mean, fanos_mean)
+        # huber_loss = self.huber_loss(experimental_fanos_mean, fanos_mean)
         # Calculate the synchronization loss
-        sync_loss = self._sync_cost * huber_loss
+        sync_loss = self._sync_cost * mse_loss
 
         return sync_loss
 
@@ -505,7 +506,6 @@ class VoltageRegularization:
         voltage_loss = tf.reduce_mean(v_pos + v_neg)
 
         return voltage_loss * self._voltage_cost
-
 
 
 class CustomMeanLayer(Layer):

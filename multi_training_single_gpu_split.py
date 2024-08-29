@@ -385,15 +385,15 @@ def main(_):
 
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
 
+        regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+
         if spontaneous:
             rate_loss = spont_rate_regularizer(_z, trim)
             osi_dsi_loss = tf.constant(0.0, dtype=dtype)
-            regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
             sync_loss = spont_sync_loss(_z, trim)
         else:
             rate_loss = evoked_rate_regularizer(_z, trim)
             osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
-            regularizers_loss = tf.constant(0.0, dtype=dtype)
             sync_loss = evoked_sync_loss(_z, trim)
 
         if annulus_mask is not None:
@@ -467,8 +467,8 @@ def main(_):
         average_gradients = [tf.add(g1, g2) / 2.0 for g1, g2 in zip(grad_spontaneous, grad_evoked)]
         # average_gradients = [g / 2.0 for g in accumulated_gradients]
         # print total loss and the total gradients for each variable:
-        # for g, v in zip(average_gradients, model.trainable_variables):
-        #     tf.print(f'Gratings {v.name}: ', 'Loss, average_gradient : ', _loss, tf.reduce_mean(tf.math.abs(g)))
+        for g, v in zip(average_gradients, model.trainable_variables):
+            tf.print(f'Gratings {v.name}: ', 'Loss, average_gradient : ', _loss, tf.reduce_mean(tf.math.abs(g)))
         # Apply average gradients
         optimizer.apply_gradients(zip(average_gradients, model.trainable_variables))
 
