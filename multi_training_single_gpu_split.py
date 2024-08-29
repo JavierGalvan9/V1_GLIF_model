@@ -385,15 +385,15 @@ def main(_):
 
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
 
-        regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
-
         if spontaneous:
             rate_loss = spont_rate_regularizer(_z, trim)
             osi_dsi_loss = tf.constant(0.0, dtype=dtype)
+            regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
             sync_loss = spont_sync_loss(_z, trim)
         else:
             rate_loss = evoked_rate_regularizer(_z, trim)
             osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
+            regularizers_loss = tf.constant(0.0, dtype=dtype)
             sync_loss = evoked_sync_loss(_z, trim)
 
         if annulus_mask is not None:

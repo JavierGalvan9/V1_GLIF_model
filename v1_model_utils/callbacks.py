@@ -143,12 +143,13 @@ class OsiDsiCallbacks:
     def node_to_pop_weights_analysis(self, indices, variable='', voltage_scale=None):
         pop_names = other_v1_utils.pop_names(self.network)
         target_cell_types = [other_v1_utils.pop_name_to_cell_type(pop_name) for pop_name in pop_names]
-        if 'rest_of_brain_weights' in variable:
-            post_indices =  np.repeat(indices[:, 0], 4)
-            voltage_scale = np.repeat(voltage_scale, 4)
-        else:
-            post_indices = indices[:, 0]
+        # if 'rest_of_brain_weights' in variable:
+        #     post_indices =  np.repeat(indices[:, 0], 4)
+        #     voltage_scale = np.repeat(voltage_scale, 4)
+        # else:
+        #     post_indices = indices[:, 0]
 
+        post_indices = indices[:, 0]
         post_cell_types = [target_cell_types[i] for i in post_indices]
 
         if voltage_scale is not None:
