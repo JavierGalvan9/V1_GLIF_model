@@ -381,8 +381,7 @@ def main(_):
         v1_evoked_rates = tf.reduce_mean(_z[:, delays[0]:seq_len-delays[1], :], (0, 1))
         # Update the EMAs
         v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
-        # tf.print('V1_ema: ', tf.reduce_mean(v1_ema), tf.reduce_mean(v1_evoked_rates), v1_ema)
-
+        # Calculate the losses and regularization terms
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
 
         if spontaneous:
@@ -399,21 +398,23 @@ def main(_):
         if annulus_mask is not None:
             if spontaneous:
                 annulus_rate_loss = annulus_spont_rate_regularizer(_z, trim)
+                annulus_osi_dsi_loss = tf.constant(0.0, dtype=dtype)
             else:
                 annulus_rate_loss = annulus_evoked_rate_regularizer(_z, trim)
                 annulus_osi_dsi_loss = annulus_OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
-                osi_dsi_loss += annulus_osi_dsi_loss
-
-            rate_loss += annulus_rate_loss
             
-        # tf.print(flags.osi_cost, osi_dsi_loss[0])
-        # tf.print('V1 OSI losses: ')
-        # tf.print(osi_dsi_loss)
+            rate_loss += annulus_rate_loss
+            osi_dsi_loss += annulus_osi_dsi_loss
+            
+        # osi_dsi_loss = tf.constant(0.0, dtype=dtype)
+        # rate_loss = tf.constant(0.0, dtype=dtype)
+        # regularizers_loss = tf.constant(0.0, dtype=dtype)
+        # voltage_loss = tf.constant(0.0, dtype=dtype) # voltage_regularizer(_v)
+        # sync_loss = spont_sync_loss(_z, trim)  #spont_sync_loss(_z, trim) + evoked_sync_loss(_z, trim)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss, 
                     regularizer_loss=regularizers_loss, sync_loss=sync_loss)
         _loss = osi_dsi_loss + rate_loss + voltage_loss + regularizers_loss + sync_loss
-        # tf.print(osi_dsi_loss[0], rate_loss, voltage_loss) #, weights_l2_regularizer)
 
         return _out, _p, _loss, _aux, None
 

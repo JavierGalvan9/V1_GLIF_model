@@ -342,9 +342,8 @@ class SpikeRateDistributionTarget:
 
 #         return reg_loss
 
-
 class SynchronizationLoss(Layer):
-    def __init__(self, network, sync_cost=10., t_start=None, t_end=None, n_samples=50, data_dir='GLIF_network', 
+    def __init__(self, network, sync_cost=10., t_start=0, t_end=0.5, n_samples=50, data_dir='GLIF_network', 
                  session='evoked', dtype=tf.float32, core_mask=None, **kwargs):
         super(SynchronizationLoss, self).__init__(dtype=dtype, **kwargs)
         self._sync_cost = sync_cost
@@ -364,125 +363,89 @@ class SynchronizationLoss(Layer):
         node_id = np.arange(len(node_ei))
         # Get the IDs for excitatory neurons
         node_id_e = node_id[node_ei == 'e']
-        self.node_id_e = tf.constant(node_id_e, dtype=tf.int32)
+        self.node_id_e = tf.constant(node_id_e, dtype=tf.int32) # 14423
         # Pre-define bin sizes (same as experimental data)
         bin_sizes = np.logspace(-3, 0, 20)
         # using the simulation length, limit bin_sizes to define at least 2 bins
         bin_sizes_mask = bin_sizes < (self._t_end - self._t_start)/2
         self.bin_sizes = bin_sizes[bin_sizes_mask]
-        self.bin_edges = [tf.range(self._t_start, self._t_end, delta=bin_size) for bin_size in self.bin_sizes]
-        # Prepare timestamps
-        time = tf.range(self._t_start_seconds, self._t_end_seconds, dtype=self._dtype) / 1000
-        self.time = time[:, tf.newaxis]
-        self.empty_time = tf.constant(np.nan, dtype=self._dtype)
+        self.epsilon = 1e-7  # Small constant to avoid division by zero
 
         # Load the experimental data
         experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
-        # Calculate mean, standard deviation, and SEM of the Fano factors
         experimental_fanos_mean = np.nanmean(experimental_fanos, axis=0)
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean[bin_sizes_mask], dtype=self._dtype)
 
-        # Set up Huber loss
-        # self.huber_loss = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
-
-    def pop_fano_tf(self, spikes, t_start=0.2, t_end=2.0, bin_edges=None, bin_sizes=None):
-        # Convert t_start and t_end to tensors
-        t_start = tf.constant(t_start, dtype=self._dtype)
-        t_end = tf.constant(t_end, dtype=self._dtype)
+    def pop_fano_tf(self, spikes):
+        # transpose the spikes tensor to have the shape (seq_len, samples)
+        all_spikes_transposed = tf.transpose(spikes)
         # Initialize the Fano factors tensor
-        fanos = tf.TensorArray(dtype=self._dtype, size=len(bin_sizes))
-        for i in range(len(bin_sizes)):
-            sp_counts = tf.histogram_fixed_width(spikes, [t_start, t_end], nbins=len(bin_edges[i])-1)
-            sp_counts = tf.cast(sp_counts, self._dtype)
-            mean_count = tf.reduce_mean(sp_counts)
-            var_count = tf.math.reduce_variance(sp_counts)
-            fanos = tf.cond( 
-                mean_count > 0,
-                lambda: fanos.write(i, var_count / mean_count),
-                lambda: fanos.write(i, 0)
-            ) 
+        fanos = tf.TensorArray(dtype=self._dtype, size=len(self.bin_sizes))
+        for i, bin_width in enumerate(self.bin_sizes):
+            # drop the last entry to avoid last bin smaller size effect
+            bin_size = int(np.round(bin_width * 1000))
+            max_index = all_spikes_transposed.shape[0] // bin_size * bin_size
+            trimmed_spikes = all_spikes_transposed[:max_index, :]
+            # Reshape the spikes tensor 
+            trimmed_spikes = tf.reshape(trimmed_spikes, [max_index // bin_size, bin_size, -1])
+            # Calculate the number of spikes in each bin
+            sp_counts = tf.reduce_sum(trimmed_spikes, axis=1)
+            # Calculate the mean and variance of spike counts
+            mean_count = tf.reduce_mean(sp_counts, axis=0)
+            mean_count = tf.maximum(mean_count, self.epsilon)
+            var_count = tf.math.reduce_variance(sp_counts, axis=0)
+            fano = var_count / mean_count
+            fanos = fanos.write(i, fano)
 
         return fanos.stack()
 
     def __call__(self, spikes, trim=True):
 
+        # if trim:
+        # else:
+        #     return tf.constant(0.0, dtype=self._dtype)
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
 
-        spikes = tf.cast(spikes, tf.bool)  # Convert to boolean
-        n_trials = tf.shape(spikes)[0]
-
-        # spikes = spike_trimming(spikes, pre_delay=pre_delay, post_delay=post_delay, trim=trim)
-        if trim:
-            spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
-            time = self.time
-            t_start = self._t_start
-            t_end = self._t_end
-            bin_sizes = self.bin_sizes
-            bin_edges = self.bin_edges
-            experimental_fanos_mean = self.experimental_fanos_mean
-        else:
-            # spikes = spikes[:, self._t_start_seconds:, :]
-            # time = tf.range(self._t_start_seconds, spikes.shape[1]+self._t_start_seconds, dtype=self._dtype) / 1000
-            time = tf.range(0, spikes.shape[1], dtype=self._dtype) / 1000
-            time = time[:, tf.newaxis]
-            # t_start = self._t_start
-            # t_end = (spikes.shape[1] + self._t_start_seconds) / 1000
-            t_start = 0
-            t_end = spikes.shape[1] / 1000
-            # using the simulation length, limit bin_sizes to define at least 2 bins
-            bin_sizes_mask = self.bin_sizes < (t_end - t_start)/2
-            bin_sizes = self.bin_sizes[bin_sizes_mask]
-            bin_edges = [tf.range(t_start, t_end, delta=bin_size) for bin_size in bin_sizes]
-            experimental_fanos_mean = self.experimental_fanos_mean[bin_sizes_mask]
-           
-        # Generate Fano factors across 100 random samples
-        fanos = tf.TensorArray(dtype=self._dtype, size=self._n_samples)
-        # ensure that the sample counts are at least 1
-        sample_counts = tf.maximum(tf.cast(tf.random.normal([self._n_samples], mean=68, stddev=10), tf.int32), 1)
-        # ensure that no sample count is larger than the number of neurons
-        sample_counts = tf.minimum(sample_counts, tf.shape(self.node_id_e)[0])
+        spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
+        spikes = tf.cast(spikes, self._dtype)  
         # choose random trials to sample from (usually we only have 1 trial to sample from)
+        n_trials = tf.shape(spikes)[0]
         sample_trials = tf.random.uniform([self._n_samples], minval=0, maxval=n_trials, dtype=tf.int32)
+        # Generate sample counts with a normal distribution
+        sample_counts = tf.cast(tf.random.normal([self._n_samples], mean=68, stddev=10), tf.int32)
+        sample_counts = tf.clip_by_value(sample_counts, clip_value_min=1, clip_value_max=tf.shape(self.node_id_e)[0])
+        # Randomize the neuron ids
         shuffled_e_ids = tf.random.shuffle(self.node_id_e)
+        selected_spikes_sample = tf.TensorArray(self._dtype, size=self._n_samples)
         previous_id = tf.constant(0, dtype=tf.int32)
-
         for i in tf.range(self._n_samples):
-            sample_num = sample_counts[i] 
-            sample_trial = sample_trials[i]
+            sample_num = sample_counts[i] # 40 #68
+            sample_trial = sample_trials[i] # 0
             ## randomly choose sample_num ids from self.node_id_e with replacement
-            # sample_ids = tf.random.shuffle(self.node_id_e)[:sample_num]
+            ## sample_ids = tf.random.shuffle(self.node_id_e)[:sample_num]
             ## randomly choose sample_num ids from shuffled_ids without replacement
-            # check if the sample_num is larger than the remaining ids
-            if previous_id + sample_num > len(shuffled_e_ids):
+            if previous_id + sample_num > tf.size(shuffled_e_ids):
                 shuffled_e_ids = tf.random.shuffle(self.node_id_e)
                 previous_id = tf.constant(0, dtype=tf.int32)
             sample_ids = shuffled_e_ids[previous_id:previous_id+sample_num]
             previous_id += sample_num
+            
+            selected_spikes = tf.reduce_sum(tf.gather(spikes[sample_trial], sample_ids, axis=1), axis=-1)
+            selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
-            selected_spikes = tf.gather(spikes[sample_trial], sample_ids, axis=1)
-            selected_time = tf.tile(time, [1, sample_num])
-            selected_spikes = selected_time[selected_spikes]
-            fano = tf.cond(
-                tf.size(selected_spikes) > 0,
-                lambda: self.pop_fano_tf(selected_spikes, t_start=t_start, t_end=t_end, bin_edges=bin_edges, bin_sizes=bin_sizes),
-                lambda: tf.zeros_like(bin_sizes, dtype=self._dtype)  # Use zeros instead of NaNs to avoid unnecessary memory usage
-            )
-            fanos = fanos.write(i, fano)
-
-        fanos = fanos.stack()
-
-        # Calculate mean, standard deviation, and SEM of the Fano factors
-        fanos_mean = tf.reduce_mean(fanos, axis=0)
-        # Calculate MSE between the experimental and calculated Fano factors
-        mse_loss = tf.sqrt(tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean)))
-        # Calculate the huber loss 
-        # huber_loss = self.huber_loss(experimental_fanos_mean, fanos_mean)
-        # Calculate the synchronization loss
+        selected_spikes_sample = selected_spikes_sample.stack()
+        fanos = self.pop_fano_tf(selected_spikes_sample)
+        # # Calculate mean, standard deviation, and SEM of the Fano factors
+        fanos_mean = tf.reduce_mean(fanos, axis=1)
+        # # Calculate MSE between the experimental and calculated Fano factors
+        mse_loss = tf.sqrt(tf.reduce_mean(tf.square(self.experimental_fanos_mean - fanos_mean)))
+        # # Calculate the synchronization loss
         sync_loss = self._sync_cost * mse_loss
 
         return sync_loss
+   
 
 class VoltageRegularization:
     def __init__(self, cell, voltage_cost=1e-5, dtype=tf.float32, core_mask=None):

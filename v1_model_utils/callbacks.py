@@ -90,18 +90,22 @@ def calculate_power_spectrum(signal, fs=1000):
     return f, Pxx
 
 @njit
-def pop_fano(spikes, bin_sizes, t_start=0.2, t_end=2.0):
+def pop_fano(spikes, bin_sizes):
     fanos = np.zeros(len(bin_sizes))
-    bin_edges = [np.arange(t_start, t_end, bin_size) for bin_size in bin_sizes]
-    # handle the case where a bin_edge is [0]
-    # bin_edges = [bin_edge if len(bin_edge) > 1 else np.array([t_start, t_end]) for bin_edge in bin_edges]
-    # spikes = spikes[(spikes >= t_start) & (spikes < t_end)]
-    for i, bin_edge in enumerate(bin_edges):
-        sp_counts = np.histogram(spikes, bins=bin_edge)[0]
+    for i, bin_width in enumerate(bin_sizes):
+        bin_size = int(np.round(bin_width * 1000))
+        max_index = spikes.shape[0] // bin_size * bin_size
+        # drop the last bin if it is not complete
+        # sum over neurons to get the spike counts
+        trimmed_spikes = np.sum(spikes[:max_index, :], axis=1) 
+        trimmed_spikes = np.reshape(trimmed_spikes, (max_index // bin_size, bin_size, -1))
+        # sum over the bins
+        sp_counts = np.sum(trimmed_spikes, axis=1)
+        # Calculate the mean of the spike counts
         mean_count = np.mean(sp_counts)
-        if mean_count > 0:
-            fanos[i] = np.var(sp_counts) / mean_count
-                
+        fano = np.where(mean_count > 0, np.var(sp_counts) / mean_count, 0)
+        fanos[i] = fano
+                 
     return fanos
 
 # # create a class for callbacks in other training sessions (e.g. validation, testing)
@@ -339,29 +343,31 @@ class OsiDsiCallbacks:
         # global_min = df[['Initial weight', 'Final weight']].min().min()
         # global_max = df[['Initial weight', 'Final weight']].max().max()
 
-        # Plot for Initial Weight
-        grouped_df = df.groupby(['Pre_names', 'Post_names'])['Initial weight'].mean().reset_index()
-        # Create a pivot table to reshape the data for the heatmap
-        pivot_df = grouped_df.pivot(index='Pre_names', columns='Post_names', values='Initial weight')
-        # Plot heatmap
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/{variable}')
         os.makedirs(boxplots_dir, exist_ok=True)
-        fig = plt.figure(figsize=(12, 6))
-        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=global_min, vmax=global_max)
-        # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-0.5, vmax=0.5)
-        heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-20, vmax=20)
-        # plt.xlabel(f'V1')
-        # plt.ylabel(f'V1')
-        plt.xticks(rotation=90)
-        plt.gca().set_aspect('equal')
-        plt.title(f'{variable}')
-        # Create a separate color bar axis
-        cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
-        # Plot color bar
-        cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
-        cbar.set_label('Initial Weight (pA)')
-        plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=False)
-        plt.close()
+
+        # Plot for Initial Weight
+        if not os.path.exists(os.path.join(self.logdir, 'Boxplots', variable, 'Initial_weight.png')):
+            grouped_df = df.groupby(['Pre_names', 'Post_names'])['Initial weight'].mean().reset_index()
+            # Create a pivot table to reshape the data for the heatmap
+            pivot_df = grouped_df.pivot(index='Pre_names', columns='Post_names', values='Initial weight')
+            # Plot heatmap
+            fig = plt.figure(figsize=(12, 6))
+            # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=global_min, vmax=global_max)
+            # heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-0.5, vmax=0.5)
+            heatmap = sns.heatmap(pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-20, vmax=20)
+            # plt.xlabel(f'V1')
+            # plt.ylabel(f'V1')
+            plt.xticks(rotation=90)
+            plt.gca().set_aspect('equal')
+            plt.title(f'{variable}')
+            # Create a separate color bar axis
+            cbar_ax = plt.gcf().add_axes([0.92, 0.15, 0.02, 0.55])  # [left, bottom, width, height]
+            # Plot color bar
+            cbar = plt.colorbar(heatmap.collections[0], cax=cbar_ax)
+            cbar.set_label('Initial Weight (pA)')
+            plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=False)
+            plt.close()
 
         ### Final Weight ###
         grouped_df = df.groupby(['Pre_names', 'Post_names'])['Final weight'].mean().reset_index()
@@ -430,18 +436,18 @@ class OsiDsiCallbacks:
         # Get the IDs for excitatory neurons
         node_id_e = node_id[node_ei == 'e']
         # Reshape spikes data 
-        new_spikes = spikes[:, :, int(1000*t_start):int(1000*t_end), :].astype(bool) # Convert to boolean
+        new_spikes = spikes[:, :, int(1000*t_start):int(1000*t_end), :]
         new_spikes = new_spikes.reshape(-1, new_spikes.shape[2], new_spikes.shape[3])
         n_trials, seq_len, n_neurons = new_spikes.shape
-        # Prepare timestamps (avoiding unnecessary memory allocation)
-        time = np.arange(t_start, t_end, 0.001).astype(np.float32)
-        most_single_neuron_spikes_in_trial = np.max(np.sum(new_spikes, axis=1))
-        # Preallocate using the known shape
-        spikes_timestamps = np.full((n_trials, n_neurons, most_single_neuron_spikes_in_trial), np.nan)
-        for i in range(n_trials):
-            for j in range(n_neurons):
-                timestamps = time[new_spikes[i, :, j]]
-                spikes_timestamps[i, j, :len(timestamps)] = timestamps
+        # # Prepare timestamps (avoiding unnecessary memory allocation)
+        # time = np.arange(t_start, t_end, 0.001).astype(np.float32)
+        # most_single_neuron_spikes_in_trial = np.max(np.sum(new_spikes, axis=1))
+        # # Preallocate using the known shape
+        # spikes_timestamps = np.full((n_trials, n_neurons, most_single_neuron_spikes_in_trial), np.nan)
+        # for i in range(n_trials):
+        #     for j in range(n_neurons):
+        #         timestamps = time[new_spikes[i, :, j]]
+        #         spikes_timestamps[i, j, :len(timestamps)] = timestamps
 
         # Generate Fano factors across random samples
         fanos = []
@@ -463,16 +469,18 @@ class OsiDsiCallbacks:
             random_trial_id = trial_ids[i]
             sample_num = sample_counts[i]
             sample_ids = np.random.choice(node_id_e, sample_num, replace=False)
-            selected_spikes = np.concatenate([spikes_timestamps[random_trial_id][np.isin(node_id, sample_ids), :]])
-            selected_spikes = selected_spikes[~np.isnan(selected_spikes)]
+            # selected_spikes = np.concatenate([spikes_timestamps[random_trial_id][np.isin(node_id, sample_ids), :]])
+            # selected_spikes = selected_spikes[~np.isnan(selected_spikes)]
+            selected_spikes = new_spikes[random_trial_id][:, np.isin(node_id, sample_ids)]
             # if there are spikes use pop_fano
             if len(selected_spikes) > 0:
-                fano = pop_fano(selected_spikes, bin_sizes, t_start=t_start, t_end=t_end)
+                fano = pop_fano(selected_spikes, bin_sizes)
             else:
                 fano = np.zeros(len(bin_sizes))
             fanos.append(fano)
 
         fanos = np.array(fanos)
+        # mean_fano = np.mean(fanos, axis=0)
         return fanos, bin_sizes
         
     def fanos_figure(self, spikes, n_samples=100, analyze_core_only=True):
