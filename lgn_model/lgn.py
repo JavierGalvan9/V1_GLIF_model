@@ -281,15 +281,15 @@ class LGN(object):
         y = y * (row_size-1) / row_size  # 119 / 120
         x[np.floor(x) < 0] = 0.
         y[np.floor(y) < 0] = 0.
-        x[np.ceil(x) >= float(col_size-1)] = float(col_size-1)
-        y[np.ceil(y) >= float(row_size-1)] = float(row_size-1)
+        x[np.ceil(x) > float(col_size-1)] = float(col_size-1)
+        y[np.ceil(y) > float(row_size-1)] = float(row_size-1)
 
         non_dominant_x = non_dominant_x * (col_size-1) / col_size  # 239 / 240
         non_dominant_y = non_dominant_y * (row_size-1) / row_size
         non_dominant_x[np.floor(non_dominant_x) < 0] = 0.
         non_dominant_y[np.floor(non_dominant_y) < 0] = 0.
-        non_dominant_x[np.ceil(non_dominant_x) >= float(col_size-1)] = float(col_size-1)
-        non_dominant_y[np.ceil(non_dominant_y) >= float(row_size-1)] = float(row_size-1)
+        non_dominant_x[np.ceil(non_dominant_x) > float(col_size-1)] = float(col_size-1)
+        non_dominant_y[np.ceil(non_dominant_y) > float(row_size-1)] = float(row_size-1)
 
         # prepare the spatial kernels in advance and store in TF format
         d_spatial = 1.
