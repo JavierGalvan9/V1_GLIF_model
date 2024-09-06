@@ -56,11 +56,9 @@ def temporal_filter(all_spatial_responses, temporal_kernels):
         tr_spatial_responses, tr_temporal_kernels, strides=[1, 1, 1, 1], padding='VALID')[0, :, 0]
     return filtered_output
 
-
 def transfer_function(arg__a):
     _h = tf.cast(arg__a >= 0, tf.float32)
     return _h * arg__a
-
 
 def select_spatial(x, y, convolved_movie):
     i1 = tf.cast(tf.stack([tf.floor(y), tf.floor(x)], axis=-1), dtype=tf.int32)
@@ -92,7 +90,6 @@ def select_spatial(x, y, convolved_movie):
 
     return spatial_responses
 
-
 def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/network/lgn_node_types.csv', 
                           h5_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/network//lgn_nodes.h5',
                           filename='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/lgn_model/data/lgn_full_col_cells.csv'
@@ -120,10 +117,9 @@ def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_mo
 
     df.to_csv(filename, index=False, sep=' ', na_rep='NaN')
     return df
-
+   
 
 class LGN(object):
-    # @profile
     def __init__(self, row_size=80, col_size=120, lgn_data_path=None, n_input=None):
         filename = f'lgn_full_col_cells_{col_size}x{row_size}.csv'
         root_path = os.path.split(__file__)[0]
@@ -276,8 +272,8 @@ class LGN(object):
             amplitude = loaded['amplitude']
             non_dom_amplitude = loaded['non_dom_amplitude']
             spontaneous_firing_rates = loaded['spontaneous_firing_rates']
-        truncation = np.min(np.sum(np.cumsum(np.abs(dom_temporal_kernels), axis=1) <= 1e-6, 1))
-        non_dom_truncation = np.min(np.sum(np.cumsum(np.abs(non_dom_temporal_kernels), axis=1) <= 1e-6, 1))
+        truncation = np.min(np.sum(np.cumsum(np.abs(dom_temporal_kernels), axis=1) <= 1e-6, axis=1))
+        non_dom_truncation = np.min(np.sum(np.cumsum(np.abs(non_dom_temporal_kernels), axis=1) <= 1e-6, axis=1))
         truncation = np.min([truncation, non_dom_truncation])
         # print(f'Could truncate {truncation} steps from filter')
 
@@ -303,19 +299,30 @@ class LGN(object):
 
         # kernels = []
         gaussian_filters = []
+        actual_spatial_range = []
         for i in range(len(spatial_range) - 1):
-            sigma = np.round(np.mean(spatial_range[i:i+2])) / 3
-            original_filter = GaussianSpatialFilter(translate=(0., 0.), sigma=(sigma, sigma), origin=(0., 0.))
-            kernel = original_filter.get_kernel(x_range, y_range, amplitude=1.).full()
-            # kernels.append(kernel)
-            nonzero_inds = np.where(np.abs(kernel) > 1e-9)
-            rm, rM = nonzero_inds[0].min(), nonzero_inds[0].max()
-            cm, cM = nonzero_inds[1].min(), nonzero_inds[1].max()
-            kernel = kernel[rm:rM + 1, cm:cM + 1]
-            gaussian_filter = kernel[..., None, None]
-            # gaussian_filter0 = tf.convert_to_tensor(gaussian_filter, dtype=tf.float32)
-            gaussian_filter = tf.constant(gaussian_filter, dtype=tf.float32) # this is faster by assuming that gaussian_filter is unmutable
-            gaussian_filters.append(gaussian_filter)
+            # check if there is any neuron in the spatial range
+            sel = tf.math.logical_and(spatial_sizes < spatial_range[i + 1], spatial_sizes >= spatial_range[i])
+            num_selected = tf.reduce_sum(tf.cast(sel, dtype=tf.int32))
+            if num_selected == 0:
+                # tf.print('No neurons selected')
+                continue
+            else: 
+                sigma = np.round(np.mean(spatial_range[i:i+2])) / 3
+                original_filter = GaussianSpatialFilter(translate=(0., 0.), sigma=(sigma, sigma), origin=(0., 0.))
+                kernel = original_filter.get_kernel(x_range, y_range, amplitude=1.).full()
+                # kernels.append(kernel)
+                nonzero_inds = np.where(np.abs(kernel) > 1e-9)
+                rm, rM = nonzero_inds[0].min(), nonzero_inds[0].max()
+                cm, cM = nonzero_inds[1].min(), nonzero_inds[1].max()
+                kernel = kernel[rm:rM + 1, cm:cM + 1]
+                gaussian_filter = kernel[..., None, None]
+                # gaussian_filter0 = tf.convert_to_tensor(gaussian_filter, dtype=tf.float32)
+                gaussian_filter = tf.constant(gaussian_filter, dtype=tf.float32) # this is faster by assuming that gaussian_filter is unmutable
+                gaussian_filters.append(gaussian_filter)
+                # append the actual and subsequent spatial range 
+                actual_spatial_range.append(spatial_range[i])
+                actual_spatial_range.append(spatial_range[i+1])
 
         if n_input is None:
             self.x = x
@@ -329,6 +336,7 @@ class LGN(object):
             self.non_dom_temporal_kernels = non_dom_temporal_kernels
             # self.kernels = kernels
             self.gaussian_filters = gaussian_filters
+            self.actual_spatial_range = list(set(actual_spatial_range))
         else:
             self.x = x[:n_input]
             self.y = y[:n_input]
@@ -341,7 +349,7 @@ class LGN(object):
             self.non_dom_temporal_kernels = non_dom_temporal_kernels[:n_input, :]
             # self.kernels = kernels
             self.gaussian_filters = gaussian_filters
-            
+            self.actual_spatial_range = list(set(actual_spatial_range))
             # other properties that are defined above needs to be also truncated
             self.spatial_sizes = self.spatial_sizes[:n_input]
             self.model_id = self.model_id[:n_input]
@@ -349,10 +357,6 @@ class LGN(object):
 
     @tf.function(jit_compile=True)
     def spatial_response(self, movie, bmtk_compat=True):
-        d_spatial = 1
-        spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
-        # spatial_range = tf.range(0, 15, d_spatial, dtype=tf.float32)
-
         # Preprocess data outside the loop if they don't change
         x = tf.constant(self.x, dtype=tf.float32)
         y = tf.constant(self.y, dtype=tf.float32)
@@ -368,19 +372,13 @@ class LGN(object):
         all_non_dom_spatial_responses = []
         neuron_ids = []
 
-        for i in range(len(spatial_range)-1):
-            sel = tf.math.logical_and(spatial_sizes < spatial_range[i + 1], spatial_sizes >= spatial_range[i])
-            num_selected = tf.reduce_sum(tf.cast(sel, dtype=tf.int32))
-            # if num_selected == 0:
-            #     tf.print('No neurons selected')
-            #     continue
-            
+        for i in range(len(self.actual_spatial_range)-1):
+            sel = tf.math.logical_and(spatial_sizes < self.actual_spatial_range[i + 1], spatial_sizes >= self.actual_spatial_range[i])
             # Construct spatial filter
             gaussian_filter = self.gaussian_filters[i]  # Assuming self.gaussian_filters is a list of precomputed filters
-
+            # The gaussian filter has shape (7, 7, 1, 1), and the movie (700, 120, 240, 1), where the 1 and 2 dimensions are the spatial dimensions          
             # Apply it
             convolved_movie = tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')
-            
             # Making BMTK compatible by normalizing the edge values
             if bmtk_compat:
                 ones = tf.ones_like(movie)
@@ -391,10 +389,10 @@ class LGN(object):
 
             spatial_responses = select_spatial(tf.boolean_mask(x, sel), tf.boolean_mask(y, sel), convolved_movie)
             non_dom_spatial_responses = select_spatial(tf.boolean_mask(non_dominant_x, sel), tf.boolean_mask(non_dominant_y, sel), convolved_movie)
+            selected_indices = tf.where(sel)[:, 0]
 
             all_spatial_responses.append(spatial_responses)
             all_non_dom_spatial_responses.append(non_dom_spatial_responses)
-            selected_indices = tf.where(sel)[:, 0]
             neuron_ids.append(selected_indices)
 
         neuron_ids = tf.concat(neuron_ids, axis=0)
