@@ -168,6 +168,7 @@ def main(_):
             print(f'Restoring checkpoint from {checkpoint_directory}...')
             optimizer_continuing = other_v1_utils.optimizers_match(optimizer, checkpoint_directory)            
             if not optimizer_continuing:
+                print(f"Optimizer does not match the checkpoint. Using a new optimizer.")
                 if flags.optimizer == 'adam':
                     optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
                 elif flags.optimizer == 'sgd':
@@ -179,10 +180,13 @@ def main(_):
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
                 optimizer.build(model.trainable_variables)
+                # print optmizer variables
+                print('Checkpoint restored with a new optimizer.')
             else:
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).assert_consumed()
+                print('Checkpoint restored!')
 
         # Option to resume the training from a checkpoint from a previous training session
         elif flags.restore_from != '' and os.path.exists(flags.restore_from):
@@ -190,6 +194,7 @@ def main(_):
             print(f'Restoring checkpoint from {checkpoint_directory} with the restore_from option...')
             optimizer_continuing = other_v1_utils.optimizers_match(optimizer, checkpoint_directory)            
             if not optimizer_continuing:
+                print(f"Optimizer does not match the checkpoint. Using a new optimizer.")
                 if flags.optimizer == 'adam':
                     optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
                 elif flags.optimizer == 'sgd':
@@ -201,16 +206,17 @@ def main(_):
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
                 optimizer.build(model.trainable_variables)
+                print('Checkpoint restored with a new optimizer.')
             else:
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).assert_consumed()
+                print('Checkpoint restored!')
         else:
             print(f"No checkpoint found in {flags.ckpt_dir} or {flags.restore_from}. Starting from scratch...\n")
             checkpoint = None
 
         model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
-        print(f"Model variables stored in dictionary\n")
 
         ### BUILD THE LOSS AND REGULARIZER FUNCTIONS ###
         # Create rate and voltage regularizers

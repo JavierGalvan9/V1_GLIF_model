@@ -83,7 +83,8 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
 
         if self._penalize_relative_change:
             # Compute voltage scale
-            voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+            _params = dict(network['node_params'])
+            voltage_scale = (_params['V_th'] - _params['E_L']).astype(np.float32)
             # Get the initial weights and properly scale them down
             indices = network["synapses"]["indices"]
             weights = np.array(network["synapses"]["weights"], dtype=np.float32)
@@ -209,7 +210,6 @@ def process_neuropixels_data(path=''):
     # Save the processed table
     df.to_csv(f'Neuropixels_data/v1_OSI_DSI_DF.csv', sep=" ", index=False)
     # return df
-
 
 def neuropixels_cell_type_to_cell_type(pop_name):
     # Convert pop_name in the neuropixels cell type to cell types. E.g, 'EXC_L23' -> 'L2/3 Exc', 'PV_L5' -> 'L5 PV'
@@ -343,7 +343,7 @@ class SpikeRateDistributionTarget:
 #         return reg_loss
 
 class SynchronizationLoss(Layer):
-    def __init__(self, network, sync_cost=10., t_start=0, t_end=0.5, n_samples=50, data_dir='GLIF_network', 
+    def __init__(self, network, sync_cost=10., t_start=0, t_end=0.5, n_samples=50, data_dir='Synchronization_data', 
                  session='evoked', dtype=tf.float32, core_mask=None, **kwargs):
         super(SynchronizationLoss, self).__init__(dtype=dtype, **kwargs)
         self._sync_cost = sync_cost
@@ -372,17 +372,18 @@ class SynchronizationLoss(Layer):
         self.epsilon = 1e-7  # Small constant to avoid division by zero
 
         # Load the experimental data
-        experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
+        # experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
+        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'all_fano_300ms_{session}.npy')
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
         experimental_fanos_mean = np.nanmean(experimental_fanos, axis=0)
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean[bin_sizes_mask], dtype=self._dtype)
 
-    def pop_fano_tf(self, spikes):
+    def pop_fano_tf(self, spikes, bin_sizes):
         # transpose the spikes tensor to have the shape (seq_len, samples)
         all_spikes_transposed = tf.transpose(spikes)
         # Initialize the Fano factors tensor
-        fanos = tf.TensorArray(dtype=self._dtype, size=len(self.bin_sizes))
-        for i, bin_width in enumerate(self.bin_sizes):
+        fanos = tf.TensorArray(dtype=self._dtype, size=len(bin_sizes))
+        for i, bin_width in enumerate(bin_sizes):
             # drop the last entry to avoid last bin smaller size effect
             bin_size = int(np.round(bin_width * 1000))
             max_index = all_spikes_transposed.shape[0] // bin_size * bin_size
@@ -402,13 +403,21 @@ class SynchronizationLoss(Layer):
 
     def __call__(self, spikes, trim=True):
 
-        # if trim:
-        # else:
-        #     return tf.constant(0.0, dtype=self._dtype)
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
 
-        spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
+        if trim:
+            spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
+            bin_sizes = self.bin_sizes
+            experimental_fanos_mean = self.experimental_fanos_mean
+        else:
+            t_start = 0
+            t_end = spikes.shape[1] / 1000
+            # using the simulation length, limit bin_sizes to define at least 2 bins
+            bin_sizes_mask = self.bin_sizes < (t_end - t_start)/2
+            bin_sizes = self.bin_sizes[bin_sizes_mask]
+            experimental_fanos_mean = self.experimental_fanos_mean[bin_sizes_mask]
+        
         spikes = tf.cast(spikes, self._dtype)  
         # choose random trials to sample from (usually we only have 1 trial to sample from)
         n_trials = tf.shape(spikes)[0]
@@ -436,11 +445,11 @@ class SynchronizationLoss(Layer):
             selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
         selected_spikes_sample = selected_spikes_sample.stack()
-        fanos = self.pop_fano_tf(selected_spikes_sample)
+        fanos = self.pop_fano_tf(selected_spikes_sample, bin_sizes=bin_sizes)
         # # Calculate mean, standard deviation, and SEM of the Fano factors
         fanos_mean = tf.reduce_mean(fanos, axis=1)
         # # Calculate MSE between the experimental and calculated Fano factors
-        mse_loss = tf.sqrt(tf.reduce_mean(tf.square(self.experimental_fanos_mean - fanos_mean)))
+        mse_loss = tf.sqrt(tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean)))
         # # Calculate the synchronization loss
         sync_loss = self._sync_cost * mse_loss
 

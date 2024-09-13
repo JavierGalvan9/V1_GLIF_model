@@ -308,7 +308,8 @@ class LGN(object):
                 # tf.print('No neurons selected')
                 continue
             else: 
-                sigma = np.round(np.mean(spatial_range[i:i+2])) / 3
+                # sigma = np.round(np.mean(spatial_range[i:i+2])) / 3
+                sigma = (spatial_range[i] + d_spatial/2) / 3
                 original_filter = GaussianSpatialFilter(translate=(0., 0.), sigma=(sigma, sigma), origin=(0., 0.))
                 kernel = original_filter.get_kernel(x_range, y_range, amplitude=1.).full()
                 # kernels.append(kernel)

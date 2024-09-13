@@ -170,10 +170,19 @@ def main(_):
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
             checkpoint.restore(checkpoint_directory).assert_consumed()
             if flags.restore_from == "Best_model":
-                logdir = checkpoint_directory
+                logdir = checkpoint_directory + "_results"
             print('Checkpoint restored!')
-            print(f'OSI/DSI results for epoch {current_epoch} will be saved in: {checkpoint_directory}\n')
+            print(f'OSI/DSI results for epoch {current_epoch} will be saved in: {logdir}\n')
+
+        elif flags.restore_from != '' and os.path.exists(flags.restore_from):
+            checkpoint_directory = tf.train.latest_checkpoint(flags.restore_from)
+            print(f'Restoring checkpoint from {checkpoint_directory}...')
+            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint.restore(checkpoint_directory).expect_partial() #.assert_consumed()
+            print('Checkpoint restored!')
+            print(f'OSI/DSI results for epoch {current_epoch} will be saved in: {logdir}\n')
         else:
+            print(f"No checkpoint found in {flags.ckpt_dir} or {flags.restore_from}. Starting from scratch...\n")
             checkpoint = None # no restoration from any checkpoint
 
         model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}

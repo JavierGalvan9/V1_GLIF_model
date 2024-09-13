@@ -122,14 +122,14 @@ def main():
 
     # Define the job submission commands for the training and evaluation scripts
     training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "48", "-t", "1:30"] # choose the L40S GPU with 48GB of memory 
-    evaluation_commands = ["run", "-g", "1", "-m", "65", "-t", "2:00"]
+    evaluation_commands = ["run", "-g", "1", "-m", "40", "-t", "1:30"]
 
     # Define the training and evaluation script calls
     # training_script = "python multi_training.py " 
     training_script = "python multi_training_single_gpu_split.py " 
     evaluation_script = "python osi_dsi_estimator.py " 
 
-    # initial_benchmark_model = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_30000/b_3jo7/Best_model'
+    # initial_benchmark_model = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_65871/b_p5bp/OSI_DSI_checkpoints'
     initial_benchmark_model = ''
 
     # Append each flag to the string
@@ -165,6 +165,7 @@ def main():
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...
         if i == 0:
             new_training_command = training_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-j", f"{sim_name}_train_{i}"]
+            # new_training_command = training_commands + ["-o", f"Out/gordito_train_{i}.out", "-e", f"Error/gordito_train_{i}.err", "-j", f"gordito_train_{i}"]
             if initial_benchmark_model:
                 new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i} --restore_from {initial_benchmark_model} "
             else:

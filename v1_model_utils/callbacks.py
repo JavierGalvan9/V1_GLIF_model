@@ -103,8 +103,9 @@ def pop_fano(spikes, bin_sizes):
         sp_counts = np.sum(trimmed_spikes, axis=1)
         # Calculate the mean of the spike counts
         mean_count = np.mean(sp_counts)
-        fano = np.where(mean_count > 0, np.var(sp_counts) / mean_count, 0)
-        fanos[i] = fano
+        if mean_count > 0:
+            # Calculate the Fano Factor
+            fanos[i] = np.var(sp_counts) / mean_count
                  
     return fanos
 
@@ -473,20 +474,18 @@ class OsiDsiCallbacks:
             # selected_spikes = selected_spikes[~np.isnan(selected_spikes)]
             selected_spikes = new_spikes[random_trial_id][:, np.isin(node_id, sample_ids)]
             # if there are spikes use pop_fano
-            if len(selected_spikes) > 0:
+            if np.sum(selected_spikes) > 0:
                 fano = pop_fano(selected_spikes, bin_sizes)
-            else:
-                fano = np.zeros(len(bin_sizes))
-            fanos.append(fano)
+                fanos.append(fano)
 
         fanos = np.array(fanos)
         # mean_fano = np.mean(fanos, axis=0)
         return fanos, bin_sizes
         
-    def fanos_figure(self, spikes, n_samples=100, analyze_core_only=True):
+    def fanos_figure(self, spikes, n_samples=100, analyze_core_only=True, data_dir='Synchronization_data'):
         # Calculate fano factors for both sessions
         evoked_fanos, evoked_bin_sizes = self.fano_factor(spikes, t_start=0.7, t_end=2.5, n_samples=n_samples, analyze_core_only=analyze_core_only)
-        spontaneous_fanos, spont_bin_sizes = self.fano_factor(spikes, t_start=0, t_end=0.5, n_samples=n_samples, analyze_core_only=analyze_core_only)
+        spontaneous_fanos, spont_bin_sizes = self.fano_factor(spikes, t_start=0.2, t_end=0.5, n_samples=n_samples, analyze_core_only=analyze_core_only)
 
         # Calculate mean, standard deviation, and SEM of the Fano factors
         evoked_fanos_mean = np.nanmean(evoked_fanos, axis=0)
@@ -504,7 +503,9 @@ class OsiDsiCallbacks:
         spontaneous_max_fano_freq = 1/(2*spont_bin_sizes[np.nanargmax(spontaneous_fanos_mean)])
 
         # Calculate the evoked experimental error committed
-        evoked_exp_data_path = 'Synchronization_data/all_fano_300ms_evoked.npy'
+        # evoked_exp_data_path = 'Synchronization_data/all_fano_300ms_evoked.npy'
+        evoked_exp_data_path = os.path.join(data_dir, 'Fano_factor_v1', 'all_fano_1800ms_evoked.npy')
+
         # load the experimental data
         evoked_exp_fanos = np.load(evoked_exp_data_path, allow_pickle=True)
         n_experimental_samples = evoked_exp_fanos.shape[0]
@@ -516,7 +517,8 @@ class OsiDsiCallbacks:
         evoked_exp_fanos_sem = evoked_exp_fanos_std / np.sqrt(n_experimental_samples)
 
         # Calculate the spontaneous experimental error committed
-        spont_exp_data_path = 'Synchronization_data/all_fano_300ms_spont.npy'
+        # spont_exp_data_path = 'Synchronization_data/all_fano_300ms_spont.npy'
+        spont_exp_data_path = os.path.join(data_dir, 'Fano_factor_v1', 'all_fano_300ms_spont.npy')
         # load the experimental data
         spont_exp_fanos = np.load(spont_exp_data_path, allow_pickle=True)
         n_experimental_samples = spont_exp_fanos.shape[0]
