@@ -121,15 +121,15 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "48", "-t", "1:30"] # choose the L40S GPU with 48GB of memory 
-    evaluation_commands = ["run", "-g", "1", "-m", "40", "-t", "1:30"]
+    training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "24", "-t", "6:00"] # choose the L40S GPU with 48GB of memory 
+    evaluation_commands = ["run", "-g", "1", "-m", "40", "-t", "1:15"]
 
     # Define the training and evaluation script calls
     # training_script = "python multi_training.py " 
     training_script = "python multi_training_single_gpu_split.py " 
     evaluation_script = "python osi_dsi_estimator.py " 
 
-    # initial_benchmark_model = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_65871/b_p5bp/OSI_DSI_checkpoints'
+    # initial_benchmark_model = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_65871/b_fppf/OSI_DSI_checkpoints'
     initial_benchmark_model = ''
 
     # Append each flag to the string

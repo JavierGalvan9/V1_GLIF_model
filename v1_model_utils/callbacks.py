@@ -458,9 +458,9 @@ class OsiDsiCallbacks:
         bin_sizes_mask = bin_sizes < (t_end - t_start)/2
         bin_sizes = bin_sizes[bin_sizes_mask]
         # Vectorize the sampling process
-        sample_counts = np.random.normal(68, 10, n_samples).astype(int)
-        # ensure that the sample counts are at least 1
-        sample_counts = np.maximum(sample_counts, 1)
+        sample_counts = np.random.normal(70, 30, n_samples).astype(int)
+        # ensure that the sample counts are at least 15
+        sample_counts = np.maximum(sample_counts, 15)
         # ensure that the sample counts are less than the number of neurons
         sample_counts = np.minimum(sample_counts, len(node_id_e))
         # trial_ids =np.random.choice(np.arange(n_trials), n_samples, replace=False)
@@ -504,7 +504,7 @@ class OsiDsiCallbacks:
 
         # Calculate the evoked experimental error committed
         # evoked_exp_data_path = 'Synchronization_data/all_fano_300ms_evoked.npy'
-        evoked_exp_data_path = os.path.join(data_dir, 'Fano_factor_v1', 'all_fano_1800ms_evoked.npy')
+        evoked_exp_data_path = os.path.join(data_dir, 'Fano_factor_v1', 'v1_fano_running_1800ms_evoked.npy')
 
         # load the experimental data
         evoked_exp_fanos = np.load(evoked_exp_data_path, allow_pickle=True)
@@ -518,7 +518,7 @@ class OsiDsiCallbacks:
 
         # Calculate the spontaneous experimental error committed
         # spont_exp_data_path = 'Synchronization_data/all_fano_300ms_spont.npy'
-        spont_exp_data_path = os.path.join(data_dir, 'Fano_factor_v1', 'all_fano_300ms_spont.npy')
+        spont_exp_data_path = os.path.join(data_dir, 'Fano_factor_v1', 'v1_fano_running_300ms_spont.npy')
         # load the experimental data
         spont_exp_fanos = np.load(spont_exp_data_path, allow_pickle=True)
         n_experimental_samples = spont_exp_fanos.shape[0]

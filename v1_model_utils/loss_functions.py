@@ -343,7 +343,7 @@ class SpikeRateDistributionTarget:
 #         return reg_loss
 
 class SynchronizationLoss(Layer):
-    def __init__(self, network, sync_cost=10., t_start=0, t_end=0.5, n_samples=50, data_dir='Synchronization_data', 
+    def __init__(self, network, sync_cost=10., t_start=0., t_end=0.5, n_samples=50, data_dir='Synchronization_data', 
                  session='evoked', dtype=tf.float32, core_mask=None, **kwargs):
         super(SynchronizationLoss, self).__init__(dtype=dtype, **kwargs)
         self._sync_cost = sync_cost
@@ -373,7 +373,7 @@ class SynchronizationLoss(Layer):
 
         # Load the experimental data
         # experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
-        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'all_fano_300ms_{session}.npy')
+        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'v1_fano_running_300ms_{session}.npy')
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
         experimental_fanos_mean = np.nanmean(experimental_fanos, axis=0)
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean[bin_sizes_mask], dtype=self._dtype)
@@ -423,8 +423,8 @@ class SynchronizationLoss(Layer):
         n_trials = tf.shape(spikes)[0]
         sample_trials = tf.random.uniform([self._n_samples], minval=0, maxval=n_trials, dtype=tf.int32)
         # Generate sample counts with a normal distribution
-        sample_counts = tf.cast(tf.random.normal([self._n_samples], mean=68, stddev=10), tf.int32)
-        sample_counts = tf.clip_by_value(sample_counts, clip_value_min=1, clip_value_max=tf.shape(self.node_id_e)[0])
+        sample_counts = tf.cast(tf.random.normal([self._n_samples], mean=70, stddev=30), tf.int32)
+        sample_counts = tf.clip_by_value(sample_counts, clip_value_min=15, clip_value_max=tf.shape(self.node_id_e)[0]) # clip the values to be between 15 and 14423
         # Randomize the neuron ids
         shuffled_e_ids = tf.random.shuffle(self.node_id_e)
         selected_spikes_sample = tf.TensorArray(self._dtype, size=self._n_samples)
