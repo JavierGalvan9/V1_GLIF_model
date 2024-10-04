@@ -1,17 +1,16 @@
-import os
+# import os
 # import h5py
 import numpy as np
 # import pickle as pkl
 import tensorflow as tf
-import pdb
+# import pdb
 import lgn_model.lgn as lgn_module
-from memory_profiler import profile
-from pympler.asizeof import asizeof, asized
-
-from time import time
+# from memory_profiler import profile
+# from pympler.asizeof import asizeof, asized
+# from time import time
 
 @tf.function(jit_compile=True) 
-def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True, image_duration=100, cpd=0.05,
+def make_drifting_grating_stimulus(row_size=80, col_size=120, moving_flag=True, image_duration=100, cpd=0.05,
                                    temporal_f=2, theta=None, phase=0, contrast=1.0):
     '''
     Create the grating movie with the desired parameters
@@ -37,7 +36,6 @@ def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True,
     # tf.debugging.assert_less_equal(contrast, 1.0, message="Contrast must be <= 1")
     # tf.debugging.assert_greater(contrast, 0.0, message="Contrast must be > 0")
 
-
     # physical_spacing = 1. / (float(cpd) * 10)    #To make sure no aliasing occurs
     physical_spacing = 1.0  # 1 degree, fixed for now. tf version lgn model need this to keep true cpd;
     row_range = tf.linspace(0.0, row_size, int(row_size / physical_spacing))
@@ -45,15 +43,12 @@ def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True,
     # number_frames_needed = int(round(frame_rate * t_max))
     number_frames_needed = tf.cast(tf.math.round(frame_rate * t_max), tf.int32)
     time_range = tf.linspace(0.0, t_max, number_frames_needed)
-
     tt, yy, xx = tf.meshgrid(time_range, row_range, col_range, indexing='ij')
 
     # theta_rad = tf.constant(np.pi * (180 - theta) / 180.0, dtype=tf.float32) #Add negative here to match brain observatory angles!
     # phase_rad = tf.constant(np.pi * (180 - phase) / 180.0, dtype=tf.float32)
-
     theta_rad = np.pi * (180 - theta) / 180.0
     phase_rad = np.pi * (180 - phase) / 180.0
-
 
     xy = xx * tf.cos(theta_rad) + yy * tf.sin(theta_rad)
     data = contrast * tf.sin(2 * np.pi * (cpd * xy + temporal_f * tt) + phase_rad)
@@ -65,10 +60,8 @@ def make_drifting_grating_stimulus(row_size=120, col_size=240, moving_flag=True,
 
 @tf.function(jit_compile=True)
 def movies_concat(movie, pre_delay, post_delay):
-    movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
-    # add an empty period before a period of gray image
-    # z1 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (pre_delay, 1, 1, 1))
-    # z2 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (post_delay, 1, 1, 1))
+    movie = tf.expand_dims(movie, axis=-1) # add dim
+    # add an gray screen period before and after the movie
     z1 = tf.zeros((pre_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
     z2 = tf.zeros((post_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
     videos = tf.concat((z1, movie, z2), 0)
@@ -80,7 +73,6 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
                                      current_input=False, regular=False, n_input=17400,
                                      bmtk_compat=True, return_firing_rates=False, rotation="cw", billeh_phase=False):
     """ make a drifting gratings stimulus for FR and OSI tuning."""
-    # mimc_lgn_std, mimc_lgn_mean = 0.02855, 0.02146
 
     lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input)
 
@@ -110,22 +102,13 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
                 mov_theta += 180
                 
             movie = make_drifting_grating_stimulus(moving_flag=True, image_duration=duration, cpd=cpd, temporal_f=temporal_f, theta=mov_theta, phase=None, contrast=contrast)
-            # movie = tf.expand_dims(movie, axis=-1) #movie[...,None]  # add dim
-
-            # # add an empty period before a period of gray image
-            # # z1 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (pre_delay, 1, 1, 1))
-            # # z2 = tf.tile(tf.zeros_like(movie[0,...])[None,...], (post_delay, 1, 1, 1))
-            # z1 = tf.zeros((pre_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
-            # z2 = tf.zeros((post_delay, movie.shape[1], movie.shape[2], movie.shape[3]))
-            # videos = tf.concat((z1, movie, z2), 0)
-            # del movie
-
+            # Add an empty gray screen period before and after the movie
             videos = movies_concat(movie, pre_delay, post_delay)
             del movie
-
+            # process spatial filters
             spatial = lgn.spatial_response(videos, bmtk_compat)
             del videos
-
+            # process temporal filters and get firing rates
             firing_rates = lgn.firing_rates_from_spatial(*spatial)
             if return_firing_rates:
                 yield tf.constant(firing_rates, dtype=tf.float32, shape=(seq_len, n_input))
@@ -154,11 +137,9 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
         output_dtypes = (tf.bool, tf.float32, tf.float32, tf.float32)
         # when using generator for dataset, it should not contain the batch dim
         output_shapes = (tf.TensorShape((seq_len, n_input)), tf.TensorShape((1)), tf.TensorShape((1)), tf.TensorShape((1)))
-        # output_shapes = (tf.TensorShape((seq_len, 17400)), tf.TensorShape((1)))
         data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b, _c, _d:
                     (tf.cast(_a, tf.bool), tf.cast(_b, tf.float32), tf.cast(_c, tf.float32), tf.cast(_d, tf.float32)))
-        # data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b:
-                    # (tf.cast(_a, tf.float32), tf.cast(_b, tf.float32)))
+        
     return data_set
 
 
