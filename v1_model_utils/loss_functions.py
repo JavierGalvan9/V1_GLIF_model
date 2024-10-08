@@ -60,8 +60,10 @@ class StiffRegularizer(Layer):
         self._target_mean_weights = tf.constant(initial_mean_weights, dtype=dtype)
 
     def __call__(self, x):
-        # if x.dtype != self._dtype:
-        #     x = tf.cast(x, self._dtype)
+
+        if len(x.shape) > 1 and x.shape[1] == 1:
+            x = tf.squeeze(x, axis=1)
+
         mean_edge_type_weights = tf.math.unsorted_segment_mean(x, self.idx, self.num_unique)
         if self._penalize_relative_change:
             # return self._strength * tf.reduce_mean(tf.abs(x - self._initial_value))
@@ -104,6 +106,10 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
             self._target_mean_weights = None
 
     def __call__(self, x):
+        
+        if len(x.shape) > 1 and x.shape[1] == 1:
+            x = tf.squeeze(x, axis=1)
+
         if self._target_mean_weights is None:
             return self._strength * tf.reduce_mean(tf.square(x))
         else:
@@ -728,69 +734,6 @@ class OrientationSelectivityLoss:
 
         total_osi_loss0 = tf.reduce_sum(osi_loss_type * self.cell_type_count) / tf.reduce_sum(self.cell_type_count)
         total_dsi_loss0 = tf.reduce_sum(dsi_loss_type * self.cell_type_count) / tf.reduce_sum(self.cell_type_count)
-
-
-        # total_osi_loss = tf.constant(0.0, dtype=self._dtype)
-        # total_dsi_loss = tf.constant(0.0, dtype=self._dtype)
-        # # penalization_terms = tf.constant(0.0, dtype=self._dtype)
-        # individual_osi_loss = {}
-        # # individual_dsi_loss = {}
-        # # individual_penalization_loss = {}
-        
-        # cell_count = tf.constant(0, dtype=self._dtype)
-
-        # for key, value in self._target_osi_dsi.items():
-        #     if tf.size(value["ids"]) != 0:
-        #         _rates_type = tf.gather(rates, value['ids'])
-        #         _weighted_osi_cos_responses_type = tf.gather(weighted_osi_cos_responses, value['ids'])
-        #         _weighted_dsi_cos_responses_type = tf.gather(weighted_dsi_cos_responses, value['ids'])
-        #         # _weighted_osi_sin_responses_type = tf.gather(weighted_osi_sin_responses, value['ids'])
-        #         # _weighted_dsi_sin_responses_type = tf.gather(weighted_dsi_sin_responses, value['ids'])
-
-        #         # Define small epsilon values to avoid differentiability issues when 0 spikes are recorded within the population
-        #         epsilon1 = 0.0005
-        #         # Calculate the approximated OSI for the population
-        #         approximated_osi_numerator = tf.reduce_mean(_weighted_osi_cos_responses_type)
-        #         approximated_dsi_numerator = tf.reduce_mean(_weighted_dsi_cos_responses_type)
-        #         # approximated_denominator = tf.maximum(tf.reduce_sum(tf.abs(_weighted_cos_responses_type)), epsilon2)
-        #         approximated_denominator = tf.maximum(tf.reduce_mean(_rates_type), epsilon1)
-
-        #         osi_approx_type = approximated_osi_numerator / approximated_denominator
-        #         dsi_approx_type = approximated_dsi_numerator / approximated_denominator
-
-        #         # osi_penalization = tf.math.square(tf.reduce_mean(_weighted_osi_sin_responses_type) / approximated_denominator)
-        #         # dsi_penalization = tf.math.square(tf.reduce_mean(_weighted_dsi_sin_responses_type) / approximated_denominator)
-
-        #         # Calculate the OSI loss
-        #         osi_loss_type = tf.math.square(osi_approx_type - value['OSI'])
-        #         dsi_loss_type = tf.math.square(dsi_approx_type - value['DSI'])
-
-        #         # individual_dsi_loss[key] = dsi_loss_type
-        #         # individual_penalization_loss[key] = osi_penalization + dsi_penalization
-
-        #         cell_count_type = tf.cast(tf.size(value["ids"]), dtype=self._dtype)
-        #         total_osi_loss += osi_loss_type * cell_count_type
-        #         total_dsi_loss += dsi_loss_type * cell_count_type
-        #         # penalization_terms += osi_penalization + dsi_penalization
-        #         cell_count += cell_count_type
-
-        #         individual_osi_loss[key] = osi_loss_type * cell_count_type
-        #     else:
-        #         individual_osi_loss[key] = 0.0
-        #         # individual_dsi_loss[key] = 0.0
-        #         # individual_penalization_loss[key] = 0.0
-        #         pass
-            
-        # # return (total_osi_loss + total_dsi_loss + penalization_terms) * self._osi_cost
-        # # return (total_osi_loss + total_dsi_loss) * self._osi_cost
-        # total_osi_loss = total_osi_loss / cell_count
-        # total_dsi_loss = total_dsi_loss / cell_count
-        # # penalization_terms = penalization_terms / cell_count
-        # # return (total_osi_loss + total_dsi_loss) * self._osi_cost, individual_osi_loss
-    
-        # # check if total_osi_loss0 == total_osi_loss and total_dsi_loss0 == total_dsi_loss
-        # tf.debugging.assert_near(total_osi_loss0, total_osi_loss, atol=1e-5, rtol=1e-5)
-        # tf.debugging.assert_near(total_dsi_loss0, total_dsi_loss, atol=1e-5, rtol=1e-5)
     
         return (total_osi_loss0 + total_dsi_loss0) * self._osi_cost
     

@@ -149,7 +149,11 @@ def main(_):
         print(f"Model built in {time()-t0:.2f} s\n")
 
         # Store the initial model variables that are going to be trained
-        model_variables_dict = {'Initial': {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}}
+        # model_variables_dict = {'Initial': {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}}
+        model_variables_dict = {'Initial': {
+            var.name: var.numpy().astype(np.float16) if len(var.shape) == 1 else var[:, 0].numpy().astype(np.float16)
+            for var in model.trainable_variables
+        }}
 
         # Define the optimizer
         if flags.optimizer == 'adam':
@@ -216,8 +220,12 @@ def main(_):
             print(f"No checkpoint found in {flags.ckpt_dir} or {flags.restore_from}. Starting from scratch...\n")
             checkpoint = None
 
-        model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
-
+        # model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
+        model_variables_dict['Best'] = {
+            var.name: var.numpy().astype(np.float16) if len(var.shape) == 1 else var[:, 0].numpy().astype(np.float16)
+            for var in model.trainable_variables
+        }
+        
         ### BUILD THE LOSS AND REGULARIZER FUNCTIONS ###
         # Create rate and voltage regularizers
         if flags.loss_core_radius > 0:
@@ -264,12 +272,11 @@ def main(_):
         model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
 
         ### SYNCHRONIZATION REGULARIZERS ###
-        evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=0.5, n_samples=500, dtype=dtype, session='evoked', data_dir='Synchronization_data')
+        evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=dtype, session='evoked', data_dir='Synchronization_data')
         model.add_loss(lambda: evoked_sync_loss(rsnn_layer.output[0][0]))
 
-        spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=0.5, n_samples=500, dtype=dtype, session='spont', data_dir='Synchronization_data')
+        spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=dtype, session='spont', data_dir='Synchronization_data')
         model.add_loss(lambda: spont_sync_loss(rsnn_layer.output[0][0]))
-
 
         ### OSI / DSI LOSSES ###
         # Define the decay factor for the exponential moving average

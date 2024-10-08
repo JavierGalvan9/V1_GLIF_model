@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import datetime as dt
+import subprocess
 from time import time
 import pickle as pkl
 from numba import njit
@@ -19,15 +20,20 @@ from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
 from v1_model_utils.model_metrics_analysis import calculate_Firing_Rate, get_borders, draw_borders
 
 
-def printgpu(gpu_id=0, verbose=0):
+def printgpu(gpu_id=0):
     if tf.config.list_physical_devices('GPU'):
+        # Check TensorFlow memory info
         meminfo = tf.config.experimental.get_memory_info(f'GPU:{gpu_id}')
         current = meminfo['current'] / 1024**3
         peak = meminfo['peak'] / 1024**3
-        if verbose == 0:
-            print(f"GPU memory use: {current:.2f} GB / Peak: {peak:.2f} GB")
-        if verbose == 1:
-            return current, peak
+        print(f'    TensorFlow GPU {gpu_id} Memory Usage: {current:.2f} GiB, Peak Usage: {peak:.2f} GiB')
+        # # Check GPU memory using nvidia-smi
+        # result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total', '--format=csv,nounits,noheader'],
+        #                     stdout=subprocess.PIPE, encoding='utf-8') # MiB
+        # used, free, total = [float(x)/1024 for x in result.stdout.strip().split(',')]
+        # print(f"    Total GPU Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
+
+        return current, peak
 
 def compose_str(metrics_values):
         _acc, _loss, _rate, _rate_loss, _voltage_loss, _regularizers_loss, _osi_dsi_loss, _sync_loss = metrics_values
@@ -842,8 +848,7 @@ class Callbacks:
             print_str += '    ' + compose_str(val_values) 
             print(print_str)
             for gpu_id in range(len(self.strategy.extended.worker_devices)):
-                mem_data = printgpu(gpu_id=gpu_id, verbose=1)
-                print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
+                printgpu(gpu_id=gpu_id)
 
         # val_classification_loss = metric_values[6] - metric_values[8] - metric_values[9] 
         # metric_values.append(val_classification_loss)
@@ -881,7 +886,11 @@ class Callbacks:
             else:
                 self.plot_raster(x, v1_spikes, y)
             
-            self.model_variables_dict['Best'] = {var.name: var.numpy() for var in self.model.trainable_variables}
+            # self.model_variables_dict['Best'] = {var.name: var.numpy() for var in self.model.trainable_variables}
+            self.model_variables_dict['Best'] = {
+                var.name: var.numpy().astype(np.float16) if len(var.shape) == 1 else var[:, 0].numpy().astype(np.float16)
+                for var in self.model.trainable_variables
+            }
         else:
             self.no_improve_epochs += 1
 
@@ -919,8 +928,7 @@ class Callbacks:
             print(print_str)
             print(f'    Step running time: {time() - self.step_init_time:.2f}s')
             for gpu_id in range(len(self.strategy.extended.worker_devices)):
-                mem_data = printgpu(gpu_id=gpu_id, verbose=1)
-                print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
+                printgpu(gpu_id=gpu_id)
          
     def save_latest_model(self):
         try:
@@ -967,6 +975,7 @@ class Callbacks:
         v1_spikes = v1_spikes.numpy()
         x = x.numpy()
         y = y.numpy()
+        seq_len = v1_spikes.shape[1]
         images_dir = os.path.join(self.logdir, 'Raster_plots')
         os.makedirs(images_dir, exist_ok=True)
         graph = InputActivityFigure(
@@ -976,7 +985,7 @@ class Callbacks:
                                     filename=f'Epoch_{self.epoch}',
                                     frequency=self.flags.temporal_f,
                                     stimuli_init_time=self.pre_delay,
-                                    stimuli_end_time=self.flags.seq_len-self.post_delay,
+                                    stimuli_end_time=seq_len-self.post_delay,
                                     reverse=False,
                                     plot_core_only=True,
                                     core_radius=self.flags.plot_core_radius,
@@ -987,6 +996,7 @@ class Callbacks:
         # concatenate the normal and spontaneous arrays
         x = np.concatenate((x_spont.numpy(), x.numpy()), axis=1)
         v1_spikes = np.concatenate((v1_spikes_spont.numpy(), v1_spikes.numpy()), axis=1)
+        seq_len = v1_spikes.shape[1]
         images_dir = os.path.join(self.logdir, 'Raster_plots')
         if plot_core_only:
             images_dir = os.path.join(images_dir, 'Core_only')
@@ -999,8 +1009,8 @@ class Callbacks:
                                     images_dir,
                                     filename=f'Epoch_{self.epoch}_complete',
                                     frequency=self.flags.temporal_f,
-                                    stimuli_init_time=self.flags.seq_len+self.pre_delay,
-                                    stimuli_end_time=2*self.flags.seq_len-self.post_delay,
+                                    stimuli_init_time=seq_len+self.pre_delay,
+                                    stimuli_end_time=2*seq_len-self.post_delay,
                                     reverse=False,
                                     plot_core_only=plot_core_only,
                                     core_radius=self.flags.plot_core_radius,
@@ -1022,27 +1032,28 @@ class Callbacks:
 
     def plot_populations_activity(self, v1_spikes, v1_spikes_spont):
         v1_spikes = np.concatenate((v1_spikes_spont.numpy(), v1_spikes.numpy()), axis=1)
-
+        seq_len = v1_spikes.shape[1]
         # Plot the mean firing rate of the population of neurons
         filename = f'Epoch_{self.epoch}'
         Population_activity = PopulationActivity(n_neurons=self.n_neurons, network=self.network, 
-                                                stimuli_init_time=self.pre_delay, stimuli_end_time=self.flags.seq_len-self.post_delay, 
+                                                stimuli_init_time=self.pre_delay, stimuli_end_time=seq_len-self.post_delay, 
                                                 image_path=self.logdir, filename=filename, data_dir=self.flags.data_dir,
                                                 core_radius=self.flags.plot_core_radius)
         Population_activity(v1_spikes, plot_core_only=True, bin_size=10)
 
     def plot_mean_firing_rate_boxplot(self, v1_spikes, y):
         v1_spikes = v1_spikes.numpy()
+        seq_len = v1_spikes.shape[1]
         DG_angles = y.numpy()
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/{self.neuropixels_feature}')
         os.makedirs(boxplots_dir, exist_ok=True)        
         if self.neuropixels_feature == "Ave_Rate(Hz)":
             metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
-                                                    drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.flags.seq_len-self.post_delay,
+                                                    drifting_gratings_init=self.pre_delay, drifting_gratings_end=seq_len-self.post_delay,
                                                     core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
         elif self.neuropixels_feature == 'Spontaneous rate (Hz)':
             metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
-                                                    spontaneous_init=self.pre_delay, spontaneous_end=self.flags.seq_len-self.post_delay,
+                                                    spontaneous_init=self.pre_delay, spontaneous_end=seq_len-self.post_delay,
                                                     core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
         # Figure for Average firing rate boxplots      
         metrics_analysis(metrics=[self.neuropixels_feature], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')    
@@ -1050,10 +1061,11 @@ class Callbacks:
     def plot_spontaneous_boxplot(self, v1_spikes, y):
         v1_spikes = v1_spikes.numpy()
         DG_angles = y.numpy()
+        seq_len = v1_spikes.shape[1]
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/Spontaneous')
         os.makedirs(boxplots_dir, exist_ok=True)
         metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
-                                                spontaneous_init=self.pre_delay, spontaneous_end=self.flags.seq_len-self.post_delay,
+                                                spontaneous_init=self.pre_delay, spontaneous_end=seq_len-self.post_delay,
                                                 core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
         # Figure for Average firing rate boxplots
         metrics_analysis(metrics=['Spontaneous rate (Hz)'], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')   
@@ -1214,8 +1226,7 @@ class Callbacks:
                     print(f'Angle {angle} done.')
                     print(f'    Trial running time: {time() - t0:.2f}s')
                     for gpu_id in range(len(self.strategy.extended.worker_devices)):
-                        mem_data = printgpu(gpu_id=gpu_id, verbose=1)
-                        print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
+                        printgpu(gpu_id=gpu_id)
 
                 # Save the dataset      
                 results_dir = os.path.join("OSI_DSI_dataset")
@@ -1268,8 +1279,7 @@ class Callbacks:
                     print(f'Trial {trial_id}/{n_trials_per_angle} - Angle {angle} done.')
                     print(f'    Trial running time: {time() - t0:.2f}s')
                     for gpu_id in range(len(self.strategy.extended.worker_devices)):
-                        mem_data = printgpu(gpu_id=gpu_id, verbose=1)
-                        print(f'    Memory consumption (current - peak) GPU {gpu_id}: {mem_data[0]:.2f} GB - {mem_data[1]:.2f} GB')
+                        printgpu(gpu_id=gpu_id)
         
             # Do the OSI/DSI analysis    
             callbacks.osi_dsi_analysis(spikes, DG_angles)   

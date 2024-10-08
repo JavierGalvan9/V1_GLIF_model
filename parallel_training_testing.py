@@ -121,7 +121,7 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "24", "-t", "6:00"] # choose the L40S GPU with 48GB of memory 
+    training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "48", "-t", "5:00"] # choose the L40S GPU with 48GB of memory 
     evaluation_commands = ["run", "-g", "1", "-m", "40", "-t", "1:15"]
 
     # Define the training and evaluation script calls
