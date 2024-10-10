@@ -82,6 +82,7 @@ def main(_):
         else:
             mixed_precision.set_global_policy('mixed_float16')
         dtype = tf.float16
+        print('Mixed precision enabled!')
     else:
         dtype = tf.float32
 
@@ -124,7 +125,7 @@ def main(_):
             n_input=flags.n_input, 
             n_output=flags.n_output,
             cue_duration=flags.cue_duration,
-            dtype=tf.float32, 
+            dtype=dtype, 
             input_weight_scale=flags.input_weight_scale,
             dampening_factor=flags.dampening_factor, 
             recurrent_dampening_factor=flags.recurrent_dampening_factor,
@@ -243,6 +244,7 @@ def main(_):
                         regular=regular,
                         return_firing_rates=True,
                         rotation=flags.rotation,
+                        dtype=dtype
                     ).batch(1)
                                 
                     return _lgn_firing_rates
@@ -282,6 +284,7 @@ def main(_):
                     rotation=flags.rotation,
                     billeh_phase=True,
                     return_firing_rates=True,
+                    dtype=dtype
                 ).batch(per_replica_batch_size)
                             
                 return _lgn_firing_rates
@@ -296,7 +299,7 @@ def main(_):
         # load LGN spontaneous firing rates 
         spontaneous_prob = 1 - tf.exp(-spontaneous_lgn_firing_rates / 1000.)
         # Generate LGN spikes
-        x = tf.random.uniform(tf.shape(spontaneous_prob)) < spontaneous_prob
+        x = tf.random.uniform(tf.shape(spontaneous_prob), dtype=dtype) < spontaneous_prob
         # Run a gray simulation to get the model state
         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)    
         _,  gray_state = distributed_roll_out(x)
@@ -332,7 +335,7 @@ def main(_):
         for angle_id, angle in enumerate(DG_angles):
             # load LGN firign rates for the given angle and calculate spiking probability
             lgn_fr = lgn_firing_rates_dict[angle]
-            lgn_fr = tf.constant(lgn_fr, dtype=tf.float32)
+            lgn_fr = tf.constant(lgn_fr, dtype=dtype)
             _p = 1 - tf.exp(-lgn_fr / 1000.)
 
             for trial_id in range(flags.n_trials_per_angle):
@@ -342,7 +345,7 @@ def main(_):
                 distributed_reset_state('gray', gray_state=gray_state)
 
                 # Generate LGN spikes
-                x = tf.random.uniform(tf.shape(_p)) < _p
+                x = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
                 chunk_size = flags.seq_len
                 num_chunks = (2500//chunk_size + 1)
                 for i in range(num_chunks):
