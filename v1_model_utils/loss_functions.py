@@ -59,6 +59,7 @@ class StiffRegularizer(Layer):
         self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
         self._target_mean_weights = tf.constant(initial_mean_weights, dtype=dtype)
 
+    @tf.function(jit_compile=True)
     def __call__(self, x):
 
         if len(x.shape) > 1 and x.shape[1] == 1:
@@ -105,6 +106,7 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
         else:
             self._target_mean_weights = None
 
+    @tf.function(jit_compile=True)
     def __call__(self, x):
         
         if len(x.shape) > 1 and x.shape[1] == 1:
@@ -615,7 +617,7 @@ class OrientationSelectivityLoss:
 
         return model_fr
     
-    def neuropixels_fr_loss(self, spikes, angle, trim=True):
+    def neuropixels_fr_loss(self, spikes, angle):
         # if the trget fr is not set, construct them
         if not hasattr(self, "_target_frs"):
 
@@ -630,7 +632,6 @@ class OrientationSelectivityLoss:
                 self._target_frs[key] = self.vonmises_model_fr(structure, key)
                 # TODO: convert it to tensor if needed.
         
-        spikes = self.spike_trimming(spikes, trim)
         # assuming 1 ms bins
         spike_rates = tf.reduce_mean(spikes, axis=[0, 1]) / spikes.shape[1] * 1000
         angle_bins = tf.constant(np.arange(-90, 91, 10), dtype=tf.float32)
@@ -676,15 +677,13 @@ class OrientationSelectivityLoss:
         final_loss = tf.reduce_mean(tf.stack(losses)) * self._osi_cost
         return final_loss
         
-    def crowd_spikes_loss(self, spikes, angle, trim=True):
+    def crowd_spikes_loss(self, spikes, angle):
         # I need to access the tuning angle. of all the neurons.
         angle = tf.cast(angle, self._dtype)
 
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
             
-        spikes = self.spike_trimming(spikes, trim)
-
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
         # sum spikes in _z, and multiply with delta_angle.
         mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
@@ -697,7 +696,7 @@ class OrientationSelectivityLoss:
         
         return angle_loss * self._osi_cost
 
-    def crowd_osi_loss(self, spikes, angle, trim=True, normalizer=None):
+    def crowd_osi_loss(self, spikes, angle, normalizer=None):
         # Calculate the angle deltas between current angle and tuning angle
         # angle = tf.cast(angle, self._dtype) 
         angle = tf.cast(angle[0][0], self._dtype) 
@@ -706,7 +705,6 @@ class OrientationSelectivityLoss:
         # clipped_delta_angle = tf.math.floormod(delta_angle, 360)
         radians_delta_angle = delta_angle * (pi / 180)
 
-        spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
         # sum spikes in _z, and multiply with delta_angle.
         rates = tf.reduce_mean(spikes, axis=[0, 1])
         if self._core_mask is not None:
@@ -739,10 +737,13 @@ class OrientationSelectivityLoss:
     
 
     def __call__(self, spikes, angle, trim, normalizer=None):
+
+        spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
+
         if self._method == "crowd_osi":
-            return self.crowd_osi_loss(spikes, angle, trim, normalizer=normalizer)
+            return self.crowd_osi_loss(spikes, angle, normalizer=normalizer)
         elif self._method == "crowd_spikes":
-            return self.crowd_spikes_loss(spikes, angle, trim)
+            return self.crowd_spikes_loss(spikes, angle)
         elif self._method == "neuropixels_fr":
-            return self.neuropixels_fr_loss(spikes, angle, trim)
+            return self.neuropixels_fr_loss(spikes, angle)
         
