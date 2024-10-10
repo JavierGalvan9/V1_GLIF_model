@@ -54,8 +54,8 @@ def temporal_filter(all_spatial_responses, temporal_kernels):
         tr_spatial_responses, temporal_kernels[:, None, :, None], strides=[1, 1, 1, 1], padding='VALID')[0, :, 0]
     return filtered_output
 
-def transfer_function(arg__a):
-    _h = tf.cast(arg__a >= 0, tf.float32)
+def transfer_function(arg__a, dtype=tf.float32):
+    _h = tf.cast(arg__a >= 0, dtype)
     return _h * arg__a
 
 def select_spatial(x, y, convolved_movie):
@@ -119,7 +119,7 @@ def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_mo
    
 
 class LGN(object):
-    def __init__(self, row_size=80, col_size=120, lgn_data_path=None, n_input=None):
+    def __init__(self, row_size=80, col_size=120, lgn_data_path=None, n_input=None, dtype=tf.float32):
         filename = f'lgn_full_col_cells_{col_size}x{row_size}.csv'
         root_path = os.path.split(__file__)[0]
         root_path = os.path.join(root_path, 'data')
@@ -139,6 +139,7 @@ class LGN(object):
             d = create_lgn_units_info(filename=lgn_data_path, csv_path=lgn_node_type_path, h5_path=lgn_node_path)
                 
         # Load basic information about the LGN units
+        self.dtype = dtype
         model_id = d['model_id'].to_numpy()
         amplitude = np.array([1. if a.count('ON') > 0 else -1. for a in model_id])
         non_dom_amplitude = np.zeros_like(amplitude)
@@ -158,7 +159,7 @@ class LGN(object):
                 else:
                     spontaneous_firing_rate = get_data_metrics_for_each_subclass(a)[b]['spont_exp']
                     spontaneous_firing_rates.append(spontaneous_firing_rate[0])
-            spontaneous_firing_rates = np.array(spontaneous_firing_rates)
+            spontaneous_firing_rates = np.array(spontaneous_firing_rates, dtype=np.float32)
             with open(s_path, 'wb') as f:
                 pkl.dump(spontaneous_firing_rates, f)
                 print('Caching spontaneous firing rates')
@@ -288,8 +289,8 @@ class LGN(object):
         else:
             with open(t_path, 'rb') as f:
                 loaded = pkl.load(f)
-            dom_temporal_kernels = loaded['dom_temporal_kernels']
-            non_dom_temporal_kernels = loaded['non_dom_temporal_kernels']
+            dom_temporal_kernels = tf.cast(loaded['dom_temporal_kernels'], dtype=dtype)
+            non_dom_temporal_kernels = tf.cast(loaded['non_dom_temporal_kernels'], dtype=dtype)
             non_dominant_x = loaded['non_dominant_x']
             non_dominant_y = loaded['non_dominant_y']
             amplitude = loaded['amplitude']
@@ -326,7 +327,7 @@ class LGN(object):
                 spatial_sizes = spatial_sizes[:n_input]
 
             gaussian_filters = []
-            actual_spatial_range = []
+            # actual_spatial_range = []
             spatial_range_indices = []
             for i in range(len(spatial_range) - 1):
                 # check if there is any neuron in the spatial range
@@ -350,14 +351,14 @@ class LGN(object):
                     gaussian_filter = tf.constant(gaussian_filter, dtype=tf.float32) # this is faster by assuming that gaussian_filter is unmutable
                     gaussian_filters.append(gaussian_filter)
                     # append the actual and subsequent spatial range 
-                    actual_spatial_range.append(spatial_range[i])
-                    actual_spatial_range.append(spatial_range[i+1])
+                    # actual_spatial_range.append(spatial_range[i])
+                    # actual_spatial_range.append(spatial_range[i+1])
 
             # Concatenate all the ids and sort them
             neuron_ids = tf.concat(spatial_range_indices, axis=0)
             neuron_ids = tf.cast(neuron_ids, dtype=tf.int32)
             sorted_neuron_ids_indices = tf.argsort(neuron_ids)
-            actual_spatial_range = list(set(actual_spatial_range))
+            # actual_spatial_range = list(set(actual_spatial_range))
             # Save the spatial kernels
             to_save = dict(
                 x=x,
@@ -367,7 +368,7 @@ class LGN(object):
                 gaussian_filters=gaussian_filters,
                 spatial_range_indices=spatial_range_indices,
                 sorted_neuron_ids_indices=sorted_neuron_ids_indices,
-                actual_spatial_range=actual_spatial_range
+                # actual_spatial_range=actual_spatial_range
             )
             with open(spatial_path, 'wb') as f:
                 pkl.dump(to_save, f)
@@ -382,47 +383,48 @@ class LGN(object):
             gaussian_filters = loaded['gaussian_filters']
             spatial_range_indices = loaded['spatial_range_indices']
             sorted_neuron_ids_indices = loaded['sorted_neuron_ids_indices']
-            actual_spatial_range = loaded['actual_spatial_range']
+            # actual_spatial_range = loaded['actual_spatial_range']
 
         # Preprocess data tensors outside the loop if they don't change
         if n_input is None:
-            self.x = tf.constant(x, dtype=tf.float32)
-            self.y = tf.constant(y, dtype=tf.float32)
-            self.non_dominant_x = tf.constant(non_dominant_x, dtype=tf.float32)
-            self.non_dominant_y = tf.constant(non_dominant_y, dtype=tf.float32)
-            self.amplitude = tf.constant(amplitude, dtype=tf.float32)
-            self.non_dom_amplitude = tf.constant(non_dom_amplitude, dtype=tf.float32)
-            self.is_composite = tf.constant(is_composite, dtype=tf.float32)
-            self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates, dtype=tf.float32)
+            self.x = tf.constant(x, dtype=dtype)
+            self.y = tf.constant(y, dtype=dtype)
+            self.non_dominant_x = tf.constant(non_dominant_x, dtype=dtype)
+            self.non_dominant_y = tf.constant(non_dominant_y, dtype=dtype)
+            self.amplitude = tf.constant(amplitude, dtype=dtype)
+            self.non_dom_amplitude = tf.constant(non_dom_amplitude, dtype=dtype)
+            self.is_composite = tf.constant(is_composite, dtype=dtype)
+            self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates, dtype=dtype)
 
-            self.dom_temporal_kernels = dom_temporal_kernels
-            self.non_dom_temporal_kernels = non_dom_temporal_kernels
-            self.gaussian_filters = gaussian_filters
+            self.dom_temporal_kernels = tf.constant(dom_temporal_kernels, dtype=dtype)
+            self.non_dom_temporal_kernels = tf.constant(non_dom_temporal_kernels, dtype=dtype)
+            # self.gaussian_filters = gaussian_filters
+            self.gaussian_filters = [tf.constant(gf, dtype=dtype) for gf in self.gaussian_filters]
             self.spatial_range_indices = spatial_range_indices
             self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
-            self.actual_spatial_range = actual_spatial_range
+            # self.actual_spatial_range = actual_spatial_range
         else:
-            self.x = tf.constant(x[:n_input], dtype=tf.float32)
-            self.y = tf.constant(y[:n_input], dtype=tf.float32)
-            self.non_dominant_x = tf.constant(non_dominant_x[:n_input], dtype=tf.float32)
-            self.non_dominant_y = tf.constant(non_dominant_y[:n_input], dtype=tf.float32)
-            self.amplitude = tf.constant(amplitude[:n_input], dtype=tf.float32)
-            self.non_dom_amplitude = tf.constant(non_dom_amplitude[:n_input], dtype=tf.float32)
-            self.is_composite = tf.constant(is_composite[:n_input], dtype=tf.float32)
-            self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates[:n_input], dtype=tf.float32)
-            
-            self.dom_temporal_kernels = dom_temporal_kernels[:, :n_input]
-            self.non_dom_temporal_kernels = non_dom_temporal_kernels[:, :n_input]
-            self.gaussian_filters = gaussian_filters
+            self.x = tf.constant(x[:n_input], dtype=dtype)
+            self.y = tf.constant(y[:n_input], dtype=dtype)
+            self.non_dominant_x = tf.constant(non_dominant_x[:n_input], dtype=dtype)
+            self.non_dominant_y = tf.constant(non_dominant_y[:n_input], dtype=dtype)
+            self.amplitude = tf.constant(amplitude[:n_input], dtype=dtype)
+            self.non_dom_amplitude = tf.constant(non_dom_amplitude[:n_input], dtype=dtype)
+            self.is_composite = tf.constant(is_composite[:n_input], dtype=dtype)
+            self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates[:n_input], dtype=dtype)
+
+            self.dom_temporal_kernels = tf.constant(dom_temporal_kernels[:, :n_input], dtype=dtype)
+            self.non_dom_temporal_kernels = tf.constant(non_dom_temporal_kernels[:, :n_input], dtype=dtype)
+            self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
             self.spatial_range_indices = spatial_range_indices
             self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
-            self.actual_spatial_range = actual_spatial_range
+            # self.actual_spatial_range = actual_spatial_range
 
     @tf.function(jit_compile=True)
     def spatial_response(self, movie, bmtk_compat=True):
 
         if not isinstance(movie, tf.Tensor):
-            movie = tf.constant(movie, dtype=tf.float32)
+            movie = tf.constant(movie, dtype=dtype)
             print(f'Movie type: {type(movie)}')
        
         all_spatial_responses = []
@@ -460,8 +462,8 @@ class LGN(object):
         dom_filtered_output = temporal_filter(all_spatial_responses, self.dom_temporal_kernels)
         non_dom_filtered_output = temporal_filter(all_non_dom_spatial_responses, self.non_dom_temporal_kernels)
 
-        dom_firing_rates = transfer_function(dom_filtered_output * self.amplitude + self.spontaneous_firing_rates)
-        non_dom_firing_rates = transfer_function(non_dom_filtered_output * self.non_dom_amplitude + self.spontaneous_firing_rates)
+        dom_firing_rates = transfer_function(dom_filtered_output * self.amplitude + self.spontaneous_firing_rates, dtype=self.dtype)
+        non_dom_firing_rates = transfer_function(non_dom_filtered_output * self.non_dom_amplitude + self.spontaneous_firing_rates, dtype=self.dtype)
         firing_rates = dom_firing_rates + self.is_composite * non_dom_firing_rates
 
         return firing_rates

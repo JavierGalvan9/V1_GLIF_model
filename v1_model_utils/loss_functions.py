@@ -53,11 +53,11 @@ class StiffRegularizer(Layer):
         if self._penalize_relative_change:
             epsilon = np.float32(1e-4)
             denominator = np.maximum(np.abs(initial_mean_weights), epsilon)
-            self._denominator = tf.constant(denominator, dtype=dtype)
+            self._denominator = tf.constant(denominator, dtype=tf.float32)
 
         self.idx = tf.constant(self.idx, dtype=tf.int32)
         self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
-        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=dtype)
+        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=tf.float32)
 
     @tf.function(jit_compile=True)
     def __call__(self, x):
@@ -74,7 +74,7 @@ class StiffRegularizer(Layer):
         else:
             reg_loss = tf.reduce_mean(tf.square(mean_edge_type_weights - self._target_mean_weights))
         
-        return reg_loss * self._strength
+        return tf.cast(reg_loss, dtype=self._dtype) * self._strength
     
 
 class L2Regularizer(tf.keras.regularizers.Regularizer):
@@ -100,7 +100,7 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
             unique_edge_type_ids, inverse_indices = np.unique(edge_type_ids, return_inverse=True)
             mean_weights = np.array([np.mean(initial_value[edge_type_ids == edge_type_id]) for edge_type_id in unique_edge_type_ids])
             # Create target mean weights array based on the edge type indices
-            self._target_mean_weights = tf.constant(mean_weights[inverse_indices], dtype=self._dtype)
+            self._target_mean_weights = tf.constant(mean_weights[inverse_indices], dtype=tf.float32)
             epsilon = tf.constant(1e-4, dtype=tf.float32)  # A small constant to avoid division by zero
             self._target_mean_weights = tf.maximum(tf.abs(self._target_mean_weights), epsilon)
         else:
@@ -634,7 +634,7 @@ class OrientationSelectivityLoss:
         
         # assuming 1 ms bins
         spike_rates = tf.reduce_mean(spikes, axis=[0, 1]) / spikes.shape[1] * 1000
-        angle_bins = tf.constant(np.arange(-90, 91, 10), dtype=tf.float32)
+        angle_bins = tf.constant(np.arange(-90, 91, 10), dtype=self._dtype)
         nbins = angle_bins.shape[0] - 1
         # now, process each layer
         # losses = tf.TensorArray(tf.float32, size=len(self._layer_info))
