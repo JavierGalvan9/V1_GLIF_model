@@ -27,11 +27,11 @@ def printgpu(gpu_id=0):
         current = meminfo['current'] / 1024**3
         peak = meminfo['peak'] / 1024**3
         print(f'    TensorFlow GPU {gpu_id} Memory Usage: {current:.2f} GiB, Peak Usage: {peak:.2f} GiB')
-        # # Check GPU memory using nvidia-smi
-        # result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total', '--format=csv,nounits,noheader'],
-        #                     stdout=subprocess.PIPE, encoding='utf-8') # MiB
-        # used, free, total = [float(x)/1024 for x in result.stdout.strip().split(',')]
-        # print(f"    Total GPU Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
+        # Check GPU memory using nvidia-smi
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total', '--format=csv,nounits,noheader'],
+                            stdout=subprocess.PIPE, encoding='utf-8') # MiB
+        used, free, total = [float(x)/1024 for x in result.stdout.strip().split(',')]
+        print(f"    Total GPU Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
 
         return current, peak
 
@@ -1029,6 +1029,7 @@ class Callbacks:
         plt.ylabel('Mean input activity')
         os.makedirs(os.path.join(self.logdir, 'Populations activity'), exist_ok=True)
         plt.savefig(os.path.join(self.logdir, 'Populations activity', f'LGN_population_activity_epoch_{self.epoch}.png'))
+        plt.close()
 
     def plot_populations_activity(self, v1_spikes, v1_spikes_spont):
         v1_spikes = np.concatenate((v1_spikes_spont.numpy(), v1_spikes.numpy()), axis=1)
