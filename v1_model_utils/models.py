@@ -2,7 +2,6 @@ import numpy as np
 import tensorflow as tf
 import os 
 import pickle as pkl
-from numba import njit
 # import subprocess
 from . import other_v1_utils
 
@@ -49,6 +48,22 @@ def spike_gauss_16(v_scaled, sigma, amplitude):
         return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
 
     return tf.identity(z_, name="spike_gauss"), grad
+
+
+@tf.custom_gradient
+def spike_gauss_b16(v_scaled, sigma, amplitude):
+    z_ = tf.greater(v_scaled, 0.)
+    z_ = tf.cast(z_, tf.bfloat16)
+
+    def grad(dy):
+        de_dz = dy
+        dz_dv_scaled = gauss_pseudo(v_scaled, sigma, amplitude)
+
+        de_dv_scaled = de_dz * dz_dv_scaled
+
+        return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
+
+    return tf.identity(z_, name='spike_gauss'), grad
 
 # @tf.custom_gradient
 # def spike_slayer(v_scaled, sigma, amplitude):
@@ -141,7 +156,7 @@ def make_pre_ind_table(indices, n_source_neurons=197613):
     sorted_pre_inds, sorted_synapse_indices = tf.math.top_k(-pre_inds, k=n_syn)
     sorted_pre_inds = -sorted_pre_inds  # Undo the negation to get the sorted pre_inds
     # Count occurrences (out-degrees) for each presynaptic neuron using bincount
-    counts = tf.math.bincount(tf.cast(sorted_pre_inds, dtype=tf.int32), minlength=n_source_neurons)
+    counts = tf.math.bincount(sorted_pre_inds, minlength=n_source_neurons)
     # Create row_splits that covers all presynaptic neurons (0 to n_source_neurons)
     row_splits = tf.concat([[0], tf.cumsum(counts)], axis=0)
     # Create the RaggedTensor with empty rows for missing neurons
@@ -160,6 +175,7 @@ def get_new_inds_table(indices, non_zero_cols, pre_ind_table):
 
     return new_indices, all_inds
 
+
 class BackgroundNoiseLayer(tf.keras.layers.Layer):
     """
     This class calculates the input currents from the BKG noise by processing all timesteps at once."
@@ -167,14 +183,13 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
     Each call takes 0.03 seconds for 600 ms of simulation.
 
     Returns:
-        _type_: input_currents (self._compute_dtype)
+        _type_: input_currents (self.compute_dtype)
     """
     def __init__(self, indices, weights, dense_shape,  
                  weights_factors, batch_size, seq_len,
                  bkg_firing_rate=250, n_bkg_units=100, 
-                 dtype=tf.float32, **kwargs):
+                 **kwargs):
         super().__init__(**kwargs)
-        self._dtype = dtype
         self._bkg_weights = weights
         self._bkg_indices = indices
         self._dense_shape = dense_shape
@@ -188,7 +203,7 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
     def calculate_bkg_i_in(self, inputs):
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
-        i_in = tf.TensorArray(dtype=self._dtype, size=self._n_syn_basis)
+        i_in = tf.TensorArray(dtype=self.compute_dtype, size=self._n_syn_basis)
         for r_id in range(self._n_syn_basis):
             weights_syn_receptors = self._bkg_weights * self._bkg_input_weights_factors[:, r_id]
             sparse_w_in = tf.sparse.SparseTensor(
@@ -202,8 +217,8 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
                                                         adjoint_b=True
                                                     )
             # Optionally cast the output back to float16
-            if i_receptor.dtype != self._dtype:
-                i_receptor = tf.cast(i_receptor, dtype=self._dtype)
+            if i_receptor.dtype != self.compute_dtype:
+                i_receptor = tf.cast(i_receptor, dtype=self.compute_dtype)
 
             # Append i_receptor to the TensorArray
             i_in = i_in.write(r_id, i_receptor)
@@ -216,15 +231,15 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
     def call(self, inp): # inp only provides the shape
         # Generate the background spikes
         seq_len = tf.shape(inp)[1]
-        # rest_of_brain = tf.random.poisson(shape=(self._batch_size, seq_len, self._n_bkg_units), 
-        #                                 lam=self._bkg_firing_rate * .001, 
-        #                                 seed=42,
-        #                                 dtype=self._compute_dtype) # this implementation is slower
-        rest_of_brain = tf.cast(tf.random.uniform(
-                (self._batch_size, seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
-                tf.float32) # (1, 600, 100)
-
-        rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
+        rest_of_brain = tf.random.poisson(shape=(self._batch_size * seq_len, self._n_bkg_units), 
+                                        lam=self._bkg_firing_rate * .001, 
+                                        dtype=self.variable_dtype) # this implementation is slower
+        
+        # rest_of_brain = tf.cast(tf.random.uniform(
+        #         (self._batch_size, seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
+        #         tf.float32) # (1, 600, 100)
+        # rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
+       
         # Create a TensorArray to save the results for every receptor type
         noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 65871, 600)
         noise_input = tf.transpose(noise_input) # (600, 50000, 5) # New shape (3000, 65871, 5)
@@ -236,14 +251,13 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
 class LGNInputLayerCell(tf.keras.layers.Layer):
     def __init__(self, indices, weights, dense_shape, weights_factors,
-                 dtype=tf.float32, **kwargs):
+                 **kwargs):
         super().__init__(**kwargs)
         self._indices = indices
         self._input_weights = weights
         self._input_weights_factors = weights_factors
         # self._n_syn_basis = weights_factors.shape[1]  # Number of receptors
         self._dense_shape = dense_shape
-        self._dtype = dtype
         # Precompute the synapses table
         self.pre_ind_table = make_pre_ind_table(indices, n_source_neurons=dense_shape[1])
 
@@ -256,7 +270,7 @@ class LGNInputLayerCell(tf.keras.layers.Layer):
     #     # If you have any trainable variables, initialize them here
     #     pass
 
-    @tf.function
+    # @tf.function
     def call(self, inputs_t, states):
         # inputs_t: Shape [batch_size, input_dim]
         batch_size = tf.shape(inputs_t)[0]
@@ -278,8 +292,8 @@ class LGNInputLayerCell(tf.keras.layers.Layer):
             num_segments=self._dense_shape[0]
         )
         # Optionally cast the output back to float16
-        if i_in.dtype != self._dtype:
-            i_in = tf.cast(i_in, dtype=self._dtype)
+        if i_in.dtype != self.compute_dtype:
+            i_in = tf.cast(i_in, dtype=self.compute_dtype)
 
         # Add batch dimension
         i_in = tf.expand_dims(i_in, axis=0)  # Shape: [1, n_post_neurons, n_syn_basis]
@@ -292,11 +306,11 @@ class LGNInputLayer(tf.keras.layers.Layer):
     Calculates input currents from the LGN by processing one timestep at a time using a custom RNN cell.
     """
     def __init__(self, indices, weights, dense_shape, weights_factors,
-                 dtype=tf.float32, **kwargs):
+                 **kwargs):
         super().__init__(**kwargs)
         self.input_cell = LGNInputLayerCell(
             indices, weights, dense_shape, weights_factors,
-            dtype=dtype, **kwargs
+            **kwargs
         )
         # Create the input RNN layer with the custom cell to recursively process all the inputs by timesteps
         self.input_rnn = tf.keras.layers.RNN(self.input_cell, return_sequences=True, return_state=False, name='lgn_rsnn')
@@ -336,6 +350,7 @@ class ClipConstraint(tf.keras.constraints.Constraint):
     def __call__(self, w):
         return tf.clip_by_value(w, self._lower_limit, self._upper_limit)
 
+
 class V1Column(tf.keras.layers.Layer):
     def __init__(
         self,
@@ -354,7 +369,7 @@ class V1Column(tf.keras.layers.Layer):
         pseudo_gauss=False,
         train_recurrent=True,
         train_recurrent_per_type=True,
-        train_input=True,
+        train_input=False,
         train_noise=True,
         hard_reset=True,
     ):
@@ -371,15 +386,15 @@ class V1Column(tf.keras.layers.Layer):
         # Define the other model variables
         self._node_type_ids = np.array(network["node_type_ids"])
         self._n_syn_basis = 5
-        self._dt = dt
-        self._recurrent_dampening = tf.cast(recurrent_dampening_factor, self._compute_dtype)
-        self._dampening_factor = tf.cast(dampening_factor, self._compute_dtype)
+        self._dt = tf.constant(dt, self.compute_dtype)
+        self._recurrent_dampening = tf.constant(recurrent_dampening_factor, self.compute_dtype)
+        self._dampening_factor = tf.constant(dampening_factor, self.compute_dtype)
         self._pseudo_gauss = pseudo_gauss
-        self._lr_scale = lr_scale
+        self._lr_scale = tf.constant(lr_scale, dtype=self.compute_dtype)
         self._spike_gradient = spike_gradient
         self._hard_reset = hard_reset
         self._n_neurons = int(network["n_nodes"])
-        self._gauss_std = tf.cast(gauss_std, self._compute_dtype)
+        self._gauss_std = tf.constant(gauss_std, self.compute_dtype)
         # Determine the membrane time decay constant
         tau = _params["C_m"] / _params["g"]
         membrane_decay = np.exp(-dt / tau)
@@ -389,11 +404,11 @@ class V1Column(tf.keras.layers.Layer):
         path='GLIF_network/synaptic_data/tau_basis.npy' # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
         tau_syns = np.load(path)
         syn_decay = np.exp(-dt / tau_syns)
-        syn_decay = tf.constant(syn_decay, dtype=self._compute_dtype)
+        syn_decay = tf.constant(syn_decay, dtype=self.compute_dtype)
         syn_decay = tf.tile(syn_decay, [self._n_neurons])
         self.syn_decay = tf.expand_dims(syn_decay, axis=0) # expand the dimension for processing different receptor types
         psc_initial = np.e / tau_syns
-        psc_initial = tf.constant(psc_initial, dtype=self._compute_dtype)
+        psc_initial = tf.constant(psc_initial, dtype=self.compute_dtype)
         psc_initial = tf.tile(psc_initial, [self._n_neurons])
         self.psc_initial = tf.expand_dims(psc_initial, axis=0) # expand the dimension for processing different receptor types
 
@@ -404,14 +419,14 @@ class V1Column(tf.keras.layers.Layer):
             return tf.gather(prop, self._node_type_ids)
     
         def _f(_v, trainable=False):
-            return tf.Variable(tf.cast(_gather(_v), self._compute_dtype), trainable=trainable)
+            return tf.Variable(tf.cast(_gather(_v), self.compute_dtype), trainable=trainable)
 
         def inv_sigmoid(_x):
             return tf.math.log(_x / (1 - _x))
 
         def custom_val(_v, trainable=False):
             _v = tf.Variable(
-                tf.cast(inv_sigmoid(_gather(_v)), self._compute_dtype),
+                tf.cast(inv_sigmoid(_gather(_v)), self.compute_dtype),
                 trainable=trainable,
             )
             def _g():
@@ -423,11 +438,11 @@ class V1Column(tf.keras.layers.Layer):
         self.t_ref = _f(_params["t_ref"])  # refractory time
         self.v_reset = _f(_params["V_reset"])
         self.asc_amps = _f(_params["asc_amps"], trainable=False)
-        _k = _params["k"]
+        _k = tf.cast(_params['k'], self.compute_dtype)
         # inverse sigmoid of the adaptation rate constant (1/ms)
         param_k, param_k_read = custom_val(_k, trainable=False)
         k = param_k_read()
-        self.exp_dt_k = tf.cast(tf.exp(-self._dt * k), self._compute_dtype)
+        self.exp_dt_k = tf.exp(-self._dt * k)
 
         self.v_th = _f(_params["V_th"])
         self.v_gap = self.v_reset - self.v_th
@@ -446,7 +461,7 @@ class V1Column(tf.keras.layers.Layer):
         with open(path, "rb") as f:
             syn_id_to_syn_weights_dict = pkl.load(f)
         synaptic_basis_weights = np.array(list(syn_id_to_syn_weights_dict.values()))
-        self.synaptic_basis_weights = tf.constant(synaptic_basis_weights, dtype=tf.float32)
+        self.synaptic_basis_weights = tf.constant(synaptic_basis_weights, dtype=self.variable_dtype)
 
         ### Network recurrent connectivity ###
         indices = np.array(network["synapses"]["indices"])
@@ -495,7 +510,7 @@ class V1Column(tf.keras.layers.Layer):
             name="sparse_recurrent_weights",
             constraint=SignedConstraint(recurrent_weight_positive),
             trainable=individual_training,
-            dtype=tf.float32
+            dtype=self.variable_dtype
         ) # shape = (n_synapses,)
 
         # prepare per_type variable, if required
@@ -509,7 +524,7 @@ class V1Column(tf.keras.layers.Layer):
                 name="recurrent_per_type_weights",
                 constraint=ClipConstraint(0.2, 5.0),
                 trainable=True,
-                dtype=tf.float32
+                dtype=self.variable_dtype
             ) # shape = (n_connection_types (21 * 21))
             # multiply this to the weights (this needs to be done in the loop)
         else:
@@ -540,12 +555,13 @@ class V1Column(tf.keras.layers.Layer):
 
         input_weight_positive = tf.Variable(
             input_weights >= 0.0, name="input_weights_sign", trainable=False)
+        
         self.input_weight_values = tf.Variable(
             input_weights * input_weight_scale / lr_scale,
             name="sparse_input_weights",
             constraint=SignedConstraint(input_weight_positive),
             trainable=train_input,
-            dtype=tf.float32
+            dtype=self.variable_dtype
         )
 
         input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int32)
@@ -575,7 +591,7 @@ class V1Column(tf.keras.layers.Layer):
             name="rest_of_brain_weights", 
             constraint=SignedConstraint(bkg_input_weight_positive),
             trainable=train_noise,
-            dtype=tf.float32
+            dtype=self.variable_dtype
         )
 
         bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int32)
@@ -607,13 +623,13 @@ class V1Column(tf.keras.layers.Layer):
         i_rec = tf.math.unsorted_segment_sum(
             sorted_data,
             sorted_segment_ids,
-            num_segments=self._n_neurons
+            num_segments=self.recurrent_dense_shape[0]
         )
 
-        if i_rec.dtype != self._compute_dtype:
-            i_rec = tf.cast(i_rec, dtype=self._compute_dtype)
+        if i_rec.dtype != self.compute_dtype:
+            i_rec = tf.cast(i_rec, dtype=self.compute_dtype)
         # Add batch dimension
-        i_rec = tf.expand_dims(i_rec, axis=0)
+        # i_rec = tf.expand_dims(i_rec, axis=0)
         i_rec = tf.reshape(i_rec, [1, -1])
             
         return i_rec
@@ -638,9 +654,9 @@ class V1Column(tf.keras.layers.Layer):
     
     def zero_state(self, batch_size, dtype=tf.float32):
         # The neurons membrane voltage start the simulation at their reset value
+        z0_buf = tf.zeros((batch_size, self._n_neurons * self.max_delay), dtype)
         v0 = tf.ones((batch_size, self._n_neurons), dtype) * tf.cast(
             self.v_th * 0.0 + 1.0 * self.v_reset, dtype)
-        z0_buf = tf.zeros((batch_size, self._n_neurons * self.max_delay), dtype)
         r0 = tf.zeros((batch_size, self._n_neurons), dtype)
         asc = tf.zeros((batch_size, self._n_neurons * 2), dtype)
         psc_rise0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), dtype)
@@ -648,7 +664,7 @@ class V1Column(tf.keras.layers.Layer):
 
         return z0_buf, v0, r0, asc, psc_rise0, psc0
 
-    @tf.function
+    # @tf.function
     def call(self, inputs, state, constants=None):
 
         # Get all the model inputs
@@ -658,9 +674,9 @@ class V1Column(tf.keras.layers.Layer):
         batch_size = tf.shape(bkg_noise)[0]
 
         if self._spike_gradient:
-            state_input = tf.zeros((1,), dtype=self._compute_dtype)
+            state_input = tf.zeros((1,), dtype=self.compute_dtype)
         else:
-            state_input = tf.zeros((4,), dtype=self._compute_dtype)
+            state_input = tf.zeros((4,), dtype=self.compute_dtype)
                 
         # Extract the network variables from the state
         z_buf, v, r, asc, psc_rise, psc = state
@@ -712,14 +728,16 @@ class V1Column(tf.keras.layers.Layer):
         # Generate the network spikes
         v_sc = (new_v - self.v_th) / self.normalizer
         if self._pseudo_gauss:
-            if self._compute_dtype == tf.bfloat16:
-                new_z = spike_function_b16(v_sc, self._dampening_factor)
-            elif self._compute_dtype == tf.float16:
+            if self.compute_dtype == tf.bfloat16:
+                new_z = spike_gauss_b16(v_sc, self._gauss_std, self._dampening_factor)
+            elif self.compute_dtype == tf.float16:
                 new_z = spike_gauss_16(v_sc, self._gauss_std, self._dampening_factor)
             else:
                 new_z = spike_gauss(v_sc, self._gauss_std, self._dampening_factor)
         else:
-            if self._compute_dtype == tf.float16:
+            if self.compute_dtype == tf.bfloat16:
+                new_z = spike_function_b16(v_sc, self._dampening_factor)
+            elif self.compute_dtype == tf.float16:
                 new_z = spike_function_16(v_sc, self._dampening_factor)
             else:
                 new_z = spike_function(v_sc, self._dampening_factor)
@@ -844,7 +862,6 @@ def create_model(
         cell.lgn_input_dense_shape,
         cell.input_weights_factors,
         # lr_scale=lr_scale,
-        dtype=dtype,
         name="input_layer",
     )(x)
 
@@ -857,7 +874,6 @@ def create_model(
         batch_size, 
         seq_len,
         # lr_scale=lr_scale,
-        dtype=dtype,
         name="noise_layer",
     )(x) # the input is provided just because in a Keras custom layer, the call method should accept input
 

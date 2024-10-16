@@ -24,6 +24,7 @@ from v1_model_utils.callbacks import OsiDsiCallbacks, printgpu
 import stim_dataset
 from time import time
 import ctypes.util
+import random
 
 
 print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
@@ -53,6 +54,7 @@ def main(_):
     # Set the seeds for reproducibility
     np.random.seed(flags.seed)
     tf.random.set_seed(flags.seed)
+    random.seed(flags.seed)
 
     # Load the checkpoint model if it exists
     logdir = flags.ckpt_dir
@@ -75,14 +77,22 @@ def main(_):
         current_epoch = (flags.run_session + 1) * flags.n_epochs
         
     # Can be used to try half precision training
-    if flags.float16:
+    if flags.dtype=='float16':
         if version.parse(tf.__version__) < version.parse("2.4.0"):
             policy = mixed_precision.Policy("mixed_float16")
             mixed_precision.set_policy(policy)
         else:
             mixed_precision.set_global_policy('mixed_float16')
         dtype = tf.float16
-        print('Mixed precision enabled!')
+        print('Mixed precision (float16) enabled!')
+    elif flags.dtype=='bfloat16':
+        if version.parse(tf.__version__) < version.parse("2.4.0"):
+            policy = mixed_precision.Policy("mixed_bfloat16")
+            mixed_precision.set_policy(policy)
+        else:
+            mixed_precision.set_global_policy('mixed_bfloat16')
+        dtype = tf.bfloat16
+        print('Mixed precision (bfloat16) enabled!')
     else:
         dtype = tf.float32
 
@@ -318,7 +328,7 @@ def main(_):
             else:
                 raise ValueError(f"Invalid reset_type: {reset_type}")
 
-        @tf.function
+        # @tf.function
         def distributed_reset_state(reset_type, gray_state=None):
             if reset_type == 'gray':
                 strategy.run(reset_state, args=(reset_type, gray_state))
@@ -362,6 +372,9 @@ def main(_):
                 for gpu_id in range(len(strategy.extended.worker_devices)):
                     printgpu(gpu_id=gpu_id)
 
+                if not flags.calculate_osi_dsi:
+                    break
+
         # Do the OSI/DSI analysis       
         if flags.calculate_osi_dsi:
             callbacks.osi_dsi_analysis(spikes, DG_angles)
@@ -379,6 +392,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('delays', '100,0', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')
     absl.app.flags.DEFINE_string('optimizer', 'adam', '')
+    absl.app.flags.DEFINE_string('dtype', 'float32', '')
 
     absl.app.flags.DEFINE_float('learning_rate', .01, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
@@ -418,7 +432,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('validation_examples', 16, '')
     absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
 
-    absl.app.flags.DEFINE_boolean('float16', False, '')
+    # absl.app.flags.DEFINE_boolean('float16', False, '')
     absl.app.flags.DEFINE_boolean('caching', True, '')
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     absl.app.flags.DEFINE_boolean('core_loss', False, '')

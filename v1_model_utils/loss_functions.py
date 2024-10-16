@@ -113,11 +113,11 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
             x = tf.squeeze(x, axis=1)
 
         if self._target_mean_weights is None:
-            return self._strength * tf.reduce_mean(tf.square(x))
+            return tf.cast(self._strength * tf.reduce_mean(tf.square(x)), dtype=self._dtype)
         else:
             relative_deviation = x / self._target_mean_weights
             mse = self._strength * tf.reduce_mean(tf.square(relative_deviation))
-            return mse
+            return tf.cast(mse, dtype=self._dtype)
 
 
 def spike_trimming(spikes, pre_delay=50, post_delay=50, trim=True):
@@ -457,7 +457,7 @@ class SynchronizationLoss(Layer):
         # # Calculate mean, standard deviation, and SEM of the Fano factors
         fanos_mean = tf.reduce_mean(fanos, axis=1)
         # # Calculate MSE between the experimental and calculated Fano factors
-        mse_loss = tf.sqrt(tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean)))
+        mse_loss = tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))
         # # Calculate the synchronization loss
         sync_loss = self._sync_cost * mse_loss
 
@@ -507,6 +507,7 @@ class OrientationSelectivityLoss:
         self._core_mask = core_mask
         self._method = method
         self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
+        self._tf_pi = tf.constant(np.pi, dtype=dtype)
         if (self._core_mask is not None) and (self._method == "crowd_spikes" or self._method == "crowd_osi"):
             self.np_core_mask = self._core_mask.numpy()
             core_tuning_angles = network['tuning_angle'][self.np_core_mask]
@@ -703,7 +704,7 @@ class OrientationSelectivityLoss:
         delta_angle = tf.expand_dims(angle, axis=0) -  self._tuning_angles
         # i want the delta_angle to be within 0-360
         # clipped_delta_angle = tf.math.floormod(delta_angle, 360)
-        radians_delta_angle = delta_angle * (pi / 180)
+        radians_delta_angle = delta_angle * (self._tf_pi / 180)
 
         # sum spikes in _z, and multiply with delta_angle.
         rates = tf.reduce_mean(spikes, axis=[0, 1])
@@ -730,12 +731,11 @@ class OrientationSelectivityLoss:
         osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values)
         dsi_loss_type = tf.math.square(dsi_approx_type - self.dsi_target_values)
 
-        total_osi_loss0 = tf.reduce_sum(osi_loss_type * self.cell_type_count) / tf.reduce_sum(self.cell_type_count)
-        total_dsi_loss0 = tf.reduce_sum(dsi_loss_type * self.cell_type_count) / tf.reduce_sum(self.cell_type_count)
+        total_osi_loss = tf.reduce_sum(osi_loss_type * self.cell_type_count) / tf.reduce_sum(self.cell_type_count)
+        total_dsi_loss = tf.reduce_sum(dsi_loss_type * self.cell_type_count) / tf.reduce_sum(self.cell_type_count)
     
-        return (total_osi_loss0 + total_dsi_loss0) * self._osi_cost
+        return (total_osi_loss + total_dsi_loss) * self._osi_cost
     
-
     def __call__(self, spikes, angle, trim, normalizer=None):
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)

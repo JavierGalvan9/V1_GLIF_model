@@ -399,7 +399,7 @@ class LGN(object):
             self.dom_temporal_kernels = tf.constant(dom_temporal_kernels, dtype=dtype)
             self.non_dom_temporal_kernels = tf.constant(non_dom_temporal_kernels, dtype=dtype)
             # self.gaussian_filters = gaussian_filters
-            self.gaussian_filters = [tf.constant(gf, dtype=dtype) for gf in self.gaussian_filters]
+            self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
             self.spatial_range_indices = spatial_range_indices
             self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
             # self.actual_spatial_range = actual_spatial_range
@@ -424,7 +424,7 @@ class LGN(object):
     def spatial_response(self, movie, bmtk_compat=True):
 
         if not isinstance(movie, tf.Tensor):
-            movie = tf.constant(movie, dtype=dtype)
+            movie = tf.constant(movie, dtype=self.dtype)
             print(f'Movie type: {type(movie)}')
        
         all_spatial_responses = []

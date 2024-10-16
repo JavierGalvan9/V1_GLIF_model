@@ -33,7 +33,7 @@ def printgpu(gpu_id=0):
         used, free, total = [float(x)/1024 for x in result.stdout.strip().split(',')]
         print(f"    Total GPU Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
 
-        return current, peak
+        # return current, peak
 
 def compose_str(metrics_values):
         _acc, _loss, _rate, _rate_loss, _voltage_loss, _regularizers_loss, _osi_dsi_loss, _sync_loss = metrics_values
@@ -838,6 +838,22 @@ class Callbacks:
 
     def on_epoch_end(self, x, v1_spikes, y, metric_values, bkg_noise=None, verbose=True,
                     x_spont=None, v1_spikes_spont=None):
+        
+        if v1_spikes.dtype == tf.float16:
+            v1_spikes = v1_spikes.numpy().astype(np.float32)
+            x = x.numpy().astype(np.float32)
+            y = y.numpy().astype(np.float32)
+            if x_spont is not None:
+                x_spont = x_spont.numpy().astype(np.float32)
+                v1_spikes_spont = v1_spikes_spont.numpy().astype(np.float32)
+        else:
+            v1_spikes = v1_spikes.numpy()
+            x = x.numpy()
+            y = y.numpy()
+            if x_spont is not None:
+                x_spont = x_spont.numpy()
+                v1_spikes_spont = v1_spikes_spont.numpy()
+
         self.step = 0
         if self.initial_metric_values is None:
             self.initial_metric_values = metric_values
@@ -972,9 +988,6 @@ class Callbacks:
         plt.close()
     
     def plot_raster(self, x, v1_spikes, y):
-        v1_spikes = v1_spikes.numpy()
-        x = x.numpy()
-        y = y.numpy()
         seq_len = v1_spikes.shape[1]
         images_dir = os.path.join(self.logdir, 'Raster_plots')
         os.makedirs(images_dir, exist_ok=True)
@@ -994,8 +1007,8 @@ class Callbacks:
 
     def composed_raster(self, x, v1_spikes, x_spont, v1_spikes_spont, y, plot_core_only=True):
         # concatenate the normal and spontaneous arrays
-        x = np.concatenate((x_spont.numpy(), x.numpy()), axis=1)
-        v1_spikes = np.concatenate((v1_spikes_spont.numpy(), v1_spikes.numpy()), axis=1)
+        x = np.concatenate((x_spont, x), axis=1)
+        v1_spikes = np.concatenate((v1_spikes_spont, v1_spikes), axis=1)
         seq_len = v1_spikes.shape[1]
         images_dir = os.path.join(self.logdir, 'Raster_plots')
         if plot_core_only:
@@ -1018,8 +1031,8 @@ class Callbacks:
         graph(x, v1_spikes)
 
     def plot_lgn_activity(self, x, x_spont):
-        x = x.numpy()[0, :, :]
-        x_spont = x_spont.numpy()[0, :, :]
+        x = x[0, :, :]
+        x_spont = x_spont[0, :, :]
         x = np.concatenate((x_spont, x), axis=0)
         x_mean = np.mean(x, axis=1)
         plt.figure(figsize=(10, 5))
@@ -1032,7 +1045,7 @@ class Callbacks:
         plt.close()
 
     def plot_populations_activity(self, v1_spikes, v1_spikes_spont):
-        v1_spikes = np.concatenate((v1_spikes_spont.numpy(), v1_spikes.numpy()), axis=1)
+        v1_spikes = np.concatenate((v1_spikes_spont, v1_spikes), axis=1)
         seq_len = v1_spikes.shape[1]
         # Plot the mean firing rate of the population of neurons
         filename = f'Epoch_{self.epoch}'
@@ -1043,9 +1056,8 @@ class Callbacks:
         Population_activity(v1_spikes, plot_core_only=True, bin_size=10)
 
     def plot_mean_firing_rate_boxplot(self, v1_spikes, y):
-        v1_spikes = v1_spikes.numpy()
         seq_len = v1_spikes.shape[1]
-        DG_angles = y.numpy()
+        DG_angles = y
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/{self.neuropixels_feature}')
         os.makedirs(boxplots_dir, exist_ok=True)        
         if self.neuropixels_feature == "Ave_Rate(Hz)":
@@ -1060,8 +1072,7 @@ class Callbacks:
         metrics_analysis(metrics=[self.neuropixels_feature], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')    
                 
     def plot_spontaneous_boxplot(self, v1_spikes, y):
-        v1_spikes = v1_spikes.numpy()
-        DG_angles = y.numpy()
+        DG_angles = y
         seq_len = v1_spikes.shape[1]
         boxplots_dir = os.path.join(self.logdir, f'Boxplots/Spontaneous')
         os.makedirs(boxplots_dir, exist_ok=True)
