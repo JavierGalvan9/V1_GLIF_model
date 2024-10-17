@@ -401,7 +401,7 @@ class V1Column(tf.keras.layers.Layer):
         current_factor = 1 / _params["C_m"] * (1 - membrane_decay) * tau
 
         # Determine the synaptic dynamic parameters for each of the 5 basis receptors.
-        path='GLIF_network/synaptic_data/tau_basis.npy' # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
+        path='synaptic_data/tau_basis.npy' # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
         tau_syns = np.load(path)
         syn_decay = np.exp(-dt / tau_syns)
         syn_decay = tf.constant(syn_decay, dtype=self.compute_dtype)
