@@ -156,6 +156,7 @@ def make_pre_ind_table(indices, n_source_neurons=197613):
     sorted_pre_inds, sorted_synapse_indices = tf.math.top_k(-pre_inds, k=n_syn)
     sorted_pre_inds = -sorted_pre_inds  # Undo the negation to get the sorted pre_inds
     # Count occurrences (out-degrees) for each presynaptic neuron using bincount
+    sorted_pre_inds = tf.cast(sorted_pre_inds, tf.int32)
     counts = tf.math.bincount(sorted_pre_inds, minlength=n_source_neurons)
     # Create row_splits that covers all presynaptic neurons (0 to n_source_neurons)
     row_splits = tf.concat([[0], tf.cumsum(counts)], axis=0)
