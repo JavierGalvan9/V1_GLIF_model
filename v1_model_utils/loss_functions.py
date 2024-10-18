@@ -409,6 +409,7 @@ class SynchronizationLoss(Layer):
 
         return fanos.stack()
 
+
     def __call__(self, spikes, trim=True):
 
         if self._core_mask is not None:

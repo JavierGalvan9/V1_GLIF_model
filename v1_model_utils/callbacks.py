@@ -839,7 +839,7 @@ class Callbacks:
     def on_epoch_end(self, x, v1_spikes, y, metric_values, bkg_noise=None, verbose=True,
                     x_spont=None, v1_spikes_spont=None):
         
-        if v1_spikes.dtype == tf.float16:
+        if self.flags.dtype != 'float32':
             v1_spikes = v1_spikes.numpy().astype(np.float32)
             x = x.numpy().astype(np.float32)
             y = y.numpy().astype(np.float32)
@@ -942,6 +942,7 @@ class Callbacks:
             print_str = f'  Step {self.step:2d}/{self.flags.steps_per_epoch} - Angle: {y[0][0]:.2f}\n'
             print_str += '    ' + compose_str(train_values)
             print(print_str)
+            tf.print(print_str)
             print(f'    Step running time: {time() - self.step_init_time:.2f}s')
             for gpu_id in range(len(self.strategy.extended.worker_devices)):
                 printgpu(gpu_id=gpu_id)

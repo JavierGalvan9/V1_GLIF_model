@@ -4,7 +4,7 @@ import os
 
 # Define the environment variables for optimal GPU performance
 os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # before import tensorflow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
@@ -31,6 +31,9 @@ import stim_dataset
 from time import time
 import ctypes.util
 import random
+
+import logging
+tf.get_logger().setLevel(logging.INFO)
 
 
 print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
@@ -460,19 +463,20 @@ def main(_):
         return _out, _p, _loss, _aux, _bkg_noise
 
 
-    def train_step(_x, _y, _w, spontaneous, trim=True):
+    def train_step(_x, _y, _w, spontaneous, trim):
         ### Forward propagation of the model
         with tf.GradientTape() as tape:
             _out, _p, _loss, _aux, _ = roll_out(_x, _y, _w, trim=trim, spontaneous=spontaneous)
             # Scale the loss for float16         
             if flags.dtype=='float16':
                 _scaled_loss = optimizer.get_scaled_loss(_loss)
-
+                loss = _scaled_loss
+            else:
+                loss = _loss
+                
+        grad = tape.gradient(loss, model.trainable_variables)
         if flags.dtype=='float16':
-            scaled_gradients = tape.gradient(_scaled_loss, model.trainable_variables)
-            grad = optimizer.get_unscaled_gradients(scaled_gradients)
-        else:
-            grad = tape.gradient(_loss, model.trainable_variables)
+            grad = optimizer.get_unscaled_gradients(grad)
 
         return _loss, _aux, _out, _p, grad
 
@@ -542,7 +546,7 @@ def main(_):
 
         return model_spikes, [0., _loss, _rate, rate_loss, voltage_loss, regularizers_loss, osi_dsi_loss, sync_loss]
     
-    @tf.function
+    # @tf.function
     def distributed_split_train_step(x, y, weights, x_spontaneous, trim):
         _out = strategy.run(split_train_step, args=(x, y, weights, x_spontaneous, trim))
         return _out
@@ -637,37 +641,21 @@ def main(_):
        
     # test_data_set = strategy.distribute_datasets_from_function(get_dataset_fn(regular=True))
 
-    # def reset_state():
-    #     tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
-
-    def reset_state(reset_type='zero', new_state=None):
-        if reset_type == 'zero':
-            tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
-        elif reset_type == 'gray':
-            # Run a gray simulation to get the model state
-            tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
-        elif reset_type == 'continue':
-            # Continue on the previous model state
-            # No action needed, as the state_variables will not be modified
-            pass
-        else:
-            raise ValueError(f"Invalid reset_type: {reset_type}")
+    def generate_gray_state():
+        # Generate LGN spikes
+        x = generate_spontaneous_spikes(spontaneous_prob)
+        tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state) 
+        # Simulate the network with a gray screen   
+        _out, _, _, _, _ = distributed_roll_out(x, y_spontaneous, w_spontaneous)
+        return tuple(_out[1:])
+    
+    def reset_state(new_state):
+        tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
 
     # @tf.function
-    def distributed_reset_state(reset_type, gray_state=None):
-        if reset_type == 'gray':
-            if gray_state is None:
-                # Generate LGN spikes
-                x = generate_spontaneous_spikes(spontaneous_prob)
-                tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)    
-                _out, _, _, _, _ = distributed_roll_out(x, y_spontaneous, w_spontaneous)
-                gray_state = tuple(_out[1:])
-                strategy.run(reset_state, args=(reset_type, gray_state))
-                return gray_state
-            else:
-                strategy.run(reset_state, args=(reset_type, gray_state))
-        else:
-            strategy.run(reset_state, args=(reset_type, zero_state))
+    def distributed_reset_state(new_state):
+        strategy.run(reset_state, args=(new_state,))
+
 
     def get_next_chunknum(chunknum, seq_len, direction='up'):
         # get the next chunk number (diviser) for seq_len.
@@ -712,7 +700,9 @@ def main(_):
     for epoch in range(n_prev_epochs, n_prev_epochs + flags.n_epochs):
         callbacks.on_epoch_start()  
         # Reset the model state to the gray state    
-        gray_state = distributed_reset_state('gray')  
+        # gray_state = distributed_reset_state('gray')  
+        gray_state = generate_gray_state()
+        distributed_reset_state(gray_state)
         
         # Load the dataset iterator - this must be done inside the epoch loop
         it = iter(train_data_set)
@@ -722,9 +712,9 @@ def main(_):
             callbacks.on_step_start()
             # try resetting every iteration
             if flags.reset_every_step:
-                distributed_reset_state('gray')
-            else:
-                distributed_reset_state('gray', gray_state=gray_state)
+                gray_state = generate_gray_state()
+
+            distributed_reset_state(gray_state)
 
             x, y, _, w = next(it) # x dtype tf.bool
             # Generate LGN spikes
@@ -795,6 +785,8 @@ def main(_):
 
         #     gray_state = distributed_reset_state('gray')  
         #     distributed_reset_state('gray', gray_state=gray_state)
+            # gray_state = generate_gray_state()
+            # distributed_reset_state(gray_state)
 
         #     # v1_spikes, lm_spikes, _ = distributed_validation_step(x, y, w, output_spikes=True)
         #     _out, _, _, _, bkg_noise = distributed_roll_out(x_spontaneous, y_spontaneous, w_spontaneous)
@@ -895,6 +887,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('val_steps', 1, '')# EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
     # absl.app.flags.DEFINE_integer('max_delay', 5, '')
     # absl.app.flags.DEFINE_integer('n_plots', 1, '')
+    absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
 
     # absl.app.flags.DEFINE_integer('pre_chunks', 3, '')
     # absl.app.flags.DEFINE_integer('post_chunks', 8, '') # the pure classification task only need 1 but to make consistent with other tasks one has to make up here

@@ -20,6 +20,21 @@ def pseudo_derivative(v_scaled, dampening_factor):
 # def slayer_pseudo(v_scaled, sigma, amplitude):
 #     return tf.math.exp(-sigma * tf.abs(v_scaled)) * amplitude
 
+# @tf.custom_gradient
+# def spike_slayer(v_scaled, sigma, amplitude):
+#     z_ = tf.greater(v_scaled, 0.0)
+#     z_ = tf.cast(z_, tf.float32)
+
+#     def grad(dy):
+#         de_dz = dy
+#         dz_dv_scaled = slayer_pseudo(v_scaled, sigma, amplitude)
+
+#         de_dv_scaled = de_dz * dz_dv_scaled
+
+#         return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
+
+#     return tf.identity(z_, name="spike_slayer"), grad
+
 @tf.custom_gradient
 def spike_gauss(v_scaled, sigma, amplitude):
     z_ = tf.greater(v_scaled, 0.0)
@@ -64,21 +79,6 @@ def spike_gauss_b16(v_scaled, sigma, amplitude):
         return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
 
     return tf.identity(z_, name='spike_gauss'), grad
-
-# @tf.custom_gradient
-# def spike_slayer(v_scaled, sigma, amplitude):
-#     z_ = tf.greater(v_scaled, 0.0)
-#     z_ = tf.cast(z_, tf.float32)
-
-#     def grad(dy):
-#         de_dz = dy
-#         dz_dv_scaled = slayer_pseudo(v_scaled, sigma, amplitude)
-
-#         de_dv_scaled = de_dz * dz_dv_scaled
-
-#         return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
-
-#     return tf.identity(z_, name="spike_slayer"), grad
 
 @tf.custom_gradient
 def spike_function(v_scaled, dampening_factor):
@@ -154,7 +154,8 @@ def make_pre_ind_table(indices, n_source_neurons=197613):
     n_syn = pre_inds.shape[0]
     # Since pre_inds may not be sorted, we sort them along with synapse_indices
     sorted_pre_inds, sorted_synapse_indices = tf.math.top_k(-pre_inds, k=n_syn)
-    sorted_pre_inds = -sorted_pre_inds  # Undo the negation to get the sorted pre_inds
+    # Count occurrences (out-degrees) for each presynaptic neuron using bincount
+    sorted_pre_inds = tf.cast(-sorted_pre_inds, dtype=tf.int32)  # Undo the negation to get the sorted pre_inds and cast to reduce memory usage
     # Count occurrences (out-degrees) for each presynaptic neuron using bincount
     counts = tf.math.bincount(sorted_pre_inds, minlength=n_source_neurons)
     # Create row_splits that covers all presynaptic neurons (0 to n_source_neurons)
@@ -228,6 +229,7 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
 
         return i_in
 
+    @tf.function
     def call(self, inp): # inp only provides the shape
         # Generate the background spikes
         seq_len = tf.shape(inp)[1]
@@ -242,9 +244,11 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
        
         # Create a TensorArray to save the results for every receptor type
         noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 65871, 600)
-        noise_input = tf.transpose(noise_input) # (600, 50000, 5) # New shape (3000, 65871, 5)
+
+        noise_input = tf.transpose(noise_input, (2, 1, 0)) # (600, 65871, 5) 
         # Reshape properly the input current
         noise_input = tf.reshape(noise_input, (self._batch_size, seq_len, -1)) # (1, 600, 250000) # (1, 3000, 333170)
+        # noise_input = tf.expand_dims(noise_input, axis=0) # (1, 600, 65871, 5)
 
         return noise_input
     
@@ -281,6 +285,7 @@ class LGNInputLayerCell(tf.keras.layers.Layer):
         sorted_indices = tf.argsort(new_indices[:, 0])
         sorted_segment_ids = tf.gather(new_indices[:, 0], sorted_indices)
         sorted_inds = tf.gather(inds, sorted_indices)
+        
         # Get the weights for each active synapse
         gathered_weights = tf.gather(self._input_weights, sorted_inds, axis=0)
         gathered_factors = tf.gather(self._input_weights_factors, sorted_inds, axis=0)
@@ -296,7 +301,7 @@ class LGNInputLayerCell(tf.keras.layers.Layer):
             i_in = tf.cast(i_in, dtype=self.compute_dtype)
 
         # Add batch dimension
-        i_in = tf.expand_dims(i_in, axis=0)  # Shape: [1, n_post_neurons, n_syn_basis]
+        # i_in = tf.expand_dims(i_in, axis=0)  # Shape: [1, n_post_neurons, n_syn_basis]
         i_in = tf.reshape(i_in, [batch_size, -1])
         # Since no states are maintained, return empty state
         return i_in, []
@@ -315,9 +320,11 @@ class LGNInputLayer(tf.keras.layers.Layer):
         # Create the input RNN layer with the custom cell to recursively process all the inputs by timesteps
         self.input_rnn = tf.keras.layers.RNN(self.input_cell, return_sequences=True, return_state=False, name='lgn_rsnn')
 
+    @tf.function
     def call(self, inputs, **kwargs):
         # inputs: Shape [batch_size, seq_len, input_dim]
         input_current = self.input_rnn(inputs, **kwargs)  # Outputs: [batch_size, seq_len, n_postsynaptic_neurons]
+
         return input_current
 
 
@@ -690,6 +697,7 @@ class V1Column(tf.keras.layers.Layer):
         i_rec = self.calculate_i_rec(rec_z_buf)
         # Add all the current sources
         rec_inputs = i_rec + external_current + bkg_noise
+
         # Scale with the learning rate
         rec_inputs = rec_inputs * self._lr_scale
         
