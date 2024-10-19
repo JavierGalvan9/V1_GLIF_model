@@ -68,11 +68,14 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
     edge_types_file = f'{source}_{target}_edge_types.csv'
     edges_h5_path = os.path.join(data_dir, edge_file)
     edges_type_df = pd.read_csv(os.path.join(data_dir, edge_types_file), delimiter=" ")
-    synaptic_models_path = os.path.join('GLIF_network', 'components', "synaptic_models")
+    # synaptic_models_path = os.path.join('GLIF_network', 'components', "synaptic_models")
+    synaptic_models_path = os.path.join(data_dir, '..', 'components', "synaptic_models")
     basis_function_weights_df = pd.read_csv('synaptic_data/basis_function_weights.csv', index_col=0)
     print(f'Saving basis function weights for {source}-{target}')
     # Map the synaptic model to a given id using a dictionary
-    path = os.path.join('GLIF_network', 'synaptic_models_to_syn_id_dict.pkl')
+    # path = os.path.join('GLIF_network', 'synaptic_models_to_syn_id_dict.pkl')
+    path = os.path.join(data_dir, '..', 'synaptic_models_to_syn_id_dict.pkl')
+    path_weights = os.path.join(data_dir, '..', 'syn_id_to_syn_weights_dict.pkl')
     if not os.path.exists(path):
         synaptic_models_to_syn_id_dict = dict()
         syn_id_to_syn_weights_dict = dict()
@@ -84,7 +87,7 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
                 syn_id_to_syn_weights_dict[syn_id] = tau_syn_weights
         with open(path, "wb") as f:
             pkl.dump(synaptic_models_to_syn_id_dict, f)
-        with open('GLIF_network/syn_id_to_syn_weights_dict.pkl', "wb") as f:
+        with open(path_weights, "wb") as f:
             pkl.dump(syn_id_to_syn_weights_dict, f)
     else:
         with open(path, "rb") as f:
@@ -155,9 +158,13 @@ def load_network(
 
     # Create / Load the network_dat pickle file from the SONATA files
     if not os.path.exists(path):
-        print("Creating network_dat.pkl file...")
-        d = create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1',
-                                output_file='GLIF_network/network_dat.pkl', save_pkl=True)
+        base_dir = os.path.dirname(path)
+        data_dir = os.path.join(base_dir, "network")
+        print(f"Creating {path} file...")
+        d = create_network_dat(data_dir=data_dir, source='v1', target='v1',
+                               output_file=path, save_pkl=True)
+        # d = create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1',
+        #                         output_file='GLIF_network/network_dat.pkl', save_pkl=True)
     else:
         print("Loading network_dat.pkl file...")
         with open(path, "rb") as f:
@@ -349,20 +356,26 @@ def load_network(
 
 # @profile
 def load_input(
-    lgn_path="GLIF_network/lgn_input_dat.pkl",
-    bkg_path="GLIF_network/bkg_input_dat.pkl",
+    data_dir="GLIF_network",
+    # lgn_path="GLIF_network/lgn_input_dat.pkl",
+    # bkg_path="GLIF_network/bkg_input_dat.pkl",
     start=0,
     duration=3000,
     dt=1,
     bmtk_id_to_tf_id=None,
     tensorflow_speed_up=False
 ):
+    lgn_path = os.path.join(data_dir, "lgn_input_dat.pkl")
+    bkg_path = os.path.join(data_dir, "bkg_input_dat.pkl")
     # LOAD THE LGN INPUT
     if not os.path.exists(lgn_path):
-        print("Creating lgn_input_dat.pkl file...")
+        # print("Creating lgn_input_dat.pkl file...")
+        print(f"Creating {lgn_path} file...")
         # Process LGN input network
-        lgn_input = create_network_dat(data_dir='GLIF_network/network', source='lgn', target='v1', 
-                                        output_file=lgn_path, save_pkl=True)
+        lgn_input = create_network_dat(data_dir=data_dir, source='lgn', target='v1',
+                                       output_file=lgn_path, save_pkl=True)
+        # lgn_input = create_network_dat(data_dir='GLIF_network/network', source='lgn', target='v1', 
+        #                                 output_file=lgn_path, save_pkl=True)
         print("Done.")
     else:
         with open(lgn_path, "rb") as f:
@@ -370,10 +383,13 @@ def load_input(
 
     # LOAD THE BACKGROUND INPUT
     if not os.path.exists(bkg_path):
-        print("Creating bkg_input_dat.pkl file...")
+        # print("Creating bkg_input_dat.pkl file...")
+        print(f"Creating {bkg_path} file...")
         # Process LGN input network
-        bkg_input = create_network_dat(data_dir='GLIF_network/network', source='bkg', target='v1', 
-                                        output_file=bkg_path, save_pkl=True)
+        bkg_input = create_network_dat(data_dir=data_dir, source='bkg', target='v1',
+                                       output_file=bkg_path, save_pkl=True)
+        # bkg_input = create_network_dat(data_dir='GLIF_network/network', source='bkg', target='v1', 
+        #                                 output_file=bkg_path, save_pkl=True)
         print("Done.")
     else:
         with open(bkg_path, "rb") as f:
@@ -449,11 +465,11 @@ def load_input(
 
         if idx == 0:
             # we load the LGN nodes and their positions
-            lgn_nodes_h5_file = h5py.File("GLIF_network/network/lgn_nodes.h5", "r")
+            lgn_nodes_h5_file = h5py.File(f"{data_dir}/network/lgn_nodes.h5", "r")
             n_inputs = len(lgn_nodes_h5_file["nodes"]["lgn"]["node_id"])
         else:
             # we load the background nodes and their positions
-            bkg_nodes_h5_file = h5py.File("GLIF_network/network/bkg_nodes.h5", "r")
+            bkg_nodes_h5_file = h5py.File(f"{data_dir}/network/bkg_nodes.h5", "r")
             n_inputs = len(bkg_nodes_h5_file["nodes"]["bkg"]["node_id"])
 
         input_populations.append(
@@ -580,6 +596,7 @@ def load_v1(flags, n_neurons, flag_str=''):
     )
     readout_neurons = readout_neurons.reshape((flags.n_output, flags.neurons_per_output))
     network["readout_neuron_ids"] = readout_neurons
+    network["data_dir"] = flags.data_dir # to use later
     #########################################
 
     ## Load the LGN and BKG input of the model
@@ -588,8 +605,9 @@ def load_v1(flags, n_neurons, flag_str=''):
                         start=1000, 
                         duration=1000,
                         dt=1,
-                        lgn_path=os.path.join(flags.data_dir, "lgn_input_dat.pkl"),
-                        bkg_path=os.path.join(flags.data_dir, "bkg_input_dat.pkl"),
+                        data_dir=flags.data_dir,
+                        # lgn_path=os.path.join(flags.data_dir, "lgn_input_dat.pkl"),
+                        # bkg_path=os.path.join(flags.data_dir, "bkg_input_dat.pkl"),
                         bmtk_id_to_tf_id=network["bmtk_id_to_tf_id"], 
                         tensorflow_speed_up=False
     )
@@ -611,7 +629,7 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     network, lgn_input, bkg_input = None, None, None
 
     if flag_str == '':
-        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}"
+        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_{flags.data_dir.replace('/', '_')}"
     
     file_dir = os.path.split(__file__)[0]
     cache_path = os.path.join(file_dir, f".cache/V1_network_{flag_str}.pkl")

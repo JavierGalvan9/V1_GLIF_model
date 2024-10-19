@@ -60,7 +60,14 @@ def get_layer_info(network):
         layer_info[layer_names[i]] = np.char.startswith(pop_name, layer_query[i])
     return layer_info  
 
-def pop_names(network, core_radius = None, n_selected_neurons=None, data_dir='GLIF_network', return_node_type_ids=False):
+def pop_names(network, core_radius = None, n_selected_neurons=None, data_dir='', return_node_type_ids=False):
+    if data_dir != '':  # if changed from default, use as is.
+        pass
+    elif "data_dir" in network:  # if defined in the network, use it.
+        data_dir = network["data_dir"]
+    else:
+        print("No data_dir defined in the network. Using the default one.")
+        data_dir = 'GLIF_network'  # if none is the cae, use the default one
     path_to_csv = os.path.join(data_dir, 'network/v1_node_types.csv')
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
 
