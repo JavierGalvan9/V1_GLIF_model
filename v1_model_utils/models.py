@@ -177,82 +177,168 @@ def get_new_inds_table(indices, non_zero_cols, pre_ind_table):
     return new_indices, all_inds
 
 
-class BackgroundNoiseLayer(tf.keras.layers.Layer):
-    """
-    This class calculates the input currents from the BKG noise by processing all timesteps at once."
-    For that reason is unfeasible if the user wants to train the LGN -> V1 weights.
-    Each call takes 0.03 seconds for 600 ms of simulation.
+# class BackgroundNoiseLayer(tf.keras.layers.Layer):
+#     """
+#     This class calculates the input currents from the BKG noise by processing all timesteps at once."
+#     For that reason is unfeasible if the user wants to train the LGN -> V1 weights.
+#     Each call takes 0.03 seconds for 600 ms of simulation.
 
-    Returns:
-        _type_: input_currents (self.compute_dtype)
-    """
-    def __init__(self, indices, weights, dense_shape,  
-                 weights_factors, batch_size, seq_len,
-                 bkg_firing_rate=250, n_bkg_units=100, 
+#     Returns:
+#         _type_: input_currents (self.compute_dtype)
+#     """
+#     def __init__(self, indices, weights, dense_shape,  
+#                  weights_factors, batch_size, seq_len,
+#                  bkg_firing_rate=250, n_bkg_units=100, 
+#                  **kwargs):
+#         super().__init__(**kwargs)
+#         self._bkg_weights = weights
+#         self._bkg_indices = indices
+#         self._dense_shape = dense_shape
+#         self._bkg_input_weights_factors = weights_factors
+#         self._batch_size = batch_size
+#         self._seq_len = seq_len
+#         self._n_syn_basis = weights_factors.shape[1]
+#         # self._lr_scale = lr_scale
+#         self._bkg_firing_rate = bkg_firing_rate
+#         self._n_bkg_units = n_bkg_units
+
+#     def calculate_bkg_i_in(self, inputs):
+#         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
+#         i_in = tf.TensorArray(dtype=self.compute_dtype, size=self._n_syn_basis)
+#         for r_id in range(self._n_syn_basis):
+#             weights_syn_receptors = self._bkg_weights * self._bkg_input_weights_factors[:, r_id]
+#             sparse_w_in = tf.sparse.SparseTensor(
+#                 self._bkg_indices,
+#                 weights_syn_receptors, 
+#                 self._dense_shape,
+#             )
+#             i_receptor = tf.sparse.sparse_dense_matmul(
+#                                                         sparse_w_in,
+#                                                         inputs,
+#                                                         adjoint_b=True
+#                                                     )
+#             # Optionally cast the output back to float16
+#             if i_receptor.dtype != self.compute_dtype:
+#                 i_receptor = tf.cast(i_receptor, dtype=self.compute_dtype)
+
+#             # Append i_receptor to the TensorArray
+#             i_in = i_in.write(r_id, i_receptor)
+
+#         # Stack the TensorArray into a single tensor
+#         i_in = i_in.stack()
+
+#         return i_in
+
+#     @tf.function
+#     def call(self, inp): # inp only provides the shape
+#         # Generate the background spikes
+#         seq_len = tf.shape(inp)[1]
+#         rest_of_brain = tf.random.poisson(shape=(self._batch_size * seq_len, self._n_bkg_units), 
+#                                         lam=self._bkg_firing_rate * .001, 
+#                                         dtype=self.variable_dtype) # this implementation is slower
+        
+#         # rest_of_brain = tf.cast(tf.random.uniform(
+#         #         (self._batch_size, seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
+#         #         tf.float32) # (1, 600, 100)
+#         # rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
+       
+#         # Create a TensorArray to save the results for every receptor type
+#         noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 65871, 600)
+
+#         noise_input = tf.transpose(noise_input, (2, 1, 0)) # (600, 65871, 5) 
+#         # Reshape properly the input current
+#         noise_input = tf.reshape(noise_input, (self._batch_size, seq_len, -1)) # (1, 600, 250000) # (1, 3000, 333170)
+#         # noise_input = tf.expand_dims(noise_input, axis=0) # (1, 600, 65871, 5)
+
+#         return noise_input
+    
+class BKGInputLayerCell(tf.keras.layers.Layer):
+    def __init__(self, indices, weights, dense_shape, syn_ids, synaptic_basis_weights,
                  **kwargs):
         super().__init__(**kwargs)
-        self._bkg_weights = weights
-        self._bkg_indices = indices
+        self._indices = indices
+        self._input_weights = weights
+        self._input_syn_ids = syn_ids
+        self._synaptic_basis_weights = synaptic_basis_weights
+        # self._n_syn_basis = weights_factors.shape[1]  # Number of receptors
         self._dense_shape = dense_shape
-        self._bkg_input_weights_factors = weights_factors
+        # Precompute the synapses table
+        self.pre_ind_table = make_pre_ind_table(indices, n_source_neurons=dense_shape[1])
+
+    @property
+    def state_size(self):
+        # No states are maintained in this cell
+        return []
+
+    # def build(self, input_shape):
+    #     # If you have any trainable variables, initialize them here
+    #     pass
+
+    # @tf.function
+    def call(self, inputs_t, states):
+        # inputs_t: Shape [batch_size, input_dim]
+        batch_size = tf.shape(inputs_t)[0]
+        # Compute the input current for the timestep
+        non_zero_cols = tf.where(inputs_t > 0)[:, 1]
+        new_indices, inds = get_new_inds_table(self._indices, non_zero_cols, self.pre_ind_table)
+        # Sort the segment IDs and corresponding data
+        # sorted_indices = tf.argsort(new_indices[:, 0])
+        # sorted_segment_ids = tf.gather(new_indices[:, 0], sorted_indices)
+        # sorted_inds = tf.gather(inds, sorted_indices)
+
+        # Get the number of presynaptic spikes
+        n_pre_spikes = tf.gather(inputs_t[0, :], new_indices[:, 1])
+        
+        # Get the weights for each active synapse
+        sorted_syn_ids = tf.gather(self._input_syn_ids, inds)
+        sorted_weights = tf.expand_dims(tf.gather(self._input_weights, inds, axis=0) * n_pre_spikes, axis=1)
+        sorted_data = sorted_weights * tf.gather(self._synaptic_basis_weights, sorted_syn_ids, axis=0)
+        # sorted_data = tf.gather(self._input_weights, inds, axis=0) * tf.gather(self._input_weights_factors, inds, axis=0)
+        # Calculate the total LGN input current received by each neuron
+        i_in = tf.math.unsorted_segment_sum(
+            sorted_data,
+            new_indices[:, 0],
+            num_segments=self._dense_shape[0]
+        )
+        # Optionally cast the output back to float16
+        if i_in.dtype != self.compute_dtype:
+            i_in = tf.cast(i_in, dtype=self.compute_dtype)
+
+        # Add batch dimension
+        # i_in = tf.expand_dims(i_in, axis=0)  # Shape: [1, n_post_neurons, n_syn_basis]
+        i_in = tf.reshape(i_in, [batch_size, -1])
+        # Since no states are maintained, return empty state
+        return i_in, []
+
+class BKGInputLayer(tf.keras.layers.Layer):
+    """
+    Calculates input currents from the LGN by processing one timestep at a time using a custom RNN cell.
+    """
+    def __init__(self, indices, weights, dense_shape, syn_ids, synaptic_basis_weights,
+                 batch_size, bkg_firing_rate=250, n_bkg_units=100,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.input_cell = BKGInputLayerCell(
+            indices, weights, dense_shape, syn_ids, synaptic_basis_weights,
+            **kwargs
+        )
         self._batch_size = batch_size
-        self._seq_len = seq_len
-        self._n_syn_basis = weights_factors.shape[1]
-        # self._lr_scale = lr_scale
         self._bkg_firing_rate = bkg_firing_rate
         self._n_bkg_units = n_bkg_units
-
-    def calculate_bkg_i_in(self, inputs):
-        # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
-        i_in = tf.TensorArray(dtype=self.compute_dtype, size=self._n_syn_basis)
-        for r_id in range(self._n_syn_basis):
-            weights_syn_receptors = self._bkg_weights * self._bkg_input_weights_factors[:, r_id]
-            sparse_w_in = tf.sparse.SparseTensor(
-                self._bkg_indices,
-                weights_syn_receptors, 
-                self._dense_shape,
-            )
-            i_receptor = tf.sparse.sparse_dense_matmul(
-                                                        sparse_w_in,
-                                                        inputs,
-                                                        adjoint_b=True
-                                                    )
-            # Optionally cast the output back to float16
-            if i_receptor.dtype != self.compute_dtype:
-                i_receptor = tf.cast(i_receptor, dtype=self.compute_dtype)
-
-            # Append i_receptor to the TensorArray
-            i_in = i_in.write(r_id, i_receptor)
-
-        # Stack the TensorArray into a single tensor
-        i_in = i_in.stack()
-
-        return i_in
+        # Create the input RNN layer with the custom cell to recursively process all the inputs by timesteps
+        self.input_rnn = tf.keras.layers.RNN(self.input_cell, return_sequences=True, return_state=False, name='noise_rsnn')
 
     @tf.function
-    def call(self, inp): # inp only provides the shape
-        # Generate the background spikes
-        seq_len = tf.shape(inp)[1]
-        rest_of_brain = tf.random.poisson(shape=(self._batch_size * seq_len, self._n_bkg_units), 
-                                        lam=self._bkg_firing_rate * .001, 
-                                        dtype=self.variable_dtype) # this implementation is slower
-        
-        # rest_of_brain = tf.cast(tf.random.uniform(
-        #         (self._batch_size, seq_len, self._n_bkg_units)) < self._bkg_firing_rate * .001, 
-        #         tf.float32) # (1, 600, 100)
-        # rest_of_brain = tf.reshape(rest_of_brain, (self._batch_size * seq_len, self._n_bkg_units)) # (batch_size*sequence_length, input_dim)
-       
-        # Create a TensorArray to save the results for every receptor type
-        noise_input = self.calculate_bkg_i_in(rest_of_brain) # (5, 65871, 600)
+    def call(self, inputs, **kwargs):
+        seq_len = tf.shape(inputs)[1]
+        rest_of_brain = tf.random.poisson(shape=(self._batch_size, seq_len, self._n_bkg_units), 
+                                    lam=self._bkg_firing_rate * .001, 
+                                    dtype=self.variable_dtype) # this implementation is slower
+        # inputs: Shape [batch_size, seq_len, input_dim]
+        input_current = self.input_rnn(rest_of_brain, **kwargs)  # Outputs: [batch_size, seq_len, n_postsynaptic_neurons]
 
-        noise_input = tf.transpose(noise_input, (2, 1, 0)) # (600, 65871, 5) 
-        # Reshape properly the input current
-        noise_input = tf.reshape(noise_input, (self._batch_size, seq_len, -1)) # (1, 600, 250000) # (1, 3000, 333170)
-        # noise_input = tf.expand_dims(noise_input, axis=0) # (1, 600, 65871, 5)
-
-        return noise_input
+        return input_current
     
-
 class LGNInputLayerCell(tf.keras.layers.Layer):
     def __init__(self, indices, weights, dense_shape, syn_ids, synaptic_basis_weights,
                  **kwargs):
@@ -603,8 +689,8 @@ class V1Column(tf.keras.layers.Layer):
             dtype=self.variable_dtype
         )
 
-        bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int64)
-        self.bkg_input_weights_factors = tf.gather(self.synaptic_basis_weights, bkg_input_syn_ids, axis=0)
+        self.bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int64)
+        # self.bkg_input_weights_factors = tf.gather(self.synaptic_basis_weights, bkg_input_syn_ids, axis=0)
 
         print(f"    > # BKG input synapses {len(bkg_input_indices)}")
         del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, bkg_input_delays
@@ -878,17 +964,29 @@ def create_model(
         name="input_layer",
     )(x)
 
-    # Create the BKG input layer of the model
-    bkg_inputs = BackgroundNoiseLayer(
+    # # Create the BKG input layer of the model
+    # bkg_inputs = BackgroundNoiseLayer(
+    #     cell.bkg_input_indices,
+    #     cell.bkg_input_weights,
+    #     cell.bkg_input_dense_shape,
+    #     cell.bkg_input_weights_factors, 
+    #     batch_size, 
+    #     seq_len,
+    #     # lr_scale=lr_scale,
+    #     name="noise_layer",
+    # )(x) # the input is provided just because in a Keras custom layer, the call method should accept input
+
+    # Generate the background spikes
+    # seq_len = tf.shape(x)[1]
+    bkg_inputs = BKGInputLayer(
         cell.bkg_input_indices,
         cell.bkg_input_weights,
         cell.bkg_input_dense_shape,
-        cell.bkg_input_weights_factors, 
+        cell.bkg_input_syn_ids, 
+        cell.synaptic_basis_weights,
         batch_size, 
-        seq_len,
-        # lr_scale=lr_scale,
         name="noise_layer",
-    )(x) # the input is provided just because in a Keras custom layer, the call method should accept input
+        )(x)
 
     # Concatenate the input layer with the initial state of the RNN
     full_inputs = tf.concat((rnn_inputs, bkg_inputs, state_input), -1) # (None, 600, 5*n_neurons+n_neurons)
