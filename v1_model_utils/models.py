@@ -254,12 +254,13 @@ class BackgroundNoiseLayer(tf.keras.layers.Layer):
     
 
 class LGNInputLayerCell(tf.keras.layers.Layer):
-    def __init__(self, indices, weights, dense_shape, weights_factors,
+    def __init__(self, indices, weights, dense_shape, syn_ids, synaptic_basis_weights,
                  **kwargs):
         super().__init__(**kwargs)
         self._indices = indices
         self._input_weights = weights
-        self._input_weights_factors = weights_factors
+        self._input_syn_ids = syn_ids
+        self._synaptic_basis_weights = synaptic_basis_weights
         # self._n_syn_basis = weights_factors.shape[1]  # Number of receptors
         self._dense_shape = dense_shape
         # Precompute the synapses table
@@ -282,18 +283,19 @@ class LGNInputLayerCell(tf.keras.layers.Layer):
         non_zero_cols = tf.where(inputs_t > 0)[:, 1]
         new_indices, inds = get_new_inds_table(self._indices, non_zero_cols, self.pre_ind_table)
         # Sort the segment IDs and corresponding data
-        sorted_indices = tf.argsort(new_indices[:, 0])
-        sorted_segment_ids = tf.gather(new_indices[:, 0], sorted_indices)
-        sorted_inds = tf.gather(inds, sorted_indices)
+        # sorted_indices = tf.argsort(new_indices[:, 0])
+        # sorted_segment_ids = tf.gather(new_indices[:, 0], sorted_indices)
+        # sorted_inds = tf.gather(inds, sorted_indices)
         
         # Get the weights for each active synapse
-        gathered_weights = tf.gather(self._input_weights, sorted_inds, axis=0)
-        gathered_factors = tf.gather(self._input_weights_factors, sorted_inds, axis=0)
-        sorted_data = gathered_weights * gathered_factors
+        sorted_syn_ids = tf.gather(self._input_syn_ids, inds)
+        sorted_weights = tf.expand_dims(tf.gather(self._input_weights, inds, axis=0), axis=1)
+        sorted_data = sorted_weights * tf.gather(self._synaptic_basis_weights, sorted_syn_ids, axis=0)
+        # sorted_data = tf.gather(self._input_weights, inds, axis=0) * tf.gather(self._input_weights_factors, inds, axis=0)
         # Calculate the total LGN input current received by each neuron
         i_in = tf.math.unsorted_segment_sum(
             sorted_data,
-            sorted_segment_ids,
+            new_indices[:, 0],
             num_segments=self._dense_shape[0]
         )
         # Optionally cast the output back to float16
@@ -310,11 +312,11 @@ class LGNInputLayer(tf.keras.layers.Layer):
     """
     Calculates input currents from the LGN by processing one timestep at a time using a custom RNN cell.
     """
-    def __init__(self, indices, weights, dense_shape, weights_factors,
+    def __init__(self, indices, weights, dense_shape, syn_ids, synaptic_basis_weights,
                  **kwargs):
         super().__init__(**kwargs)
         self.input_cell = LGNInputLayerCell(
-            indices, weights, dense_shape, weights_factors,
+            indices, weights, dense_shape, syn_ids, synaptic_basis_weights,
             **kwargs
         )
         # Create the input RNN layer with the custom cell to recursively process all the inputs by timesteps
@@ -493,7 +495,7 @@ class V1Column(tf.keras.layers.Layer):
         self.pre_ind_table = make_pre_ind_table(indices, n_source_neurons=self.recurrent_dense_shape[1])
 
         # add dimension for the weights factors - TensorShape([23525415, 1])
-        weights = tf.expand_dims(weights, axis=1) 
+        # weights = tf.expand_dims(weights, axis=1) 
         # Set the sign of the connections (exc or inh)
         recurrent_weight_positive = tf.Variable(
             weights >= 0.0, name="recurrent_weights_sign", trainable=False)
@@ -537,11 +539,11 @@ class V1Column(tf.keras.layers.Layer):
         else:
             self.per_type_training = False
             
-        syn_ids = tf.constant(syn_ids, dtype=tf.int32)
-        self.recurrent_weights_factors = tf.gather(self.synaptic_basis_weights, syn_ids, axis=0) # TensorShape([23525415, 5])
+        self.syn_ids = tf.constant(syn_ids, dtype=tf.int64)
+        # self.recurrent_weights_factors = tf.gather(self.synaptic_basis_weights, self.syn_ids, axis=0) # TensorShape([23525415, 5])
         print(f"    > # Recurrent synapses: {len(indices)}")
 
-        del indices, weights, dense_shape, syn_ids, delays
+        del indices, weights, dense_shape, delays, syn_ids
 
         ### LGN input connectivity ###
         self.lgn_input_dense_shape = (self._n_neurons, lgn_input["n_inputs"],)
@@ -558,7 +560,7 @@ class V1Column(tf.keras.layers.Layer):
         self.input_indices = tf.Variable(input_indices, trainable=False, dtype=tf.int64)
 
         # Define the Tensorflow variables
-        input_weights = tf.expand_dims(input_weights, axis=1) # add dimension for the weights factors - TensorShape([23525415, 1])
+        # input_weights = tf.expand_dims(input_weights, axis=1) # add dimension for the weights factors - TensorShape([23525415, 1])
 
         input_weight_positive = tf.Variable(
             input_weights >= 0.0, name="input_weights_sign", trainable=False)
@@ -571,8 +573,8 @@ class V1Column(tf.keras.layers.Layer):
             dtype=self.variable_dtype
         )
 
-        input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int32)
-        self.input_weights_factors = tf.gather(self.synaptic_basis_weights, input_syn_ids, axis=0)
+        self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64)
+        # self.input_weights_factors = tf.gather(self.synaptic_basis_weights, input_syn_ids, axis=0)
 
         print(f"    > # LGN input synapses {len(input_indices)}")
         del input_indices, input_weights, input_syn_ids, input_delays
@@ -601,7 +603,7 @@ class V1Column(tf.keras.layers.Layer):
             dtype=self.variable_dtype
         )
 
-        bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int32)
+        bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int64)
         self.bkg_input_weights_factors = tf.gather(self.synaptic_basis_weights, bkg_input_syn_ids, axis=0)
 
         print(f"    > # BKG input synapses {len(bkg_input_indices)}")
@@ -614,22 +616,23 @@ class V1Column(tf.keras.layers.Layer):
         # contributions for those rows.        
         non_zero_cols = tf.where(rec_z_buf > 0)[:, 1]
         new_indices, inds = get_new_inds_table(self.recurrent_indices, non_zero_cols, self.pre_ind_table)
-        # Sort the segment IDs and corresponding data
-        sorted_indices = tf.argsort(new_indices[:, 0])
-        sorted_segment_ids = tf.gather(new_indices[:, 0], sorted_indices)
-        sorted_inds = tf.gather(inds, sorted_indices)
+        # # Sort the segment IDs and corresponding data
+        # sorted_indices = tf.argsort(new_indices[:, 0])
+        # sorted_segment_ids = tf.gather(new_indices[:, 0], sorted_indices)
+        # sorted_inds = tf.gather(inds, sorted_indices)
         # Get the weights for each active synapse
-        gathered_weights = tf.gather(self.recurrent_weight_values, sorted_inds, axis=0)
-        gathered_factors = tf.gather(self.recurrent_weights_factors, sorted_inds, axis=0)
-        sorted_data = gathered_weights * gathered_factors
+        sorted_syn_ids = tf.gather(self.syn_ids, inds)
+        sorted_weights = tf.expand_dims(tf.gather(self.recurrent_weight_values, inds, axis=0), axis=1)
+        sorted_data = sorted_weights * tf.gather(self.synaptic_basis_weights, sorted_syn_ids, axis=0)
+        # sorted_data = tf.gather(self.recurrent_weight_values, inds, axis=0) * tf.gather(self.recurrent_weights_factors, inds, axis=0)
         if self.per_type_training:
             per_type_weights = tf.expand_dims(tf.gather(self.recurrent_per_type_weight_values, 
-                                                        tf.gather(self.connection_type_ids, sorted_inds)), axis=1)
+                                                        tf.gather(self.connection_type_ids, inds)), axis=1)
             sorted_data = sorted_data * per_type_weights
         # Calculate the total recurrent current received by each neuron
         i_rec = tf.math.unsorted_segment_sum(
             sorted_data,
-            sorted_segment_ids,
+            new_indices[:, 0],
             num_segments=self.recurrent_dense_shape[0]
         )
 
@@ -640,6 +643,7 @@ class V1Column(tf.keras.layers.Layer):
         i_rec = tf.reshape(i_rec, [1, -1])
             
         return i_rec
+
               
     def update_psc(self, psc, psc_rise, rec_inputs):
         new_psc_rise = psc_rise * self.syn_decay + rec_inputs * self.psc_initial
@@ -868,7 +872,8 @@ def create_model(
         cell.input_indices,
         cell.input_weight_values,
         cell.lgn_input_dense_shape,
-        cell.input_weights_factors,
+        cell.input_syn_ids,
+        cell.synaptic_basis_weights,
         # lr_scale=lr_scale,
         name="input_layer",
     )(x)
