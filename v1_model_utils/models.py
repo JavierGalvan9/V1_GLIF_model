@@ -288,7 +288,7 @@ class BKGInputLayerCell(tf.keras.layers.Layer):
         # sorted_inds = tf.gather(inds, sorted_indices)
 
         # Get the number of presynaptic spikes
-        n_pre_spikes = tf.gather(inputs_t[0, :], new_indices[:, 1])
+        n_pre_spikes = tf.cast(tf.gather(inputs_t[0, :], new_indices[:, 1]), dtype=self.variable_dtype)
         
         # Get the weights for each active synapse
         sorted_syn_ids = tf.gather(self._input_syn_ids, inds)
