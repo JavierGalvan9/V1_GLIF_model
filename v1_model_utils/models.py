@@ -157,6 +157,7 @@ def make_pre_ind_table(indices, n_source_neurons=197613):
     # Count occurrences (out-degrees) for each presynaptic neuron using bincount
     sorted_pre_inds = tf.cast(-sorted_pre_inds, dtype=tf.int32)  # Undo the negation to get the sorted pre_inds and cast to reduce memory usage
     # Count occurrences (out-degrees) for each presynaptic neuron using bincount
+    sorted_pre_inds = tf.cast(sorted_pre_inds, tf.int32)
     counts = tf.math.bincount(sorted_pre_inds, minlength=n_source_neurons)
     # Create row_splits that covers all presynaptic neurons (0 to n_source_neurons)
     row_splits = tf.concat([[0], tf.cumsum(counts)], axis=0)
@@ -496,7 +497,7 @@ class V1Column(tf.keras.layers.Layer):
         current_factor = 1 / _params["C_m"] * (1 - membrane_decay) * tau
 
         # Determine the synaptic dynamic parameters for each of the 5 basis receptors.
-        path='GLIF_network/synaptic_data/tau_basis.npy' # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
+        path='synaptic_data/tau_basis.npy' # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
         tau_syns = np.load(path)
         syn_decay = np.exp(-dt / tau_syns)
         syn_decay = tf.constant(syn_decay, dtype=self.compute_dtype)

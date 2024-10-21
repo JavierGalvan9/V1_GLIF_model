@@ -1,9 +1,6 @@
 biorealistic-v1-model
 bmtk
-GLIF_network/
-GLIF_network_old/
-GLIF_network_original/
-GLIF_network_adjusted/
+GLIF_network*
 log_dir*
 logdir*
 *.ipynb*
@@ -21,8 +18,10 @@ network_data_extractor.py
 GLIF_network/input/firing_rates_mine.lzma
 __pycache__
 *.out
+*.err
 logs/
 results*/
+core_*/
 legit_results/
 *.html
 .vscode/settings.json

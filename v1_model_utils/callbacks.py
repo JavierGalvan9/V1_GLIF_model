@@ -429,13 +429,13 @@ class OsiDsiCallbacks:
         
         if analyze_core_only:
             # Isolate the core neurons
-            pop_names = other_v1_utils.pop_names(self.network, core_radius=self.flags.loss_core_radius)
+            pop_names = other_v1_utils.pop_names(self.network, core_radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
             core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
             n_core_neurons = np.sum(core_mask)
             spikes = spikes[:, :, :, core_mask]
         else:
             n_core_neurons = spikes.shape[-1]
-            pop_names = other_v1_utils.pop_names(self.network)
+            pop_names = other_v1_utils.pop_names(self.network, data_dir=self.flags.data_dir)
 
         # Calculate the Fano Factor for the spikes
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
