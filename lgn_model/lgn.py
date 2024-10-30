@@ -93,7 +93,7 @@ def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_mo
                           h5_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/network//lgn_nodes.h5',
                           filename='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/lgn_model/data/lgn_full_col_cells.csv'
                           ):
-    filename = os.path.join('data', filename)
+    # filename = os.path.join('data', filename)
     # Load both the h5 file and the csv file
     csv_file = pd.read_csv(csv_path, sep=' ')
     features = ['id', 'model_id', 'x', 'y', 'ei', 'location', 'spatial_size', 'kpeaks_dom_0', 'kpeaks_dom_1', 'weight_dom_0', 'weight_dom_1', 'delay_dom_0', 'delay_dom_1', 'kpeaks_non_dom_0', 'kpeaks_non_dom_1', 'weight_non_dom_0', 'weight_non_dom_1', 'delay_non_dom_0', 'delay_non_dom_1', 'tuning_angle', 'sf_sep']
@@ -119,23 +119,31 @@ def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_mo
    
 
 class LGN(object):
-    def __init__(self, row_size=80, col_size=120, lgn_data_path=None, n_input=None, dtype=tf.float32):
+    def __init__(self, row_size=80, col_size=120, data_dir='GLIF_network', n_input=None, dtype=tf.float32):
         filename = f'lgn_full_col_cells_{col_size}x{row_size}.csv'
-        root_path = os.path.split(__file__)[0]
-        root_path = os.path.join(root_path, 'data')
-        lgn_data_path = os.path.join(root_path, filename)
+        lgn_code_dir = os.path.split(__file__)[0]
+        # go up one folder and add "GLIF_network" to the path
+        root_dir = os.path.split(lgn_code_dir)[0]
+        data_dir_rel = os.path.join(root_dir, data_dir)  # relative directory
+        lgn_data_dir = os.path.join(data_dir_rel, 'tf_data')
+        lgn_data_path = os.path.join(lgn_data_dir, filename)
+        # root_path = os.path.split(__file__)[0]
+        # root_path = os.path.join(root_path, 'data')
+        # lgn_data_path = os.path.join(root_path, filename)
         if os.path.exists(lgn_data_path):
             d = pd.read_csv(lgn_data_path, delimiter=' ')
         else:
             print('Creating LGN units info')
             # making the LGN file generation work in more generic environments
-            model_path = os.path.split(__file__)[0]
+            # model_path = os.path.split(__file__)[0]
             # go up one folder and add "GLIF_network" to the path
-            model_path = os.path.split(model_path)[0]
-            model_path = os.path.join(model_path, 'GLIF_network')
-            model_path = os.path.join(model_path, 'network')
-            lgn_node_path = os.path.join(model_path, 'lgn_nodes.h5')
-            lgn_node_type_path = os.path.join(model_path, 'lgn_node_types.csv')
+            # model_path = os.path.split(model_path)[0]
+            # model_path = os.path.join(model_path, 'GLIF_network')
+
+            os.makedirs(lgn_data_dir, exist_ok=True)
+            network_dir = os.path.join(data_dir_rel, 'network')
+            lgn_node_path = os.path.join(network_dir, 'lgn_nodes.h5')
+            lgn_node_type_path = os.path.join(network_dir, 'lgn_node_types.csv')
             d = create_lgn_units_info(filename=lgn_data_path, csv_path=lgn_node_type_path, h5_path=lgn_node_path)
                 
         # Load basic information about the LGN units
@@ -146,7 +154,7 @@ class LGN(object):
         is_composite = np.array([('ON' in mid and 'OFF' in mid) for mid in model_id]).astype(np.float32)
 
         # Load the spontaneous firing rates
-        s_path = os.path.join(root_path, f'spontaneous_firing_rates_{col_size}x{row_size}.pkl')
+        s_path = os.path.join(lgn_data_dir, f'spontaneous_firing_rates_{col_size}x{row_size}.pkl')
         if not os.path.exists(s_path):
             cell_type = [a[:a.find('_')] for a in model_id]
             tf_str = [a[a.find('_') + 1:] for a in model_id]
@@ -168,7 +176,7 @@ class LGN(object):
                 spontaneous_firing_rates = pkl.load(f)
 
         # Load the temporal kernels
-        t_path = os.path.join(root_path, f'temporal_kernels_{col_size}x{row_size}.pkl')
+        t_path = os.path.join(lgn_data_dir, f'temporal_kernels_{col_size}x{row_size}.pkl')
         if not os.path.exists(t_path):
             nkt = 600
             kernel_length = 700
@@ -298,7 +306,7 @@ class LGN(object):
             spontaneous_firing_rates = loaded['spontaneous_firing_rates']
 
         # Load the spatial kernels
-        spatial_path = os.path.join(root_path, f'spatial_kernels_{col_size}x{row_size}.pkl')  
+        spatial_path = os.path.join(lgn_data_dir, f'spatial_kernels_{col_size}x{row_size}.pkl')  
         if not os.path.exists(spatial_path):
             # Scale x and y within the range
             col_max = float(col_size - 1)

@@ -29,8 +29,8 @@ def sort_indices_tf(indices, *arrays):
     sorted_arrays = [tf.gather(arr, sorted_ind).numpy() for arr in [indices, *arrays]]
     return tuple(sorted_arrays)
 
-def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1', 
-                        output_file='GLIF_network/network_dat.pkl', save_pkl=True):
+def create_network_dat(data_dir='GLIF_network', source='v1', target='v1', 
+                        output_file='GLIF_network/tf_data/network_dat.pkl', save_pkl=True):
     # Extract the network data into a pickle file from the SONATA files
     new_network_dat = {"nodes": [], "edges": []}
 
@@ -39,9 +39,10 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
         # Load the nodes file and create a dictionary with the node ids and the node parameters
         node_file = f'{source}_nodes.h5'
         node_types_file = f'{source}_node_types.csv'
-        nodes_h5_path = os.path.join(data_dir, node_file)
-        node_types_df = pd.read_csv(os.path.join(data_dir, node_types_file), delimiter=" ")
-        cell_models_path = os.path.join('GLIF_network', "components", "cell_models")
+        nodes_h5_path = os.path.join(data_dir, 'network', node_file)
+        node_types_df = pd.read_csv(os.path.join(data_dir, 'network', node_types_file), delimiter=" ")
+        # cell_models_path = os.path.join('GLIF_network', "components", "cell_models")
+        cell_models_path = os.path.join(data_dir, "components", "cell_models")
 
         with h5py.File(nodes_h5_path, "r") as nodes_h5_file:
             source_node_ids = np.array(nodes_h5_file["nodes"][source]["node_id"], dtype=np.int32)
@@ -66,16 +67,17 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
     # Process edges
     edge_file = f'{source}_{target}_edges.h5'
     edge_types_file = f'{source}_{target}_edge_types.csv'
-    edges_h5_path = os.path.join(data_dir, edge_file)
-    edges_type_df = pd.read_csv(os.path.join(data_dir, edge_types_file), delimiter=" ")
+    edges_h5_path = os.path.join(data_dir, 'network', edge_file)
+    edges_type_df = pd.read_csv(os.path.join(data_dir, 'network', edge_types_file), delimiter=" ")
     # synaptic_models_path = os.path.join('GLIF_network', 'components', "synaptic_models")
-    synaptic_models_path = os.path.join(data_dir, '..', 'components', "synaptic_models")
+    synaptic_models_path = os.path.join(data_dir, 'components', "synaptic_models")
     basis_function_weights_df = pd.read_csv('synaptic_data/basis_function_weights.csv', index_col=0)
     print(f'Saving basis function weights for {source}-{target}')
     # Map the synaptic model to a given id using a dictionary
     # path = os.path.join('GLIF_network', 'synaptic_models_to_syn_id_dict.pkl')
-    path = os.path.join(data_dir, '..', 'synaptic_models_to_syn_id_dict.pkl')
-    path_weights = os.path.join(data_dir, '..', 'syn_id_to_syn_weights_dict.pkl')
+    tf_dir = os.path.join(data_dir, 'tf_data')
+    path = os.path.join(tf_dir, 'synaptic_models_to_syn_id_dict.pkl')
+    path_weights = os.path.join(tf_dir, 'syn_id_to_syn_weights_dict.pkl')
     if not os.path.exists(path):
         synaptic_models_to_syn_id_dict = dict()
         syn_id_to_syn_weights_dict = dict()
@@ -85,6 +87,7 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
                 synaptic_models_to_syn_id_dict[synaptic_model] = syn_id
                 tau_syn_weights = basis_function_weights_df.loc[synaptic_model].values
                 syn_id_to_syn_weights_dict[syn_id] = tau_syn_weights
+        os.makedirs(tf_dir, exist_ok=True)
         with open(path, "wb") as f:
             pkl.dump(synaptic_models_to_syn_id_dict, f)
         with open(path_weights, "wb") as f:
@@ -145,8 +148,9 @@ def create_network_dat(data_dir='GLIF_network/network', source='v1', target='v1'
 
 # @profile
 def load_network(
-    path="GLIF_network/network_dat.pkl",
-    h5_path="GLIF_network/network/v1_nodes.h5",
+    # path="GLIF_network/tf_data/network_dat.pkl",
+    # h5_path="GLIF_network/network/v1_nodes.h5",
+    data_dir="GLIF_network",
     core_only=True,
     n_neurons=296991,
     seed=3000,
@@ -155,11 +159,14 @@ def load_network(
     tensorflow_speed_up=False):
 
     rd = np.random.RandomState(seed=seed)
+    
+    path = os.path.join(data_dir, "tf_data", "network_dat.pkl")
+    h5_path = os.path.join(data_dir, "network", "v1_nodes.h5")
 
     # Create / Load the network_dat pickle file from the SONATA files
     if not os.path.exists(path):
-        base_dir = os.path.dirname(path)
-        data_dir = os.path.join(base_dir, "network")
+        # base_dir = os.path.dirname(path)
+        # data_dir = os.path.join(base_dir, "network")
         print(f"Creating {path} file...")
         d = create_network_dat(data_dir=data_dir, source='v1', target='v1',
                                output_file=path, save_pkl=True)
@@ -365,8 +372,8 @@ def load_input(
     bmtk_id_to_tf_id=None,
     tensorflow_speed_up=False
 ):
-    lgn_path = os.path.join(data_dir, "lgn_input_dat.pkl")
-    bkg_path = os.path.join(data_dir, "bkg_input_dat.pkl")
+    lgn_path = os.path.join(data_dir, 'tf_data', "lgn_input_dat.pkl")
+    bkg_path = os.path.join(data_dir, 'tf_data', "bkg_input_dat.pkl")
     # LOAD THE LGN INPUT
     if not os.path.exists(lgn_path):
         # print("Creating lgn_input_dat.pkl file...")
@@ -560,8 +567,9 @@ def load_v1(flags, n_neurons, flag_str=''):
     # Initialize the network 
     t0 = time()
     network = load_network(
-                        path=os.path.join(flags.data_dir, "network_dat.pkl"),
-                        h5_path=os.path.join(flags.data_dir, "network/v1_nodes.h5"),
+                        # path=os.path.join(flags.data_dir, "tf_data", "network_dat.pkl"),
+                        # h5_path=os.path.join(flags.data_dir, "network", "v1_nodes.h5"),
+                        data_dir=flags.data_dir,
                         core_only=flags.core_only,
                         n_neurons=n_neurons,
                         seed=flags.seed,

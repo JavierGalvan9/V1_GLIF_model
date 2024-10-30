@@ -61,7 +61,7 @@ def main(_):
     if logdir == '':
         flag_str = f'v1_{flags.neurons}'
         for name, value in flags.flag_values_dict().items():
-            if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection']:
+            if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection', 'data_dir']:
                 flag_str += f'_{name}_{value}'
         # Define flag string as the second part of results_path
         results_dir = f'{flags.results_dir}/{flag_str}'
@@ -251,6 +251,7 @@ def main(_):
                         pre_delay=500,
                         post_delay = post_delay,
                         n_input=flags.n_input,
+                        data_dir=flags.data_dir,
                         regular=regular,
                         return_firing_rates=True,
                         rotation=flags.rotation,
@@ -291,6 +292,7 @@ def main(_):
                     pre_delay=flags.seq_len,
                     post_delay=0,
                     n_input=flags.n_input,
+                    data_dir=flags.data_dir,
                     rotation=flags.rotation,
                     billeh_phase=True,
                     return_firing_rates=True,

@@ -113,7 +113,7 @@ def main():
     # Save the configuration of the model based on the main features
     flag_str = f'v1_{v1_neurons}'
     for name, value in vars(flags).items():
-        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection']:
+        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection', 'data_dir']:
             flag_str += f'_{name}_{value}'
 
     # Define flag string as the second part of results_path
@@ -137,8 +137,8 @@ def main():
         "-N1", "-c1", "-n8",
         "--gpus=a100:1",
         "--partition=d3",
-        "--mem=100G",
-        "--time=6:00:00",
+        "--mem=60G",
+        "--time=4:00:00",
         "--qos=d3",
     ]
     evaluation_commands = [
@@ -146,8 +146,8 @@ def main():
         "-N1", "-c1", "-n8",
         "--gpus=a100:1",
         "--partition=d3",
-        "--mem=100G",
-        "--time=4:00:00",
+        "--mem=60G",
+        "--time=2:00:00",
         "--qos=d3",
     ]
 

@@ -553,7 +553,8 @@ class V1Column(tf.keras.layers.Layer):
         self.voltage_offset = _f(voltage_offset)
 
         # Find the synaptic basis representation for each synaptic type
-        path = os.path.join('GLIF_network', 'syn_id_to_syn_weights_dict.pkl')
+        # path = os.path.join('GLIF_network', 'syn_id_to_syn_weights_dict.pkl')
+        path = os.path.join(network["data_dir"], 'tf_data', 'syn_id_to_syn_weights_dict.pkl')
         with open(path, "rb") as f:
             syn_id_to_syn_weights_dict = pkl.load(f)
         synaptic_basis_weights = np.array(list(syn_id_to_syn_weights_dict.values()))

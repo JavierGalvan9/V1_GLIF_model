@@ -1221,6 +1221,7 @@ class Callbacks:
                             pre_delay=500,
                             post_delay = post_delay,
                             n_input=self.flags.n_input,
+                            data_dir=self.flags.data_dir,
                             regular=regular,
                             return_firing_rates=True,
                             rotation=self.flags.rotation,
