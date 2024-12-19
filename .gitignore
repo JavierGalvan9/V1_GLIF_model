@@ -3,7 +3,7 @@ bmtk
 GLIF_network*
 log_dir*
 logdir*
-*.ipynb*
+pruebas.ipynb
 v1_model_utils/__pycache__
 v1_model_utils/.cache
 general_utils/__pycache__
@@ -30,3 +30,8 @@ v1_model_utils/Old
 v1_model_utils/models2.py
 OSI_DSI_dataset
 v1_model_utils/Old/models_old.py
+.ipynb_checkpoints/prueba_gpu-checkpoint.ipynb
+lgn_model/.cache_lgn
+lgn_model/data
+v1_model_utils/Old/models_old.py
+lgn_model/data/temporal_kernels_120x80.pkl

@@ -275,8 +275,8 @@ class LGN(object):
             # Apply the truncation to both dominant and non-dominant temporal kernels
             truncation = int(np.min([dom_truncation, non_dom_truncation]))
             # Truncate the kernels from the truncation point onwards
-            dom_temporal_kernels = dom_temporal_kernels[:, truncation:]
-            non_dom_temporal_kernels = non_dom_temporal_kernels[:, truncation:]
+            dom_temporal_kernels = dom_temporal_kernels[:, dom_truncation:]
+            non_dom_temporal_kernels = non_dom_temporal_kernels[:, non_dom_truncation:]
             # Transpose and provide proper shape to the kernels
             dom_temporal_kernels = tf.transpose(dom_temporal_kernels)
             non_dom_temporal_kernels = tf.transpose(non_dom_temporal_kernels)
@@ -404,8 +404,8 @@ class LGN(object):
             self.is_composite = tf.constant(is_composite, dtype=dtype)
             self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates, dtype=dtype)
 
-            self.dom_temporal_kernels = tf.constant(dom_temporal_kernels, dtype=dtype)
-            self.non_dom_temporal_kernels = tf.constant(non_dom_temporal_kernels, dtype=dtype)
+            self.dom_temporal_kernels = tf.cast(dom_temporal_kernels, dtype=dtype)
+            self.non_dom_temporal_kernels = tf.cast(non_dom_temporal_kernels, dtype=dtype)
             # self.gaussian_filters = gaussian_filters
             self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
             self.spatial_range_indices = spatial_range_indices
@@ -421,14 +421,14 @@ class LGN(object):
             self.is_composite = tf.constant(is_composite[:n_input], dtype=dtype)
             self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates[:n_input], dtype=dtype)
 
-            self.dom_temporal_kernels = tf.constant(dom_temporal_kernels[:, :n_input], dtype=dtype)
-            self.non_dom_temporal_kernels = tf.constant(non_dom_temporal_kernels[:, :n_input], dtype=dtype)
+            self.dom_temporal_kernels = tf.cast(dom_temporal_kernels[:, :n_input], dtype=dtype)
+            self.non_dom_temporal_kernels = tf.cast(non_dom_temporal_kernels[:, :n_input], dtype=dtype)
             self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
             self.spatial_range_indices = spatial_range_indices
             self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
             # self.actual_spatial_range = actual_spatial_range
 
-    @tf.function(jit_compile=True)
+    @tf.function#(jit_compile=True) # for this model it seems to be better without the jit_compile (dont know why)
     def spatial_response(self, movie, bmtk_compat=True):
 
         if not isinstance(movie, tf.Tensor):
@@ -465,7 +465,7 @@ class LGN(object):
 
         return all_spatial_responses, all_non_dom_spatial_responses
 
-    @tf.function(jit_compile=True)
+    @tf.function#(jit_compile=True) # for this model it seems to be better without the jit_compile (dont know why)
     def firing_rates_from_spatial(self, all_spatial_responses, all_non_dom_spatial_responses):
         dom_filtered_output = temporal_filter(all_spatial_responses, self.dom_temporal_kernels)
         non_dom_filtered_output = temporal_filter(all_non_dom_spatial_responses, self.non_dom_temporal_kernels)

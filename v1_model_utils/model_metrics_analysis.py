@@ -65,7 +65,7 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
 
     if session == 'drifting_gratings':
         # Find the preferred DG angle for each neuron
-        if n_trials > 2:
+        if n_trials >= 8:
             TuningAngleEstimation = PreferredTuningAngleAnalysis(firing_rates=firingRates, orientations=DG_angles, 
                                                                 preferred_orientations=network['tuning_angle'])
             new_tuning_angles, preferred_angle_rates = TuningAngleEstimation.calculate_tuning_angle()
@@ -76,7 +76,7 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
             osi_dsi_df["max_mean_rate(Hz)"] = np.max(all_direction_rates, axis=0)
 
         # Calculate the DSI and OSI
-        if n_angles > 2:
+        if n_angles >= 8:
             phase_rad = np.deg2rad(DG_angles)
             # Ensure phase_rad is a 2D array with shape (8, 1) for broadcasting
             phase_rad = phase_rad[:, np.newaxis]
@@ -470,7 +470,7 @@ class MetricsBoxplot:
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"v1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"v1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
-        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="Baseline model", data_dir='NEST_metrics'))
         df = pd.concat(self.osi_dsi_dfs, ignore_index=True)
 
         # Create a figure to compare several model metrics against Neuropixels data
@@ -489,7 +489,7 @@ class MetricsBoxplot:
             "V1 GLIF model": "tab:orange",
             "Neuropixels": "tab:gray",
             "Billeh et al (2020)": "tab:blue",
-            "NEST simulation": "tab:pink"
+            "Baseline model": "tab:pink"
         }
 
         # Establish the order of the neuron types in the boxplots
