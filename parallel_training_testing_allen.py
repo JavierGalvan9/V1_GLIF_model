@@ -20,6 +20,7 @@ parser.add_argument('--restore_from', default='', type=str)
 parser.add_argument('--comment', default='', type=str)
 parser.add_argument('--delays', default='100,0', type=str)
 parser.add_argument('--scale', default='2,2', type=str)
+parser.add_argument('--dtype', default='float32', type=str)
 
 parser.add_argument('--optimizer', default='adam', type=str)
 parser.add_argument('--learning_rate', default=0.001, type=float)
