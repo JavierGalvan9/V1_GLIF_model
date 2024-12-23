@@ -764,10 +764,11 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     network, lgn_input, bkg_input = None, None, None
 
     if flag_str == '':
-        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_{flags.data_dir.replace('/', '_')}_random_weights_{flags.random_weights}"
+        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_random_weights_{flags.random_weights}"
     
     file_dir = os.path.split(__file__)[0]
-    cache_path = os.path.join(file_dir, f".cache/V1_network_{flag_str}.pkl")
+    cache_dir = os.path.join(flags.data_dir, "tf_data")
+    cache_path = os.path.join(cache_dir, f"V1_network_{flag_str}.pkl")
     print(f"> Looking for cached V1 model in {cache_path}")
     
     if os.path.exists(cache_path):
@@ -785,7 +786,8 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
         network, lgn_input, bkg_input = load_v1(flags=flags, n_neurons=n_neurons)
 
     if store:
-        os.makedirs(os.path.join(file_dir, ".cache"), exist_ok=True)
+        # os.makedirs(os.path.join(file_dir, ".cache"), exist_ok=True)
+        os.makedirs(cache_dir, exist_ok=True)
         with open(cache_path, "wb") as f:
             pkl.dump((network, lgn_input, bkg_input), f)
         print(f"> Cached V1 model in {cache_path}")
