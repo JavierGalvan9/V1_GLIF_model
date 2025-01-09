@@ -20,6 +20,7 @@ parser.add_argument('--restore_from', default='', type=str)
 parser.add_argument('--comment', default='', type=str)
 parser.add_argument('--delays', default='100,0', type=str)
 parser.add_argument('--scale', default='2,2', type=str)
+parser.add_argument('--dtype', default='float32', type=str)
 
 parser.add_argument('--optimizer', default='adam', type=str)
 parser.add_argument('--learning_rate', default=0.001, type=float)
@@ -113,7 +114,7 @@ def main():
     # Save the configuration of the model based on the main features
     flag_str = f'v1_{v1_neurons}'
     for name, value in vars(flags).items():
-        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection', 'data_dir']:
+        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection']:
             flag_str += f'_{name}_{value}'
 
     # Define flag string as the second part of results_path
@@ -134,20 +135,20 @@ def main():
     # evaluation_commands = ["run", "-g", "1", "-m", "65", "-t", "2:00"]
     training_commands = [
         "sbatch",
-        "-N1", "-c1", "-n8",
+        "-N1", "-c1", "-n4",
         "--gpus=a100:1",
         "--partition=d3",
         "--mem=60G",
-        "--time=4:00:00",
+        "--time=12:00:00",
         "--qos=d3",
     ]
     evaluation_commands = [
         "sbatch",
-        "-N1", "-c1", "-n8",
+        "-N1", "-c1", "-n4",
         "--gpus=a100:1",
         "--partition=d3",
         "--mem=60G",
-        "--time=2:00:00",
+        "--time=4:00:00",
         "--qos=d3",
     ]
 
@@ -212,7 +213,7 @@ def main():
             continue
         else:
             new_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-J", f"{sim_name}_test_{i}"]
-            new_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'OSI_DSI_checkpoints' --run_session {i}"
+            new_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
             new_evaluation_command = new_evaluation_command + ["--wrap"] + [new_evaluation_script]
             eval_job_id = submit_job(new_evaluation_command)
             eval_job_ids.append(eval_job_id)
