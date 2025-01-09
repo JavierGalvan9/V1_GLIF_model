@@ -111,7 +111,6 @@ def main(_):
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
     print(f'Per replica batch size: {per_replica_batch_size}')
     print(f'Global batch size: {global_batch_size}\n')
-
     print(f'Training with current input: {flags.current_input}')
     print(f'Pseudo derivative gaussian: {flags.pseudo_gauss}')
 
@@ -541,7 +540,6 @@ def main(_):
         if not spontaneous:
             train_osi_dsi_loss.update_state(_aux['osi_dsi_loss'])
 
-
         return _loss, _aux, _out#, grad
 
     @tf.function
@@ -681,10 +679,14 @@ def main(_):
     # # load LGN spontaneous firing rates 
     # spontaneous_prob = 1 - tf.exp(-spontaneous_lgn_firing_rates / 1000.)
 
-    @tf.function
+    # @tf.function
     def generate_spontaneous_spikes(spontaneous_prob):
         random_uniform = tf.random.uniform(tf.shape(spontaneous_prob), dtype=dtype)
         return tf.less(random_uniform, spontaneous_prob)
+
+    @tf.function
+    def distributed_generate_spontaneous_spikes(spontaneous_prob):
+        return strategy.run(generate_spontaneous_spikes, args=(spontaneous_prob,)) 
     
     # del gray_data_set, gray_it, spontaneous_lgn_firing_rates
 
@@ -788,10 +790,7 @@ def main(_):
 
             x, y, _, _ = next(it) # x dtype tf.bool
             # Generate LGN spikes
-            x_spontaneous = generate_spontaneous_spikes(spontaneous_prob)
-
-            # tf.print(x)
-            # tf.print(x_spontaneous)
+            x_spontaneous = distributed_generate_spontaneous_spikes(spontaneous_prob)
     
             # with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
             while True:

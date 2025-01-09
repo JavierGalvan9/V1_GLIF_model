@@ -134,7 +134,7 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{4 * flags.n_gpus}", "-m", "80", "-t", "1:45"] # choose the L40S GPU with 48GB of memory 
+    training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{4 * flags.n_gpus}", "-m", "80", "-t", "24:00"] # choose the L40S GPU with 48GB of memory 
     evaluation_commands = ["run", "-g", "1", "-m", "40", "-c", "4", "-t", "1:00"]
 
     # Define the training and evaluation script calls
@@ -184,7 +184,6 @@ def main():
             else:
                 new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
             new_training_command = new_training_command + [new_training_script]
-            print(new_training_command)
             job_id = submit_job(new_training_command)
         else:
             new_training_command = training_commands + ['-d', job_ids[i-1], "-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-j", f"{sim_name}_train_{i}"]
@@ -194,14 +193,14 @@ def main():
             job_id = submit_job(new_training_command)
         job_ids.append(job_id)
 
-        # if flags.n_runs == 1: # the run is a single run, no need to submit evaluation jobs. osi_dsi will be evaluated at the end of training run
-        #     continue
-        # else:
-        #     new_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-j", f"{sim_name}_test_{i}"]
-        #     new_evaluation_script = evaluation_script + f"--seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
-        #     new_evaluation_command = new_evaluation_command + [new_evaluation_script]
-        #     eval_job_id = submit_job(new_evaluation_command)
-        #     eval_job_ids.append(eval_job_id)
+        if flags.n_runs == 1: # the run is a single run, no need to submit evaluation jobs. osi_dsi will be evaluated at the end of training run
+            continue
+        else:
+            new_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-j", f"{sim_name}_test_{i}"]
+            new_evaluation_script = evaluation_script + f"--seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
+            new_evaluation_command = new_evaluation_command + [new_evaluation_script]
+            eval_job_id = submit_job(new_evaluation_command)
+            eval_job_ids.append(eval_job_id)
 
     # # Final evaluation with the best model
     # final_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_final.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_final.err", "-j", f"{sim_name}_test_final"]

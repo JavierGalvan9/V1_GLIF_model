@@ -1529,52 +1529,52 @@ class V1Column(tf.keras.layers.Layer):
         return i_rec_flat
     
     # def calculate_i_rec(self, rec_z_buf):
-        # This is a new faster implementation that uses the pre_ind_table as a raggedTensor and exploits
-        # the sparseness of the rec_z_buf.
-        # it identifies the non_zero rows of rec_z_buf and only computes the
-        # contributions for those rows.     
-        batch_size = tf.shape(rec_z_buf)[0]
-        n_post_neurons = self.recurrent_dense_shape[0]
-        # Find the indices of non-zero spikes in rec_z_buf
-        # non_zero_indices: [num_non_zero_spikes, 2], columns are [batch_index, pre_neuron_index]
-        non_zero_indices = tf.where(rec_z_buf > 0)
-        batch_indices = non_zero_indices[:, 0]         # Shape: [num_non_zero_spikes]
-        pre_neuron_indices = non_zero_indices[:, 1]    # Shape: [num_non_zero_spikes]
-        # Get the indices into self.recurrent_indices for each pre_neuron_index
-        # self.pre_ind_table is a RaggedTensor or a list of lists mapping pre_neuron_index to indices in recurrent_indices
-        new_indices, new_weights, new_syn_ids, post_in_degree, all_synapse_inds = get_new_inds_table(self.recurrent_indices, self.recurrent_weight_values, self.syn_ids, pre_neuron_indices, self.pre_ind_table)
-        # Expand batch_indices to match the length of inds_flat
-        # row_lengths = selected_rows.row_lengths()  # Shape: [num_non_zero_spikes]
-        batch_indices_per_connection = tf.repeat(batch_indices, post_in_degree)
-        # batch_indices_per_connection: Shape: [total_num_connections]
-        post_neuron_indices = new_indices[:, 0]  # Indices of post-synaptic neurons
-        # Compute segment_ids for unsorted_segment_sum
-        # We need to combine batch_indices and post_neuron_indices to create unique segment IDs
-        segment_ids = batch_indices_per_connection * n_post_neurons + post_neuron_indices
-        num_segments = batch_size * n_post_neurons
-        # Get the weights for each active synapse
-        new_weights = tf.expand_dims(new_weights, axis=1)
-        new_weights = new_weights * tf.gather(self.synaptic_basis_weights, new_syn_ids, axis=0)
-        # Weight the synaptic currents by the per-type weights
-        if self.per_type_training:
-            per_type_weights = tf.expand_dims(tf.gather(self.recurrent_per_type_weight_values, 
-                                                        tf.gather(self.connection_type_ids, all_synapse_inds)), axis=1)
-            new_weights = new_weights * per_type_weights
-        # Calculate the total recurrent current received by each neuron
-        i_rec_flat = tf.math.unsorted_segment_sum(
-            new_weights,
-            segment_ids,
-            num_segments=num_segments
-        )
+    #     # This is a new faster implementation that uses the pre_ind_table as a raggedTensor and exploits
+    #     # the sparseness of the rec_z_buf.
+    #     # it identifies the non_zero rows of rec_z_buf and only computes the
+    #     # contributions for those rows.     
+    #     batch_size = tf.shape(rec_z_buf)[0]
+    #     n_post_neurons = self.recurrent_dense_shape[0]
+    #     # Find the indices of non-zero spikes in rec_z_buf
+    #     # non_zero_indices: [num_non_zero_spikes, 2], columns are [batch_index, pre_neuron_index]
+    #     non_zero_indices = tf.where(rec_z_buf > 0)
+    #     batch_indices = non_zero_indices[:, 0]         # Shape: [num_non_zero_spikes]
+    #     pre_neuron_indices = non_zero_indices[:, 1]    # Shape: [num_non_zero_spikes]
+    #     # Get the indices into self.recurrent_indices for each pre_neuron_index
+    #     # self.pre_ind_table is a RaggedTensor or a list of lists mapping pre_neuron_index to indices in recurrent_indices
+    #     new_indices, new_weights, new_syn_ids, post_in_degree, all_synapse_inds = get_new_inds_table(self.recurrent_indices, self.recurrent_weight_values, self.syn_ids, pre_neuron_indices, self.pre_ind_table)
+    #     # Expand batch_indices to match the length of inds_flat
+    #     # row_lengths = selected_rows.row_lengths()  # Shape: [num_non_zero_spikes]
+    #     batch_indices_per_connection = tf.repeat(batch_indices, post_in_degree)
+    #     # batch_indices_per_connection: Shape: [total_num_connections]
+    #     post_neuron_indices = new_indices[:, 0]  # Indices of post-synaptic neurons
+    #     # Compute segment_ids for unsorted_segment_sum
+    #     # We need to combine batch_indices and post_neuron_indices to create unique segment IDs
+    #     segment_ids = batch_indices_per_connection * n_post_neurons + post_neuron_indices
+    #     num_segments = batch_size * n_post_neurons
+    #     # Get the weights for each active synapse
+    #     new_weights = tf.expand_dims(new_weights, axis=1)
+    #     new_weights = new_weights * tf.gather(self.synaptic_basis_weights, new_syn_ids, axis=0)
+    #     # Weight the synaptic currents by the per-type weights
+    #     if self.per_type_training:
+    #         per_type_weights = tf.expand_dims(tf.gather(self.recurrent_per_type_weight_values, 
+    #                                                     tf.gather(self.connection_type_ids, all_synapse_inds)), axis=1)
+    #         new_weights = new_weights * per_type_weights
+    #     # Calculate the total recurrent current received by each neuron
+    #     i_rec_flat = tf.math.unsorted_segment_sum(
+    #         new_weights,
+    #         segment_ids,
+    #         num_segments=num_segments
+    #     )
 
-        if i_rec_flat.dtype != self.compute_dtype:
-            i_rec_flat = tf.cast(i_rec_flat, dtype=self.compute_dtype)
-        # Add batch dimension
-        # i_rec = tf.expand_dims(i_rec, axis=0)
-        # i_rec_flat = tf.reshape(i_rec_flat, [1, -1])
-        # i_rec_flat = tf.reshape(i_rec_flat, [batch_size, -1])
+    #     if i_rec_flat.dtype != self.compute_dtype:
+    #         i_rec_flat = tf.cast(i_rec_flat, dtype=self.compute_dtype)
+    #     # Add batch dimension
+    #     # i_rec = tf.expand_dims(i_rec, axis=0)
+    #     # i_rec_flat = tf.reshape(i_rec_flat, [1, -1])
+    #     # i_rec_flat = tf.reshape(i_rec_flat, [batch_size, -1])
             
-        return i_rec_flat        
+    #     return i_rec_flat        
     
     def update_psc(self, psc, psc_rise, rec_inputs):
         new_psc_rise = psc_rise * self.syn_decay + rec_inputs * self.psc_initial
