@@ -13,6 +13,7 @@ import numpy as np
 import tensorflow as tf
 import pickle as pkl
 from packaging import version
+import re
 
 if version.parse(tf.__version__) < version.parse("2.4.0"):
     from tensorflow.keras.mixed_precision import experimental as mixed_precision
