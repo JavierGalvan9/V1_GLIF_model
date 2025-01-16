@@ -308,7 +308,7 @@ def main(_):
                 v1_ema = tf.Variable(data_loaded['v1_ema'], trainable=False, name='V1_EMA')
         else:
             # 3 Hz is near the average FR of cortex
-            v1_ema = tf.Variable(tf.constant(0.003, shape=(flags.neurons,), dtype=tf.float32), trainable=False, name='V1_EMA')
+            v1_ema = tf.Variable(tf.constant(0.003, shape=(network["n_nodes"],), dtype=tf.float32), trainable=False, name='V1_EMA')
             # v1_ema = tf.Variable(0.01 * tf.ones(shape=(flags.neurons,)), trainable=False, name='V1_EMA')
 
         # here we need information of the layer mask for the OSI loss
@@ -441,7 +441,7 @@ def main(_):
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         _initial_state = _state_variables
         seq_len = tf.shape(_x)[1]
-        dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, flags.neurons), dtype)
+        dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
         # _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
         _out = extractor_model((_x, dummy_zeros, _initial_state))
         _z, _v = _out[0]
@@ -964,7 +964,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('n_epochs', 50, '')
     absl.app.flags.DEFINE_integer('osi_dsi_eval_period', 1, '') # number of epochs for osi/dsi evaluation if n_runs = 1
     absl.app.flags.DEFINE_integer('batch_size', 1, '')
-    absl.app.flags.DEFINE_integer('neurons', 65871, '')
+    absl.app.flags.DEFINE_integer('neurons', 0, '')  # 0 to take all neurons
     absl.app.flags.DEFINE_integer("n_input", 17400, "")  
     absl.app.flags.DEFINE_integer('seq_len', 600, '')
     # absl.app.flags.DEFINE_integer('im_slice', 100, '')

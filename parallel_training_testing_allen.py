@@ -147,7 +147,7 @@ def main():
         "-N1", "-c1", "-n4",
         "--gpus=a100:1",
         "--partition=d3",
-        "--mem=60G",
+        "--mem=200G",
         "--time=4:00:00",
         "--qos=d3",
     ]

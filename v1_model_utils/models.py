@@ -1173,7 +1173,6 @@ class V1Column(tf.keras.layers.Layer):
         _params["asc_amps"] = (_params["asc_amps"] / voltage_scale[..., None])  # _params['asc_amps'] has shape (111, 2)
         # Define the other model variables
         self._node_type_ids = np.array(network["node_type_ids"])
-        self._n_syn_basis = 5
         self._dt = tf.constant(dt, self.compute_dtype)
         self._recurrent_dampening = tf.constant(recurrent_dampening_factor, self.compute_dtype)
         self._dampening_factor = tf.constant(dampening_factor, self.compute_dtype)
@@ -1193,6 +1192,7 @@ class V1Column(tf.keras.layers.Layer):
         # Determine the synaptic dynamic parameters for each of the 5 basis receptors.
         path='synaptic_data/tau_basis.npy' # [0.7579732  1.33243834 2.34228851 4.11750046 7.23813909]
         tau_syns = np.load(path)
+        self._n_syn_basis = tau_syns.size
         syn_decay = np.exp(-dt / tau_syns)
         syn_decay = tf.constant(syn_decay, dtype=self.compute_dtype)
         syn_decay = tf.tile(syn_decay, [self._n_neurons])
