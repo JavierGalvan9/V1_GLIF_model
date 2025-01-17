@@ -48,7 +48,7 @@ parser.add_argument('--plot_core_radius', default=400.0, type=float)
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=50, type=int)
 parser.add_argument('--batch_size', default=1, type=int)
-parser.add_argument('--neurons', default=10, type=int)
+parser.add_argument('--neurons', default=0, type=int)
 parser.add_argument('--steps_per_epoch', default=20, type=int)
 parser.add_argument('--val_steps', default=1, type=int)
 
@@ -86,6 +86,7 @@ parser.add_argument('--pseudo_gauss', default=False, action='store_true')
 parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
 parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')
+parser.add_argument('--random_weights', default=False, action='store_true')
 parser.add_argument('--rotation', default='ccw', type=str)
 
 
@@ -114,7 +115,7 @@ def main():
     # Save the configuration of the model based on the main features
     flag_str = f'v1_{v1_neurons}'
     for name, value in vars(flags).items():
-        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection']:
+        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection', 'random_weights']:
             flag_str += f'_{name}_{value}'
 
     # Define flag string as the second part of results_path
