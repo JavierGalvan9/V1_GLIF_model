@@ -79,7 +79,7 @@ def pop_names(network, core_radius = None, n_selected_neurons=None, data_dir='',
         node_type_id_to_pop_name = node_types['pop_name'].to_dict()
 
         # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
-        node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][network['tf_id_to_bmtk_id']]
+        node_type_ids = np.array(node_h5['nodes']['v1']['node_type_id'][()])[network['tf_id_to_bmtk_id']]
         true_pop_names = np.array([node_type_id_to_pop_name[nid] for nid in node_type_ids])
 
         if core_radius is not None:
@@ -134,24 +134,23 @@ def connection_type_ids(network, core_radius=None, data_dir='GLIF_network', retu
 
 def angle_tunning(network, data_dir='GLIF_network'):
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
-    node_h5 = h5py.File(path_to_h5, mode='r')
-    angle_tunning = np.array(node_h5['nodes']['v1']['0']['tuning_angle'][:])[network['tf_id_to_bmtk_id']]    
+    with h5py.File(path_to_h5, mode='r') as node_h5:
+        angle_tunning = np.array(node_h5['nodes']['v1']['0']['tuning_angle'][:])[network['tf_id_to_bmtk_id']]
     
     return angle_tunning
 
 def isolate_core_neurons(network, radius=None, n_selected_neurons=None, data_dir='GLIF_network'):
     path_to_h5 = os.path.join(data_dir, 'network/v1_nodes.h5')
-    node_h5 = h5py.File(path_to_h5, mode='r')
-    x = node_h5['nodes']['v1']['0']['x'][()][network['tf_id_to_bmtk_id']]
-    z = node_h5['nodes']['v1']['0']['z'][()][network['tf_id_to_bmtk_id']]
-    r = np.sqrt(x ** 2 + z ** 2)
-    if radius is not None:
-        selected_mask = r < radius
-    # if a number of neurons is given, select the closest neurons
-    elif n_selected_neurons is not None:
-        selected_mask = np.argsort(r)[:n_selected_neurons]
-        selected_mask = np.isin(np.arange(len(r)), selected_mask)
-       
+    with h5py.File(path_to_h5, mode='r') as node_h5:
+        x = np.array(node_h5['nodes']['v1']['0']['x'][()])[network['tf_id_to_bmtk_id']]
+        z = np.array(node_h5['nodes']['v1']['0']['z'][()])[network['tf_id_to_bmtk_id']]
+        r = np.sqrt(x ** 2 + z ** 2)
+        if radius is not None:
+            selected_mask = r < radius
+        elif n_selected_neurons is not None:
+            selected_mask = np.argsort(r)[:n_selected_neurons]
+            selected_mask = np.isin(np.arange(len(r)), selected_mask)
+    
     return selected_mask
     
 def isolate_neurons(network, neuron_population='e23', data_dir='GLIF_network'):
@@ -167,7 +166,7 @@ def isolate_neurons(network, neuron_population='e23', data_dir='GLIF_network'):
         node_type_id_to_pop_name = node_types['pop_name'].to_dict()
 
         # Get node_type_ids for the current network
-        node_type_ids = node_h5['nodes']['v1']['node_type_id'][()]
+        node_type_ids = np.array(node_h5['nodes']['v1']['node_type_id'][()])
         true_node_type_ids = node_type_ids[network['tf_id_to_bmtk_id']]
         selected_mask = np.zeros(n_neurons, bool)
 
