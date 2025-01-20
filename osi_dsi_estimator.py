@@ -320,7 +320,7 @@ def main(_):
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         _initial_state = _state_variables
         seq_len = tf.shape(_x)[1]
-        dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, flags.neurons), dtype)
+        dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
         _out = extractor_model((_x, dummy_zeros, _initial_state))
         z = _out[0][0]
         # update state_variables with the new model state
@@ -539,7 +539,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('run_session', 0, '')
     absl.app.flags.DEFINE_integer('n_epochs', 50, '')
     absl.app.flags.DEFINE_integer('batch_size', 1, '')
-    absl.app.flags.DEFINE_integer('neurons', 65871, '')  # -1 to take all neurons
+    absl.app.flags.DEFINE_integer('neurons', 0, '')  # 0 to take all neurons
     absl.app.flags.DEFINE_integer('steps_per_epoch', 20, '')# EA and garret dose not need this many but pure classification needs 781 = int(50000/64)
     absl.app.flags.DEFINE_integer('val_steps', 1, '')# EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
     # number of LGN filters in visual space (input population)

@@ -21,6 +21,8 @@ __pycache__
 *.err
 logs/
 results*/
+*result/
+*results/
 core_*/
 legit_results/
 *.html

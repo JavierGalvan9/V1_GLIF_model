@@ -158,7 +158,6 @@ def load_network(
     n_neurons=296991,
     seed=3000,
     connected_selection=True,
-    n_syn_basis=5,
     tensorflow_speed_up=False,
     random_weights=False):
 
@@ -208,6 +207,8 @@ def load_network(
 
     # Get the number of nodes in the full V1 network
     n_nodes = sum([len(a["ids"]) for a in d["nodes"]])  # 296991 total neurons
+    if n_neurons <= 0:
+        n_neurons = n_nodes  # use all of the neurons in the network
     # Create arrays to convert between bmtk and tf ides
     tf_id_to_bmtk_id = np.arange(n_nodes, dtype=np.int32)
     bmtk_id_to_tf_id = np.full(n_nodes, -1, dtype=np.int32)
