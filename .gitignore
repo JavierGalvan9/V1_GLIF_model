@@ -37,3 +37,7 @@ lgn_model/.cache_lgn
 lgn_model/data
 v1_model_utils/Old/models_old.py
 lgn_model/data/temporal_kernels_120x80.pkl
+synaptic_data/basis_function_weights_5.csv
+synaptic_data/tau_basis_5.npy
+.gitignore
+synaptic_data/double_alpha_params_full.csv

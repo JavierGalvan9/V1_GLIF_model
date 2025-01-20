@@ -146,12 +146,12 @@ class OsiDsiCallbacks:
         self.post_delay = post_delay
         self.current_epoch = current_epoch
         self.model_variables_dict = model_variables_init
-        # # Analize changes in trainable variables.
-        # if self.model_variables_dict is not None:
-        #     for var in self.model_variables_dict['Best'].keys():
-        #         t0 = time()
-        #         self.trainable_variable_change_heatmaps_and_distributions(var)
-        #         print(f'Time spent in {var}: {time()-t0}')
+        # Analize changes in trainable variables.
+        if self.model_variables_dict is not None:
+            for var in self.model_variables_dict['Best'].keys():
+                t0 = time()
+                self.trainable_variable_change_heatmaps_and_distributions(var)
+                print(f'Time spent in {var}: {time()-t0}')
 
     def trainable_variable_change_heatmaps_and_distributions(self, variable):
         node_types_voltage_scale = (self.network['node_params']['V_th'] - self.network['node_params']['E_L']).astype(np.float16)
