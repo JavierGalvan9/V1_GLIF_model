@@ -429,6 +429,7 @@ class SynchronizationLoss(Layer):
         spikes = tf.cast(spikes, self._dtype)  
         # choose random trials to sample from (usually we only have 1 trial to sample from)
         n_trials = tf.shape(spikes)[0]
+        # increase the base seed to avoid the same random neurons to be selected in every instantiation of the class
         self._base_seed = self._base_seed + 1
         sample_trials = tf.random.uniform([self._n_samples], minval=0, maxval=n_trials, dtype=tf.int32, seed=self._base_seed)
         # Generate sample counts with a normal distribution
@@ -447,7 +448,8 @@ class SynchronizationLoss(Layer):
             ## sample_ids = tf.random.shuffle(self.node_id_e)[:sample_num]
             ## randomly choose sample_num ids from shuffled_ids without replacement
             if previous_id + sample_num > tf.size(shuffled_e_ids):
-                shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
+                # shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
+                shuffled_e_ids = tf.random.shuffle(shuffled_e_ids, seed=self._base_seed)
                 previous_id = tf.constant(0, dtype=tf.int32)
             sample_ids = shuffled_e_ids[previous_id:previous_id+sample_num]
             previous_id += sample_num
