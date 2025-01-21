@@ -82,15 +82,15 @@ def pop_names(network, core_radius = None, n_selected_neurons=None, data_dir='',
         node_type_ids = np.array(node_h5['nodes']['v1']['node_type_id'][()])[network['tf_id_to_bmtk_id']]
         true_pop_names = np.array([node_type_id_to_pop_name[nid] for nid in node_type_ids])
 
-        if core_radius is not None:
-            selected_mask = isolate_core_neurons(network, radius=core_radius, data_dir=data_dir)
-        elif n_selected_neurons is not None:
-            selected_mask = isolate_core_neurons(network, n_selected_neurons=n_selected_neurons, data_dir=data_dir)
-        else:
-            selected_mask = np.full(len(true_pop_names), True)
-            
-        true_pop_names = true_pop_names[selected_mask]
-        node_type_ids = node_type_ids[selected_mask]
+    if core_radius is not None:
+        selected_mask = isolate_core_neurons(network, radius=core_radius, data_dir=data_dir)
+    elif n_selected_neurons is not None:
+        selected_mask = isolate_core_neurons(network, n_selected_neurons=n_selected_neurons, data_dir=data_dir)
+    else:
+        selected_mask = np.full(len(true_pop_names), True)
+        
+    true_pop_names = true_pop_names[selected_mask]
+    node_type_ids = node_type_ids[selected_mask]
 
     if return_node_type_ids:
         return true_pop_names, node_type_ids
@@ -144,12 +144,13 @@ def isolate_core_neurons(network, radius=None, n_selected_neurons=None, data_dir
     with h5py.File(path_to_h5, mode='r') as node_h5:
         x = np.array(node_h5['nodes']['v1']['0']['x'][()])[network['tf_id_to_bmtk_id']]
         z = np.array(node_h5['nodes']['v1']['0']['z'][()])[network['tf_id_to_bmtk_id']]
-        r = np.sqrt(x ** 2 + z ** 2)
-        if radius is not None:
-            selected_mask = r < radius
-        elif n_selected_neurons is not None:
-            selected_mask = np.argsort(r)[:n_selected_neurons]
-            selected_mask = np.isin(np.arange(len(r)), selected_mask)
+        
+    r = np.sqrt(x ** 2 + z ** 2)
+    if radius is not None:
+        selected_mask = r < radius
+    elif n_selected_neurons is not None:
+        selected_mask = np.argsort(r)[:n_selected_neurons]
+        selected_mask = np.isin(np.arange(len(r)), selected_mask)
     
     return selected_mask
     
