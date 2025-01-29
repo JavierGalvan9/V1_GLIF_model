@@ -387,23 +387,26 @@ class SynchronizationLoss(Layer):
 
     def pop_fano_tf(self, spikes, bin_sizes):
         # transpose the spikes tensor to have the shape (seq_len, samples)
-        all_spikes_transposed = tf.transpose(spikes)
+        spikes = tf.expand_dims(tf.expand_dims(spikes, axis=-1), axis=-1)
         # Initialize the Fano factors tensor
         fanos = tf.TensorArray(dtype=self._dtype, size=len(bin_sizes))
         for i, bin_width in enumerate(bin_sizes):
-            # drop the last entry to avoid last bin smaller size effect
-            bin_size = int(np.round(bin_width * 1000))
-            max_index = all_spikes_transposed.shape[0] // bin_size * bin_size
-            trimmed_spikes = all_spikes_transposed[:max_index, :]
-            # Reshape the spikes tensor 
-            trimmed_spikes = tf.reshape(trimmed_spikes, [max_index // bin_size, bin_size, -1])
-            # Calculate the number of spikes in each bin
-            sp_counts = tf.reduce_sum(trimmed_spikes, axis=1)
-            # Calculate the mean and variance of spike counts
-            mean_count = tf.reduce_mean(sp_counts, axis=0)
+            bin_size = int(np.round(bin_width * 1000))            
+            # Filter with shape [bin_size, 1, 1, 1]
+            kernel = tf.ones((bin_size, 1, 1, 1), dtype=self._dtype)
+                
+            convolved = tf.nn.conv2d(
+                spikes,
+                kernel,
+                strides=[1, bin_size, 1, 1],
+                padding="VALID"
+            )
+            sp_counts = tf.squeeze(convolved, axis=[2, 3])  # => [n_samples, new_height]
+            mean_count = tf.reduce_mean(sp_counts, axis=1)  # => [n_samples]
+            var_count = tf.math.reduce_variance(sp_counts, axis=1)  # => [n_samples]
             mean_count = tf.maximum(mean_count, self.epsilon)
-            var_count = tf.math.reduce_variance(sp_counts, axis=0)
-            fano = var_count / mean_count
+            fano_per_sample = var_count / mean_count  # => [n_samples]
+            fano = tf.reduce_mean(fano_per_sample)
             fanos = fanos.write(i, fano)
 
         return fanos.stack()
@@ -458,9 +461,7 @@ class SynchronizationLoss(Layer):
             selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
         selected_spikes_sample = selected_spikes_sample.stack()
-        fanos = self.pop_fano_tf(selected_spikes_sample, bin_sizes=bin_sizes)
-        # # Calculate mean, standard deviation, and SEM of the Fano factors
-        fanos_mean = tf.reduce_mean(fanos, axis=1)
+        fanos_mean = self.pop_fano_tf(selected_spikes_sample, bin_sizes=bin_sizes)
         # # Calculate MSE between the experimental and calculated Fano factors
         mse_loss = tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))
         # # Calculate the synchronization loss
