@@ -1111,8 +1111,8 @@ class SignedConstraint(tf.keras.constraints.Constraint):
         self._positive = positive
 
     def __call__(self, w):
-        sign_corrected_w = tf.where(
-            self._positive, tf.nn.relu(w), -tf.nn.relu(-w))
+        condition = tf.greater(self._positive, 0)  # yields bool
+        sign_corrected_w = tf.where(condition, tf.nn.relu(w), -tf.nn.relu(-w))
         return sign_corrected_w
 
 
@@ -1122,8 +1122,8 @@ class SparseSignedConstraint(tf.keras.constraints.Constraint):
         self._positive = positive
 
     def __call__(self, w):
-        sign_corrected_w = tf.where(
-            self._positive, tf.nn.relu(w), -tf.nn.relu(-w))
+        condition = tf.greater(self._positive, 0)  # yields bool
+        sign_corrected_w = tf.where(condition, tf.nn.relu(w), -tf.nn.relu(-w))
         return tf.where(self._mask, sign_corrected_w, tf.zeros_like(sign_corrected_w))
 
 
@@ -1273,8 +1273,10 @@ class V1Column(tf.keras.layers.Layer):
         # add dimension for the weights factors - TensorShape([23525415, 1])
         # weights = tf.expand_dims(weights, axis=1) 
         # Set the sign of the connections (exc or inh)
-        recurrent_weight_positive = tf.Variable(
-            weights >= 0.0, name="recurrent_weights_sign", trainable=False)
+        # recurrent_weight_positive = tf.Variable(
+        #     weights >= 0.0, name="recurrent_weights_sign", trainable=False)
+        recurrent_weight_positive = tf.constant(weights >= 0, dtype=tf.int8)
+
         # if training the recurrent connection per type, turn off recurrent training
         # of individual connections
         if train_recurrent:
@@ -1336,8 +1338,10 @@ class V1Column(tf.keras.layers.Layer):
 
         # Define the Tensorflow variables
         # input_weights = tf.expand_dims(input_weights, axis=1) # add dimension for the weights factors - TensorShape([23525415, 1])
-        input_weight_positive = tf.Variable(
-            input_weights >= 0.0, name="input_weights_sign", trainable=False)
+        # input_weight_positive = tf.Variable(
+        #     input_weights >= 0.0, name="input_weights_sign", trainable=False)
+        input_weight_positive = tf.constant(input_weights >= 0, dtype=tf.int8)
+
         self.input_weight_values = tf.Variable(
             input_weights * input_weight_scale / lr_scale,
             name="sparse_input_weights",
@@ -1367,8 +1371,9 @@ class V1Column(tf.keras.layers.Layer):
         self.pre_bkg_ind_table = make_pre_ind_table(bkg_input_indices, n_source_neurons=bkg_input["n_inputs"])
 
         # Define Tensorflow variables
-        bkg_input_weight_positive = tf.Variable(
-            bkg_input_weights >= 0.0, name="bkg_input_weights_sign", trainable=False)
+        # bkg_input_weight_positive = tf.Variable(
+        #     bkg_input_weights >= 0.0, name="bkg_input_weights_sign", trainable=False)
+        bkg_input_weight_positive = tf.constant(bkg_input_weights >= 0, dtype=tf.int8)
         self.bkg_input_weights = tf.Variable(
             bkg_input_weights * input_weight_scale / lr_scale, 
             name="rest_of_brain_weights", 

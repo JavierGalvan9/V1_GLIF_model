@@ -582,6 +582,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("calculate_osi_dsi", True, "")
     absl.app.flags.DEFINE_boolean('random_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
+    absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
 
     absl.app.flags.DEFINE_string("rotation", "ccw", "")
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')

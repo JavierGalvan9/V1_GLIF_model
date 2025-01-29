@@ -308,7 +308,7 @@ def main(_):
                 v1_ema = tf.Variable(data_loaded['v1_ema'], trainable=False, name='V1_EMA')
         else:
             # 3 Hz is near the average FR of cortex
-            v1_ema = tf.Variable(tf.constant(0.003, shape=(network["n_nodes"],), dtype=tf.float32), trainable=False, name='V1_EMA')
+            v1_ema = tf.Variable(tf.constant(0.003, shape=(flags.neurons,), dtype=tf.float32), trainable=False, name='V1_EMA')
             # v1_ema = tf.Variable(0.01 * tf.ones(shape=(flags.neurons,)), trainable=False, name='V1_EMA')
 
         # here we need information of the layer mask for the OSI loss
@@ -438,12 +438,24 @@ def main(_):
         spontaneous_prob = compute_spontaneous_lgn_firing_rates()
 
     def roll_out(_x, _y, _state_variables, spontaneous=False, trim=True):
+
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         _initial_state = _state_variables
         seq_len = tf.shape(_x)[1]
         dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
-        # _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
-        _out = extractor_model((_x, dummy_zeros, _initial_state))
+
+        if flags.gradient_checkpointing:
+            @tf.recompute_grad
+            def roll_out_with_gradient_checkpointing(x, state_vars):
+                # Call extractor model without storing intermediate state variables
+                dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
+                _out = extractor_model((x, dummy_zeros, state_vars))
+                return _out
+
+            _out = roll_out_with_gradient_checkpointing(_x, _initial_state)
+        else:
+            _out = extractor_model((_x, dummy_zeros, _initial_state))
+
         _z, _v = _out[0]
 
         if flags.dtype != 'float32':
@@ -509,7 +521,7 @@ def main(_):
         ### Forward propagation of the model
         with tf.GradientTape() as tape:
             # _out, _p, _loss, _aux, _ = roll_out(_x, _y, _w, trim=trim, spontaneous=spontaneous)
-            _out, _loss, _aux = roll_out(_x, _y, state_variables, trim=trim, spontaneous=spontaneous)
+            _out, _loss, _aux = roll_out(tf.cast(_x, dtype), _y, state_variables, trim=trim, spontaneous=spontaneous)
             # Scale the loss for float16         
             if flags.dtype=='float16':
                 _scaled_loss = optimizer.get_scaled_loss(_loss)
@@ -1012,6 +1024,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("spontaneous_training", False, "")
     absl.app.flags.DEFINE_boolean('random_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
+    absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
 
     absl.app.run(main)
 
