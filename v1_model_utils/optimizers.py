@@ -104,7 +104,7 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
                     )
                 )
 
-    @tf.function
+    @tf.function(jit_compile=True)
     def update_step(self, gradient, variable):
         """Update step given gradient and the associated model variable."""
         # Get current iteration
