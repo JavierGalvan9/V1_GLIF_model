@@ -31,6 +31,7 @@ import stim_dataset
 from time import time
 import ctypes.util
 import random
+from optimizers import ExponentiatedAdam
 
 import logging
 tf.get_logger().setLevel(logging.INFO)
@@ -173,7 +174,9 @@ def main(_):
 
         # Define the optimizer
         if flags.optimizer == 'adam':
-            optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
+            optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)
+        elif flags.optimizer == 'exp_adam':
+            optimizer = ExponentiatedAdam(flags.learning_rate, epsilon=1e-11)
         elif flags.optimizer == 'sgd':
             optimizer = tf.keras.optimizers.SGD(flags.learning_rate, momentum=0.0, nesterov=False)
         else:
@@ -194,7 +197,9 @@ def main(_):
             if not optimizer_continuing:
                 print(f"Optimizer does not match the checkpoint. Using a new optimizer.")
                 if flags.optimizer == 'adam':
-                    optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
+                    optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)
+                elif flags.optimizer == 'exp_adam':
+                    optimizer = ExponentiatedAdam(flags.learning_rate, epsilon=1e-11)
                 elif flags.optimizer == 'sgd':
                     optimizer = tf.keras.optimizers.SGD(flags.learning_rate, momentum=0.0, nesterov=False)
                 else:
@@ -219,7 +224,9 @@ def main(_):
             if not optimizer_continuing:
                 print(f"Optimizer does not match the checkpoint. Using a new optimizer.")
                 if flags.optimizer == 'adam':
-                    optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
+                    optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)
+                elif flags.optimizer == 'exp_adam':
+                    optimizer = ExponentiatedAdam(flags.learning_rate, epsilon=1e-11)
                 elif flags.optimizer == 'sgd':
                     optimizer = tf.keras.optimizers.SGD(flags.learning_rate, momentum=0.0, nesterov=False)
                 else:
@@ -350,7 +357,7 @@ def main(_):
                                                                     method=flags.osi_loss_method,
                                                                     subtraction_ratio=flags.osi_loss_subtraction_ratio,
                                                                     layer_info=layer_info)
-            placeholder_angle = tf.constant(per_replica_batch_size, dtype=tf.float32, shape=(1, 1))
+            placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
             model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
         extractor_model = tf.keras.Model(inputs=model.inputs,

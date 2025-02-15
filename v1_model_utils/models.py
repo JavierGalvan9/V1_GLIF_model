@@ -179,7 +179,8 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, dense
             return de_dv_rid  # shape: [batch_size, n_pre_neurons]
         # Use tf.map_fn to apply per_receptor_grad to each receptor index
         # tf.map_fn will return a tensor of shape [n_syn_basis, batch_size, n_pre_neurons]
-        de_dv_all = tf.map_fn(per_receptor_grad, tf.range(n_syn_basis), 
+        de_dv_all = tf.map_fn(per_receptor_grad, 
+                            tf.range(n_syn_basis), 
                             dtype=dy.dtype,
                             parallel_iterations=1)
         # Sum over all receptors
@@ -1482,8 +1483,9 @@ class V1Column(tf.keras.layers.Layer):
     #     # Stack the TensorArray into a single tensor
     #     i_in = i_in.stack()
     #     noise_input = tf.transpose(i_in, (2, 1, 0)) # (batch_size, 65871, 5) 
+    #     noise_input_flat = tf.reshape(noise_input, [self.batch_size * self._n_neurons, self._n_syn_basis])
 
-    #     return noise_input
+    #     return noise_input_flat
     
     def calculate_noise_current(self, rest_of_brain):
         # x_t: Shape [batch_size, input_dim]
@@ -1611,7 +1613,7 @@ class V1Column(tf.keras.layers.Layer):
 
         return z0_buf, v0, r0, asc, psc_rise0, psc0
 
-    # @tf.function
+    # @tf.function # dont use it in here because it breaks the graph structure and the custom gradients
     def call(self, inputs, state, constants=None):
 
         # # Get all the model inputs
@@ -1862,8 +1864,12 @@ def create_model(
     #     name="noise_layer",
     #     )(x)
 
+    # bkg_inputs = tf.random.poisson(shape=(batch_size, seq_len, 100), 
+    #                                 lam=250*.001, 
+    #                                 dtype=dtype) # this implementation is slower
+
     # Concatenate the input layer with the initial state of the RNN
-    # full_inputs = tf.concat((rnn_inputs, bkg_inputs, state_input), -1) # (None, 600, 5*n_neurons+n_neurons)
+    # full_inputs = tf.concat((tf.cast(x, dtype), bkg_inputs, state_input), -1) # (None, 600, 5*n_neurons+n_neurons)
     # full_inputs = tf.concat((tf.cast(x, dtype), bkg_inputs, state_input), -1)
     full_inputs = tf.concat((tf.cast(x, dtype), state_input), -1)
     
