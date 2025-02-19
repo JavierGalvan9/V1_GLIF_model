@@ -277,7 +277,7 @@ def main(_):
 
         ### RECURRENT REGULARIZERS ###
         rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, network, penalize_relative_change=True, dtype=tf.float32)
-        model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
+        # model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
         # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
         # rec_weight_l2_regularizer = losses.L2Regularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
 
@@ -285,25 +285,25 @@ def main(_):
         rate_core_mask = None if flags.all_neuron_rate_loss else core_mask
         evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=False, rate_cost=flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
                                                                     data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32)
-        model.add_loss(lambda: evoked_rate_regularizer(rsnn_layer.output[0][0]))
+        # model.add_loss(lambda: evoked_rate_regularizer(rsnn_layer.output[0][0]))
         
         ### SPONTANEOUS RATES REGULARIZERS ###
         spont_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
                                                                     data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32)
-        model.add_loss(lambda: spont_rate_regularizer(rsnn_layer.output[0][0]))
+        # model.add_loss(lambda: spont_rate_regularizer(rsnn_layer.output[0][0]))
         # evoked_rate_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
 
         ### VOLTAGE REGULARIZERS ###
         # voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32, core_mask=core_mask)
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32)
-        model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
+        # model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
 
         ### SYNCHRONIZATION REGULARIZERS ###
         evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=tf.float32, session='evoked', data_dir='Synchronization_data')
-        model.add_loss(lambda: evoked_sync_loss(rsnn_layer.output[0][0]))
+        # model.add_loss(lambda: evoked_sync_loss(rsnn_layer.output[0][0]))
 
         spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=tf.float32, session='spont', data_dir='Synchronization_data')
-        model.add_loss(lambda: spont_sync_loss(rsnn_layer.output[0][0]))
+        # model.add_loss(lambda: spont_sync_loss(rsnn_layer.output[0][0]))
 
         ### OSI / DSI LOSSES ###
         # Define the decay factor for the exponential moving average
@@ -330,8 +330,8 @@ def main(_):
                                                         method=flags.osi_loss_method,
                                                         subtraction_ratio=flags.osi_loss_subtraction_ratio,
                                                         layer_info=layer_info)
-        placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
-        model.add_loss(lambda: OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
+        # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
+        # model.add_loss(lambda: OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
         # osi_dsi_loss = OSI_DSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,1)), trim=True) 
 
         # model.add_loss(rate_loss)
@@ -345,10 +345,10 @@ def main(_):
         if annulus_mask is not None:
             annulus_spont_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
                                                                                 data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32)
-            model.add_loss(lambda: annulus_spont_rate_regularizer(rsnn_layer.output[0][0]))
+            # model.add_loss(lambda: annulus_spont_rate_regularizer(rsnn_layer.output[0][0]))
             annulus_evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=False, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
                                                                                 data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32)
-            model.add_loss(lambda: annulus_evoked_rate_regularizer(rsnn_layer.output[0][0]))
+            # model.add_loss(lambda: annulus_evoked_rate_regularizer(rsnn_layer.output[0][0]))
 
             # Add OSI/DSI regularizer for the annulus
             annulus_OSI_DSI_Loss = losses.OrientationSelectivityLoss(network=network, osi_cost=0.1*flags.osi_cost,
@@ -357,8 +357,8 @@ def main(_):
                                                                     method=flags.osi_loss_method,
                                                                     subtraction_ratio=flags.osi_loss_subtraction_ratio,
                                                                     layer_info=layer_info)
-            placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
-            model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
+            # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
+            # model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
         extractor_model = tf.keras.Model(inputs=model.inputs,
                                         #  outputs=[rsnn_layer.output, model.output, prediction_layer.output])
