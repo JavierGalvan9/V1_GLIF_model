@@ -183,11 +183,11 @@ def main(_):
             print(f"Invalid optimizer: {flags.optimizer}")
             raise ValueError
         
-        optimizer.build(model.trainable_variables)
+        # optimizer.build(model.trainable_variables)
 
-        #Enable loss scaling for training float16 model
-        if flags.dtype == 'float16':
-            optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
+        # #Enable loss scaling for training float16 model
+        # if flags.dtype == 'float16':
+        #     optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
         
         # Restore model and optimizer from a checkpoint if it exists
         if flags.ckpt_dir != '' and os.path.exists(os.path.join(flags.ckpt_dir, "Intermediate_checkpoints")):
@@ -208,7 +208,7 @@ def main(_):
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
-                optimizer.build(model.trainable_variables)
+                # optimizer.build(model.trainable_variables)
                 # print optmizer variables
                 print('Checkpoint restored with a new optimizer.')
             else:
@@ -235,7 +235,7 @@ def main(_):
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
-                optimizer.build(model.trainable_variables)
+                # optimizer.build(model.trainable_variables)
                 print('Checkpoint restored with a new optimizer.')
             else:
                 # Restore the model
@@ -245,6 +245,10 @@ def main(_):
         else:
             print(f"No checkpoint found in {flags.ckpt_dir} or {flags.restore_from}. Starting from scratch...\n")
             checkpoint = None
+
+        #Enable loss scaling for training float16 model
+        if flags.dtype == 'float16':
+            optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
 
         model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
         # model_variables_dict['Best'] = {
@@ -379,6 +383,7 @@ def main(_):
         # state_variables = tf.nest.map_structure(lambda a: tf.Variable(
         #     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
         # ), zero_state)
+        dummy_zeros = tf.zeros((per_replica_batch_size, flags.seq_len, network["n_nodes"]), dtype)
 
         # Add other metrics and losses
         train_loss = tf.keras.metrics.Mean()
@@ -449,13 +454,12 @@ def main(_):
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         _initial_state = _state_variables
         seq_len = tf.shape(_x)[1]
-        dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
 
         if flags.gradient_checkpointing:
             @tf.recompute_grad
             def roll_out_with_gradient_checkpointing(x, state_vars):
                 # Call extractor model without storing intermediate state variables
-                dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
+                # dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
                 _out = extractor_model((x, dummy_zeros, state_vars))
                 return _out
 

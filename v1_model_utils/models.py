@@ -45,7 +45,7 @@ def spike_gauss(v_scaled, sigma, amplitude):
         dz_dv_scaled = gauss_pseudo(v_scaled, sigma, amplitude)
         de_dv_scaled = de_dz * dz_dv_scaled
 
-        return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
+        return [de_dv_scaled, None, None]
 
     return tf.identity(z_, name="spike_gauss"), grad
 
@@ -60,7 +60,7 @@ def spike_gauss_16(v_scaled, sigma, amplitude):
 
         de_dv_scaled = de_dz * dz_dv_scaled
 
-        return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
+        return [de_dv_scaled, None, None]
 
     return tf.identity(z_, name="spike_gauss"), grad
 
@@ -76,7 +76,7 @@ def spike_gauss_b16(v_scaled, sigma, amplitude):
 
         de_dv_scaled = de_dz * dz_dv_scaled
 
-        return [de_dv_scaled, tf.zeros_like(sigma), tf.zeros_like(amplitude)]
+        return [de_dv_scaled, None, None]
 
     return tf.identity(z_, name='spike_gauss'), grad
 
@@ -91,7 +91,7 @@ def spike_function(v_scaled, dampening_factor):
 
         de_dv_scaled = de_dz * dz_dv_scaled
 
-        return [de_dv_scaled, tf.zeros_like(dampening_factor)]
+        return [de_dv_scaled, None]
 
     return tf.identity(z_, name="spike_function"), grad
 
@@ -106,7 +106,7 @@ def spike_function_16(v_scaled, dampening_factor):
 
         de_dv_scaled = de_dz * dz_dv_scaled
 
-        return [de_dv_scaled, tf.zeros_like(dampening_factor)]
+        return [de_dv_scaled, None]
 
     return tf.identity(z_, name="spike_function"), grad
 
@@ -121,7 +121,7 @@ def spike_function_b16(v_scaled, dampening_factor):
 
         de_dv_scaled = de_dz * dz_dv_scaled
 
-        return [de_dv_scaled, tf.zeros_like(dampening_factor)]
+        return [de_dv_scaled, None]
 
     return tf.identity(z_, name="spike_function"), grad
 
@@ -820,18 +820,19 @@ def make_pre_ind_table(indices, n_source_neurons=197613):
     This approach ensures that every presynaptic neuron, even those with no
     postsynaptic connections, has an entry in the RaggedTensor.
     """
-    pre_inds = indices[:, 1]
-    n_syn = pre_inds.shape[0]
-    # Since pre_inds may not be sorted, we sort them along with synapse_indices
-    sorted_pre_inds, sorted_synapse_indices = tf.math.top_k(-pre_inds, k=n_syn)
-    # Count occurrences (out-degrees) for each presynaptic neuron using bincount
-    sorted_pre_inds = tf.cast(-sorted_pre_inds, dtype=tf.int32)  # Undo the negation to get the sorted pre_inds and cast to reduce memory usage
-    # Count occurrences (out-degrees) for each presynaptic neuron using bincount
-    counts = tf.math.bincount(sorted_pre_inds, minlength=n_source_neurons)
-    # Create row_splits that covers all presynaptic neurons (0 to n_source_neurons)
+    # Extract presynaptic IDs
+    pre_ids = indices[:, 1]  # shape: [num_synapses]
+    # Sort the synapses by presynaptic ID
+    sort_idx = tf.argsort(pre_ids, axis=0)
+    sorted_pre = tf.gather(pre_ids, sort_idx)
+    # Count how many synapses belong to each presynaptic neuron
+    # (We cast to int32 for tf.math.bincount.)
+    counts = tf.math.bincount(tf.cast(sorted_pre, tf.int32), minlength=n_source_neurons)
+    # Build row_splits to define a RaggedTensor from these sorted indices
     row_splits = tf.concat([[0], tf.cumsum(counts)], axis=0)
-    # Create the RaggedTensor with empty rows for missing neurons
-    rt = tf.RaggedTensor.from_row_splits(sorted_synapse_indices, row_splits)
+    # The values of the RaggedTensor are the original synapse-array row indices,
+    # but sorted by presyn neuron
+    rt = tf.RaggedTensor.from_row_splits(sort_idx, row_splits, validate=False)
 
     return rt
 
@@ -1721,7 +1722,8 @@ class V1Column(tf.keras.layers.Layer):
         # Define the model outputs and the new state of the network
         outputs = (
             new_z,
-            new_v * self.voltage_scale + self.voltage_offset,
+            new_v,
+            # new_v * self.voltage_scale + self.voltage_offset,
             # (input_current + tf.reduce_sum(asc, axis=-1)) * self.voltage_scale,
         )
 
@@ -1892,7 +1894,7 @@ def create_model(
         hidden = rsnn_out
 
     spikes = hidden[0]
-    voltage = hidden[1]
+    # voltage = hidden[1]
 
     # computes the mean of the spikes tensor along the second and third dimensions
     # (which represent time and neurons),
