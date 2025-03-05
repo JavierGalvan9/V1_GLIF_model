@@ -378,8 +378,10 @@ class SynchronizationLoss(Layer):
         self.epsilon = 1e-7  # Small constant to avoid division by zero
 
         # Load the experimental data
+        duration = str(int((t_end - t_start) * 1000))
+        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'v1_fano_running_{duration}ms_{session}.npy')
         # experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
-        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'v1_fano_running_300ms_{session}.npy')
+        assert os.path.exists(experimental_data_path), f'File not found: {experimental_data_path}'
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
         experimental_fanos_mean = np.nanmean(experimental_fanos[:, bin_sizes_mask], axis=0)
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean, dtype=self._dtype)

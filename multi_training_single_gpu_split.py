@@ -183,11 +183,11 @@ def main(_):
             print(f"Invalid optimizer: {flags.optimizer}")
             raise ValueError
         
-        # optimizer.build(model.trainable_variables)
+        optimizer.build(model.trainable_variables) # the optimizer needs to be built before restoring from the checkpoint
 
-        # #Enable loss scaling for training float16 model
-        # if flags.dtype == 'float16':
-        #     optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
+        #Enable loss scaling for training float16 model. This needs to be done before restoring from the checkpoint
+        if flags.dtype == 'float16':
+            optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
         
         # Restore model and optimizer from a checkpoint if it exists
         if flags.ckpt_dir != '' and os.path.exists(os.path.join(flags.ckpt_dir, "Intermediate_checkpoints")):
@@ -205,6 +205,8 @@ def main(_):
                 else:
                     print(f"Invalid optimizer: {flags.optimizer}")
                     raise ValueError
+                if flags.dtype == 'float16':
+                    optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
@@ -232,6 +234,8 @@ def main(_):
                 else:
                     print(f"Invalid optimizer: {flags.optimizer}")
                     raise ValueError
+                if flags.dtype == 'float16':
+                    optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
@@ -245,10 +249,6 @@ def main(_):
         else:
             print(f"No checkpoint found in {flags.ckpt_dir} or {flags.restore_from}. Starting from scratch...\n")
             checkpoint = None
-
-        #Enable loss scaling for training float16 model
-        if flags.dtype == 'float16':
-            optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
 
         model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
         # model_variables_dict['Best'] = {
