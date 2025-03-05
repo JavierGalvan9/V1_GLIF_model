@@ -210,7 +210,6 @@ def main(_):
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
-                # optimizer.build(model.trainable_variables)
                 # print optmizer variables
                 print('Checkpoint restored with a new optimizer.')
             else:
@@ -239,7 +238,6 @@ def main(_):
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
-                # optimizer.build(model.trainable_variables)
                 print('Checkpoint restored with a new optimizer.')
             else:
                 # Restore the model
@@ -404,12 +402,12 @@ def main(_):
         def reset_train_metrics():
             train_loss.reset_states(), train_firing_rate.reset_states()
             train_rate_loss.reset_states(), train_voltage_loss.reset_states(), train_regularizer_loss.reset_states(), 
-            train_osi_dsi_loss.reset_states()#, train_sync_loss.reset_states()
+            train_osi_dsi_loss.reset_states(), train_sync_loss.reset_states()
 
         def reset_validation_metrics():
             val_loss.reset_states(), val_firing_rate.reset_states(), 
             val_rate_loss.reset_states(), val_voltage_loss.reset_states(), val_regularizer_loss.reset_states(), 
-            val_osi_dsi_loss.reset_states()#, val_sync_loss.reset_states()
+            val_osi_dsi_loss.reset_states(), val_sync_loss.reset_states()
 
         # Precompute spontaneous LGN firing rates once
         def compute_spontaneous_lgn_firing_rates():
