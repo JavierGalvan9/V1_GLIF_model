@@ -301,10 +301,10 @@ def main(_):
         # model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
 
         ### SYNCHRONIZATION REGULARIZERS ###
-        evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=tf.float32, session='evoked', data_dir='Synchronization_data')
+        evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=flags.fano_samples, dtype=tf.float32, session='evoked', data_dir='Synchronization_data')
         # model.add_loss(lambda: evoked_sync_loss(rsnn_layer.output[0][0]))
 
-        spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=tf.float32, session='spont', data_dir='Synchronization_data')
+        spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=flags.fano_samples, dtype=tf.float32, session='spont', data_dir='Synchronization_data')
         # model.add_loss(lambda: spont_sync_loss(rsnn_layer.output[0][0]))
 
         ### OSI / DSI LOSSES ###
@@ -486,10 +486,12 @@ def main(_):
             rate_loss = spont_rate_regularizer(_z, trim)
             osi_dsi_loss = tf.constant(0.0, dtype=tf.float32)
             sync_loss = spont_sync_loss(_z, trim)
+            # regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         else:
             rate_loss = evoked_rate_regularizer(_z, trim)
             osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
             sync_loss = evoked_sync_loss(_z, trim)
+            # regularizers_loss = tf.constant(0.0, dtype=tf.float32)
 
         if annulus_mask is not None:
             if spontaneous:
@@ -515,16 +517,6 @@ def main(_):
         # _loss = osi_dsi_loss + rate_loss + voltage_loss + regularizers_loss + sync_loss
 
         return _out, _loss, _aux
-
-    # @tf.function
-    # def distributed_roll_out(x, y, w, spontaneous=False, trim=True):
-    #     _out, _p, _loss, _aux, _bkg_noise = strategy.run(roll_out, args=(x, y, w, trim, spontaneous))
-    #     # if output_spikes:
-    #     #     return _out[0][0]
-    #     # else:
-    #     #     return _out, _p, _loss, _aux
-    #     return _out, _p, _loss, _aux, _bkg_noise
-
 
     def train_step(_x, _y, state_variables, spontaneous, trim):
         ### Forward propagation of the model
@@ -563,18 +555,51 @@ def main(_):
 
         return _loss, _aux, _out#, grad
 
+    # @tf.function
+    # def distributed_train_step(x, y, state_variables, spontaneous, trim):
+    #     _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
+    #     return _loss, _aux, _out, grad
+
+    # def combine_gradients(_x, _y, state_variables, _x_spontaneous, trim=True):
+    #     evoked_loss, _evoked_aux, _evoked_out, evoked_grad = distributed_train_step(_x, _y, state_variables, False, trim)
+    #     spont_loss, _spont_aux, _spont_out, spont_grad = distributed_train_step(_x_spontaneous, _y, state_variables, True, trim)
+    #     # Combine gradients
+    #     combined_gradients = []
+    #     for evo_grad, spo_grad in zip(evoked_grad, spont_grad):
+    #         combined_gradients.append(evo_grad + spo_grad)
+
+    #     # Apply combined gradients
+    #     optimizer.apply_gradients(zip(combined_gradients, model.trainable_variables))
+        
+    #     return evoked_loss, _evoked_aux, _evoked_out, spont_loss, _spont_aux, _spont_out
+    
+    # @tf.function
+    # def split_train_step(_x, _y, state_variables, _x_spontaneous, trim=True):
+    #     evoked_loss, _evoked_aux, _out_evoked, spont_loss, _spont_aux, _out_spontaneous = strategy.run(combine_gradients, args=(_x, _y, state_variables, _x_spontaneous, trim))
+
+    #     v1_spikes_evoked = strategy.experimental_local_results(_out_evoked)[0][0][0]
+    #     v1_spikes_spont = strategy.experimental_local_results(_out_spontaneous)[0][0][0]
+    #     model_spikes = (v1_spikes_evoked, v1_spikes_spont)	
+
+    #     rate_loss = train_rate_loss.result()
+    #     voltage_loss = train_voltage_loss.result()
+    #     regularizers_loss = train_regularizer_loss.result()
+    #     sync_loss = train_sync_loss.result()
+    #     osi_dsi_loss = train_osi_dsi_loss.result()
+    #     _loss = train_loss.result()
+    #     rate = train_firing_rate.result()
+
+    #     step_values = [_loss, rate, rate_loss, voltage_loss, regularizers_loss, osi_dsi_loss, sync_loss]
+        
+    #     return model_spikes, step_values
+
     @tf.function
     def distributed_train_step(x, y, state_variables, spontaneous, trim):
         _loss, _aux, _out = strategy.run(train_step, args=(x, y, state_variables, spontaneous, trim))
         # _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
         return _loss, _aux, _out#, grad
 
-    # @tf.function
-    # def distributed_train_step(dist_inputs):
-    #     per_replica_losses = mirrored_strategy.run(train_step, args=(dist_inputs,))
-    #     return mirrored_strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
-    #                             axis=None)
-
+    @tf.function
     def split_train_step(_x, _y, state_variables, _x_spontaneous, trim=True):
         # Run the training step for the spontaneous condition
         _loss_spontaneous, _, _out_spontaneous = distributed_train_step(_x_spontaneous, _y, state_variables, True, trim)
@@ -727,6 +752,7 @@ def main(_):
         # Simulate the network with a gray screen   
         # _out, _, _, _, _ = distributed_roll_out(x, y_spontaneous, w_spontaneous)
         _out, _loss, _aux = roll_out(x, y_spontaneous, zero_state, True)
+        # _out = roll_out(x, y_spontaneous, zero_state, True)
         return tuple(_out[1:])
     
     @tf.function
@@ -831,9 +857,10 @@ def main(_):
                     # # distributed_train_step(x, y, w, trim=chunknum==1)
                     # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=chunknum==1)
                     model_spikes, step_values = split_train_step(x, y, gray_state, x_spontaneous, trim=True)
+                    # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=True)
                     break
                 except tf.errors.ResourceExhaustedError as e:
-                    print("OOM error occured")
+                    print("OOM error occurred")
                     import gc
                     gc.collect()
                     # # increase the chunknum
@@ -999,6 +1026,7 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_integer('n_plots', 1, '')
     absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
     absl.app.flags.DEFINE_integer("cue_duration", 40, "")
+    absl.app.flags.DEFINE_integer('fano_samples', 500, '')
 
     # absl.app.flags.DEFINE_integer('pre_chunks', 3, '')
     # absl.app.flags.DEFINE_integer('post_chunks', 8, '') # the pure classification task only need 1 but to make consistent with other tasks one has to make up here
