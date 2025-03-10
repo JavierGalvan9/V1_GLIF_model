@@ -599,7 +599,6 @@ def main(_):
         # _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
         return _loss, _aux, _out#, grad
 
-    @tf.function
     def split_train_step(_x, _y, state_variables, _x_spontaneous, trim=True):
         # Run the training step for the spontaneous condition
         _loss_spontaneous, _, _out_spontaneous = distributed_train_step(_x_spontaneous, _y, state_variables, True, trim)
