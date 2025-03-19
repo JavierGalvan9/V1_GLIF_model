@@ -40,8 +40,7 @@ class StiffRegularizer(Layer):
         initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
         edge_type_ids = network['synapses']['edge_type_ids']
         # Scale initial values by the voltage scale of the node IDs
-        voltage_scale_node_ids = voltage_scale[network['node_type_ids'][indices[:, 0]]]
-        initial_value /= voltage_scale_node_ids
+        initial_value /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
         # Find unique values and their first occurrence indices
         unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
         # Sort first_occurrence_indices to maintain the order of first appearances
@@ -379,32 +378,28 @@ class SynchronizationLoss(Layer):
         self.epsilon = 1e-7  # Small constant to avoid division by zero
 
         # Load the experimental data
+        duration = str(int((t_end - t_start) * 1000))
+        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'v1_fano_running_{duration}ms_{session}.npy')
         # experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
-        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'v1_fano_running_300ms_{session}.npy')
+        assert os.path.exists(experimental_data_path), f'File not found: {experimental_data_path}'
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
         experimental_fanos_mean = np.nanmean(experimental_fanos[:, bin_sizes_mask], axis=0)
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean, dtype=self._dtype)
 
     def pop_fano_tf(self, spikes, bin_sizes):
-        # transpose the spikes tensor to have the shape (seq_len, samples)
-        spikes = tf.expand_dims(tf.expand_dims(spikes, axis=-1), axis=-1)
-        # Initialize the Fano factors tensor
+        spikes = tf.expand_dims(spikes, axis=-1)
         fanos = tf.TensorArray(dtype=self._dtype, size=len(bin_sizes))
         for i, bin_width in enumerate(bin_sizes):
-            bin_size = int(np.round(bin_width * 1000))            
-            # Filter with shape [bin_size, 1, 1, 1]
-            kernel = tf.ones((bin_size, 1, 1, 1), dtype=self._dtype)
-                
-            convolved = tf.nn.conv2d(
-                spikes,
-                kernel,
-                strides=[1, bin_size, 1, 1],
-                padding="VALID"
-            )
-            sp_counts = tf.squeeze(convolved, axis=[2, 3])  # => [n_samples, new_height]
-            mean_count = tf.reduce_mean(sp_counts, axis=1)  # => [n_samples]
-            var_count = tf.math.reduce_variance(sp_counts, axis=1)  # => [n_samples]
+            bin_size = int(np.round(bin_width * 1000))
+            # Use convolution for efficient binning
+            kernel = tf.ones((bin_size, 1, 1), dtype=self._dtype)
+            convolved = tf.nn.conv1d(spikes, kernel, stride=bin_size, padding="VALID")
+            sp_counts = tf.squeeze(convolved, axis=-1)  # Shape: (60, new_width)
+            # Compute mean and variance of spike counts
+            mean_count = tf.reduce_mean(sp_counts, axis=1)
+            var_count = tf.math.reduce_variance(sp_counts, axis=1)
             mean_count = tf.maximum(mean_count, self.epsilon)
+            # fanos.append(tf.reduce_mean(var_count / mean_count))
             fano_per_sample = var_count / mean_count  # => [n_samples]
             fano = tf.reduce_mean(fano_per_sample)
             fanos = fanos.write(i, fano)
@@ -433,7 +428,7 @@ class SynchronizationLoss(Layer):
         # choose random trials to sample from (usually we only have 1 trial to sample from)
         n_trials = tf.shape(spikes)[0]
         # increase the base seed to avoid the same random neurons to be selected in every instantiation of the class
-        self._base_seed = self._base_seed + 1
+        self._base_seed += 1
         sample_trials = tf.random.uniform([self._n_samples], minval=0, maxval=n_trials, dtype=tf.int32, seed=self._base_seed)
         # Generate sample counts with a normal distribution
         sample_size = 70
@@ -476,20 +471,22 @@ class VoltageRegularization:
         self._cell = cell
         self._dtype = dtype
         self._core_mask = core_mask
-        self._voltage_offset = tf.cast(self._cell.voltage_offset, dtype)
-        self._voltage_scale = tf.cast(self._cell.voltage_scale, dtype)
-        if core_mask is not None:
-            self._voltage_offset = tf.boolean_mask(self._voltage_offset, core_mask)
-            self._voltage_scale = tf.boolean_mask(self._voltage_scale, core_mask)
+        # self._voltage_offset = tf.cast(self._cell.voltage_offset, dtype)
+        # self._voltage_scale = tf.cast(self._cell.voltage_scale, dtype)
+        # if core_mask is not None:
+        #     self._voltage_offset = tf.boolean_mask(self._voltage_offset, core_mask)
+        #     self._voltage_scale = tf.boolean_mask(self._voltage_scale, core_mask)
 
     def __call__(self, voltages):
         if self._core_mask is not None:
             voltages = tf.boolean_mask(voltages, self._core_mask, axis=2)
             
-        voltages = (voltages - self._voltage_offset) / self._voltage_scale
-        v_pos = tf.square(tf.nn.relu(voltages - 1.0))
-        v_neg = tf.square(tf.nn.relu(-voltages + 1.0))
-        voltage_loss = tf.reduce_mean(tf.reduce_mean(v_pos + v_neg, -1))
+        # voltages = (voltages - self._voltage_offset) / self._voltage_scale
+        # v_pos = tf.square(tf.nn.relu(voltages - 1.0))
+        # v_neg = tf.square(tf.nn.relu(-voltages + 1.0))
+        # voltage_loss = tf.reduce_mean(tf.reduce_mean(v_pos + v_neg, -1))
+        v_tot = tf.square(voltages - 1.0)
+        voltage_loss = tf.reduce_mean(v_tot)
 
         return voltage_loss * self._voltage_cost
 

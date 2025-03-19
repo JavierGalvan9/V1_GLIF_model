@@ -62,6 +62,7 @@ parser.add_argument('--cue_duration', default=40, type=int)
 # parser.add_argument('--validation_examples', default=16, type=int)
 parser.add_argument('--seed', default=3000, type=int)
 parser.add_argument('--neurons_per_output', default=16, type=int)
+parser.add_argument('--fano_samples', default=500, type=int)
 
 # parser.add_argument('--float16', default=False, action='store_true')
 # parser.add_argument('--caching', default=True, action='store_true')

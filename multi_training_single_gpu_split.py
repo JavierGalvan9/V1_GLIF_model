@@ -183,9 +183,9 @@ def main(_):
             print(f"Invalid optimizer: {flags.optimizer}")
             raise ValueError
         
-        optimizer.build(model.trainable_variables)
+        optimizer.build(model.trainable_variables) # the optimizer needs to be built before restoring from the checkpoint
 
-        #Enable loss scaling for training float16 model
+        #Enable loss scaling for training float16 model. This needs to be done before restoring from the checkpoint
         if flags.dtype == 'float16':
             optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
         
@@ -205,10 +205,11 @@ def main(_):
                 else:
                     print(f"Invalid optimizer: {flags.optimizer}")
                     raise ValueError
+                if flags.dtype == 'float16':
+                    optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
-                optimizer.build(model.trainable_variables)
                 # print optmizer variables
                 print('Checkpoint restored with a new optimizer.')
             else:
@@ -232,10 +233,11 @@ def main(_):
                 else:
                     print(f"Invalid optimizer: {flags.optimizer}")
                     raise ValueError
+                if flags.dtype == 'float16':
+                    optimizer = mixed_precision.LossScaleOptimizer(optimizer) # to prevent suffering from underflow gradients when using tf.float16
                 # Restore the model
                 checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
                 checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
-                optimizer.build(model.trainable_variables)
                 print('Checkpoint restored with a new optimizer.')
             else:
                 # Restore the model
@@ -277,7 +279,7 @@ def main(_):
 
         ### RECURRENT REGULARIZERS ###
         rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, network, penalize_relative_change=True, dtype=tf.float32)
-        model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
+        # model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
         # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
         # rec_weight_l2_regularizer = losses.L2Regularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
 
@@ -285,25 +287,25 @@ def main(_):
         rate_core_mask = None if flags.all_neuron_rate_loss else core_mask
         evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=False, rate_cost=flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
                                                                     data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32)
-        model.add_loss(lambda: evoked_rate_regularizer(rsnn_layer.output[0][0]))
+        # model.add_loss(lambda: evoked_rate_regularizer(rsnn_layer.output[0][0]))
         
         ### SPONTANEOUS RATES REGULARIZERS ###
         spont_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
                                                                     data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32)
-        model.add_loss(lambda: spont_rate_regularizer(rsnn_layer.output[0][0]))
+        # model.add_loss(lambda: spont_rate_regularizer(rsnn_layer.output[0][0]))
         # evoked_rate_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
 
         ### VOLTAGE REGULARIZERS ###
         # voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32, core_mask=core_mask)
         voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32)
-        model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
+        # model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
 
         ### SYNCHRONIZATION REGULARIZERS ###
-        evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=tf.float32, session='evoked', data_dir='Synchronization_data')
-        model.add_loss(lambda: evoked_sync_loss(rsnn_layer.output[0][0]))
+        evoked_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=flags.fano_samples, dtype=tf.float32, session='evoked', data_dir='Synchronization_data')
+        # model.add_loss(lambda: evoked_sync_loss(rsnn_layer.output[0][0]))
 
-        spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=500, dtype=tf.float32, session='spont', data_dir='Synchronization_data')
-        model.add_loss(lambda: spont_sync_loss(rsnn_layer.output[0][0]))
+        spont_sync_loss = losses.SynchronizationLoss(network, sync_cost=flags.sync_cost, core_mask=core_mask, t_start=0.2, t_end=flags.seq_len/1000, n_samples=flags.fano_samples, dtype=tf.float32, session='spont', data_dir='Synchronization_data')
+        # model.add_loss(lambda: spont_sync_loss(rsnn_layer.output[0][0]))
 
         ### OSI / DSI LOSSES ###
         # Define the decay factor for the exponential moving average
@@ -330,8 +332,8 @@ def main(_):
                                                         method=flags.osi_loss_method,
                                                         subtraction_ratio=flags.osi_loss_subtraction_ratio,
                                                         layer_info=layer_info)
-        placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
-        model.add_loss(lambda: OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
+        # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
+        # model.add_loss(lambda: OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
         # osi_dsi_loss = OSI_DSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,1)), trim=True) 
 
         # model.add_loss(rate_loss)
@@ -345,10 +347,10 @@ def main(_):
         if annulus_mask is not None:
             annulus_spont_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
                                                                                 data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32)
-            model.add_loss(lambda: annulus_spont_rate_regularizer(rsnn_layer.output[0][0]))
+            # model.add_loss(lambda: annulus_spont_rate_regularizer(rsnn_layer.output[0][0]))
             annulus_evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=False, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
                                                                                 data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32)
-            model.add_loss(lambda: annulus_evoked_rate_regularizer(rsnn_layer.output[0][0]))
+            # model.add_loss(lambda: annulus_evoked_rate_regularizer(rsnn_layer.output[0][0]))
 
             # Add OSI/DSI regularizer for the annulus
             annulus_OSI_DSI_Loss = losses.OrientationSelectivityLoss(network=network, osi_cost=0.1*flags.osi_cost,
@@ -357,8 +359,8 @@ def main(_):
                                                                     method=flags.osi_loss_method,
                                                                     subtraction_ratio=flags.osi_loss_subtraction_ratio,
                                                                     layer_info=layer_info)
-            placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
-            model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
+            # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
+            # model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
         extractor_model = tf.keras.Model(inputs=model.inputs,
                                         #  outputs=[rsnn_layer.output, model.output, prediction_layer.output])
@@ -379,6 +381,7 @@ def main(_):
         # state_variables = tf.nest.map_structure(lambda a: tf.Variable(
         #     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
         # ), zero_state)
+        dummy_zeros = tf.zeros((per_replica_batch_size, flags.seq_len, network["n_nodes"]), dtype)
 
         # Add other metrics and losses
         train_loss = tf.keras.metrics.Mean()
@@ -399,12 +402,12 @@ def main(_):
         def reset_train_metrics():
             train_loss.reset_states(), train_firing_rate.reset_states()
             train_rate_loss.reset_states(), train_voltage_loss.reset_states(), train_regularizer_loss.reset_states(), 
-            train_osi_dsi_loss.reset_states()#, train_sync_loss.reset_states()
+            train_osi_dsi_loss.reset_states(), train_sync_loss.reset_states()
 
         def reset_validation_metrics():
             val_loss.reset_states(), val_firing_rate.reset_states(), 
             val_rate_loss.reset_states(), val_voltage_loss.reset_states(), val_regularizer_loss.reset_states(), 
-            val_osi_dsi_loss.reset_states()#, val_sync_loss.reset_states()
+            val_osi_dsi_loss.reset_states(), val_sync_loss.reset_states()
 
         # Precompute spontaneous LGN firing rates once
         def compute_spontaneous_lgn_firing_rates():
@@ -449,13 +452,12 @@ def main(_):
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         _initial_state = _state_variables
         seq_len = tf.shape(_x)[1]
-        dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
 
         if flags.gradient_checkpointing:
             @tf.recompute_grad
             def roll_out_with_gradient_checkpointing(x, state_vars):
                 # Call extractor model without storing intermediate state variables
-                dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
+                # dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
                 _out = extractor_model((x, dummy_zeros, state_vars))
                 return _out
 
@@ -484,10 +486,12 @@ def main(_):
             rate_loss = spont_rate_regularizer(_z, trim)
             osi_dsi_loss = tf.constant(0.0, dtype=tf.float32)
             sync_loss = spont_sync_loss(_z, trim)
+            # regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         else:
             rate_loss = evoked_rate_regularizer(_z, trim)
             osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
             sync_loss = evoked_sync_loss(_z, trim)
+            # regularizers_loss = tf.constant(0.0, dtype=tf.float32)
 
         if annulus_mask is not None:
             if spontaneous:
@@ -513,16 +517,6 @@ def main(_):
         # _loss = osi_dsi_loss + rate_loss + voltage_loss + regularizers_loss + sync_loss
 
         return _out, _loss, _aux
-
-    # @tf.function
-    # def distributed_roll_out(x, y, w, spontaneous=False, trim=True):
-    #     _out, _p, _loss, _aux, _bkg_noise = strategy.run(roll_out, args=(x, y, w, trim, spontaneous))
-    #     # if output_spikes:
-    #     #     return _out[0][0]
-    #     # else:
-    #     #     return _out, _p, _loss, _aux
-    #     return _out, _p, _loss, _aux, _bkg_noise
-
 
     def train_step(_x, _y, state_variables, spontaneous, trim):
         ### Forward propagation of the model
@@ -561,17 +555,49 @@ def main(_):
 
         return _loss, _aux, _out#, grad
 
+    # @tf.function
+    # def distributed_train_step(x, y, state_variables, spontaneous, trim):
+    #     _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
+    #     return _loss, _aux, _out, grad
+
+    # def combine_gradients(_x, _y, state_variables, _x_spontaneous, trim=True):
+    #     evoked_loss, _evoked_aux, _evoked_out, evoked_grad = distributed_train_step(_x, _y, state_variables, False, trim)
+    #     spont_loss, _spont_aux, _spont_out, spont_grad = distributed_train_step(_x_spontaneous, _y, state_variables, True, trim)
+    #     # Combine gradients
+    #     combined_gradients = []
+    #     for evo_grad, spo_grad in zip(evoked_grad, spont_grad):
+    #         combined_gradients.append(evo_grad + spo_grad)
+
+    #     # Apply combined gradients
+    #     optimizer.apply_gradients(zip(combined_gradients, model.trainable_variables))
+        
+    #     return evoked_loss, _evoked_aux, _evoked_out, spont_loss, _spont_aux, _spont_out
+    
+    # @tf.function
+    # def split_train_step(_x, _y, state_variables, _x_spontaneous, trim=True):
+    #     evoked_loss, _evoked_aux, _out_evoked, spont_loss, _spont_aux, _out_spontaneous = strategy.run(combine_gradients, args=(_x, _y, state_variables, _x_spontaneous, trim))
+
+    #     v1_spikes_evoked = strategy.experimental_local_results(_out_evoked)[0][0][0]
+    #     v1_spikes_spont = strategy.experimental_local_results(_out_spontaneous)[0][0][0]
+    #     model_spikes = (v1_spikes_evoked, v1_spikes_spont)	
+
+    #     rate_loss = train_rate_loss.result()
+    #     voltage_loss = train_voltage_loss.result()
+    #     regularizers_loss = train_regularizer_loss.result()
+    #     sync_loss = train_sync_loss.result()
+    #     osi_dsi_loss = train_osi_dsi_loss.result()
+    #     _loss = train_loss.result()
+    #     rate = train_firing_rate.result()
+
+    #     step_values = [_loss, rate, rate_loss, voltage_loss, regularizers_loss, osi_dsi_loss, sync_loss]
+        
+    #     return model_spikes, step_values
+
     @tf.function
     def distributed_train_step(x, y, state_variables, spontaneous, trim):
         _loss, _aux, _out = strategy.run(train_step, args=(x, y, state_variables, spontaneous, trim))
         # _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
         return _loss, _aux, _out#, grad
-
-    # @tf.function
-    # def distributed_train_step(dist_inputs):
-    #     per_replica_losses = mirrored_strategy.run(train_step, args=(dist_inputs,))
-    #     return mirrored_strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
-    #                             axis=None)
 
     def split_train_step(_x, _y, state_variables, _x_spontaneous, trim=True):
         # Run the training step for the spontaneous condition
@@ -725,6 +751,7 @@ def main(_):
         # Simulate the network with a gray screen   
         # _out, _, _, _, _ = distributed_roll_out(x, y_spontaneous, w_spontaneous)
         _out, _loss, _aux = roll_out(x, y_spontaneous, zero_state, True)
+        # _out = roll_out(x, y_spontaneous, zero_state, True)
         return tuple(_out[1:])
     
     @tf.function
@@ -829,9 +856,10 @@ def main(_):
                     # # distributed_train_step(x, y, w, trim=chunknum==1)
                     # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=chunknum==1)
                     model_spikes, step_values = split_train_step(x, y, gray_state, x_spontaneous, trim=True)
+                    # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=True)
                     break
                 except tf.errors.ResourceExhaustedError as e:
-                    print("OOM error occured")
+                    print("OOM error occurred")
                     import gc
                     gc.collect()
                     # # increase the chunknum
@@ -997,6 +1025,7 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_integer('n_plots', 1, '')
     absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
     absl.app.flags.DEFINE_integer("cue_duration", 40, "")
+    absl.app.flags.DEFINE_integer('fano_samples', 500, '')
 
     # absl.app.flags.DEFINE_integer('pre_chunks', 3, '')
     # absl.app.flags.DEFINE_integer('post_chunks', 8, '') # the pure classification task only need 1 but to make consistent with other tasks one has to make up here
