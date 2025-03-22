@@ -489,7 +489,7 @@ class VoltageRegularization:
         voltage_loss = tf.reduce_mean(v_tot)
 
         return voltage_loss * self._voltage_cost
-
+    
 
 class CustomMeanLayer(Layer):
     def call(self, inputs):
@@ -755,18 +755,24 @@ class OrientationSelectivityLoss:
         osi_approx_type = osi_numerator / approximated_denominator  # [batch_size, n_node_types]
         dsi_approx_type = dsi_numerator / approximated_denominator
 
+        # Average over batch size
+        osi_approx_type = tf.reduce_mean(osi_approx_type, axis=0)
+        dsi_approx_type = tf.reduce_mean(dsi_approx_type, axis=0)
+
         # Compute losses
         # osi_target_values = self.osi_target_values[tf.newaxis, :]  # [1, n_node_types]
         # dsi_target_values = self.dsi_target_values[tf.newaxis, :]  # [1, n_node_types]
-        osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values[tf.newaxis, :])  # [batch_size, n_node_types]
-        dsi_loss_type = tf.math.square(dsi_approx_type - self.dsi_target_values[tf.newaxis, :])
-
+        osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values)  # [n_node_types]
+        dsi_loss_type = tf.math.square(dsi_approx_type - self.dsi_target_values)
+    
         # cell_type_count = self.cell_type_count[tf.newaxis, :]  # [1, n_node_types]
-        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count[tf.newaxis, :], axis=1)  # [batch_size]
+        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)  # [1]
         denominator = tf.reduce_sum(self.cell_type_count)  # Scalar
 
-        total_loss_per_batch = numerator / denominator  # [batch_size]
-        total_loss = tf.reduce_mean(total_loss_per_batch) * self._osi_cost
+        # total_loss_per_batch = numerator / denominator  # [batch_size]
+        # total_loss = tf.reduce_mean(total_loss_per_batch) * self._osi_cost
+
+        total_loss = (numerator / denominator) * self._osi_cost
 
         return total_loss
 

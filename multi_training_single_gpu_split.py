@@ -474,10 +474,6 @@ def main(_):
         # # update state_variables with the new model state
         # new_state = tuple(_out[1:])
         # tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
-        # update the exponential moving average of the firing rates
-        v1_evoked_rates = tf.reduce_mean(_z[:, delays[0]:seq_len-delays[1], :], (0, 1))
-        # Update the EMAs
-        v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
         # Calculate the losses and regularization terms
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
         regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
@@ -488,6 +484,10 @@ def main(_):
             sync_loss = spont_sync_loss(_z, trim)
             # regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         else:
+            # update the exponential moving average of the firing rates over drifting gratings presentation
+            v1_evoked_rates = tf.reduce_mean(_z[:, delays[0]:seq_len-delays[1], :], (0, 1))
+            # Update the EMAs
+            v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
             rate_loss = evoked_rate_regularizer(_z, trim)
             osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
             sync_loss = evoked_sync_loss(_z, trim)
@@ -550,8 +550,8 @@ def main(_):
         train_voltage_loss.update_state(_aux['voltage_loss'])
         train_regularizer_loss.update_state(_aux['regularizer_loss'])
         train_sync_loss.update_state(_aux['sync_loss'] )
-        if not spontaneous:
-            train_osi_dsi_loss.update_state(_aux['osi_dsi_loss'])
+        # if not spontaneous:
+        train_osi_dsi_loss.update_state(_aux['osi_dsi_loss'])
 
         return _loss, _aux, _out#, grad
 
