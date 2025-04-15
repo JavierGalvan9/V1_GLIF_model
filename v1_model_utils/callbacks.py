@@ -18,6 +18,7 @@ from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivit
 from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
 from v1_model_utils.model_metrics_analysis import calculate_Firing_Rate, get_borders, draw_borders
 from v1_model_utils.psd_utils import PSDAnalyzer
+import shutil
 
 # Set style parameters for publication quality
 plt.rcParams.update({
@@ -41,7 +42,12 @@ plt.rcParams.update({
 })
 
 sns.set(style="ticks")
-plt.rcParams['text.usetex'] = True
+if shutil.which('latex') is not None:
+    use_tex = True
+else:
+    use_tex = False
+    print("LaTeX not found. Using MathText for rendering.")
+plt.rcParams['text.usetex'] = use_tex
 
 def printgpu(gpu_id=0):
     if tf.config.list_physical_devices('GPU'):

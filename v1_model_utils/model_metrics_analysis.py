@@ -20,6 +20,7 @@ from scipy.stats import ks_2samp
 from scipy.stats import f as f_distribution
 from scipy.optimize import curve_fit
 from numba import njit
+import shutil
 
 mpl.style.use('default')
 # rd = np.random.RandomState(seed=42)
@@ -46,7 +47,7 @@ plt.rcParams.update({
 })
 
 sns.set(style="ticks")
-plt.rcParams['text.usetex'] = True
+plt.rcParams['text.usetex'] = shutil.which('latex') is not None
 
 def calculate_Firing_Rate(z, stimulus_init=500, stimulus_end=2500, temporal_axis=2):
     # Select the relevant portion of the data along the temporal axis
