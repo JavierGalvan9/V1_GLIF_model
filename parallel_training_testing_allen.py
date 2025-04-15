@@ -88,6 +88,7 @@ parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
 parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')
 parser.add_argument('--random_weights', default=False, action='store_true')
+parser.add_argument('--gradient_checkpointing', default=False, action='store_true')
 parser.add_argument('--rotation', default='ccw', type=str)
 
 
