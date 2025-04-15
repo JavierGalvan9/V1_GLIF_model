@@ -701,7 +701,8 @@ class CustomMeanLayer(Layer):
 
 class OrientationSelectivityLoss:
     def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, 
-                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None, neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv"):
+                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None,
+                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv"):
         
         self._network = network
         self._osi_cost = osi_cost
