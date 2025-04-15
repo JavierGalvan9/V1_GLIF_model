@@ -67,7 +67,7 @@ def main(_):
     if logdir == '':
         flag_str = f'v1_{flags.neurons}'
         for name, value in flags.flag_values_dict().items():
-            if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection', 'random_weights']:
+            if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection', 'random_weights', 'uniform_weights']:
                 flag_str += f'_{name}_{value}'
         # Define flag string as the second part of results_path
         results_dir = f'{flags.results_dir}/{flag_str}'
@@ -288,12 +288,12 @@ def main(_):
         ### EVOKED RATES REGULARIZERS ###
         rate_core_mask = None if flags.all_neuron_rate_loss else core_mask
         evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=False, rate_cost=flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
-                                                                    data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32)
+                                                                    data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32, neuropixels_df=flags.neuropixels_df)
         # model.add_loss(lambda: evoked_rate_regularizer(rsnn_layer.output[0][0]))
         
         ### SPONTANEOUS RATES REGULARIZERS ###
         spont_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=flags.rate_cost, pre_delay=delays[0], post_delay=delays[1], 
-                                                                    data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32)
+                                                                    data_dir=flags.data_dir, core_mask=rate_core_mask, seed=flags.seed, dtype=tf.float32, neuropixels_df=flags.neuropixels_df)
         # model.add_loss(lambda: spont_rate_regularizer(rsnn_layer.output[0][0]))
         # evoked_rate_regularizer = models.SpikeRateDistributionRegularization(target_firing_rates, flags.rate_cost)
 
@@ -334,7 +334,8 @@ def main(_):
                                                         dtype=tf.float32, core_mask=core_mask,
                                                         method=flags.osi_loss_method,
                                                         subtraction_ratio=flags.osi_loss_subtraction_ratio,
-                                                        layer_info=layer_info)
+                                                        layer_info=layer_info,
+                                                        neuropixels_df=flags.neuropixels_df)
         # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
         # model.add_loss(lambda: OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
         # osi_dsi_loss = OSI_DSI_Loss(rsnn_layer.output[0][0], tf.constant(0, dtype=tf.float32, shape=(1,1)), trim=True) 
@@ -987,6 +988,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
     absl.app.flags.DEFINE_string('optimizer', 'adam', '')
+    absl.app.flags.DEFINE_string('neuropixels_df', 'v1_OSI_DSI_DF.csv', 'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
 
     absl.app.flags.DEFINE_float('learning_rate', .001, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')
@@ -1062,6 +1064,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
     absl.app.flags.DEFINE_boolean("spontaneous_training", False, "")
     absl.app.flags.DEFINE_boolean('random_weights', False, '')
+    absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", False, "")
 

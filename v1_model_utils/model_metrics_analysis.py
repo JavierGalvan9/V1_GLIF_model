@@ -370,7 +370,7 @@ class ModelMetricsAnalysis:
 
     def __init__(self, spikes, DG_angles, network, data_dir='GLIF_network', 
                  drifting_gratings_init=None, drifting_gratings_end=None, spontaneous_init=None, spontaneous_end=None,
-                 core_radius=400, save_df=False, df_directory='Metrics_analysis'):
+                 core_radius=400, save_df=False, df_directory='Metrics_analysis', neuropixels_df='v1_OSI_DSI_DF.csv'):
         self.n_neurons = network['n_nodes']
         self.network = network
         self.data_dir = data_dir 
@@ -378,6 +378,13 @@ class ModelMetricsAnalysis:
         self.drifting_gratings_end = drifting_gratings_end
         self.spontaneous_init = spontaneous_init
         self.spontaneous_end = spontaneous_end
+        
+        # Handle both full paths and just filenames for neuropixels_df
+        if os.path.isabs(neuropixels_df) or os.path.exists(neuropixels_df):
+            self.neuropixels_df = os.path.basename(neuropixels_df)  # Extract just the filename
+        else:
+            self.neuropixels_df = neuropixels_df
+            
         # self.analyze_core_only = analyze_core_only
         self.core_radius = core_radius
         # Isolate the core neurons if necessary
@@ -413,7 +420,7 @@ class ModelMetricsAnalysis:
 
         boxplot = MetricsBoxplot(save_dir=directory, filename=filename)
         # boxplot.plot(metrics=metrics, metrics_df=metrics_df, additional_dfs=[osi_approx_real_df], additional_dfs_labels=['Approximation'], axis=axis)
-        boxplot.plot(metrics=metrics, metrics_df=self.metrics_df, axis=axis)
+        boxplot.plot(metrics=metrics, metrics_df=self.metrics_df, neuropixels_df=self.neuropixels_df, axis=axis)
 
     
 class MetricsBoxplot:
@@ -447,6 +454,9 @@ class MetricsBoxplot:
 
     @staticmethod
     def neuropixels_cell_type_to_cell_type(pop_name):
+        if ' ' in pop_name:
+            return pop_name
+
         # Convert pop_name in the neuropixels cell type to cell types. E.g, 'EXC_L23' -> 'L2/3 Exc', 'PV_L5' -> 'L5 PV'
         layer = pop_name.split('_')[1]
         class_name = pop_name.split('_')[0]
@@ -514,15 +524,16 @@ class MetricsBoxplot:
 
         return df
 
-    def plot(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], metrics_df=None, axis=None):
+    def plot(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], metrics_df=None, neuropixels_df="v1_OSI_DSI_DF.csv", axis=None):
         # Get the dataframes for the model and Neuropixels OSI and DSI 
         if metrics_df is None:
             metrics_df = f"v1_OSI_DSI_DF.csv"
 
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="Untrained model", data_dir='NEST_metrics'))
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
+        # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"OSI_DSI_neuropixels_v4.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
-        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"v1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(neurpixels_df, data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         df = pd.concat(self.osi_dsi_dfs, ignore_index=True)
 
         # Create a figure to compare several model metrics against Neuropixels data

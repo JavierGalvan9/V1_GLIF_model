@@ -1,6 +1,7 @@
 import matplotlib
 matplotlib.use('agg')# to avoid GUI request on clusters
 import os
+import copy
 
 # Define the environment variables for optimal GPU performance
 os.environ['TF_GPU_THREAD_MODE'] = 'global'
@@ -60,7 +61,7 @@ def main(_):
     if logdir == '':
         flag_str = f'v1_{flags.neurons}'
         for name, value in flags.flag_values_dict().items():
-            if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection', 'random_weights']:
+            if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection', 'random_weights', 'uniform_weights']:
                 flag_str += f'_{name}_{value}'
         # Define flag string as the second part of results_path
         results_dir = f'{flags.results_dir}/{flag_str}'
@@ -128,7 +129,18 @@ def main(_):
         load_fn = load_sparse.cached_load_v1
     else:
         load_fn = load_sparse.load_v1
-    network, lgn_input, bkg_input = load_fn(flags, flags.neurons, flag_str=flag_str)
+    
+    # Create a deep copy of flags and override uniform_weights to False
+    # This ensures initial weight distribution is preserved for visualization
+    if flags.uniform_weights:
+        modified_flags = copy.deepcopy(flags)
+        modified_flags.uniform_weights = False
+        load_fn = load_sparse.load_v1  # revert to original load function
+    else:
+        modified_flags = flags
+    
+    # Use modified flags for loading network
+    network, lgn_input, bkg_input = load_fn(modified_flags, flags.neurons, flag_str=flag_str)
     print(f"Model files loading: {time()-t0:.2f} seconds\n")
 
     # Define the scope in which the model training will be executed
@@ -488,10 +500,12 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("spontaneous_training", False, "")
     absl.app.flags.DEFINE_boolean("calculate_osi_dsi", True, "")
     absl.app.flags.DEFINE_boolean('random_weights', False, '')
+    absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
 
     absl.app.flags.DEFINE_string("rotation", "ccw", "")
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
+    absl.app.flags.DEFINE_string('neuropixels_df', 'v1_OSI_DSI_DF.csv', 'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
 
     absl.app.run(main)
