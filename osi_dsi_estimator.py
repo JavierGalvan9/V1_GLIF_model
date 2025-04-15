@@ -75,6 +75,7 @@ def main(_):
         flag_str = logdir.split(os.path.sep)[-2]
          # Load current epoch from the file
         if os.path.exists(os.path.join(logdir, 'train_end_data.pkl')):
+            import pickle as pkl
             with open(os.path.join(logdir, 'train_end_data.pkl'), 'rb') as f:
                 data_loaded = pkl.load(f)
             current_epoch = len(data_loaded['epoch_metric_values']['train_loss'])
@@ -170,18 +171,7 @@ def main(_):
 
         # Store the initial model variables that are going to be trained
         # model_variables_dict = {'Initial': {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}}
-        model_variables_dict = {'Initial': {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}}
-
-        # # Define the optimizer
-        # if flags.optimizer == 'adam':
-        #     optimizer = tf.keras.optimizers.Adam(flags.learning_rate, epsilon=1e-11)  
-        # elif flags.optimizer == 'sgd':
-        #     optimizer = tf.keras.optimizers.SGD(flags.learning_rate, momentum=0.0, nesterov=False)
-        # else:
-        #     print(f"Invalid optimizer: {flags.optimizer}")
-        #     raise ValueError
-
-        # optimizer.build(model.trainable_variables)
+        model_variables_dict = {'Initial': {var.name: var.numpy() for var in model.trainable_variables}} # float32 dtype
 
         # Restore model and optimizer from a checkpoint if it exists
         if flags.ckpt_dir != '' and os.path.exists(os.path.join(flags.ckpt_dir, flags.restore_from)):
@@ -209,7 +199,7 @@ def main(_):
             print(f"No checkpoint found in {flags.ckpt_dir} or {flags.restore_from}. Starting from scratch...\n")
 
         # model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
-        model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
+        model_variables_dict['Best'] =  {var.name: var.numpy() for var in model.trainable_variables} # float32 dtype
         print(f"Model variables stored in dictionary\n")
 
         # Build the model layers
@@ -226,6 +216,7 @@ def main(_):
 
         # Precompute spontaneous LGN firing rates once
         def compute_spontaneous_lgn_firing_rates():
+            import pickle as pkl
             # cache_dir = "lgn_model/.cache_lgn"
             cache_dir = f"{flags.data_dir}/tf_data"
             cache_file = os.path.join(cache_dir, f"spontaneous_lgn_probabilities_n_input_{flags.n_input}_seqlen_{flags.seq_len}.pkl")
@@ -265,10 +256,12 @@ def main(_):
         DG_angles = np.arange(0, 360, 45)
         # Precompute the OSI/DSI LGN firing rates dataset
         def compute_osi_dsi_lgn_firing_rates():
+            import pickle as pkl
             # cache_dir = "lgn_model/.cache_lgn"
             cache_dir = f"{flags.data_dir}/tf_data"
-            post_delay = flags.seq_len - (2500 % flags.seq_len) if flags.seq_len < 2500 else 0
-            osi_seq_len = 2500 + post_delay
+            stim_duration = flags.spont_duration + flags.evoked_duration
+            osi_seq_len = int(np.ceil(stim_duration/flags.seq_len)) * flags.seq_len
+            post_delay = osi_seq_len - stim_duration
             osi_dataset_path = os.path.join(cache_dir, f"osi_dsi_lgn_probabilities_n_input_{flags.n_input}_seqlen_{osi_seq_len}.pkl")
 
             if os.path.exists(osi_dataset_path):
@@ -281,7 +274,7 @@ def main(_):
                 print("Creating OSI/DSI dataset...")
                 lgn_firing_rates = stim_dataset.generate_drifting_grating_tuning(
                     seq_len=osi_seq_len,
-                    pre_delay=500,
+                    pre_delay=flags.spont_duration,
                     post_delay=post_delay,
                     n_input=flags.n_input,
                     data_dir=flags.data_dir,
@@ -356,120 +349,23 @@ def main(_):
     gray_state = distributed_generate_gray_state(spontaneous_prob)
     continuing_state = gray_state
     
-    # # LGN firing rates to the different angles
-    # DG_angles = np.arange(0, 360, 45)
-    # osi_dataset_path = os.path.join('OSI_DSI_dataset', 'lgn_firing_rates.pkl')
-    # if not os.path.exists(osi_dataset_path):
-    #     print('Creating OSI/DSI dataset...')
-    #     # Define OSI/DSI dataset
-    #     def get_osi_dsi_dataset_fn(regular=False):
-    #         def _f(input_context):
-    #             post_delay = flags.seq_len - (2500 % flags.seq_len)
-    #             _lgn_firing_rates = stim_dataset.generate_drifting_grating_tuning(
-    #                 seq_len=2500+post_delay,
-    #                 pre_delay=500,
-    #                 post_delay = post_delay,
-    #                 n_input=flags.n_input,
-    #                 regular=regular,
-    #                 return_firing_rates=True,
-    #                 rotation=flags.rotation,
-    #                 dtype=dtype
-    #             ).batch(1)
-                            
-    #             return _lgn_firing_rates
-    #         return _f
-    
-    #     osi_dsi_data_set = strategy.distribute_datasets_from_function(get_osi_dsi_dataset_fn(regular=True))
-    #     test_it = iter(osi_dsi_data_set)
-    #     lgn_firing_rates_dict = {}  # Dictionary to store firing rates
-    #     for angle_id, angle in enumerate(DG_angles):
-    #         t0 = time()
-    #         lgn_firing_rates = next(test_it)
-    #         lgn_firing_rates_dict[angle] = lgn_firing_rates.numpy()
-    #         print(f'Angle {angle} done.')
-    #         print(f'    Trial running time: {time() - t0:.2f}s')
-    #         for gpu_id in range(len(strategy.extended.worker_devices)):
-    #             printgpu(gpu_id=gpu_id)
-
-    #     # Save the dataset      
-    #     results_dir = os.path.join("OSI_DSI_dataset")
-    #     os.makedirs(results_dir, exist_ok=True)
-    #     with open(osi_dataset_path, 'wb') as f:
-    #         pkl.dump(lgn_firing_rates_dict, f)
-    #     print('OSI/DSI dataset created successfully!')
-    # else:
-    #     # Load the LGN firing rates dataset
-    #     with open(osi_dataset_path, 'rb') as f:
-    #         lgn_firing_rates_dict = pkl.load(f)
-
-    # # Define the dataset for the gray simulation
-    # def get_gray_dataset_fn():
-    #     def _f(input_context):
-    #         _lgn_firing_rates = stim_dataset.generate_drifting_grating_tuning(
-    #             seq_len=flags.seq_len,
-    #             pre_delay=flags.seq_len,
-    #             post_delay=0,
-    #             n_input=flags.n_input,
-    #             rotation=flags.rotation,
-    #             billeh_phase=True,
-    #             return_firing_rates=True,
-    #             dtype=dtype
-    #         ).batch(per_replica_batch_size)
-                        
-    #         return _lgn_firing_rates
-    #     return _f
-
-    # # We define the dataset generates function under the strategy scope for a randomly selected orientation       
-    # # test_data_set = strategy.distribute_datasets_from_function(get_dataset_fn(regular=True))   
-    # gray_data_set = strategy.distribute_datasets_from_function(get_gray_dataset_fn())
-    # gray_it = iter(gray_data_set)
-    # spontaneous_lgn_firing_rates = next(iter(gray_data_set))   
-    # spontaneous_lgn_firing_rates = tf.constant(spontaneous_lgn_firing_rates, dtype=dtype)
-    # # load LGN spontaneous firing rates 
-    # spontaneous_prob = 1 - tf.exp(-spontaneous_lgn_firing_rates / 1000.)
-    # # Generate LGN spikes
-    # x = tf.random.uniform(tf.shape(spontaneous_prob), dtype=dtype) < spontaneous_prob
-    # # Run a gray simulation to get the model state
-    # tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)    
-    # _,  gray_state = distributed_roll_out(x)
-    # del gray_data_set, gray_it, spontaneous_lgn_firing_rates, spontaneous_prob, x
-
-    # def reset_state(reset_type='zero', new_state=None):
-    #     if reset_type == 'zero':
-    #         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state)
-    #     elif reset_type == 'gray':
-    #         # Run a gray simulation to get the model state
-    #         tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
-    #     elif reset_type == 'continue':
-    #         # Continue on the previous model state
-    #         # No action needed, as the state_variables will not be modified
-    #         pass
-    #     else:
-    #         raise ValueError(f"Invalid reset_type: {reset_type}")
-
-    # # @tf.function
-    # def distributed_reset_state(reset_type, gray_state=None):
-    #     if reset_type == 'gray':
-    #         strategy.run(reset_state, args=(reset_type, gray_state))
-    #     else:
-    #         strategy.run(reset_state, args=(reset_type, zero_state))
-
     # Define the callbacks for the OSI/DSI analysis
-    sim_duration = int(np.ceil(2500/flags.seq_len)) * flags.seq_len
-    post_delay = sim_duration - 2500
+    stim_duration = flags.spont_duration + flags.evoked_duration
+    sim_duration = int(np.ceil(stim_duration/flags.seq_len)) * flags.seq_len
+    post_delay = sim_duration - stim_duration
     callbacks = OsiDsiCallbacks(network, lgn_input, bkg_input, flags, logdir, current_epoch=current_epoch,
-                                pre_delay=500, post_delay=post_delay, model_variables_init=model_variables_dict)
+                                pre_delay=flags.spont_duration, post_delay=post_delay, model_variables_init=model_variables_dict)
 
     n_iterations = int(np.ceil(flags.n_trials_per_angle / per_replica_batch_size))
     chunk_size = flags.seq_len
-    num_chunks = int(np.ceil(2500/chunk_size))
+    num_chunks = int(np.ceil(sim_duration/chunk_size))
     spikes = np.zeros((flags.n_trials_per_angle, len(DG_angles), sim_duration, network['n_nodes']), dtype=np.uint8)
 
     for angle_id, angle in enumerate(DG_angles):
         print(f'Running angle {angle}...')
         # load LGN firign rates for the given angle and calculate spiking probability
         t0 = time()
-        # load LGN firign rates for the given angle and calculate spiking probability
+        # load LGN firing rates for the given angle and calculate spiking probability
         lgn_prob = lgn_firing_probabilities_dict[angle]
         lgn_prob = tf.tile(tf.expand_dims(lgn_prob, axis=0), [per_replica_batch_size, 1, 1])
 
@@ -491,7 +387,7 @@ def main(_):
                 
             if angle_id == 0:
                 # Raster plot for 0 degree orientation
-                callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[0], y=angle)
+                callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
     
             print(f'    Angle processing time: {time() - t0:.2f}s')
             for gpu_id in range(len(strategy.extended.worker_devices)):
@@ -499,6 +395,14 @@ def main(_):
 
             if not flags.calculate_osi_dsi:
                 break
+
+    # # Save the spikes in a pickle file
+    # from v1_model_utils import other_v1_utils
+    # core_mask = other_v1_utils.isolate_core_neurons(network, radius=flags.plot_core_radius, data_dir=flags.data_dir)
+    # spikes_plot = spikes[:, :, :, core_mask]
+    # import pickle as pkl
+    # with open(f'v1_core_osi_spikes.pkl', 'wb') as f:
+    #     pkl.dump(spikes_plot, f)
 
     # Do the OSI/DSI analysis       
     if flags.calculate_osi_dsi:
@@ -546,6 +450,8 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('n_input', 17400, '')
     absl.app.flags.DEFINE_integer("n_output", 2, "")
     absl.app.flags.DEFINE_integer('seq_len', 600, '')
+    absl.app.flags.DEFINE_integer('spont_duration', 2000, '')
+    absl.app.flags.DEFINE_integer('evoked_duration', 2000, '')
     absl.app.flags.DEFINE_integer('seed', 3000, '')
     absl.app.flags.DEFINE_integer('neurons_per_output', 16, '')
 

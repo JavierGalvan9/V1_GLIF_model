@@ -9,7 +9,7 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-import tensorflow as tf
+# import tensorflow as tf
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -19,10 +19,34 @@ import other_v1_utils
 from scipy.stats import ks_2samp
 from scipy.stats import f as f_distribution
 from scipy.optimize import curve_fit
+from numba import njit
 
 mpl.style.use('default')
 # rd = np.random.RandomState(seed=42)
 
+# Set style parameters for publication quality
+plt.rcParams.update({
+    'font.family': 'Arial',
+    'font.size': 12,
+    'axes.linewidth': 1.2,
+    'axes.labelpad': 8,
+    'xtick.major.width': 1.2,
+    'ytick.major.width': 1.2,
+    'xtick.major.size': 5,
+    'ytick.major.size': 5,
+    'legend.frameon': True,
+    'legend.fontsize': 11,
+    'axes.labelsize': 12,
+    'axes.titlesize': 14,
+    'xtick.labelsize': 12,
+    'ytick.labelsize': 12,
+    'savefig.dpi': 300,
+    'savefig.bbox': 'tight',
+    'savefig.transparent': True
+})
+
+sns.set(style="ticks")
+plt.rcParams['text.usetex'] = True
 
 def calculate_Firing_Rate(z, stimulus_init=500, stimulus_end=2500, temporal_axis=2):
     # Select the relevant portion of the data along the temporal axis
@@ -109,7 +133,7 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
 
     return osi_dsi_df
 
-def compute_ks_statistics(df, metric='Ave_Rate(Hz)', min_n_sample=15):
+def compute_ks_statistics(df, metric='Ave_Rate(Hz)', data_source1='V1 GLIF model', data_source2='Neuropixels', min_n_sample=15):
     """
     Compute the Kolmogorov-Smirnov statistic and similarity scores for each cell type in the dataframe.
     Parameters:
@@ -128,8 +152,8 @@ def compute_ks_statistics(df, metric='Ave_Rate(Hz)', min_n_sample=15):
         # Filter data for current cell type from two different data types
         # df1 = df.loc[(df.index == cell_type) & (df['data_type'] == 'V1/LM GLIF model'), metric]
         # df2 = df.loc[(df.index == cell_type) & (df['data_type'] == 'Neuropixels'), metric]
-        df1 = df.loc[(df['cell_type'] == cell_type) & (df['data_type'] == 'V1 GLIF model'), metric]
-        df2 = df.loc[(df['cell_type'] == cell_type) & (df['data_type'] == 'Neuropixels'), metric]
+        df1 = df.loc[(df['cell_type'] == cell_type) & (df['data_type'] == data_source1), metric]
+        df2 = df.loc[(df['cell_type'] == cell_type) & (df['data_type'] == data_source2), metric]
         # Drop NA values
         df1.dropna(inplace=True)
         df2.dropna(inplace=True)
@@ -163,6 +187,49 @@ def draw_borders(ax, borders, ylim):
             Rectangle((borders[i], ylim[0]), w, h, alpha=0.08, color="k", zorder=-10)
         )
     return ax   
+
+@njit
+def ang_dir(angle1, angle2):
+    """
+    Calculate the minimum angular distance between two angles.
+    Returns the smaller of the two possible angle differences (clockwise or counterclockwise).
+    All angles are in degrees.
+    
+    Parameters:
+    -----------
+    angle1, angle2 : float or numpy.ndarray
+        Angles in degrees
+        
+    Returns:
+    --------
+    float or numpy.ndarray
+        Minimum angular distance between the angles (0-180 degrees)
+    """
+    # Ensure angles are in the range [0, 360)
+    angle1 = np.mod(angle1, 360)
+    angle2 = np.mod(angle2, 360)
+    
+    # Calculate absolute difference
+    diff = np.abs(angle1 - angle2)
+    
+    # Compare with the complementary angle (360 - diff)
+    # and take the minimum - this avoids the list construction and axis parameter
+    return np.minimum(diff, 360 - diff)
+
+@njit
+def double_gaussian(theta, C, Rp, Rn, theta_pref, sigma):
+    # According to Mazurek, M., Kager, M., & Van Hooser, S. D. (2014). 
+    # Robust quantification of orientation selectivity and direction selectivity. 
+    # Frontiers in neural circuits, 8, 92.
+    # the best method to estimate tuning parameters from orientation and direction
+    # responses if to fit them with a double gaussian function.
+    delta_theta = ang_dir(theta, theta_pref) # restrict the angle to be between 0 and 180
+    delta_theta2 = ang_dir(theta, theta_pref-180)
+    denominator = 2 * sigma**2
+    term1 = Rp * np.exp(-(delta_theta**2) / denominator)
+    term2 = Rn * np.exp(-(delta_theta2**2) / denominator)
+    return C + term1 + term2
+
 
 class PreferredTuningAngleAnalysis:
     def __init__(self, firing_rates, orientations, preferred_orientations):
@@ -216,26 +283,6 @@ class PreferredTuningAngleAnalysis:
             [-M, 0, 0, 0, self.alpha/2],  # Lower bounds
             [M, 3*M, 3*M, 360, np.inf]  # Upper bounds
         )
-
-    def ang_dir(self, angle1, angle2):
-        # Restrict the angle to be between 0 and 180
-        angle1 = angle1 % 360
-        angle2 = angle2 % 360
-        diff = np.abs(angle1-angle2)
-        return np.min([diff, 360-diff], axis=0)
-
-    def double_gaussian(self, theta, C, Rp, Rn, theta_pref, sigma):
-        # According to Mazurek, M., Kager, M., & Van Hooser, S. D. (2014). 
-        # Robust quantification of orientation selectivity and direction selectivity. 
-        # Frontiers in neural circuits, 8, 92.
-        # the best method to estimate tuning parameters from orientation and direction
-        # responses if to fit them with a double gaussian function.
-        delta_theta = self.ang_dir(theta, theta_pref) # restrict the angle to be between 0 and 180
-        delta_theta2 = self.ang_dir(theta, theta_pref-180)
-        denominator = 2 * sigma**2
-        term1 = Rp * np.exp(-(delta_theta**2) / denominator)
-        term2 = Rn * np.exp(-(delta_theta2**2) / denominator)
-        return C + term1 + term2
     
     def calculate_orientation_vectors(self, responses, orientations):
         # Calculate orientation vectors for each trial.
@@ -278,7 +325,7 @@ class PreferredTuningAngleAnalysis:
                 self.alpha / 2,  # sigma
             ]
             # Explore several initial values for sigma (a1, a2) and theta_pref (b1, b2)
-            initial_sigmas = [self.alpha/2, self.alpha, 40, 60, 90]
+            initial_sigmas = [self.alpha/2, self.alpha, 2*self.alpha]
             # If the maximum is at 0, we also try 360
             if M_orientation == 0:
                 initial_pref_orientations = [0, 360]
@@ -294,9 +341,9 @@ class PreferredTuningAngleAnalysis:
                 for sigma in initial_sigmas:
                     initial_guess[4] = sigma
                     try:
-                        popt, _ = curve_fit(self.double_gaussian, self.orientations, neuron_responses, 
-                                            p0=initial_guess, bounds=bounds, maxfev=10000)
-                        fit_error = np.sum((self.double_gaussian(self.orientations, *popt) - neuron_responses) ** 2)
+                        popt, _ = curve_fit(double_gaussian, self.orientations, neuron_responses, 
+                                            p0=initial_guess, bounds=bounds, ftol=1e-4, maxfev=1000)
+                        fit_error = np.sum((double_gaussian(self.orientations, *popt) - neuron_responses) ** 2)
                         if fit_error < best_error:
                             best_error = fit_error
                             best_fit = popt
@@ -308,7 +355,7 @@ class PreferredTuningAngleAnalysis:
                 pref_angle = pref_angle % 360
                 self.new_tuning_angles.append(pref_angle)
                 # get the max response of the fit
-                max_response = self.double_gaussian(pref_angle, *best_fit)
+                max_response = double_gaussian(pref_angle, *best_fit)
                 self.max_firing_rates.append(max_response)
             else:
                 self.new_tuning_angles.append(np.nan)
@@ -439,8 +486,14 @@ class MetricsBoxplot:
             nonresponding = df["Rate at preferred direction (Hz)"] < 0.5
             df.loc[nonresponding, "OSI"] = np.nan
             df.loc[nonresponding, "DSI"] = np.nan
+        
         if 'firing_rate_sp' in df.columns:
             df.rename(columns={"firing_rate_sp": "Spontaneous rate (Hz)"}, inplace=True)  
+        elif 'Spont_Rate(Hz)' in df.columns:
+            df.rename(columns={"Spont_Rate(Hz)": "Spontaneous rate (Hz)"}, inplace=True)
+        
+        if 'Ave_Rate(Hz)' in df.columns:
+            df.rename(columns={"Ave_Rate(Hz)": "Evoked rate (Hz)"}, inplace=True)
 
         # Sort the neurons by neuron types
         df = df.sort_values(by="cell_type")
@@ -451,7 +504,7 @@ class MetricsBoxplot:
         else:
             df["data_type"] = data_dir
 
-        columns = ["cell_type", "data_type", "Rate at preferred direction (Hz)", "OSI", "DSI", 'Ave_Rate(Hz)', 'Spontaneous rate (Hz)']
+        columns = ["cell_type", "data_type", "Rate at preferred direction (Hz)", "OSI", "DSI", 'Evoked rate (Hz)', 'Spontaneous rate (Hz)']
         # Ensure all required columns exist in the DataFrame, fill with NaN if not present
         for col in columns:
             if col not in df.columns:
@@ -466,11 +519,10 @@ class MetricsBoxplot:
         if metrics_df is None:
             metrics_df = f"v1_OSI_DSI_DF.csv"
 
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="Untrained model", data_dir='NEST_metrics'))
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
-        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"v1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
-        # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"v1_OSI_DSI_DF_pop_name.csv", data_source_name="NEST simulation", data_dir='NEST_metrics'))
-        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="Baseline model", data_dir='NEST_metrics'))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"v1_OSI_DSI_DF.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         df = pd.concat(self.osi_dsi_dfs, ignore_index=True)
 
         # Create a figure to compare several model metrics against Neuropixels data
@@ -486,34 +538,48 @@ class MetricsBoxplot:
             axs = [axis]
 
         color_pal = {
-            "V1 GLIF model": "tab:orange",
-            "Neuropixels": "tab:gray",
-            "Billeh et al (2020)": "tab:blue",
-            "Baseline model": "tab:pink"
+            "Untrained model": "#FFCC80",  # Light orange
+            "V1 GLIF model": "#FF8C00",    # Dark orange
+            "Billeh et al (2020)": "tab:blue",  # Steel blue
+            "Neuropixels": "tab:gray"       # Gray
         }
+
+        # color_pal = {
+        #     "V1 GLIF model": "tab:orange",
+        #     "Neuropixels": "tab:gray",
+        #     "Billeh et al (2020)": "tab:blue",
+        #     "Untrained model": "tab:pink"
+        # }
+
+        # Set the order for hue in boxplots by creating a custom hue_order list
+        hue_order = ["Untrained model", "V1 GLIF model", "Billeh et al (2020)", "Neuropixels"]
+        # Filter hue_order to only include data types that are present in the dataframe
+        hue_order = [h for h in hue_order if h in df["data_type"].unique()]
 
         # Establish the order of the neuron types in the boxplots
         cell_type_order = np.sort(df['cell_type'].unique())
 
         for idx, metric in enumerate(metrics):
-            if metric in ["Rate at preferred direction (Hz)", 'Ave_Rate(Hz)', 'Spontaneous rate (Hz)']:
+            if metric in ["Rate at preferred direction (Hz)", 'Evoked rate (Hz)', 'Spontaneous rate (Hz)']:
                 ylims = [0, 100]
             else:
                 ylims = [0, 1]
 
-            average_similarity_score = compute_ks_statistics(df, metric=metric)
-            plot_one_metric(axs[idx], df, metric, ylims, color_pal, hue_order=cell_type_order, similarity_score=average_similarity_score)
+            initial_average_similarity_score = compute_ks_statistics(df, metric=metric, data_source1='Untrained model', data_source2='Neuropixels')
+            final_average_similarity_score = compute_ks_statistics(df, metric=metric, data_source1='V1 GLIF model', data_source2='Neuropixels')
+            plot_one_metric(axs[idx], df, metric, ylims, color_pal, cell_type_order=cell_type_order,
+                            hue_order=hue_order, initial_similarity_score=initial_average_similarity_score, final_similarity_score=final_average_similarity_score)
 
-        axs[0].legend(loc="upper right", fontsize=16)
-        axs[0].set_title(f"V1", fontsize=20)
+        axs[0].legend(loc="upper right", fontsize=20)
+        # axs[0].set_title(f"V1", fontsize=20)
         if len(axs) > 1:
             for i in range(len(axs)-1):
                 axs[i].set_xticklabels([])
 
         xticklabel = axs[n_metrics-1].get_xticklabels()
         for label in xticklabel:
-            label.set_fontsize(14)
-            label.set_weight("bold")
+            label.set_fontsize(20)
+            # label.set_weight("bold")
 
         if axis is None:
             plt.tight_layout()
@@ -522,13 +588,14 @@ class MetricsBoxplot:
             plt.close()
 
 
-def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None, similarity_score=None):
+def plot_one_metric(ax, df, metric_name, ylim, cpal=None, cell_type_order=None, hue_order=None, initial_similarity_score=None, final_similarity_score=None):
 
     sns.boxplot(
         x="cell_type",
         y=metric_name,
         hue="data_type",
-        order=hue_order,
+        order=cell_type_order,
+        hue_order=hue_order,  # Add this parameter to control the order of the hue categories
         data=df,
         ax=ax,
         width=0.7,
@@ -551,14 +618,14 @@ def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None, simila
     #     legend=False
     # )
 
-    ax.tick_params(axis="x", labelrotation=90)
+    ax.tick_params(axis="x", labelrotation=90, labelsize=20)
     ax.set_ylim(ylim)
     ax.set_xlabel("")
     # Modify the label sizes
-    ax.set_ylabel(metric_name, fontsize=16)
+    ax.set_ylabel(metric_name, fontsize=22)
     yticklabel = ax.get_yticklabels()
     for label in yticklabel:
-        label.set_fontsize(14)
+        label.set_fontsize(20)
 
     # Apply shadings to each layer
     xticklabel = ax.get_xticklabels()
@@ -568,10 +635,12 @@ def plot_one_metric(ax, df, metric_name, ylim, cpal=None, hue_order=None, simila
     # Hide the legend
     ax.get_legend().remove()
     # Add the average similarity score to the legend
-    if similarity_score is not None:
-        ax.text(0.05, 0.9, f'S: {similarity_score:.2f}', transform=ax.transAxes, fontsize=14,
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
-
+    if initial_similarity_score is not None and final_similarity_score is not None:
+        ax.text(0.05, 0.9, r'$S_0$' + f': {initial_similarity_score:.2f}\n' + r'$S_f$' + f': {final_similarity_score:.2f}', 
+                transform=ax.transAxes, fontsize=20, verticalalignment='top', 
+                bbox=dict(boxstyle='round', facecolor='white', 
+                        edgecolor='black', alpha=0.7, linewidth=1.))
+                
     return ax
 
 class OneShotTuningAnalysis:
@@ -591,31 +660,14 @@ class OneShotTuningAnalysis:
         self.current_orientation = current_orientation[0][0]
         
         # Isolate the core neurons if necessary
-        # if self.analyze_core_only:
         if self.core_radius > 0:
-            # core_neurons = 65871
-            # core_radius = 400
-            # n_neurons_plot = 65871
             self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
             n_neurons_plot = np.sum(self.core_mask)
-
-            # Calculate the core_neurons mask
-            # if self.n_neurons > core_neurons:
-            #     self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=core_radius, data_dir=self.data_dir)
-            #     # self.core_mask = other_v1_utils.isolate_core_neurons(self.network, n_selected_neurons=core_neurons, data_dir=self.data_dir) 
-            #     # self.n_neurons = core_neurons
-            #     # if n_neurons is overridden, it won't run for the second time...
-            #     n_neurons_plot = core_neurons
-            # else:
-            #     self.core_mask = np.full(self.n_neurons, True)
-            #     n_neurons_plot = self.n_neurons
         else:
             self.core_mask = np.full(self.n_neurons, True)
-            # core_radius = None
             n_neurons_plot = self.n_neurons
 
         spikes = spikes[:, :, :, self.core_mask]
-        # Calculate the firing rates along every orientation
         # Calculate the firing rates for each neuron in the given configuration
         self.firing_rate = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init, stimulus_end=self.drifting_gratings_end, 
                                                 temporal_axis=2)

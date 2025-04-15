@@ -9,6 +9,30 @@ import seaborn as sns
 from . import other_v1_utils, toolkit
 
 
+# Set style parameters for publication quality
+plt.rcParams.update({
+    'font.family': 'Arial',
+    'font.size': 12,
+    'axes.linewidth': 1.2,
+    'axes.labelpad': 8,
+    'xtick.major.width': 1.2,
+    'ytick.major.width': 1.2,
+    'xtick.major.size': 5,
+    'ytick.major.size': 5,
+    'legend.frameon': True,
+    'legend.fontsize': 11,
+    'axes.labelsize': 12,
+    'axes.titlesize': 14,
+    'xtick.labelsize': 12,
+    'ytick.labelsize': 12,
+    'savefig.dpi': 300,
+    'savefig.bbox': 'tight',
+    'savefig.transparent': True
+})
+
+sns.set(style="ticks")
+plt.rcParams['text.usetex'] = True
+
 class InputActivityFigure:
     def __init__(
         self,
@@ -252,7 +276,7 @@ class RasterPlot:
             )
             ax.set_ylim([0, spikes.shape[-1]])
             ax.set_yticks([0, spikes.shape[-1]])
-            ax.set_ylabel(self.y_label, fontsize=20)
+            ax.set_ylabel(self.y_label, fontsize=24)
 
         ax.axvline(
             self.stimuli_init_time,
@@ -266,7 +290,7 @@ class RasterPlot:
         )
         ax.set_xlim([0, spikes.shape[1]])
         ax.set_xticks([0, spikes.shape[1]])
-        ax.tick_params(axis="both", which="major", labelsize=18)
+        ax.tick_params(axis="both", which="major", labelsize=20)
 
 
 class LaminarPlot:
@@ -430,7 +454,9 @@ class LaminarPlot:
             ax.annotate(
                 f"L{layer_label[i]}",
                 (5, (self.n_neurons - y - h / 2)),
-                fontsize=5 * scale,
+                fontsize=6 * scale,
+                color="k",
+                fontweight="bold",
                 va="center",
             )
 
@@ -514,10 +540,10 @@ class LaminarPlot:
         )
         ax.set_ylim([0, self.n_neurons])
         ax.set_yticks([0, self.n_neurons])
-        ax.set_ylabel("Network Neuron ID", fontsize=20)
+        ax.set_ylabel("Network Neuron ID", fontsize=24)
         ax.set_xlim([0, seq_len])
         ax.set_xticks([0, seq_len])
-        ax.tick_params(axis="both", which="major", labelsize=18)
+        ax.tick_params(axis="both", which="major", labelsize=20)
 
 
 class DriftingGrating:
@@ -570,9 +596,8 @@ class DriftingGrating:
         ax.set_xticks(np.linspace(0, stimulus_length, 6))
         ax.set_xticklabels([str(int(x))
                            for x in np.linspace(0, simulation_length, 6)])
-        # ax.set_xlabel('Time [ms]', fontsize=20)
-        ax.set_xlabel("Time [ms]")
-        # ax.tick_params(axis='both', which='major', labelsize=18)
+        ax.set_xlabel("Time [ms]", fontsize=24)
+        ax.tick_params(axis='both', which='major', labelsize=20)
 
 
 class LGN_sample_plot:

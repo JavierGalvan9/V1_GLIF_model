@@ -28,7 +28,7 @@ import other_v1_utils
 #     def __call__(self, x):
 #         return self._strength * tf.reduce_mean(tf.square(x))
 
-class StiffRegularizer(Layer):
+class MeanStiffRegularizer(Layer):
     def __init__(self, strength, network, penalize_relative_change=False, dtype=tf.float32):
         self._strength = tf.cast(strength, dtype)
         self._dtype = dtype
@@ -75,6 +75,184 @@ class StiffRegularizer(Layer):
         
         return tf.cast(reg_loss, dtype=self._dtype) * self._strength
     
+class MeanStdStiffRegularizer(Layer):
+    def __init__(self, strength, network, penalize_relative_change=False, 
+                    std_weight=0.5, logspace=True, dtype=tf.float32):
+        self._strength = tf.cast(strength, dtype)
+        self._dtype = dtype
+        self._penalize_relative_change = penalize_relative_change
+        self._std_weight = std_weight  # Weight for std deviation component
+        self._logspace = logspace  # Whether to use logspace for std calculation
+        self._epsilon = tf.constant(1e-6, dtype=dtype)  # Small value to avoid log(0)
+        
+        # Compute voltage scale
+        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+        # Get the initial weights and properly scale them down
+        indices = network["synapses"]["indices"]
+        initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
+        edge_type_ids = network['synapses']['edge_type_ids']
+        # Scale initial values by the voltage scale of the node IDs
+        initial_value /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        # Find unique values and their first occurrence indices
+        unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
+        # Sort first_occurrence_indices to maintain the order of first appearances
+        self.num_unique = unique_edge_types.shape[0]            
+        sum_weights = np.bincount(self.idx, weights=initial_value, minlength=self.num_unique)
+        count_weights = np.bincount(self.idx, minlength=self.num_unique)
+        initial_mean_weights = sum_weights / count_weights
+        
+        # Calculate std deviation per edge type in logspace if requested
+        self._target_std_weights = []
+        for i in range(self.num_unique):
+            edge_type_weights = initial_value[self.idx == i]
+            if self._logspace:
+                # Use abs to handle any potential negative weights
+                log_weights = np.log(np.abs(edge_type_weights) + np.float32(1e-6))
+                std = np.std(log_weights)
+            else:
+                std = np.std(edge_type_weights)
+            self._target_std_weights.append(std)
+        self._target_std_weights = tf.constant(self._target_std_weights, dtype=self._dtype)
+        
+        # Determine target mean weights and denominators for relative change
+        if self._penalize_relative_change:
+            epsilon = np.float32(1e-4)
+            denominator = np.maximum(np.abs(initial_mean_weights), epsilon)
+            self._denominator = tf.constant(denominator, dtype=tf.float32)
+            # Also for std deviation
+            epsilon = np.float32(1e-3)
+            std_denominator = np.maximum(np.abs(self._target_std_weights.numpy()), epsilon)
+            self._std_denominator = tf.constant(std_denominator, dtype=tf.float32)
+
+        self.idx = tf.constant(self.idx, dtype=tf.int32)
+        self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
+        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=tf.float32)
+
+    @tf.function(jit_compile=True)
+    def __call__(self, x):
+
+        if len(x.shape) > 1 and x.shape[1] == 1:
+            x = tf.squeeze(x, axis=1)
+
+        # Calculate mean per edge type
+        mean_edge_type_weights = tf.math.unsorted_segment_mean(x, self.idx, self.num_unique)
+
+        # Calculate std deviation per edge type
+        if self._logspace:
+            # Use abs for log transformation to handle potential negative weights
+            abs_x = tf.abs(x)
+            log_x = tf.math.log(abs_x + self._epsilon)
+            mean_log_x = tf.math.unsorted_segment_mean(log_x, self.idx, self.num_unique)
+            # Get log values for each input position
+            gathered_mean_log_x = tf.gather(mean_log_x, self.idx)
+            # Calculate squared differences
+            squared_diffs = tf.square(log_x - gathered_mean_log_x)
+            # Calculate variance and std dev with epsilon for stability
+            log_var = tf.math.unsorted_segment_mean(squared_diffs, self.idx, self.num_unique)
+            std_edge_type_weights = tf.sqrt(log_var + self._epsilon)        # prevent division by zero for edge_types with just 1 edge
+        else:
+            # Calculate variance directly with improved stability
+            gathered_means = tf.gather(mean_edge_type_weights, self.idx)
+            squared_diffs = tf.square(x - gathered_means)
+            var_edge_type_weights = tf.math.unsorted_segment_mean(squared_diffs, self.idx, self.num_unique)
+            std_edge_type_weights = tf.sqrt(var_edge_type_weights + self._epsilon) # prevent division by zero for edge_types with just 1 edge
+
+        # Calculate losses with improved numerical stability
+        if self._penalize_relative_change:
+            # Mean deviation component - with safe division
+            mean_relative_deviation = (mean_edge_type_weights - self._target_mean_weights) / self._denominator
+            mean_loss = tf.sqrt(tf.reduce_mean(tf.square(mean_relative_deviation)))
+            
+            # Std deviation component - with safe division
+            std_relative_deviation = (std_edge_type_weights - self._target_std_weights) / self._std_denominator
+            std_loss = tf.sqrt(tf.reduce_mean(tf.square(std_relative_deviation)))
+        else:
+            # Mean deviation component
+            mean_squared_error = tf.square(mean_edge_type_weights - self._target_mean_weights)
+            mean_loss = tf.reduce_mean(mean_squared_error)
+            
+            # Std deviation component
+            std_squared_error = tf.square(std_edge_type_weights - self._target_std_weights)
+            std_loss = tf.reduce_mean(std_squared_error)
+        
+        # Combine losses with weighting
+        total_loss = (1.0 - self._std_weight) * mean_loss + self._std_weight * std_loss
+        return tf.cast(total_loss, dtype=self._dtype) * self._strength
+                
+                    
+class StiffKLLogNormalRegularizer(Layer):
+    """Regularization using KL divergence for log-normal distributions
+
+    Args:
+        Layer (_type_): _description_
+    """
+    def __init__(self, strength, network, dtype=tf.float32):
+        self._strength = tf.cast(strength, dtype)
+        self._dtype = dtype
+        self.epsilon = tf.constant(1e-8, dtype=dtype)
+
+        # Compute voltage scale and rescale initial weights
+        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+        indices = network["synapses"]["indices"]
+        initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
+        edge_type_ids = network['synapses']['edge_type_ids']
+        initial_value /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+
+        # Edge type indexing
+        unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
+        self.idx = tf.constant(self.idx, dtype=tf.int32)
+        self.num_unique = tf.constant(unique_edge_types.shape[0], dtype=tf.int32)
+        # Filter edge types with more than 2 connections
+        count_weights = np.bincount(self.idx, minlength=self.num_unique)
+        self.edges_mask = count_weights > 2
+        # Create indices for valid edge types (for gather operations)
+        self.valid_indices = tf.convert_to_tensor(np.where(self.edges_mask)[0], dtype=tf.int32)
+        self.num_valid = tf.shape(self.valid_indices)[0]
+
+        # Precompute mean and std of log(initial weights) per edge type
+        log_initial_value = np.log(np.abs(initial_value) + 1e-10)  # Add small epsilon in numpy
+        self._target_log_mean_all = tf.math.unsorted_segment_mean(
+            tf.constant(log_initial_value, dtype), self.idx, self.num_unique
+        )
+        # Variance per edge type
+        log_squared_diff = (log_initial_value - self._target_log_mean_all.numpy()[self.idx]) ** 2
+        log_var = tf.math.unsorted_segment_mean(
+            tf.constant(log_squared_diff, dtype), self.idx, self.num_unique
+        )
+        log_std_all = tf.sqrt(log_var + self.epsilon)  # Add epsilon before sqrt
+
+        # Pre-filter target values using gather instead of boolean_mask
+        self._target_log_mean = tf.gather(self._target_log_mean_all, self.valid_indices)
+        self._target_log_std = tf.gather(log_std_all, self.valid_indices)
+
+    @tf.function(jit_compile=True)
+    def __call__(self, x):
+        if len(x.shape) > 1 and x.shape[1] == 1:
+            x = tf.squeeze(x, axis=1)
+
+        # Calculate log of absolute values with epsilon for stability
+        log_x = tf.math.log(tf.abs(x) + self.epsilon)
+        # Calculate mean and std of log(x) per edge type
+        log_mean_all = tf.math.unsorted_segment_mean(log_x, self.idx, self.num_unique)
+        # Calculate std deviation with better numerical stability
+        squared_diff = tf.square(log_x - tf.gather(log_mean_all, self.idx))
+        log_var_all = tf.math.unsorted_segment_mean(squared_diff, self.idx, self.num_unique)
+        log_std_all = tf.sqrt(log_var_all + self.epsilon)  # Add epsilon before sqrt
+        # Use gather instead of boolean_mask
+        log_mean = tf.gather(log_mean_all, self.valid_indices)
+        log_std = tf.gather(log_std_all, self.valid_indices)
+        # KL divergence calculation with improved numerical stability
+        log_ratio = tf.math.log(self._target_log_std + self.epsilon) - tf.math.log(log_std + self.epsilon)
+        denominator = 2.0 * tf.square(self._target_log_std) + self.epsilon
+        std_ratio = tf.square(log_std) / denominator
+        diff_ratio = tf.square(log_mean - self._target_log_mean) / denominator
+        
+        # Combine terms after stable calculations
+        kl = log_ratio + std_ratio + diff_ratio - 0.5
+        # Use reduce_mean without abs since KL should be positive
+        kl_mean = tf.reduce_mean(kl)
+
+        return self._strength * tf.cast(kl_mean, dtype=self._dtype)
 
 class L2Regularizer(tf.keras.regularizers.Regularizer):
     def __init__(self, strength, network, flags, penalize_relative_change=False, dtype=tf.float32):

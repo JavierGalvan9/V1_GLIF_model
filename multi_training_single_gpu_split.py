@@ -278,7 +278,9 @@ def main(_):
         # prediction_layer = model.get_layer('prediction')
 
         ### RECURRENT REGULARIZERS ###
-        rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, network, penalize_relative_change=True, dtype=tf.float32)
+        # rec_weight_regularizer = losses.StiffKLLogNormalRegularizer(flags.recurrent_weight_regularization, network, dtype=tf.float32)
+        # rec_weight_regularizer = losses.MeanStdStiffRegularizer(flags.recurrent_weight_regularization, network, penalize_relative_change=True, dtype=tf.float32)
+        rec_weight_regularizer = losses.MeanStiffRegularizer(flags.recurrent_weight_regularization, network, dtype=tf.float32)
         # model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
         # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
         # rec_weight_l2_regularizer = losses.L2Regularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
