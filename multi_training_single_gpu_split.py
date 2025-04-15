@@ -988,7 +988,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
     absl.app.flags.DEFINE_string('optimizer', 'adam', '')
-    absl.app.flags.DEFINE_string('neuropixels_df', 'v1_OSI_DSI_DF.csv', 'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
+    absl.app.flags.DEFINE_string('neuropixels_df', 'Neruopixels_data/v1_OSI_DSI_DF.csv', 'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
 
     absl.app.flags.DEFINE_float('learning_rate', .001, '')
     absl.app.flags.DEFINE_float('rate_cost', 100., '')

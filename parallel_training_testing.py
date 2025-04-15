@@ -91,7 +91,7 @@ parser.add_argument('--gradient_checkpointing', default=True, action='store_true
 parser.add_argument('--nogradient_checkpointing', dest='gradient_checkpointing', action='store_false')
 
 parser.add_argument('--rotation', default='ccw', type=str)
-parser.add_argument('--neuropixels_df', default='v1_OSI_DSI_DF.csv', type=str, help='File name of the Neuropixels DataFrame for OSI/DSI analysis')
+parser.add_argument('--neuropixels_df', default='Neuropixels_data/v1_OSI_DSI_DF.csv', type=str, help='File name of the Neuropixels DataFrame for OSI/DSI analysis')
 
 
 def submit_job(command):

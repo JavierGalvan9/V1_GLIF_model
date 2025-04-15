@@ -506,6 +506,6 @@ if __name__ == '__main__':
 
     absl.app.flags.DEFINE_string("rotation", "ccw", "")
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
-    absl.app.flags.DEFINE_string('neuropixels_df', 'v1_OSI_DSI_DF.csv', 'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
+    absl.app.flags.DEFINE_string('neuropixels_df', 'Neuropixels_data/v1_OSI_DSI_DF.csv', 'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
 
     absl.app.run(main)
