@@ -534,7 +534,7 @@ class MetricsBoxplot:
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"OSI_DSI_neuropixels_v4.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
-        self.osi_dsi_dfs.append(self.get_osi_dsi_df(neurpixels_df, data_source_name="Neuropixels", data_dir='Neuropixels_data'))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(neuropixels_df, data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         df = pd.concat(self.osi_dsi_dfs, ignore_index=True)
 
         # Create a figure to compare several model metrics against Neuropixels data
