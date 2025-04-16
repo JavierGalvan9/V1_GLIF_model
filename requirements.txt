@@ -1,0 +1,39 @@
+# Core dependencies
+tensorflow==2.15.0
+numpy==1.23.5
+pandas>=2.2.0
+matplotlib>=3.8.2
+seaborn>=0.13.2
+scipy>=1.12.0
+h5py>=3.10.0
+absl-py>=2.1.0
+
+# Brain modeling toolkit
+bmtk>=1.0.8
+
+# Data handling and processing
+lz4>=4.3.3
+scikit-learn>=1.0.0
+scikit-image>=0.22.0
+statsmodels>=0.14.1
+numba>=0.59.0
+
+# Performance profiling
+memory_profiler>=0.61.0
+line_profiler>=4.1.0
+psutil>=5.9.8
+pympler>=1.0.1
+
+# Progress visualization
+tqdm>=4.61.0
+
+# Jupyter notebooks
+jupyter>=1.0.0
+
+# Optional dependencies that may be useful
+# Uncomment if needed
+# tensorboard>=2.15.0
+
+# CUDA requirements
+# The model is tested with CUDA 11.8 and cuDNN 8.8.0
+# Make sure your system has compatible CUDA drivers installed
