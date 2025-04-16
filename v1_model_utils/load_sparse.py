@@ -159,7 +159,8 @@ def load_network(
     seed=3000,
     connected_selection=True,
     tensorflow_speed_up=False,
-    random_weights=False):
+    random_weights=False,
+    uniform_weights=False):
 
     rd = np.random.RandomState(seed=seed)
     
@@ -320,6 +321,14 @@ def load_network(
         weights_tf = edge["params"]["weight"][edge_exists].astype(np.float32)
         if random_weights:
             np.random.shuffle(weights_tf)
+        if uniform_weights:
+            pos_weights = weights_tf[weights_tf > 0]
+            neg_weights = weights_tf[weights_tf < 0]
+            avg_pos_weight = np.mean(pos_weights)
+            avg_neg_weight = np.mean(neg_weights)
+            weights_tf[weights_tf > 0] = avg_pos_weight
+            weights_tf[weights_tf < 0] = avg_neg_weight
+
 
         n_new_edge = len(target_tf_ids)
         n_edges += int(n_new_edge)
@@ -691,7 +700,8 @@ def load_v1(flags, n_neurons, flag_str=''):
                         seed=flags.seed,
                         connected_selection=flags.connected_selection,
                         tensorflow_speed_up=False,
-                        random_weights=flags.random_weights
+                        random_weights=flags.random_weights,
+                        uniform_weights=flags.uniform_weights
     )
     print('Load_network: %.2f seconds' % (time() - t0))
 
@@ -765,7 +775,7 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     network, lgn_input, bkg_input = None, None, None
 
     if flag_str == '':
-        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_random_weights_{flags.random_weights}"
+        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_random_weights_{flags.random_weights}_uniform_weights_{flags.uniform_weights}"
     
     file_dir = os.path.split(__file__)[0]
     cache_dir = os.path.join(flags.data_dir, "tf_data")

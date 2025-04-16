@@ -86,10 +86,12 @@ parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
 parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')
 parser.add_argument('--random_weights', default=False, action='store_true')
+parser.add_argument('--uniform_weights', default=False, action='store_true')
 parser.add_argument('--gradient_checkpointing', default=True, action='store_true')
 parser.add_argument('--nogradient_checkpointing', dest='gradient_checkpointing', action='store_false')
 
 parser.add_argument('--rotation', default='ccw', type=str)
+parser.add_argument('--neuropixels_df', default='Neuropixels_data/v1_OSI_DSI_DF.csv', type=str, help='File name of the Neuropixels DataFrame for OSI/DSI analysis')
 
 
 def submit_job(command):
@@ -112,7 +114,7 @@ def main():
     # Save the configuration of the model based on the main features
     flag_str = f'v1_{v1_neurons}'
     for name, value in vars(flags).items():
-        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection', 'random_weights']:
+        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection', 'random_weights', 'uniform_weights']:
             flag_str += f'_{name}_{value}'
 
     # Define flag string as the second part of results_path

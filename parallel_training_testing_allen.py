@@ -88,23 +88,34 @@ parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
 parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')
 parser.add_argument('--random_weights', default=False, action='store_true')
+parser.add_argument('--uniform_weights', default=False, action='store_true')
 parser.add_argument('--gradient_checkpointing', default=False, action='store_true')
 parser.add_argument('--rotation', default='ccw', type=str)
+parser.add_argument('--print_only', default=False, action='store_true', help='Only print the commands without submitting them')
+parser.add_argument('--neuropixels_df', default='Neuropixels_data/v1_OSI_DSI_DF.csv', type=str, help='File name of the Neuropixels DataFrame for OSI/DSI analysis')
 
 
-def submit_job(command):
+def submit_job(command, print_only=False):
     """ 
     Submit a job to the cluster using the command provided.
+    If print_only is True, just print the command without submitting.
     """
-    # print("Trying to run the following command.")
-    # print(command)
+    if print_only:
+        print("\n=== COMMAND ===")
+        print(" ".join(command))
+        # For the wrapped python command, extract it for easier viewing
+        if "--wrap" in command:
+            wrap_index = command.index("--wrap")
+            if wrap_index < len(command) - 1:
+                print("\n=== PYTHON COMMAND ===")
+                print(command[wrap_index + 1])
+        # Return a dummy job ID for print-only mode
+        return "DUMMY_JOB_ID"
+    
+    # Actually submit the job
     result = subprocess.run(command, capture_output=True, text=True)
     job_id = re.search(r'\d+', result.stdout.strip())
-    # print("got this one")
-    # print(result)
-    # print(job_id)
     job_id = job_id.group()
-
     return job_id
 
 def main():                
@@ -117,7 +128,7 @@ def main():
     # Save the configuration of the model based on the main features
     flag_str = f'v1_{v1_neurons}'
     for name, value in vars(flags).items():
-        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection', 'random_weights']:
+        if value != parser.get_default(name) and name in ['n_input', 'core_only', 'connected_selection', 'random_weights', 'uniform_weights']:
             flag_str += f'_{name}_{value}'
 
     # Define flag string as the second part of results_path
@@ -168,7 +179,7 @@ def main():
     for name, value in vars(flags).items():
         # if value != parser.get_default(name) and name in ['learning_rate', 'rate_cost', 'voltage_cost', 'osi_cost', 'temporal_f', 'n_input', 'seq_len']:
         # if value != parser.get_default(name):
-        if name not in ['seed']: 
+        if name not in ['seed', 'print_only']: 
             if type(value) == bool and value == False:
                 training_script += f"--no{name} "
                 evaluation_script += f"--no{name} "
@@ -191,7 +202,7 @@ def main():
 
     initial_evaluation_command = initial_evaluation_command + ["--wrap"] + [initial_evaluation_script]
     # initial_evaluation_command = [initial_evaluation_script]
-    eval_job_id = submit_job(initial_evaluation_command)
+    eval_job_id = submit_job(initial_evaluation_command, flags.print_only)
     eval_job_ids.append(eval_job_id)
 
     for i in range(flags.n_runs):
@@ -203,13 +214,13 @@ def main():
             else:
                 new_training_script = training_script + f" --seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
             new_training_command = new_training_command + ["--wrap"] + [new_training_script]
-            job_id = submit_job(new_training_command)
+            job_id = submit_job(new_training_command, flags.print_only)
         else:
             new_training_command = training_commands + ['-d', job_ids[i-1], "-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-J", f"{sim_name}_train_{i}"]
             # new_training_script = training_script + f"--osi_cost 0.1 --rate_cost 10 --seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
             new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
             new_training_command = new_training_command + ["--wrap"] + [new_training_script]
-            job_id = submit_job(new_training_command)
+            job_id = submit_job(new_training_command, flags.print_only)
         job_ids.append(job_id)
 
         if flags.n_runs == 1: # the run is a single run, no need to submit evaluation jobs. osi_dsi will be evaluated at the end of training run
@@ -218,18 +229,21 @@ def main():
             new_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-J", f"{sim_name}_test_{i}"]
             new_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
             new_evaluation_command = new_evaluation_command + ["--wrap"] + [new_evaluation_script]
-            eval_job_id = submit_job(new_evaluation_command)
+            eval_job_id = submit_job(new_evaluation_command, flags.print_only)
             eval_job_ids.append(eval_job_id)
 
     # Final evaluation with the best model
     final_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_final.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_final.err", "-J", f"{sim_name}_test_final"]
     final_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
     final_evaluation_command = final_evaluation_command + ["--wrap"] + [final_evaluation_script]
-    eval_job_id = submit_job(final_evaluation_command)
+    eval_job_id = submit_job(final_evaluation_command, flags.print_only)
     eval_job_ids.append(eval_job_id)
 
-    print("Submitted training jobs with the following JOBIDs:", job_ids)
-    print("Submitted evaluation jobs with the following JOBIDs:", eval_job_ids)
+    if flags.print_only:
+        print("\n=== COMMANDS WERE ONLY PRINTED, NOT SUBMITTED ===\n")
+    else:
+        print("Submitted training jobs with the following JOBIDs:", job_ids)
+        print("Submitted evaluation jobs with the following JOBIDs:", eval_job_ids)
 
 
 if __name__ == '__main__':

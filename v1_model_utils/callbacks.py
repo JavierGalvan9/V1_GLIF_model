@@ -18,6 +18,7 @@ from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivit
 from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
 from v1_model_utils.model_metrics_analysis import calculate_Firing_Rate, get_borders, draw_borders
 from v1_model_utils.psd_utils import PSDAnalyzer
+import shutil
 
 # Set style parameters for publication quality
 plt.rcParams.update({
@@ -41,7 +42,12 @@ plt.rcParams.update({
 })
 
 sns.set(style="ticks")
-plt.rcParams['text.usetex'] = True
+if shutil.which('latex') is not None:
+    use_tex = True
+else:
+    use_tex = False
+    print("LaTeX not found. Using MathText for rendering.")
+plt.rcParams['text.usetex'] = use_tex
 
 def printgpu(gpu_id=0):
     if tf.config.list_physical_devices('GPU'):
@@ -962,7 +968,8 @@ class OsiDsiCallbacks:
         metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir,
                                                 drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.pre_delay+self.flags.evoked_duration,
                                                 spontaneous_init=0, spontaneous_end=self.pre_delay,
-                                                core_radius=self.flags.plot_core_radius, df_directory=self.images_dir, save_df=True)
+                                                core_radius=self.flags.plot_core_radius, df_directory=self.images_dir, save_df=True,
+                                                neuropixels_df=self.flags.neuropixels_df)
         # Figure for OSI/DSI boxplots
         metrics_analysis(metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], directory=boxplots_dir, filename=f'Epoch_{self.current_epoch}')
         # Figure for Average firing rate boxplots
@@ -1456,11 +1463,13 @@ class Callbacks:
         if self.neuropixels_feature == "Evoked rate (Hz)":
             metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
                                                     drifting_gratings_init=self.pre_delay, drifting_gratings_end=seq_len-self.post_delay,
-                                                    core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
+                                                    core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False,
+                                                    neuropixels_df=self.flags.neuropixels_df) 
         elif self.neuropixels_feature == 'Spontaneous rate (Hz)':
             metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
                                                     spontaneous_init=self.pre_delay, spontaneous_end=seq_len-self.post_delay,
-                                                    core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
+                                                    core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False,
+                                                    neuropixels_df=self.flags.neuropixels_df) 
         # Figure for Average firing rate boxplots      
         metrics_analysis(metrics=[self.neuropixels_feature], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')    
                 
@@ -1471,7 +1480,7 @@ class Callbacks:
         os.makedirs(boxplots_dir, exist_ok=True)
         metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir, 
                                                 spontaneous_init=self.pre_delay, spontaneous_end=seq_len-self.post_delay,
-                                                core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False) 
+                                                core_radius=self.flags.plot_core_radius, df_directory=self.logdir, save_df=False,
+                                                neuropixels_df=self.flags.neuropixels_df)
         # Figure for Average firing rate boxplots
-        metrics_analysis(metrics=['Spontaneous rate (Hz)'], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')   
-                       
+        metrics_analysis(metrics=['Spontaneous rate (Hz)'], directory=boxplots_dir, filename=f'Epoch_{self.epoch}')

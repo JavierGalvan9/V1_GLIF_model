@@ -7,7 +7,7 @@ import pandas as pd
 from matplotlib import patches
 import seaborn as sns
 from . import other_v1_utils, toolkit
-
+import shutil
 
 # Set style parameters for publication quality
 plt.rcParams.update({
@@ -31,7 +31,7 @@ plt.rcParams.update({
 })
 
 sns.set(style="ticks")
-plt.rcParams['text.usetex'] = True
+plt.rcParams['text.usetex'] = shutil.which('latex') is not None
 
 class InputActivityFigure:
     def __init__(

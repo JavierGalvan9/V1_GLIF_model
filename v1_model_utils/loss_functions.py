@@ -394,6 +394,11 @@ def process_neuropixels_data(path=''):
     # return df
 
 def neuropixels_cell_type_to_cell_type(pop_name):
+    if not isinstance(pop_name, str):
+        return pop_name
+    if ' ' in pop_name:  # This is already new. No need to update.
+        return pop_name
+
     # Convert pop_name in the neuropixels cell type to cell types. E.g, 'EXC_L23' -> 'L2/3 Exc', 'PV_L5' -> 'L5 PV'
     layer = pop_name.split('_')[1]
     class_name = pop_name.split('_')[0]
@@ -414,7 +419,8 @@ class SpikeRateDistributionTarget:
         The main difference is that this class will calculate the loss
         for each subtypes of the neurons."""
     def __init__(self, network, spontaneous_fr=False, rate_cost=.5, pre_delay=None, post_delay=None, 
-                 data_dir='GLIF_network', core_mask=None, rates_dampening=1.0, seed=42, dtype=tf.float32):
+                 data_dir='GLIF_network', core_mask=None, rates_dampening=1.0, seed=42, dtype=tf.float32,
+                 neuropixels_df='Neuropixels_data/v1_OSI_DSI_DF.csv'):
         self._network = network
         self._rate_cost = rate_cost
         self._pre_delay = pre_delay
@@ -426,6 +432,7 @@ class SpikeRateDistributionTarget:
         self._data_dir = data_dir
         self._dtype = dtype
         self._seed = seed
+        self._neuropixels_df = neuropixels_df
         if spontaneous_fr:
             self.neuropixels_feature = 'firing_rate_sp'
         else:
@@ -440,33 +447,49 @@ class SpikeRateDistributionTarget:
             dict: Dictionary containing rates and node_type_ids for each population query.
         """
         # Load data
-        neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
-        if not os.path.exists(neuropixels_data_path):
-            process_neuropixels_data(path=neuropixels_data_path)
+        # neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
 
+        neuropixels_data_path = self._neuropixels_df
+        if neuropixels_data_path == 'Neuropixels_data/v1_OSI_DSI_DF.csv':
+            if not os.path.exists(neuropixels_data_path):
+                process_neuropixels_data(path=neuropixels_data_path)
+        else: # just inform the user that the custom file is loading.
+            print(f"Using custom neuropixels data file for FR loss: {neuropixels_data_path}")
+
+        # New dataset has Spont_Rate(Hz) instead of firing_rate_sp.
+        # if reading firing_rate_sp fails, replace it with Spont_Rate(Hz) and try again.
         features_to_load = ['ecephys_unit_id', 'cell_type', 'firing_rate_sp', 'Ave_Rate(Hz)']
-        np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
+        try:
+            np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
+        except ValueError:
+            print(f"Neuropixels data file {neuropixels_data_path} does not contain firing_rate_sp. Using Spont_Rate(Hz) instead.")
+            features_to_load = ['ecephys_unit_id', 'cell_type', 'Spont_Rate(Hz)', 'Ave_Rate(Hz)']
+            np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
+            # Rename the column to match the original
+            np_df.rename(columns={'Spont_Rate(Hz)': 'firing_rate_sp'}, inplace=True)
         area_node_types = pd.read_csv(os.path.join(self._data_dir, f'network/v1_node_types.csv'), sep=" ")
+        # Ensure they use the new names
+        np_df["cell_type"] = np_df["cell_type"].apply(neuropixels_cell_type_to_cell_type)
 
         # Define population queries
         query_mapping = {
-            "i1H": 'ALL_L1',
-            "e23": 'EXC_L23',
-            "i23P": 'PV_L23',
-            "i23S": 'SST_L23',
-            "i23V": 'VIP_L23',
-            "e4": 'EXC_L4',
-            "i4P": 'PV_L4',
-            "i4S": 'SST_L4',
-            "i4V": 'VIP_L4',
-            "e5": 'EXC_L5',
-            "i5P": 'PV_L5',
-            "i5S": 'SST_L5',
-            "i5V": 'VIP_L5',
-            "e6": 'EXC_L6',
-            "i6P": 'PV_L6',
-            "i6S": 'SST_L6',
-            "i6V": 'VIP_L6'
+            "i1H": 'L1 Htr3a',
+            "e23": 'L2/3 Exc',
+            "i23P": 'L2/3 PV',
+            "i23S": 'L2/3 SST',
+            "i23V": 'L2/3 VIP',
+            "e4": 'L4 Exc',
+            "i4P": 'L4 PV',
+            "i4S": 'L4 SST',
+            "i4V": 'L4 VIP',
+            "e5": 'L5 Exc',
+            "i5P": 'L5 PV',
+            "i5S": 'L5 SST',
+            "i5V": 'L5 VIP',
+            "e6": 'L6 Exc',
+            "i6P": 'L6 PV',
+            "i6S": 'L6 SST',
+            "i6V": 'L6 VIP'
         }
 
         # Define the reverse mapping
@@ -678,7 +701,8 @@ class CustomMeanLayer(Layer):
 
 class OrientationSelectivityLoss:
     def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, 
-                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None):
+                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None,
+                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv"):
         
         self._network = network
         self._osi_cost = osi_cost
@@ -689,6 +713,7 @@ class OrientationSelectivityLoss:
         self._method = method
         self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
         self._tf_pi = tf.constant(np.pi, dtype=dtype)
+        self._neuropixels_df = neuropixels_df
         if (self._core_mask is not None) and (self._method == "crowd_spikes" or self._method == "crowd_osi"):
             self.np_core_mask = self._core_mask.numpy()
             core_tuning_angles = network['tuning_angle'][self.np_core_mask]
@@ -755,9 +780,14 @@ class OrientationSelectivityLoss:
             dict: Dictionary containing rates and node_type_ids for each population query.
         """
         # Load data
-        neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
-        if not os.path.exists(neuropixels_data_path):
-            process_neuropixels_data(path=neuropixels_data_path)
+        # neuropixels_data_path = f'Neuropixels_data/v1_OSI_DSI_DF.csv'
+        neuropixels_data_path = self._neuropixels_df
+        # if the default one is specified and the file doesn't exist, process the data
+        if neuropixels_data_path == "Neuropixels_data/v1_OSI_DSI_DF.csv":
+            if not os.path.exists(neuropixels_data_path):
+                process_neuropixels_data(path=neuropixels_data_path)
+        else:
+            print(f"Using custom neuropixels data file for OSI/DSI loss: {neuropixels_data_path}")
         features_to_load = ['ecephys_unit_id', 'cell_type', 'OSI', 'DSI', "Ave_Rate(Hz)", "max_mean_rate(Hz)"]
         osi_dsi_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
         
@@ -964,4 +994,4 @@ class OrientationSelectivityLoss:
             return self.crowd_spikes_loss(spikes, angle)
         elif self._method == "neuropixels_fr":
             return self.neuropixels_fr_loss(spikes, angle)
-        
+

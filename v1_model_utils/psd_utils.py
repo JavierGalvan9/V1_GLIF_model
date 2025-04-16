@@ -9,6 +9,7 @@ from collections import defaultdict
 from statsmodels.stats.multitest import multipletests
 import pandas as pd
 import other_v1_utils
+import shutil
 
 # Set style parameters for publication quality
 plt.rcParams.update({
@@ -32,7 +33,7 @@ plt.rcParams.update({
 })
 
 sns.set(style="ticks")
-plt.rcParams['text.usetex'] = True
+plt.rcParams['text.usetex'] = shutil.which('latex') is not None
 
 
 def compute_band_power(freqs, psd, band):
