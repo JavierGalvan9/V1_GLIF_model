@@ -1,6 +1,15 @@
 # V1_GLIF_model
 
 A TensorFlow implementation of a biologically plausible model of mouse primary visual cortex (V1) with Lateral Geniculate Nucleus (LGN) input, based on Allen Institute models. This project simulates V1 neurons' responses to visual stimuli using Generalized Leaky Integrate and Fire (GLIF) neurons.
+This is a successor project of making a model of the mouse primary visual cortex (https://portal.brain-map.org/explore/models/mv1-all-layers)
+
+The improvements will be:
+
+- Connection probability and weights are derived from coherent datasets, including the Allen Institute synaptic physiology data and MICrONS electron microscopy connectomics dataset (instead from the literature).
+- Synaptic connections are now expressed by double alpha functions and the receptor types are more elaborated.
+- Segregation of the L5 excitatory cells into IT, ET, and NP types.
+- More GLIF cell models are used.
+- Only PointNet version is available as of now.
 
 ![Fig1](https://github.com/user-attachments/assets/167be7dd-4723-48db-9166-4e5b38df8c23)
 
@@ -136,6 +145,9 @@ Results are saved in the `Simulation_results` directory.
   - Input currents (`input_current`, `recurrent_current`)
   - LGN activity (`z_lgn`) -->
 
+## Notes
+In the new V1 model, the LGN coordinates are defined as the visual field coordinates (elevation and azimuth), though these coordinates are not zero-centered. The LGN’s elevation axis is oriented upward, aligning with the V1 model’s z-axis; however, this may conflict with conventional image coordinate systems, where row indices increase downward. Note that this definition differs from our previous model (Billeh et al., 2020), which defined the LGN coordinate axis as downward. Use the y_dir and flip_y options in BMTK to control image orientation when presenting data to this network.
+
 ## Reference Data
 
 The `Neuropixels_data` directory contains experimental recordings that the model can be trained to match, including:
@@ -152,7 +164,7 @@ The model requires specific package versions. Key dependencies include:
 
 ## Citations
 
-Based on the Allen Institute models of mouse V1:
+Based on the Allen Institute models and experimental data of mouse V1:
 - Billeh et al. (2020), "Systematic Integration of Structural and Functional Data into Multi-Scale Models of Mouse Primary Visual Cortex", Neuron
 - Siegle et al. (2021), "Survey of spiking in the mouse visual system reveals functional hierarchy", Nature
 
