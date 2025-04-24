@@ -447,6 +447,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
+    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', "mean", '')
     absl.app.flags.DEFINE_float('lr_scale', 1., '')
     absl.app.flags.DEFINE_float('temporal_f', 2., '')
     absl.app.flags.DEFINE_float('max_time', -1, '')

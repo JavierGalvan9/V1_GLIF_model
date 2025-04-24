@@ -995,3 +995,77 @@ class OrientationSelectivityLoss:
         elif self._method == "neuropixels_fr":
             return self.neuropixels_fr_loss(spikes, angle)
 
+
+class EarthMoversDistanceRegularizer(Layer):
+    """
+    Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
+    synaptic weight distributions, per edge type, averaged over all edge types.
+    Uses TF operations for initialization and tf.map_fn in call for memory efficiency.
+    """
+    def __init__(self, strength, network, dtype=tf.float32):
+        super().__init__()
+        self._strength = tf.cast(strength, dtype)
+        self._dtype = dtype
+
+        # --- Original Initialization Logic ---
+        voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+        indices = network["synapses"]["indices"]
+        initial_value_np = np.array(network["synapses"]["weights"], dtype=np.float32)
+        # edge_type_ids_np = network['synapses']['edge_type_ids']
+        # use the connection_type_ids instead
+        edge_type_ids_np = other_v1_utils.connection_type_ids(network)
+        initial_value_np /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        n_edges = len(initial_value_np)
+        # --- End Original Initialization Logic ---
+
+        # Convert to TF Tensors
+        initial_value = tf.constant(initial_value_np, dtype=tf.float32)
+        edge_type_ids = tf.constant(edge_type_ids_np, dtype=tf.int32)
+        
+        unique_edge_types, idx = np.unique(edge_type_ids, return_inverse=True)
+        self.num_unique = tf.constant(unique_edge_types.shape[0], dtype=tf.int32)
+
+        self._initial_value = tf.constant(initial_value, dtype=tf.float32)
+        
+        
+        # presort the initial value
+        for i in tf.range(self.num_unique):
+            mask = tf.equal(idx, i)
+            y_i = tf.boolean_mask(self._initial_value, mask)
+            y_i = tf.sort(y_i)
+            self._initial_value = tf.tensor_scatter_nd_update(self._initial_value, tf.where(mask), y_i)
+
+
+        ### 2. Reorder original_indices and initial_value based on sorted edge types
+        original_indices = tf.range(n_edges, dtype=tf.int32)
+        sorted_indices = tf.argsort(edge_type_ids)
+        permuted_original_indices = tf.gather(original_indices, sorted_indices)
+        sorted_edge_type_ids = tf.gather(edge_type_ids, sorted_indices) # Needed for unique
+
+        # 3. Find unique edge types and row indices for ragged tensor construction
+        unique_types, row_indices = tf.unique(sorted_edge_type_ids)
+        nrows = tf.shape(unique_types)[0]
+
+        # 4. Construct group_indices RaggedTensor (indices into the *original* weight tensor)
+        self._group_indices = tf.RaggedTensor.from_value_rowids(
+            values=permuted_original_indices,
+            value_rowids=row_indices,
+            nrows=nrows
+        )
+
+    @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
+    def __call__(self, x):
+        x = tf.cast(x, tf.float32)
+        if len(x.shape) > 1 and x.shape[1] == 1:
+            x = tf.squeeze(x, axis=1)
+        emd_losses = tf.TensorArray(self._dtype, size=self.num_unique)
+        for i in tf.range(self.num_unique):
+            x_i = tf.gather(x, self._group_indices[i])
+            y_i = tf.gather(self._initial_value, self._group_indices[i])
+
+            # y_i is presorted.
+            emd = tf.reduce_mean(tf.abs(tf.sort(x_i) - y_i))
+            emd_losses = emd_losses.write(i, emd)
+        emd_losses = emd_losses.stack()
+        reg_loss = tf.reduce_mean(emd_losses)
+        return reg_loss * self._strength
