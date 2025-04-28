@@ -1,6 +1,7 @@
 import matplotlib
 matplotlib.use('agg')# to avoid GUI request on clusters
 import os
+import copy
 
 # Define the environment variables for optimal GPU performance
 os.environ['TF_GPU_THREAD_MODE'] = 'global'
@@ -280,7 +281,21 @@ def main(_):
         ### RECURRENT REGULARIZERS ###
         # rec_weight_regularizer = losses.StiffKLLogNormalRegularizer(flags.recurrent_weight_regularization, network, dtype=tf.float32)
         # rec_weight_regularizer = losses.MeanStdStiffRegularizer(flags.recurrent_weight_regularization, network, penalize_relative_change=True, dtype=tf.float32)
-        rec_weight_regularizer = losses.MeanStiffRegularizer(flags.recurrent_weight_regularization, network, dtype=tf.float32)
+        if flags.recurrent_weight_regularization > 0 and flags.uniform_weights:
+            print("Uniform weights are set to True. Loading the network with original weights for regularizer.")
+            dummy_flags = copy.deepcopy(flags)
+            dummy_flags.uniform_weights = False # read network with original weights
+            rec_reg_network, _, _ = load_fn(dummy_flags, dummy_flags.neurons, flag_str='')
+        else:
+            rec_reg_network = network    
+        if flags.recurrent_weight_regularizer_type == 'mean':
+            print("Using mean regularizer")
+            rec_weight_regularizer = losses.MeanStiffRegularizer(flags.recurrent_weight_regularization, rec_reg_network, penalize_relative_change=True, dtype=tf.float32)
+        elif flags.recurrent_weight_regularizer_type == 'emd':
+            print("Using emd regularizer")
+            rec_weight_regularizer = losses.EarthMoversDistanceRegularizer(flags.recurrent_weight_regularization, rec_reg_network, dtype=tf.float32)
+        else:
+            raise ValueError(f"Invalid recurrent weight regularizer type: {flags.recurrent_weight_regularizer_type}")
         # model.add_loss(lambda: rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values))
         # rec_weight_regularizer = losses.StiffRegularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
         # rec_weight_l2_regularizer = losses.L2Regularizer(flags.recurrent_weight_regularization, rsnn_layer.cell.recurrent_weight_values)
@@ -1001,6 +1016,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
+    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'mean', 'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, earth_movers')
     absl.app.flags.DEFINE_float('lr_scale', 1., '')
     # absl.app.flags.DEFINE_float('p_reappear', .5, '')
     absl.app.flags.DEFINE_float('max_time', -1, '')

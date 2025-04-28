@@ -321,13 +321,6 @@ def load_network(
         weights_tf = edge["params"]["weight"][edge_exists].astype(np.float32)
         if random_weights:
             np.random.shuffle(weights_tf)
-        if uniform_weights:
-            pos_weights = weights_tf[weights_tf > 0]
-            neg_weights = weights_tf[weights_tf < 0]
-            avg_pos_weight = np.mean(pos_weights)
-            avg_neg_weight = np.mean(neg_weights)
-            weights_tf[weights_tf > 0] = avg_pos_weight
-            weights_tf[weights_tf < 0] = avg_neg_weight
 
 
         n_new_edge = len(target_tf_ids)
@@ -349,6 +342,14 @@ def load_network(
     delays = np.concatenate(delays, axis=0, dtype=np.float16)
     syn_ids = np.concatenate(syn_ids, axis=0, dtype=np.uint8)
     edge_type_ids = np.concatenate(edge_type_ids, axis=0, dtype=np.uint16)
+    
+    if uniform_weights:
+        pos_weights = weights[weights > 0]
+        neg_weights = weights[weights < 0]
+        avg_pos_weight = np.mean(pos_weights)
+        avg_neg_weight = np.mean(neg_weights)
+        weights[weights > 0] = avg_pos_weight
+        weights[weights < 0] = avg_neg_weight
 
     # sort indices by considering first all the targets of node 0, then all of node 1, ...
     # indices, weights, delays, tau_syn_weights_array, syn_ids = sort_indices(indices, weights, delays, tau_syn_weights_array, syn_ids)
@@ -775,7 +776,12 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     network, lgn_input, bkg_input = None, None, None
 
     if flag_str == '':
-        flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_random_weights_{flags.random_weights}_uniform_weights_{flags.uniform_weights}"
+        # Making it consistent with the main script.
+        flag_str = f'v1_{flags.neurons}'
+        for name, value in flags.flag_values_dict().items():
+            if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection', 'random_weights', 'uniform_weights']:
+                flag_str += f'_{name}_{value}'
+        # flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_random_weights_{flags.random_weights}_uniform_weights_{flags.uniform_weights}"
     
     file_dir = os.path.split(__file__)[0]
     cache_dir = os.path.join(flags.data_dir, "tf_data")

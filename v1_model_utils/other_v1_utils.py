@@ -102,7 +102,7 @@ def pop_names(network, core_radius = None, n_selected_neurons=None, data_dir='',
     
     
 
-def connection_type_ids(network, core_radius=None, data_dir='GLIF_network', return_names=False):
+def connection_type_ids(network, core_radius=None, data_dir='', return_names=False):
     # first, get the pop_names
     pop_names_var = pop_names(network, core_radius=core_radius, data_dir=data_dir)
     cell_types = [pop_name_to_cell_type(pop_name) for pop_name in pop_names_var]
