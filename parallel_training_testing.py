@@ -71,6 +71,7 @@ parser.add_argument('--caching', default=True, action='store_true')
 parser.add_argument('--core_only', default=False, action='store_true')
 parser.add_argument('--core_loss', default=False, action='store_true')
 parser.add_argument('--hard_reset', default=False, action='store_true')
+parser.add_argument('--low_memory_gpu', default=False, action='store_true')
 
 parser.add_argument('--train_recurrent', default=False, action='store_true')
 parser.add_argument('--train_recurrent_per_type', default=False, action='store_true')
@@ -141,8 +142,11 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{4 * flags.n_gpus}", "-m", "80", "-t", "24:00"] # choose the L40S GPU with 48GB of memory 
-    # training_commands = ["run", "-g", "1", "-m", "40", "-c", "4", "-t", "0:30"] # choose the L40S GPU with 48GB of memory
+    if flags.low_memory_gpu:
+        training_commands = ["run", "-g", "1", "-m", "40", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
+    else:
+        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{4 * flags.n_gpus}", "-m", "40", "-t", "36:00"] # choose the L40S GPU with 48GB of memory 
+
     evaluation_commands = ["run", "-g", "1", "-m", "40", "-c", "4", "-t", "1:00"]
 
     # Define the training and evaluation script calls
@@ -157,7 +161,7 @@ def main():
     for name, value in vars(flags).items():
         # if value != parser.get_default(name) and name in ['learning_rate', 'rate_cost', 'voltage_cost', 'osi_cost', 'temporal_f', 'n_input', 'seq_len']:
         # if value != parser.get_default(name):
-        if name not in ['seed', 'n_gpus']: 
+        if name not in ['seed', 'n_gpus', 'low_memory_gpu']: 
             if type(value) == bool and value == False:
                 training_script += f"--no{name} "
                 evaluation_script += f"--no{name} "

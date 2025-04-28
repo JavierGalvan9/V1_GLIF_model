@@ -389,7 +389,9 @@ def main(_):
             lgn_spikes = generate_spontaneous_spikes(lgn_prob)
             # Reset the memory stats
             # tf.config.experimental.reset_memory_stats('GPU:0')
-            
+
+            # Start tracking time for this angle
+            iter_start_time = time()            
             for i in range(num_chunks):
                 chunk = lgn_spikes[:, i * chunk_size : (i + 1) * chunk_size, :]
                 v1_z_chunk, continuing_state = distributed_roll_out(chunk, continuing_state)
@@ -397,6 +399,9 @@ def main(_):
                 # lm_spikes[angle_id, i * chunk_size : (i + 1) * chunk_size, :] += lm_z_chunk.numpy()[0, :, :].astype(float)
                 spikes[start_idx:end_idx, angle_id, i * chunk_size : (i + 1) * chunk_size, :] += v1_z_chunk.numpy()[:iteration_length, :, :].astype(np.uint8)
                 
+            # Track GPU memory and inference time
+            callbacks.track_performance(iter_start_time, gpu_id=0)
+
             if angle_id == 0:
                 # Raster plot for 0 degree orientation
                 callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)

@@ -76,6 +76,23 @@ def printgpu(gpu_id=0):
                 used, free, total = [float(x)/1024 for x in info.split(',')]
                 print(f"    Total GPU {gpu_id} Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
 
+def get_gpu_memory(gpu_id=0):
+    """Returns GPU memory usage in GiB using only nvidia-smi."""
+    try:
+        # Get GPU memory info using nvidia-smi
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+            stdout=subprocess.PIPE, encoding='utf-8'
+        )
+        gpu_memory_info = result.stdout.strip().split('\n')
+        if gpu_id < len(gpu_memory_info):
+            used_memory = float(gpu_memory_info[gpu_id]) / 1024  # Convert MiB to GiB
+            return used_memory
+        else:
+            return 0.0
+    except:
+        return 0.0
+
 def compose_str(metrics_values):
         # _acc, _loss, _rate, _rate_loss, _voltage_loss, _regularizers_loss, _osi_dsi_loss, _sync_loss = metrics_values
         _loss, _rate, _rate_loss, _voltage_loss, _regularizers_loss, _osi_dsi_loss, _sync_loss = metrics_values
@@ -167,14 +184,73 @@ class OsiDsiCallbacks:
         self.images_dir = self.logdir
         self.pre_delay = pre_delay
         self.post_delay = post_delay
+        stim_duration = flags.spont_duration + flags.evoked_duration
+        self.sim_duration = int(np.ceil(stim_duration/flags.seq_len)) * flags.seq_len
         self.current_epoch = current_epoch
         self.model_variables_dict = model_variables_init
-        # Analize changes in trainable variables.
+        # Tracking inference performance metrics
+        self.inference_times = []
+        self.inference_memory = []
+        # Analyze changes in trainable variables.
         if self.model_variables_dict is not None:
             for var in self.model_variables_dict['Best'].keys():
                 t0 = time()
                 self.trainable_variable_change_heatmaps_and_distributions(var)
                 print(f'Time spent in {var}: {time()-t0}')
+
+    # Add method to save inference metrics to CSV
+    def save_inference_metrics(self):
+        # Calculate training statistics and save to CSV
+        # Get the simulation name (last part of logdir)
+        sim_name = os.path.basename(self.logdir)
+        
+        # Calculate statistics for step time
+        mean_step_time = np.mean(self.inference_times)
+        sem_step_time = np.std(self.inference_times) / np.sqrt(len(self.inference_times))
+        
+        # Calculate statistics for GPU memory usage
+        # Filter out None values that might have been recorded when memory tracking failed
+        gpu_memory_data = [m for m in self.inference_memory if m is not None]
+        if gpu_memory_data:
+            mean_gpu_memory = np.mean(gpu_memory_data)
+            sem_gpu_memory = np.std(gpu_memory_data) / np.sqrt(len(gpu_memory_data))
+        else:
+            mean_gpu_memory = 0.0
+            sem_gpu_memory = 0.0
+
+        # Create a directory for saving statistics if it doesn't exist
+        stats_dir = os.path.dirname(os.path.dirname(self.logdir))  # Go up to Simulation_results
+        stats_file = os.path.join(stats_dir, 'training_statistics.csv')
+        
+        # Check if file exists to determine if we need to write headers
+        file_exists = os.path.isfile(stats_file)
+        
+        # Write data to CSV file
+        with open(stats_file, 'a') as f:
+            if not file_exists:
+                # Write header if file doesn't exist
+                f.write('sim_name,n_neurons,batch_size,seq_len,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
+            # Write data
+            f.write(f'{sim_name},{self.n_neurons},{self.flags.n_trials_per_angle},{self.sim_duration},'
+                     f'{mean_step_time},{sem_step_time},{mean_gpu_memory},{sem_gpu_memory},'
+                     'test')
+        
+        print(f"Inference metrics saved to {stats_file}")
+
+    # Add method to track memory usage
+    def track_gpu_memory(self, gpu_id=0):
+        if tf.config.list_physical_devices('GPU'):
+            used_memory = get_gpu_memory(gpu_id=gpu_id)
+            self.inference_memory.append(used_memory)
+
+    def track_inference_time(self, start_time):
+        end_time = time()
+        inference_time = end_time - start_time
+        self.inference_times.append(inference_time)
+
+    def track_performance(self, start_time, gpu_id=0):
+        self.track_inference_time(start_time)
+        self.track_gpu_memory(gpu_id=gpu_id)
 
     def trainable_variable_change_heatmaps_and_distributions(self, variable):
         node_types_voltage_scale = (self.network['node_params']['V_th'] - self.network['node_params']['E_L']).astype(np.float32)
@@ -1001,6 +1077,7 @@ class Callbacks:
         self.post_delay = post_delay
         self.step = 0
         self.step_running_time = []
+        self.step_memory_usage = []  # Track GPU memory usage per step
         self.model_variables_dict = model_variables_init
         self.initial_metric_values = None
         self.summary_writer = tf.summary.create_file_writer(self.logdir)
@@ -1063,7 +1140,6 @@ class Callbacks:
 
     def on_train_end(self, metric_values, normalizers=None):
         self.train_end_time = time()
-        self.final_metric_values = metric_values
         print("\n ---------- Training ended at ", dt.datetime.now().strftime('%d-%m-%Y %H:%M'), ' ----------\n')
         print(f"Total time spent: {self.train_end_time - self.train_start_time:.2f} seconds")
         print(f"Average step time: {np.mean(self.step_running_time):.2f} seconds\n")
@@ -1075,7 +1151,7 @@ class Callbacks:
         print(f"|{'-' * (max_key_length + 2)}|{'-' * (max_key_length + 2)}|{'-' * (max_key_length + 2)}|")
 
         n_metrics = len(self.initial_metric_values)//2
-        for initial, final, key in zip(self.initial_metric_values[n_metrics:], self.final_metric_values[n_metrics:], self.metrics_keys[n_metrics:]):
+        for initial, final, key in zip(self.initial_metric_values[n_metrics:], metric_values[n_metrics:], self.metrics_keys[n_metrics:]):
             print(f"| {key:<{max_key_length}} | {initial:<{max_key_length}.3f} | {final:<{max_key_length}.3f} |")
 
         # Save epoch_metric_values and min_val_loss to a file
@@ -1089,6 +1165,43 @@ class Callbacks:
 
         with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'wb') as f:
             pkl.dump(data_to_save, f)
+            
+        # Calculate training statistics and save to CSV
+        # Get the simulation name (last part of logdir)
+        sim_name = os.path.basename(self.logdir)
+        
+        # Calculate statistics for step time
+        mean_step_time = np.mean(self.step_running_time)
+        sem_step_time = np.std(self.step_running_time) / np.sqrt(len(self.step_running_time))
+        
+        # Calculate statistics for GPU memory usage
+        # Filter out None values that might have been recorded when memory tracking failed
+        gpu_memory_data = [m for m in self.step_memory_usage if m is not None]
+        if gpu_memory_data:
+            mean_gpu_memory = np.mean(gpu_memory_data)
+            sem_gpu_memory = np.std(gpu_memory_data) / np.sqrt(len(gpu_memory_data))
+        else:
+            mean_gpu_memory = 0.0
+            sem_gpu_memory = 0.0
+        
+        # Create a directory for saving statistics if it doesn't exist
+        stats_dir = os.path.dirname(os.path.dirname(self.logdir))  # Go up to Simulation_results
+        stats_file = os.path.join(stats_dir, 'training_statistics.csv')
+        
+        # Check if file exists to determine if we need to write headers
+        file_exists = os.path.isfile(stats_file)
+        
+        # Write data to CSV file
+        with open(stats_file, 'a') as f:
+            if not file_exists:
+                # Write header if file doesn't exist
+                f.write('sim_name,n_neurons,batch_size,seq_len,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
+            
+            # Write data row
+            f.write(f'{sim_name},{self.n_neurons},{self.flags.batch_size},{self.flags.seq_len},'
+                   f'{mean_step_time:.4f},{sem_step_time:.4f},{mean_gpu_memory:.4f},{sem_gpu_memory:.4f},"train"\n')
+            
+        print(f"\nTraining statistics saved to {stats_file}")
 
         if self.flags.n_runs > 1:
             self.save_intermediate_checkpoint()
@@ -1199,6 +1312,13 @@ class Callbacks:
 
     def on_step_end(self, train_values, y, verbose=True):
         self.step_running_time.append(time() - self.step_init_time)
+        
+        # Capture GPU memory usage using the get_gpu_memory function
+        # Only retrieve nvidia-smi GPU memory usage
+        if tf.config.list_physical_devices('GPU'):
+            used_memory = get_gpu_memory(gpu_id=0)
+            self.step_memory_usage.append(used_memory)
+        
         if verbose:
             print_str = f'  Step {self.step:2d}/{self.flags.steps_per_epoch}\n'
             print_str += '    ' + compose_str(train_values)

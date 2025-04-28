@@ -37,6 +37,8 @@ from optimizers import ExponentiatedAdam
 import logging
 tf.get_logger().setLevel(logging.INFO)
 
+# tf.config.optimizer.set_jit(True)
+
 
 print("--- CUDA version: ", tf.sysconfig.get_build_info()["cuda_version"])
 print("--- CUDNN version: ", tf.sysconfig.get_build_info()["cudnn_version"])

@@ -4,8 +4,13 @@ import os
 import pickle as pkl
 # import subprocess
 from . import other_v1_utils
-# from cuda_ops.synaptic_currents.synaptic_currents_ops import calculate_synaptic_currents_cuda
 
+try:
+    from cuda_ops.synaptic_currents.synaptic_currents_ops import calculate_synaptic_currents_cuda
+except ImportError:
+    calculate_synaptic_currents_cuda = None
+
+calculate_synaptic_currents_cuda = None
 # Define a custom gradient for the spike function.
 # Diverse functions can be used to define the gradient.
 # Here we provide variations of this functions depending on
@@ -125,7 +130,7 @@ def spike_function_b16(v_scaled, dampening_factor):
 
     return tf.identity(z_, name="spike_function"), grad
 
-
+# @tf.function(jit_compile=True) # (No registered 'RaggedGather' OpKernel for XLA_GPU_JIT devices)
 @tf.custom_gradient
 def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, dense_shape, 
                                 synaptic_basis_weights, syn_ids, pre_ind_table):
@@ -671,20 +676,32 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
     
-    def calculate_i_rec_with_custom_grad(self, rec_z_buf):     
-        # # Replace the original function call with:
-        # i_rec_flat = calculate_synaptic_currents_cuda(
-        #     tf.cast(rec_z_buf, dtype=self.variable_dtype), 
-        #     self.recurrent_indices, 
-        #     self.recurrent_weight_values, 
-        #     self.recurrent_dense_shape, 
-        #     self.synaptic_basis_weights, 
-        #     tf.cast(self.syn_ids, dtype=tf.int32), 
-        #     self.pre_ind_table
-        # )     
-        i_rec_flat = calculate_synaptic_currents(rec_z_buf, self.recurrent_indices, self.recurrent_weight_values, self.recurrent_dense_shape, 
-                                                 self.synaptic_basis_weights, self.syn_ids, self.pre_ind_table)
-        # # Cast i_rec to the compute dtype if necessary
+    def calculate_i_rec_with_custom_grad(self, rec_z_buf):    
+
+        # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
+        if calculate_synaptic_currents_cuda is not None:
+            i_rec_flat = calculate_synaptic_currents_cuda(
+                tf.cast(rec_z_buf, dtype=self.variable_dtype), 
+                self.recurrent_indices, 
+                self.recurrent_weight_values, 
+                self.recurrent_dense_shape, 
+                self.synaptic_basis_weights, 
+                tf.cast(self.syn_ids, dtype=tf.int32), 
+                self.pre_ind_table
+            )     
+        else:
+            # Use the CPU implementation if CUDA is not available
+            i_rec_flat = calculate_synaptic_currents(
+                rec_z_buf, 
+                self.recurrent_indices, 
+                self.recurrent_weight_values, 
+                self.recurrent_dense_shape, 
+                self.synaptic_basis_weights, 
+                self.syn_ids, 
+                self.pre_ind_table
+            )
+        
+        # Cast i_rec to the compute dtype if necessary
         if i_rec_flat.dtype != self.compute_dtype:
             i_rec_flat = tf.cast(i_rec_flat, dtype=self.compute_dtype)
 
