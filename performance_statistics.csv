@@ -1,0 +1,6 @@
+sim_name,n_neurons,n_edges,batch_size,seq_len,mean_rate,sem_rate,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode
+Simulation_results,203816,179735332,10,4000,0.0005,0.0000,75.3258,3.0781,21.2822,0.2229,"test"
+Simulation_results,203816,179735332,10,4000,0.0005,0.0000,74.1306,3.0352,23.6895,0.0909,"test"
+Simulation_results,203816,179735332,10,4000,0.0040,0.0000,110.6692,2.3641,24.7090,0.0000,"test"
+Simulation_results,203816,179735332,10,4000,0.0040,0.0000,110.9144,2.4362,25.7324,0.0335,"test"
+Simulation_results,203816,179735332,10,4000,0.0041,0.0000,111.5548,2.5415,25.4785,0.1337,"test"
