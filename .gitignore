@@ -52,6 +52,5 @@ cuda_ops/
 test_synaptic_currents_cuda.py
 v1_model_utils/synaptic_currents_triton.py
 figures
-performance_figures
 synaptic_data/tau_basis_3.npy
 synaptic_data/basis_function_weights_3.csv
