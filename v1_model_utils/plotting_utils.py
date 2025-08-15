@@ -326,10 +326,30 @@ class LaminarPlot:
             self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, radius=core_radius, data_dir=self.data_dir
             )
-            core_neurons = np.sum(self.core_mask)
-            self.n_neurons = core_neurons
+            self.n_neurons = np.sum(self.core_mask)
         else:
             self.core_mask = np.full(self.n_neurons, True)
+
+        # if plot_core_only:
+        #     # if self.n_neurons > self.core_neurons:
+        #         # self.n_neurons = self.core_neurons
+        #     # core_neurons = 16679 #65871 
+        #     # core_radius = 400 #200
+        #     if core_mask is None:
+        #         self.core_mask = other_v1_utils.isolate_core_neurons(
+        #             self.network, radius=core_radius, data_dir=self.data_dir
+        #         )
+        #         # set a flag to now that spikes are core-only
+        #         self.core_only = False
+        #     else:
+        #         self.core_mask = core_mask
+        #         self.core_only = True
+
+        #     core_neurons = np.sum(self.core_mask)
+        #     self.n_neurons = core_neurons
+        # else:
+        #     self.core_mask = np.full(self.n_neurons, True)
+        #     self.core_only = False
 
          # use the true_pop_names, true_node_type_ids to create a dictionary with the node_type_id as key and the pop_name as value
         # since many of them are repeated we can use the unique function to get the unique pop_names
@@ -467,8 +487,17 @@ class LaminarPlot:
             )
             ax.add_patch(rect)
 
-        spikes = np.array(spikes)
-        spikes = np.transpose(spikes[self.batch_ind, :, self.core_mask])
+        spikes = np.array(spikes)[self.batch_ind, :, :]
+
+        # Check if the spikes is already filtered for core neurons
+        if spikes.shape[1] != self.n_neurons and spikes.shape[1] == len(self.core_mask):    
+            # spikes = np.transpose(spikes[:, self.core_mask])
+            spikes = spikes[:, self.core_mask]
+
+        # if not self.core_only:
+        #     spikes = np.transpose(spikes[:, self.core_mask])
+        # else:
+        #     spikes = np.transpose(spikes[self.batch_ind, :, :])
 
         # e
         times, ids = np.where(spikes * self.e_mask[None, :].astype(float))
@@ -670,11 +699,20 @@ class PopulationActivity:
         os.makedirs(self.images_path, exist_ok=True)
 
     def __call__(self, spikes, plot_core_only=True, bin_size=10):
+
+        # Extract spikes from the batch dimension first
+        self.spikes = np.array(spikes)[0, :, :]  # Shape: (time, neurons)
+
         if plot_core_only:
             self.core_mask = other_v1_utils.isolate_core_neurons(
-                self.network, radius=self.core_radius, data_dir=self.data_dir
-            )
+                    self.network, radius=self.core_radius, data_dir=self.data_dir
+                )
             self.n_neurons = np.sum(self.core_mask)
+            # Apply core mask to filter neurons
+            if self.spikes.shape[1] != self.n_neurons and self.spikes.shape[1] == len(self.core_mask):
+                # If the spikes are already filtered for core neurons
+                self.spikes = self.spikes[:, self.core_mask]
+
             # if self.n_neurons > 65871:
             #     self.n_neurons = 65871
             #     core_radius = 400
@@ -684,8 +722,7 @@ class PopulationActivity:
         else:
             self.core_mask = np.full(self.n_neurons, True)
 
-        self.spikes = np.array(spikes)[0, :, self.core_mask]
-        self.spikes = np.transpose(self.spikes)
+        # self.spikes = np.transpose(self.spikes)
         self.neurons_ordering()
         # self.plot_populations_activity(bin_size)
         self.subplot_populations_activity(bin_size)

@@ -10,8 +10,8 @@ general_utils/__pycache__
 Simulation_results
 Error
 Out
-requirements.txt
-requirements.yml
+# requirements.txt
+# requirements.yml
 drifting_gratings.sh
 input_data_extractor.py
 network_data_extractor.py
@@ -44,5 +44,14 @@ Paper_figures
 cuda_ops
 Neuropixels_data/PSP data
 synaptic_data/double_alpha_params_full.csv
-v1_model_utils/test_synaptic_currents_cuda.py
+Paper_figures
+cuda_ops
+Neuropixels_data/PSP data
+.gitignore
+cuda_ops/
+test_synaptic_currents_cuda.py
 v1_model_utils/synaptic_currents_triton.py
+figures
+performance_figures
+synaptic_data/tau_basis_3.npy
+synaptic_data/basis_function_weights_3.csv

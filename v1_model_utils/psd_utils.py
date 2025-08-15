@@ -46,7 +46,18 @@ def bootstrap_relative_change(stim_trials, spont_trials, n_boot=1000):
     for _ in range(n_boot):
         stim_sample = np.random.choice(stim_trials, size=len(stim_trials), replace=True)
         spont_sample = np.random.choice(spont_trials, size=len(spont_trials), replace=True)
-        delta = (np.mean(stim_sample) - np.mean(spont_sample)) / np.mean(spont_sample)
+        
+        # Handle division by zero by checking if spont_sample mean is close to zero
+        spont_mean = np.mean(spont_sample)
+        if np.abs(spont_mean) < 1e-10:  # Very small number to avoid division by zero
+            delta = 0.0  # Set to 0 if denominator is effectively zero
+        else:
+            delta = (np.mean(stim_sample) - spont_mean) / spont_mean
+        
+        # Handle infinite values
+        if np.isinf(delta) or np.isnan(delta):
+            delta = 0.0
+            
         boot_deltas.append(delta)
     return np.mean(boot_deltas), np.percentile(boot_deltas, [2.5, 97.5])
 
@@ -62,6 +73,12 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
     data = []
     for cell_type in stim_trials_list[0]:
         if cell_type not in spont_trials_list[0]:
+            continue
+
+        # Check if cell_type exists in ALL trials of both lists
+        if not all(cell_type in trial for trial in stim_trials_list):
+            continue
+        if not all(cell_type in trial for trial in spont_trials_list):
             continue
 
         for band_name, band_range in bands.items():
@@ -96,6 +113,11 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
 
     df = pd.DataFrame(data)
 
+    # Filter out rows with infinite values in 'Relative Delta Power'
+    df = df[np.isfinite(df["Relative Delta Power"])]
+    df = df[np.isfinite(df["CI lower"])]
+    df = df[np.isfinite(df["CI upper"])]
+
     reject, pvals_corrected, _, _ = multipletests(df["p-value"].fillna(1.0), method='fdr_bh')
     df["p-adj"] = pvals_corrected
     df["Significant"] = reject
@@ -113,12 +135,19 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
         subdf = df[df["Band"] == band].reset_index(drop=True)
 
         for idx, row in subdf.iterrows():
+            # Calculate error bar values correctly
+            lower_err = row["Relative Delta Power"] - row["CI lower"]
+            upper_err = row["CI upper"] - row["Relative Delta Power"]
+
+            # Ensure error bars are positive and finite
+            lower_err = max(lower_err, 0) if np.isfinite(lower_err) else 0
+            upper_err = max(upper_err, 0) if np.isfinite(upper_err) else 0
+
             ax.barh(
                 y=idx,
                 width=row["Relative Delta Power"],
                 color=color, edgecolor='black',
-                xerr=[[row["Relative Delta Power"] - row["CI lower"]],
-                      [row["CI upper"] - row["Relative Delta Power"]]],
+                xerr=[[lower_err], [upper_err]],
                 capsize=3, alpha=0.7
             )
             if row["Significant"]:
@@ -187,6 +216,12 @@ def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_pa
     pvals = []
     for cell_type in stim_trials_list[0]:
         if cell_type not in spont_trials_list[0]:
+            continue
+
+        # Check if cell_type exists in ALL trials of both lists
+        if not all(cell_type in trial for trial in stim_trials_list):
+            continue
+        if not all(cell_type in trial for trial in spont_trials_list):
             continue
 
         for band_name, band_range in bands.items():
@@ -325,7 +360,7 @@ def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_pa
         plt.savefig(os.path.join(save_path, f'absolute_band_power.png'), dpi=300, bbox_inches='tight', transparent=False)
     plt.close()
 
-def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, title_suffix="Spontaneous", save_path=None):
+def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=True, title_suffix="Spontaneous", save_path=None):
     colors = {
         'Exc': 'r', 'PV': 'b', 'SST': 'g', 'VIP': 'darkviolet',
         'Htr3a': 'pink', 'ET': 'firebrick', 'IT': 'tomato', 'NP': 'lightcoral'
@@ -395,6 +430,22 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, title_suf
                 color=color, alpha=0.2
             )
 
+        if add_1f:
+            # Add 1/f fit line
+            freqs = psd_dict[cell_type]['frequencies']
+            # Use only frequencies greater than 1 Hz for fitting
+            mask = freqs > 1
+            log_freqs = np.log10(psd_dict[cell_type]['frequencies'][mask])
+            log_psd = np.log10(psd_dict[cell_type]['mean_psd'][mask])
+            # For a fixed slope, we only need to find the intercept
+            # Using the formula: log(psd) = fixed_slope * log(f) + intercept
+            # Solve for intercept by taking the mean of (log_psd - fixed_slope * log_freqs)
+            slope = -1  # Fixed slope for 1/f decay
+            intercept = np.mean(log_psd - slope * log_freqs)
+            # Generate the fitted curve
+            fitted_curve = 10**intercept * freqs**slope
+            ax.plot(freqs[mask], fitted_curve[mask], color='black', linestyle='--', linewidth=2, label='1/f Fit')
+
         is_first = (layer == 'L1')
         ax.axvspan(4, 8, alpha=0.1, color="blue", label="Theta (4-8 Hz)" if is_first else "_nolegend_")
         ax.axvspan(8, 12, alpha=0.1, color="green", label="Alpha (8-12 Hz)" if is_first else "_nolegend_")
@@ -440,17 +491,17 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, title_suf
 
 class PSDAnalyzer:
     def __init__(self, network, fs=1.0, analyze_core_only=True, population_average=True, normalize=True, normalize_by_n2=False, normalize_by_rate=True,
-                 save_path=None, data_dir='GLIF_network'):
-        
+                 save_path=None, data_dir='GLIF_network', radius=200):
+
         if analyze_core_only:
+            pop_names = other_v1_utils.pop_names(network, core_radius=radius, data_dir=data_dir)
             # Isolate the core neurons
-            pop_names = other_v1_utils.pop_names(network, core_radius=200, data_dir=data_dir)
-            self.core_mask = other_v1_utils.isolate_core_neurons(network, radius=200, data_dir=data_dir)
-            # spikes = spikes[:, :, :, core_mask]
+            self.core_mask = other_v1_utils.isolate_core_neurons(network, radius=radius, data_dir=data_dir)
+            self.n_neurons = np.sum(self.core_mask)
         else:
-            pop_names = other_v1_utils.pop_names(network, core_radius=400, data_dir=data_dir)
-            n_core_neurons = len(pop_names)
-            self.core_mask = np.ones(n_core_neurons, dtype=bool)
+            pop_names = other_v1_utils.pop_names(network, data_dir=data_dir)
+            self.n_neurons = len(pop_names)
+            self.core_mask = np.ones(self.n_neurons, dtype=bool)
 
         cell_types = [other_v1_utils.pop_name_to_cell_type(name) for name in pop_names]
         self.cell_types_map = {i: cell_types[i] for i in range(len(cell_types))}
@@ -572,9 +623,10 @@ class PSDAnalyzer:
         else:
             raise ValueError(f"Unexpected spike array shape: {spikes.shape}. Expected 3D or 4D array.")
 
-        # Mask core neurons
-        spikes = spikes[:, :, self.core_mask]
-
+        # Mask core neurons (which still may be the full set of neurons)
+        if spikes.shape[2] != self.n_neurons and spikes.shape[2] == len(self.core_mask):    
+            spikes = spikes[:, :, self.core_mask]
+        
         # Process evoked trials if time window is provided
         evoked_psds = None
         evoked_power_spectrum_dict = None

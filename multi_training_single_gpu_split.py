@@ -109,7 +109,11 @@ def main(_):
     # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.ReductionToOneDevice(reduce_to_device="cpu:0")) 
     # device = "/gpu:0" if tf.config.list_physical_devices("GPU") else "/cpu:0"
     # strategy = tf.distribute.OneDeviceStrategy(device=device)
-    strategy = tf.distribute.MirroredStrategy()
+    # Use NCCL for multi-GPU all-reduce to avoid CPU fallback
+    if len(physical_devices) > 1:
+        strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
+    else:
+        strategy = tf.distribute.MirroredStrategy()
 
     per_replica_batch_size = flags.batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
@@ -463,16 +467,17 @@ def main(_):
             # repeat the spontaneous firing rates with shape (seqlen, n_input) to match the batch size 
             spontaneous_prob = tf.tile(tf.expand_dims(spontaneous_prob, axis=0), [per_replica_batch_size, 1, 1])
 
-            return tf.cast(spontaneous_prob, dtype=dtype)
+            return spontaneous_prob
 
         # Load the spontaneous probabilities once
         spontaneous_prob = compute_spontaneous_lgn_firing_rates()
+        spontaneous_prob = tf.constant(spontaneous_prob, dtype=dtype)
 
-    def roll_out(_x, _y, _state_variables, spontaneous=False, trim=True):
 
-        # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
-        _initial_state = _state_variables
-        seq_len = tf.shape(_x)[1]
+    def roll_out(x, y, initial_state, spontaneous=False, trim=True):
+
+        # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), initial_state)
+        seq_len = tf.shape(x)[1]
 
         if flags.gradient_checkpointing:
             @tf.recompute_grad
@@ -482,9 +487,9 @@ def main(_):
                 _out = extractor_model((x, dummy_zeros, state_vars))
                 return _out
 
-            _out = roll_out_with_gradient_checkpointing(_x, _initial_state)
+            _out = roll_out_with_gradient_checkpointing(x, initial_state)
         else:
-            _out = extractor_model((_x, dummy_zeros, _initial_state))
+            _out = extractor_model((x, dummy_zeros, initial_state))
 
         _z, _v = _out[0]
 
@@ -494,25 +499,24 @@ def main(_):
 
         # # update state_variables with the new model state
         # new_state = tuple(_out[1:])
-        # tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
+        # tf.nest.map_structure(lambda a, b: a.assign(b), initial_state, new_state)
         # Calculate the losses and regularization terms
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
-        regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
-
+        
         if spontaneous:
             rate_loss = spont_rate_regularizer(_z, trim)
             osi_dsi_loss = tf.constant(0.0, dtype=tf.float32)
             sync_loss = spont_sync_loss(_z, trim)
-            # regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+            # sync_loss = tf.constant(0.0, dtype=tf.float32)
         else:
             # update the exponential moving average of the firing rates over drifting gratings presentation
             v1_evoked_rates = tf.reduce_mean(_z[:, delays[0]:seq_len-delays[1], :], (0, 1))
             # Update the EMAs
             v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
             rate_loss = evoked_rate_regularizer(_z, trim)
-            osi_dsi_loss = OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
+            osi_dsi_loss = OSI_DSI_Loss(_z, y, trim, normalizer=v1_ema)
             sync_loss = evoked_sync_loss(_z, trim)
-            # regularizers_loss = tf.constant(0.0, dtype=tf.float32)
+            # sync_loss = tf.constant(0.0, dtype=tf.float32)
 
         if annulus_mask is not None:
             if spontaneous:
@@ -520,51 +524,70 @@ def main(_):
                 annulus_osi_dsi_loss = tf.constant(0.0, dtype=tf.float32)
             else:
                 annulus_rate_loss = annulus_evoked_rate_regularizer(_z, trim)
-                annulus_osi_dsi_loss = annulus_OSI_DSI_Loss(_z, _y, trim, normalizer=v1_ema)
-            
+                annulus_osi_dsi_loss = annulus_OSI_DSI_Loss(_z, y, trim, normalizer=v1_ema)
+
             rate_loss += annulus_rate_loss
             osi_dsi_loss += annulus_osi_dsi_loss
             
         # osi_dsi_loss = tf.constant(0.0, dtype=dtype)
         # rate_loss = tf.constant(0.0, dtype=dtype)
-        # regularizers_loss = tf.constant(0.0, dtype=dtype)
         # voltage_loss = tf.constant(0.0, dtype=dtype) # voltage_regularizer(_v)
         # sync_loss = spont_sync_loss(_z, trim)  #spont_sync_loss(_z, trim) + evoked_sync_loss(_z, trim)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss, 
-                    regularizer_loss=regularizers_loss, sync_loss=sync_loss)
+                    sync_loss=sync_loss)
         # Rescale the losses based on the number of replicas
-        _loss = tf.nn.scale_regularization_loss(rate_loss + voltage_loss + regularizers_loss + osi_dsi_loss + sync_loss)
+        _loss = tf.nn.scale_regularization_loss(rate_loss + voltage_loss + osi_dsi_loss + sync_loss)
         # _loss = osi_dsi_loss + rate_loss + voltage_loss + regularizers_loss + sync_loss
 
         return _out, _loss, _aux
 
-    def train_step(_x, _y, state_variables, spontaneous, trim):
+    def train_step(x, y, state_variables, spontaneous, trim):
+        use_loss_scaling = (flags.dtype == 'float16' and hasattr(optimizer, 'get_scaled_loss'))
+
         ### Forward propagation of the model
-        with tf.GradientTape() as tape:
-            # _out, _p, _loss, _aux, _ = roll_out(_x, _y, _w, trim=trim, spontaneous=spontaneous)
-            _out, _loss, _aux = roll_out(tf.cast(_x, dtype), _y, state_variables, trim=trim, spontaneous=spontaneous)
-            # Scale the loss for float16         
-            if flags.dtype=='float16':
-                _scaled_loss = optimizer.get_scaled_loss(_loss)
-                loss = _scaled_loss
-            else:
-                loss = _loss
-                
-        grad = tape.gradient(loss, model.trainable_variables)
-        if flags.dtype=='float16':
-            grad = optimizer.get_unscaled_gradients(grad)
-        
+        with tf.GradientTape() as tape_main:
+            # _out, _p, _loss, _aux, _ = roll_out(x, y, _w, trim=trim, spontaneous=spontaneous)
+            _out, _loss_main, _aux = roll_out(tf.cast(x, dtype), y, state_variables, trim=trim, spontaneous=spontaneous)
+            # Mixed precision scaling
+            loss_main_for_grad = optimizer.get_scaled_loss(_loss_main) if use_loss_scaling else _loss_main
+
+        # REG graph (regularizer on weights only)
+        with tf.GradientTape() as tape_reg:
+            reg_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+            _aux['regularizer_loss'] = reg_loss
+            reg_loss = tf.nn.scale_regularization_loss(reg_loss)
+            # Mixed precision scaling
+            loss_reg_for_grad = optimizer.get_scaled_loss(reg_loss) if use_loss_scaling else reg_loss
+
+        total_loss = _loss_main + reg_loss
+
+        # Compute gradients
+        grads_main = tape_main.gradient(loss_main_for_grad, model.trainable_variables)
+        grads_reg = tape_reg.gradient(loss_reg_for_grad, model.trainable_variables)
+
+        if use_loss_scaling:
+            grads_main = optimizer.get_unscaled_gradients(grads_main)
+            grads_reg = optimizer.get_unscaled_gradients(grads_reg)           
+
+        # Combine gradients with None-safe replacement
+        combined_grads = []
+        for v, gm, gr in zip(model.trainable_variables, grads_main, grads_reg):
+            gm = gm if gm is not None else tf.zeros_like(v)
+            gr = gr if gr is not None else tf.zeros_like(v)
+            combined_grads.append(gm + gr)
         # The optimizer will aggregate the gradients across replicas automatically before applying them by default,
         # so the losses have to be properly scaled to account for the number of replicas
         # https://www.tensorflow.org/tutorials/distribute/custom_training
         # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/optimizer_v2/optimizer_v2.py#L741
-        optimizer.apply_gradients(zip(grad, model.trainable_variables)) #, experimental_aggregate_gradients=False)
-        # for g, v in zip(grad, model.trainable_variables):
-        #     tf.print(f"Gradient for {v.name}: ", g)
+        optimizer.apply_gradients(zip(combined_grads, model.trainable_variables))
+        # Optional debug print; very expensive, keep off in multi-GPU
+        if flags.debug_gradients:
+            for g, v in zip(combined_grads, model.trainable_variables):
+                tf.print(f"Gradient for {v.name}: ", tf.reduce_min(g), tf.reduce_max(g), tf.reduce_mean(g))
 
         ### Backpropagation of the model
-        train_loss.update_state(_loss * strategy.num_replicas_in_sync)
+        train_loss.update_state(total_loss * strategy.num_replicas_in_sync)
         rate = tf.reduce_mean(_out[0][0], axis=-1)
         train_firing_rate.update_state(rate)
         train_rate_loss.update_state(_aux['rate_loss'])
@@ -574,7 +597,7 @@ def main(_):
         # if not spontaneous:
         train_osi_dsi_loss.update_state(_aux['osi_dsi_loss'])
 
-        return _loss, _aux, _out#, grad
+        return total_loss, _aux, _out#, grad
 
     # @tf.function
     # def distributed_train_step(x, y, state_variables, spontaneous, trim):
@@ -620,11 +643,11 @@ def main(_):
         # _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
         return _loss, _aux, _out#, grad
 
-    def split_train_step(_x, _y, state_variables, _x_spontaneous, trim=True):
+    def split_train_step(x, y, state_variables, x_spontaneous, trim=True):
         # Run the training step for the spontaneous condition
-        _loss_spontaneous, _, _out_spontaneous = distributed_train_step(_x_spontaneous, _y, state_variables, True, trim)
+        _loss_spontaneous, _, _out_spontaneous = distributed_train_step(x_spontaneous, y, state_variables, True, trim)
         # Run the training step for the non-spontaneous condition
-        _loss_evoked, _, _out_evoked = distributed_train_step(_x, _y, state_variables, False, trim)
+        _loss_evoked, _, _out_evoked = distributed_train_step(x, y, state_variables, False, trim)
         # _loss = _loss_evoked + _loss_spontaneous
 
         v1_spikes_evoked = strategy.experimental_local_results(_out_evoked)[0][0][0]
@@ -665,9 +688,9 @@ def main(_):
 
     #     return spikes, step_values
 
-    def validation_step(_x, _y, state_variables, output_spikes=True):
-        # _out, _p, _loss, _aux, _bkg_noise = roll_out(_x, _y, _w)
-        _out, _loss, _aux = roll_out(_x, _y, state_variables)
+    def validation_step(x, y, state_variables, output_spikes=True):
+        # _out, _p, _loss, _aux, _bkg_noise = roll_out(x, y, _w)
+        _out, _loss, _aux = roll_out(x, y, state_variables)
         val_loss.update_state(_loss)
         rate = tf.reduce_mean(_out[0][0], axis=-1)
         val_firing_rate.update_state(rate)
@@ -770,7 +793,6 @@ def main(_):
         y_spontaneous = tf.constant(0, dtype=dtype, shape=(per_replica_batch_size,1)) 
         # tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, zero_state) 
         # Simulate the network with a gray screen   
-        # _out, _, _, _, _ = distributed_roll_out(x, y_spontaneous, w_spontaneous)
         _out, _loss, _aux = roll_out(x, y_spontaneous, zero_state, True)
         # _out = roll_out(x, y_spontaneous, zero_state, True)
         return tuple(_out[1:])
@@ -959,7 +981,6 @@ def main(_):
         v1_spikes = model_spikes[0]
         v1_spikes_spont = model_spikes[1]
 
-        # if the model train loss is minimal, save the model.
         stop = callbacks.on_epoch_end(x, v1_spikes, y, metric_values, verbose=True,
                                       x_spont=x_spontaneous, v1_spikes_spont=v1_spikes_spont)
 
@@ -1013,12 +1034,12 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('voltage_cost', 1., '')
     absl.app.flags.DEFINE_float('osi_cost', 1., '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
-    absl.app.flags.DEFINE_float('dampening_factor', .5, '')
-    absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
+    absl.app.flags.DEFINE_float('dampening_factor', 0.1, '')
+    absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.1, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
-    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'mean', 'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, earth_movers')
+    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'mean', 'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, emd')
     absl.app.flags.DEFINE_float('lr_scale', 1., '')
     # absl.app.flags.DEFINE_float('p_reappear', .5, '')
     absl.app.flags.DEFINE_float('max_time', -1, '')
@@ -1085,6 +1106,8 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", False, "")
+    # New: enable/disable very expensive gradient logging
+    absl.app.flags.DEFINE_boolean("debug_gradients", False, "")
 
     absl.app.run(main)
 

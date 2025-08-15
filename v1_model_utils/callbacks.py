@@ -176,6 +176,7 @@ class OsiDsiCallbacks:
     def __init__(self, network, lgn_input, bkg_input, flags, logdir, current_epoch=0,
                 pre_delay=50, post_delay=50, model_variables_init=None):
         self.n_neurons = flags.neurons
+        self.n_edges = network['n_edges'] + len(lgn_input['weights'])
         self.network = network
         self.lgn_input = lgn_input
         self.bkg_input = bkg_input
@@ -191,6 +192,7 @@ class OsiDsiCallbacks:
         # Tracking inference performance metrics
         self.inference_times = []
         self.inference_memory = []
+        self.inference_rates = []
         # Analyze changes in trainable variables.
         if self.model_variables_dict is not None:
             for var in self.model_variables_dict['Best'].keys():
@@ -202,7 +204,7 @@ class OsiDsiCallbacks:
     def save_inference_metrics(self):
         # Calculate training statistics and save to CSV
         # Get the simulation name (last part of logdir)
-        sim_name = os.path.basename(self.logdir)
+        sim_name = os.path.basename(os.path.dirname(os.path.dirname(self.logdir)))
         
         # Calculate statistics for step time
         mean_step_time = np.mean(self.inference_times)
@@ -218,9 +220,13 @@ class OsiDsiCallbacks:
             mean_gpu_memory = 0.0
             sem_gpu_memory = 0.0
 
+        # Calculate average firing rate
+        mean_rate = np.mean(self.inference_rates)
+        sem_rate = np.std(self.inference_rates) / np.sqrt(len(self.inference_rates))
+
         # Create a directory for saving statistics if it doesn't exist
-        stats_dir = os.path.dirname(os.path.dirname(self.logdir))  # Go up to Simulation_results
-        stats_file = os.path.join(stats_dir, 'training_statistics.csv')
+        stats_dir = os.path.dirname(self.logdir)  # Go up to Simulation_results
+        stats_file = os.path.join(stats_dir, 'performance_statistics.csv')
         
         # Check if file exists to determine if we need to write headers
         file_exists = os.path.isfile(stats_file)
@@ -229,11 +235,11 @@ class OsiDsiCallbacks:
         with open(stats_file, 'a') as f:
             if not file_exists:
                 # Write header if file doesn't exist
-                f.write('sim_name,n_neurons,batch_size,seq_len,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
+                f.write('sim_name,n_neurons,n_edges,batch_size,seq_len,mean_rate,sem_rate,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
             # Write data
-            f.write(f'{sim_name},{self.n_neurons},{self.flags.n_trials_per_angle},{self.sim_duration},'
-                     f'{mean_step_time},{sem_step_time},{mean_gpu_memory},{sem_gpu_memory},'
-                     'test')
+            f.write(f'{sim_name},{self.n_neurons},{self.n_edges},{self.flags.n_trials_per_angle},{self.sim_duration},'
+                     f'{mean_rate:.4f},{sem_rate:.4f},{mean_step_time:.4f},{sem_step_time:.4f},{mean_gpu_memory:.4f},{sem_gpu_memory:.4f},"test"\n')
+                     
         
         print(f"Inference metrics saved to {stats_file}")
 
@@ -248,9 +254,10 @@ class OsiDsiCallbacks:
         inference_time = end_time - start_time
         self.inference_times.append(inference_time)
 
-    def track_performance(self, start_time, gpu_id=0):
+    def track_performance(self, start_time, average_rate, gpu_id=0):
         self.track_inference_time(start_time)
         self.track_gpu_memory(gpu_id=gpu_id)
+        self.inference_rates.append(average_rate)
 
     def trainable_variable_change_heatmaps_and_distributions(self, variable):
         node_types_voltage_scale = (self.network['node_params']['V_th'] - self.network['node_params']['E_L']).astype(np.float32)
@@ -672,7 +679,7 @@ class OsiDsiCallbacks:
 
             # plt.tight_layout(rect=[0, 0, 0.9, 1])  # Adjust layout to make room for colorbar
             plt.tight_layout()
-            plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=True, bbox_inches='tight')
+            plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'), dpi=300, transparent=False, bbox_inches='tight')
             plt.close()
 
         ### Final Weight ###
@@ -732,25 +739,26 @@ class OsiDsiCallbacks:
         t_start_idx = int(t_start * 1000)
         t_end_idx = int(t_end * 1000)
         spikes = spikes[:, :, t_start_idx:t_end_idx, :]
-
-        if analyze_core_only:
-            # Isolate the core neurons
-            # pop_names = other_v1_utils.pop_names(self.network, core_radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
-            core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
-            n_core_neurons = np.sum(core_mask)
-            # spikes = spikes[:, :, :, core_mask]
-        else:
-            n_core_neurons = spikes.shape[-1]
-            core_mask = np.ones(n_core_neurons, dtype=bool)
-            # pop_names = other_v1_utils.pop_names(self.network, data_dir=self.flags.data_dir)
-
-        # Calculate the Fano Factor for the spikes
         pop_names = other_v1_utils.pop_names(self.network, data_dir=self.flags.data_dir)
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
+
+        if analyze_core_only:
+            core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.loss_core_radius, data_dir=self.flags.data_dir)
+            node_ei = node_ei[core_mask]
+            n_neurons = np.sum(core_mask)
+
+            if spikes.shape[3] != n_neurons and spikes.shape[3] == len(core_mask):
+                # If the spikes tensor is already core-only, we can use the provided mask
+                spikes = spikes[:, :, :, core_mask]
+            elif spikes.shape[3] != n_neurons and spikes.shape[3] != len(core_mask):
+                # If the spikes tensor is not core-only, we need to apply the core isolation
+                raise ValueError(f"Spikes tensor shape mismatch: expected {n_neurons} neurons, but got {spikes.shape[3]} neurons in the spikes tensor.")
+
         # Get the IDs for excitatory neurons
-        total_mask = np.logical_and(node_ei == 'e', core_mask)
-        n_e_neurons = np.sum(total_mask)
-        spikes = spikes[:, :, :, total_mask]
+        e_mask = node_ei == 'e'
+        n_e_neurons = np.sum(e_mask)
+        spikes = spikes[:, :, :, e_mask]
+
         node_id_e = np.arange(0, n_e_neurons)
         # Reshape the spikes tensor to have the shape (n_trials, seq_len, n_neurons)
         spikes = np.reshape(spikes, [spikes.shape[0]*spikes.shape[1], spikes.shape[2], spikes.shape[3]])
@@ -797,11 +805,13 @@ class OsiDsiCallbacks:
         # Calculate fano factors for both sessions
         evoked_t_start_seconds = self.pre_delay / 1000 + 0.2
         evoked_t_end_seconds = evoked_t_start_seconds + evoked_fano_duration / 1000
-        evoked_fanos, evoked_bin_sizes = self.fano_factor(spikes, t_start=evoked_t_start_seconds, t_end=evoked_t_end_seconds, n_samples=n_samples, analyze_core_only=analyze_core_only)
+        evoked_fanos, evoked_bin_sizes = self.fano_factor(spikes, t_start=evoked_t_start_seconds, t_end=evoked_t_end_seconds, 
+                                                          n_samples=n_samples, analyze_core_only=analyze_core_only)
         
         spont_t_start_seconds = 0.2
         spont_t_end_seconds = spont_t_start_seconds + spont_fano_duration / 1000
-        spontaneous_fanos, spont_bin_sizes = self.fano_factor(spikes, t_start=spont_t_start_seconds, t_end=spont_t_end_seconds, n_samples=n_samples, analyze_core_only=analyze_core_only)
+        spontaneous_fanos, spont_bin_sizes = self.fano_factor(spikes, t_start=spont_t_start_seconds, t_end=spont_t_end_seconds, 
+                                                             n_samples=n_samples, analyze_core_only=analyze_core_only)
     
         # Calculate mean, standard deviation, and SEM of the Fano factors
         evoked_fanos_mean = np.nanmean(evoked_fanos, axis=0)
@@ -979,18 +989,24 @@ class OsiDsiCallbacks:
                                     )
         graph(x, v1_spikes)
 
-    def plot_population_firing_rates_vs_tuning_angle(self, spikes, DG_angles, core_radius=400):
+    def plot_population_firing_rates_vs_tuning_angle(self, spikes, DG_angles, analyze_core_only=True):
         # Save the spikes
         spikes_dir = os.path.join(self.images_dir, 'Spikes_OSI_DSI')
         os.makedirs(spikes_dir, exist_ok=True)
 
-        # Isolate the core neurons
-        core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.plot_core_radius, data_dir=self.flags.data_dir)
-        spikes = spikes[:, :, :, core_mask]
+        tuning_angles = self.network['tuning_angle']
+
+        # Handle core masking based on input data
+        if analyze_core_only:
+            core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.flags.plot_core_radius, data_dir=self.flags.data_dir)
+            if spikes.shape[3] != np.sum(core_mask) and spikes.shape[3] == len(core_mask):
+                spikes = spikes[:, :, :, core_mask]
+            
+            tuning_angles = tuning_angles[core_mask]
+        
         spikes = np.sum(spikes, axis=0).astype(np.float32)/self.flags.n_trials_per_angle
         seq_len = spikes.shape[1]
 
-        tuning_angles = self.network['tuning_angle'][core_mask]
         for angle_id, angle in enumerate(DG_angles):
             firingRates = calculate_Firing_Rate(spikes[angle_id, :, :], stimulus_init=self.pre_delay, stimulus_end=seq_len-self.post_delay, temporal_axis=0)
             x = tuning_angles
@@ -1020,7 +1036,8 @@ class OsiDsiCallbacks:
     def osi_dsi_analysis(self, v1_spikes, DG_angles):
         ### Power spectral analysis
         psd_analyzer = PSDAnalyzer(self.network, fs=1.0, analyze_core_only=True, population_average=True, normalize=False, normalize_by_n2=True, 
-                                   normalize_by_rate=False, save_path=os.path.join(self.images_dir, 'Power_Spectrum'), data_dir=self.flags.data_dir)
+                                   normalize_by_rate=False, save_path=os.path.join(self.images_dir, 'Power_Spectrum'), data_dir=self.flags.data_dir, 
+                                   radius=self.flags.plot_core_radius)
         stimulus_duration = v1_spikes.shape[2]
         psd_analyzer(v1_spikes, t_spont_start=0, t_spont_end=self.pre_delay, t_evoked_start=self.pre_delay+0, t_evoked_end=stimulus_duration-self.post_delay)
 
@@ -1038,9 +1055,9 @@ class OsiDsiCallbacks:
         self.fanos_figure(v1_spikes, n_samples=1000, spont_fano_duration=300, evoked_fano_duration=300, analyze_core_only=True)
         self.fanos_figure(v1_spikes, n_samples=1000, spont_fano_duration=1800, evoked_fano_duration=1800, analyze_core_only=True)
         print('Fanos figure saved in ', time() - t_fano0, ' seconds!\n')
-        # Plot the tuning angle analysis
-        self.plot_population_firing_rates_vs_tuning_angle(v1_spikes, DG_angles)
-        # Estimate tuning parameters from the model neurons
+        # # Plot the tuning angle analysis
+        self.plot_population_firing_rates_vs_tuning_angle(v1_spikes, DG_angles, analyze_core_only=True)
+        # # Estimate tuning parameters from the model neurons
         metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir,
                                                 drifting_gratings_init=self.pre_delay, drifting_gratings_end=self.pre_delay+self.flags.evoked_duration,
                                                 spontaneous_init=0, spontaneous_end=self.pre_delay,
@@ -1060,6 +1077,7 @@ class Callbacks:
                 save_optimizer=True, spontaneous_training=False):
         
         self.n_neurons = flags.neurons
+        self.n_edges = network['n_edges'] + len(lgn_input['weights'])
         self.network = network
         self.lgn_input = lgn_input
         self.bkg_input = bkg_input
@@ -1078,6 +1096,7 @@ class Callbacks:
         self.step = 0
         self.step_running_time = []
         self.step_memory_usage = []  # Track GPU memory usage per step
+        self.step_rate = []  # Track step rate
         self.model_variables_dict = model_variables_init
         self.initial_metric_values = None
         self.summary_writer = tf.summary.create_file_writer(self.logdir)
@@ -1183,10 +1202,14 @@ class Callbacks:
         else:
             mean_gpu_memory = 0.0
             sem_gpu_memory = 0.0
+
+        # Calcualte the mean and sem rate
+        mean_rate = np.mean(self.step_rate)
+        sem_rate = np.std(self.step_rate) / np.sqrt(len(self.step_rate))
         
         # Create a directory for saving statistics if it doesn't exist
-        stats_dir = os.path.dirname(os.path.dirname(self.logdir))  # Go up to Simulation_results
-        stats_file = os.path.join(stats_dir, 'training_statistics.csv')
+        stats_dir = os.path.dirname(self.logdir)  # Go up to Simulation_results
+        stats_file = os.path.join(stats_dir, 'performance_statistics.csv')
         
         # Check if file exists to determine if we need to write headers
         file_exists = os.path.isfile(stats_file)
@@ -1195,11 +1218,11 @@ class Callbacks:
         with open(stats_file, 'a') as f:
             if not file_exists:
                 # Write header if file doesn't exist
-                f.write('sim_name,n_neurons,batch_size,seq_len,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
+                f.write('sim_name,n_neurons,n_edges,batch_size,seq_len,mean_rate,sem_rate,mean_step_time,sem_step_time,mean_gpu_memory,sem_gpu_memory,mode\n')
             
             # Write data row
-            f.write(f'{sim_name},{self.n_neurons},{self.flags.batch_size},{self.flags.seq_len},'
-                   f'{mean_step_time:.4f},{sem_step_time:.4f},{mean_gpu_memory:.4f},{sem_gpu_memory:.4f},"train"\n')
+            f.write(f'{sim_name},{self.n_neurons},{self.n_edges},{self.flags.batch_size},{2*self.flags.seq_len},'
+                   f'{mean_rate:.4f},{sem_rate:.4f},{mean_step_time:.4f},{sem_step_time:.4f},{mean_gpu_memory:.4f},{sem_gpu_memory:.4f},"train"\n')
             
         print(f"\nTraining statistics saved to {stats_file}")
 
@@ -1312,6 +1335,8 @@ class Callbacks:
 
     def on_step_end(self, train_values, y, verbose=True):
         self.step_running_time.append(time() - self.step_init_time)
+
+        self.step_rate.append(train_values[1])
         
         # Capture GPU memory usage using the get_gpu_memory function
         # Only retrieve nvidia-smi GPU memory usage

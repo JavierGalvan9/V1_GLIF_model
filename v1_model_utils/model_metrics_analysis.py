@@ -20,7 +20,9 @@ from scipy.stats import ks_2samp
 from scipy.stats import f as f_distribution
 from scipy.optimize import curve_fit
 from numba import njit
+from joblib import Parallel, delayed
 import shutil
+import math
 
 mpl.style.use('default')
 # rd = np.random.RandomState(seed=42)
@@ -91,14 +93,16 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
     if session == 'drifting_gratings':
         # Find the preferred DG angle for each neuron
         if n_trials >= 8:
-            TuningAngleEstimation = PreferredTuningAngleAnalysis(firing_rates=firingRates, orientations=DG_angles, 
-                                                                preferred_orientations=network['tuning_angle'])
-            new_tuning_angles, preferred_angle_rates = TuningAngleEstimation.calculate_tuning_angle()
+            # Calculate the preferred tuning angle using the PreferredTuningAngleAnalysis class with the possibility of bootstrapping to estimate the error
+            TuningAngleEstimation = PreferredTuningAngleAnalysis(firing_rates=firingRates, orientations=DG_angles)
+            new_tuning_angles, preferred_angle_rates, osi_p_values, angle_ci_low, angle_ci_high, ci_half_width = TuningAngleEstimation(n_bootstrap=None, confidence_level=0.95, n_jobs=-1)
             osi_dsi_df["max_mean_rate(Hz)"] = preferred_angle_rates
             osi_dsi_df["preferred_angle"] = new_tuning_angles
+            osi_dsi_df["p_value_OSI"] = osi_p_values
         else:
             osi_dsi_df["preferred_angle"] = DG_angles[np.argmax(all_direction_rates, axis=0)]
             osi_dsi_df["max_mean_rate(Hz)"] = np.max(all_direction_rates, axis=0)
+            osi_dsi_df["p_value_OSI"] = np.nan
 
         # Calculate the DSI and OSI
         if n_angles >= 8:
@@ -127,6 +131,11 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
         osi_dsi_df['firing_rate_sp'] = average_all_direction_rates
         if remove_zero_rate_neurons:
             osi_dsi_df = osi_dsi_df[osi_dsi_df["firing_rate_sp"] != 0]
+
+    elif session == 'natural':
+        osi_dsi_df['firing_rate_ns'] = average_all_direction_rates
+        if remove_zero_rate_neurons:
+            osi_dsi_df = osi_dsi_df[osi_dsi_df["firing_rate_ns"] != 0]
 
     if save_df:
         os.makedirs(directory, exist_ok=True)
@@ -217,23 +226,31 @@ def ang_dir(angle1, angle2):
     # and take the minimum - this avoids the list construction and axis parameter
     return np.minimum(diff, 360 - diff)
 
-@njit
+@njit(fastmath=True, cache=True)
 def double_gaussian(theta, C, Rp, Rn, theta_pref, sigma):
-    # According to Mazurek, M., Kager, M., & Van Hooser, S. D. (2014). 
-    # Robust quantification of orientation selectivity and direction selectivity. 
-    # Frontiers in neural circuits, 8, 92.
-    # the best method to estimate tuning parameters from orientation and direction
-    # responses if to fit them with a double gaussian function.
-    delta_theta = ang_dir(theta, theta_pref) # restrict the angle to be between 0 and 180
-    delta_theta2 = ang_dir(theta, theta_pref-180)
-    denominator = 2 * sigma**2
-    term1 = Rp * np.exp(-(delta_theta**2) / denominator)
-    term2 = Rn * np.exp(-(delta_theta2**2) / denominator)
-    return C + term1 + term2
+    """Highly optimized Numba-compiled double gaussian function."""
+    result = np.empty_like(theta, dtype=np.float64)
+    sigma_sq_2 = 2.0 * sigma * sigma  # Pre-compute denominator
+    theta_pref_180 = theta_pref - 180.0  # Pre-compute offset
+    
+    for i in range(theta.size):
+        # Calculate angular distances more efficiently
+        diff1 = abs(theta[i] - theta_pref)
+        delta_theta = min(diff1, 360.0 - diff1)
+        
+        diff2 = abs(theta[i] - theta_pref_180)  
+        delta_theta2 = min(diff2, 360.0 - diff2)
+        
+        # Compute exponentials
+        exp_term1 = Rp * np.exp(-(delta_theta * delta_theta) / sigma_sq_2)
+        exp_term2 = Rn * np.exp(-(delta_theta2 * delta_theta2) / sigma_sq_2)
+        result[i] = C + exp_term1 + exp_term2
+    
+    return result
 
 
 class PreferredTuningAngleAnalysis:
-    def __init__(self, firing_rates, orientations, preferred_orientations):
+    def __init__(self, firing_rates, orientations):
         """
         This class determines the preferred tuning angle of each neuron in the network according to their responses 
         to different orientations. The preferred tuning angle is determined by fitting the responses to a double
@@ -245,9 +262,6 @@ class PreferredTuningAngleAnalysis:
         self.firing_rates = firing_rates
         self.orientations = orientations
         self.alpha = self.orientations[1] - self.orientations[0]
-        self.preferred_orientations = preferred_orientations
-        self.new_tuning_angles = []
-        self.max_firing_rates = []
 
     def hotelling_t2_test(self, orientation_vectors):
         """
@@ -276,7 +290,7 @@ class PreferredTuningAngleAnalysis:
         # Compute the p-value from the F-distribution
         p_value = 1 - f_distribution.cdf(f_statistic, df1, df2)
         # Significant if p-value < 0.01
-        return p_value < 0.05
+        return p_value
 
     def get_bounds(self, M):
         # Define contraints on the fit parameters from the double gaussian
@@ -299,73 +313,235 @@ class PreferredTuningAngleAnalysis:
         
         return orientation_vectors
 
-    def calculate_tuning_angle(self):
-        for neuron_idx in range(self.firing_rates.shape[2]):
-            neuron_responses_all_trials = self.firing_rates[:, :, neuron_idx]
+    def fit_neuron_tuning(self, neuron_responses, orientations, alpha):
+        """
+        Helper function to fit double Gaussian to neuron responses.
+        
+        Returns:
+        --------
+        tuple: (best_fit_params, best_error) or (None, np.inf) if fitting fails
+        """
+        # Skip fitting if responses are all zeros
+        if np.sum(neuron_responses) == 0:
+            return None, np.inf
+        
+        # Prepare for curve fitting
+        M = np.max(neuron_responses)
+        M_orientation = orientations[np.argmax(neuron_responses)]
+        
+        # Initial guess for the fit parameters
+        initial_guess = [
+            0,  # C (baseline)
+            M,  # Rp (preferred response)
+            M,  # Rn (null response)
+            M_orientation,  # theta_pref (preferred orientation)
+            alpha / 2,  # sigma (tuning width)
+        ]
+        
+        # Explore several initial values for sigma and theta_pref
+        initial_sigmas = [alpha/2, alpha, 2*alpha]
+        # If the maximum is at 0, we also try 360
+        if M_orientation == 0:
+            initial_pref_orientations = [0, 360]
+        else:
+            initial_pref_orientations = [M_orientation]
+
+        bounds = self.get_bounds(M)
+        best_fit = None
+        best_error = np.inf   
+
+        # Try different initial conditions to find best fit
+        for pref_orientation in initial_pref_orientations:
+            initial_guess[3] = pref_orientation      
+            for sigma in initial_sigmas:
+                initial_guess[4] = sigma
+                try:
+                    popt, _ = curve_fit(double_gaussian, orientations, neuron_responses, 
+                                        p0=initial_guess, bounds=bounds, ftol=1e-4, maxfev=1000)
+                    fit_error = np.sum((double_gaussian(orientations, *popt) - neuron_responses) ** 2)
+                    if fit_error < best_error:
+                        best_error = fit_error
+                        best_fit = popt
+                except RuntimeError:
+                    continue
+
+        return best_fit, best_error
+
+    def bootstrap_single_iteration(self, neuron_responses_all_trials, orientations, alpha, n_trials):
+        """Single bootstrap iteration - can be parallelized"""
+        # Bootstrap resampling: sample trials with replacement
+        boot_trial_indices = np.random.choice(n_trials, size=n_trials, replace=True)
+        boot_responses_all_trials = neuron_responses_all_trials[boot_trial_indices, :]
+        boot_responses = np.mean(boot_responses_all_trials, axis=0)
+        
+        # Fit double Gaussian to bootstrap sample
+        boot_fit, _ = self.fit_neuron_tuning(boot_responses, orientations, alpha)
+
+        if boot_fit is not None:
+            # Extract preferred angle from bootstrap fit
+            boot_pref_angle = boot_fit[3] if boot_fit[2] < boot_fit[1] else boot_fit[3] - 180
+            boot_pref_angle = boot_pref_angle % 360
+            boot_max_response = max([boot_fit[1], boot_fit[2]])
+            return boot_pref_angle, boot_max_response
+        else:
+            return None, None
+
+    def circ_bootstrap_ci(self, angles_deg, ci=0.95):
+        """
+        angles_deg : 1‑D array‑like bootstrap sample (0–360°)
+        ci         : desired confidence level, e.g. 0.95
+        Returns    : (circular mean, (lower_CI, upper_CI))  in degrees
+        """
+        a = np.asarray(angles_deg) % 360                       # ensure 0–360
+        x, y = np.cos(np.deg2rad(a)), np.sin(np.deg2rad(a))    # unit vectors
+        mean = math.degrees(math.atan2(y.mean(), x.mean())) % 360
+
+        # unwrap sample so every point lies within ±180° of the mean
+        shifted = ((a - mean + 180) % 360) - 180
+        lo = np.percentile(shifted, (100 - ci*100) / 2)
+        hi = np.percentile(shifted, 100 - (100 - ci*100) / 2)
+
+        # calculate the half-width of the confidence interval
+        half_width = abs(hi - lo) / 2
+
+        high_95_ci = (mean + hi) % 360
+        low_95_ci = (mean + lo) % 360
+
+        return mean, low_95_ci, high_95_ci, half_width
+
+    def calculate_tuning_angles(self, firing_rates, orientations, n_bootstrap=None, confidence_level=0.95, n_jobs=-1):
+        """
+        Calculate tuning angles for neurons with bootstrap confidence intervals for neurons 
+        that pass the Hotelling T2 test.
+        
+        Parameters:
+        -----------
+        firing_rates : numpy.ndarray
+            Shape (n_trials, n_orientations, n_neurons)
+        orientations : numpy.ndarray
+            Array of orientation angles in degrees
+        n_bootstrap : int
+            Number of bootstrap samples (default: 1000)
+        confidence_level : float
+            Confidence level for error estimation (default: 0.95)
+        
+        Returns:
+        --------
+        tuple
+            (new_tuning_angles, max_firing_rates, osi_p_values, angle_errors_lower, angle_errors_upper, bootstrap_angles)
+        """
+        n_trials, n_orientations, n_neurons = firing_rates.shape
+        alpha = orientations[1] - orientations[0]
+        
+        # Initialize output arrays
+        osi_p_values = []
+        new_tuning_angles = []
+        max_firing_rates = []
+        angle_errors_lower = []
+        angle_errors_upper = []
+        half_widths = []
+        
+        for neuron_idx in range(n_neurons):
+            neuron_responses_all_trials = firing_rates[:, :, neuron_idx]
             neuron_responses = np.mean(neuron_responses_all_trials, axis=0)
-
+            # Skip neurons with no activity
             if np.sum(neuron_responses_all_trials) == 0:
-                self.new_tuning_angles.append(np.nan)
-                self.max_firing_rates.append(np.max(neuron_responses))
+                osi_p_values.append(np.nan)
+                new_tuning_angles.append(np.nan)
+                max_firing_rates.append(np.max(neuron_responses))
+                angle_errors_lower.append(np.nan)
+                angle_errors_upper.append(np.nan)
+                half_widths.append(np.nan)
                 continue
             
-            orientation_vectors = self.calculate_orientation_vectors(neuron_responses_all_trials, self.orientations)
-            if not self.hotelling_t2_test(orientation_vectors):
-                self.new_tuning_angles.append(np.nan)
-                self.max_firing_rates.append(np.max(neuron_responses))
+            # Test for significant orientation tuning
+            orientation_vectors = self.calculate_orientation_vectors(neuron_responses_all_trials, orientations)
+            p_value = self.hotelling_t2_test(orientation_vectors)
+            osi_p_values.append(p_value)
+            
+            if p_value >= 0.05:
+                new_tuning_angles.append(np.nan)
+                max_firing_rates.append(np.max(neuron_responses))
+                angle_errors_lower.append(np.nan)
+                angle_errors_upper.append(np.nan)
+                half_widths.append(np.nan)
                 continue
             
-            M = np.max(neuron_responses)
-            M_orientation = self.orientations[np.argmax(neuron_responses)]
-            # Initial guess for the fit parameters
-            initial_guess = [
-                0,  # C
-                M,  # Rp
-                M,  # Rn
-                M_orientation,  # theta_pref
-                self.alpha / 2,  # sigma
-            ]
-            # Explore several initial values for sigma (a1, a2) and theta_pref (b1, b2)
-            initial_sigmas = [self.alpha/2, self.alpha, 2*self.alpha]
-            # If the maximum is at 0, we also try 360
-            if M_orientation == 0:
-                initial_pref_orientations = [0, 360]
+            # **PARALLELIZED BOOTSTRAP SECTION**  
+            if n_bootstrap is not None:     
+                # Parallel bootstrap computation
+                bootstrap_results = Parallel(n_jobs=n_jobs, verbose=0)(
+                    delayed(self.bootstrap_single_iteration)(
+                        neuron_responses_all_trials, orientations, alpha, n_trials
+                    ) for _ in range(n_bootstrap)
+                )
+                # Extract results from parallel computation
+                bootstrap_pref_angles = []
+                bootstrap_max_responses = []
+                for boot_pref_angle, boot_max_response in bootstrap_results:
+                    if boot_pref_angle is not None:
+                        bootstrap_pref_angles.append(boot_pref_angle)
+                        bootstrap_max_responses.append(boot_max_response)
+            
+                # Calculate bootstrap statistics (same as before)
+                if len(bootstrap_pref_angles) > 0:
+                    final_max_response = np.mean(bootstrap_max_responses)
+                    bootstrap_pref_angles = np.array(bootstrap_pref_angles)
+                    est, low, high, half_width = self.circ_bootstrap_ci(bootstrap_pref_angles, ci=confidence_level)
+                    new_tuning_angles.append(est)
+                    max_firing_rates.append(final_max_response)
+                    angle_errors_lower.append(low)
+                    angle_errors_upper.append(high)
+                    half_widths.append(half_width)
+                else:
+                    new_tuning_angles.append(np.nan)
+                    max_firing_rates.append(np.nan)
+                    angle_errors_lower.append(np.nan)
+                    angle_errors_upper.append(np.nan)
+                    half_widths.append(np.nan)
             else:
-                initial_pref_orientations = [M_orientation]
+                # Fallback logic (same as before)
+                original_fit, _ = self.fit_neuron_tuning(neuron_responses, orientations, alpha)
+                if original_fit is not None:
+                    pref_angle = original_fit[3] if original_fit[2] < original_fit[1] else original_fit[3] - 180
+                    pref_angle = pref_angle % 360
+                    max_response = max([original_fit[1], original_fit[2]])
+                    new_tuning_angles.append(pref_angle)
+                    max_firing_rates.append(max_response)
+                else:
+                    new_tuning_angles.append(np.nan)
+                    max_firing_rates.append(np.max(neuron_responses))
+                angle_errors_lower.append(np.nan)
+                angle_errors_upper.append(np.nan)
+                half_widths.append(np.nan)
 
-            bounds = self.get_bounds(M)
-            best_fit = None
-            best_error = np.inf   
-
-            for pref_orientation in initial_pref_orientations:
-                initial_guess[3] = pref_orientation      
-                for sigma in initial_sigmas:
-                    initial_guess[4] = sigma
-                    try:
-                        popt, _ = curve_fit(double_gaussian, self.orientations, neuron_responses, 
-                                            p0=initial_guess, bounds=bounds, ftol=1e-4, maxfev=1000)
-                        fit_error = np.sum((double_gaussian(self.orientations, *popt) - neuron_responses) ** 2)
-                        if fit_error < best_error:
-                            best_error = fit_error
-                            best_fit = popt
-                    except RuntimeError as e:
-                        continue
-
-            if best_fit is not None:
-                pref_angle = best_fit[3] if best_fit[2] < best_fit[1] else best_fit[3] - 180
-                pref_angle = pref_angle % 360
-                self.new_tuning_angles.append(pref_angle)
-                # get the max response of the fit
-                max_response = double_gaussian(pref_angle, *best_fit)
-                self.max_firing_rates.append(max_response)
-            else:
-                self.new_tuning_angles.append(np.nan)
-                self.max_firing_rates.append(np.max(neuron_responses))
-
-        self.new_tuning_angles = np.array(self.new_tuning_angles) 
-        self.max_firing_rates = np.array(self.max_firing_rates)
-
-        return self.new_tuning_angles, self.max_firing_rates
+        return (np.array(new_tuning_angles), np.array(max_firing_rates), 
+                np.array(osi_p_values), np.array(angle_errors_lower), 
+                np.array(angle_errors_upper), np.array(half_widths))
+    
+    # define a call method to use the class directly
+    def __call__(self, n_bootstrap=None, confidence_level=0.95, n_jobs=-1):
+        """
+        Call method to calculate tuning angles and other metrics.
+        
+        Parameters:
+        -----------
+        firing_rates : numpy.ndarray
+            Shape (n_trials, n_orientations, n_neurons)
+        orientations : numpy.ndarray
+            Array of orientation angles in degrees
+        n_bootstrap : int
+            Number of bootstrap samples (default: 1000)
+        confidence_level : float
+            Confidence level for error estimation (default: 0.95)
+        
+        Returns:
+        --------
+        tuple
+            (new_tuning_angles, max_firing_rates, osi_p_values, angle_errors_lower, angle_errors_upper, half_widths)
+        """
+        return self.calculate_tuning_angles(self.firing_rates, self.orientations, n_bootstrap, confidence_level, n_jobs)
+    
 
 class ModelMetricsAnalysis:    
 
@@ -385,25 +561,26 @@ class ModelMetricsAnalysis:
             self.neuropixels_df = os.path.basename(neuropixels_df)  # Extract just the filename
         else:
             self.neuropixels_df = neuropixels_df
-            
-        # self.analyze_core_only = analyze_core_only
-        self.core_radius = core_radius
-        # Isolate the core neurons if necessary
-        if self.core_radius > 0:
-            self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
-            n_neurons_plot = np.sum(self.core_mask)
-        else:
-            self.core_mask = np.full(self.n_neurons, True)
-            # core_radius = None
-            n_neurons_plot = self.n_neurons
 
         # Calculate the firing rates
         if len(spikes.shape) == 3:
             spikes = np.expand_dims(spikes, axis=0)
         elif len(spikes.shape) == 2:
             spikes = np.expand_dims(np.expand_dims(spikes, axis=0), axis=0)
+            
+        # self.analyze_core_only = analyze_core_only
+        self.core_radius = core_radius
+        # Isolate the core neurons if necessary
+        if self.core_radius > 0:
+            self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
+            if spikes.shape[3] != np.sum(self.core_mask) and spikes.shape[3] == len(self.core_mask):
+                spikes = spikes[:, :, :, self.core_mask]           
+            n_neurons_plot = np.sum(self.core_mask)
+        else:
+            self.core_mask = np.full(self.n_neurons, True)
+            # core_radius = None
+            n_neurons_plot = self.n_neurons
 
-        spikes = spikes[:, :, :, self.core_mask]
         if self.drifting_gratings_init is not None:
             firingRates = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init, 
                                                 stimulus_end=self.drifting_gratings_end, temporal_axis=2)

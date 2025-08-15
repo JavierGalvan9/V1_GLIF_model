@@ -182,6 +182,7 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, dense
             de_dv_rid = tf.sparse.sparse_dense_matmul(dy_r, sparse_w_rec, adjoint_a=False)
             
             return de_dv_rid  # shape: [batch_size, n_pre_neurons]
+        
         # Use tf.map_fn to apply per_receptor_grad to each receptor index
         # tf.map_fn will return a tensor of shape [n_syn_basis, batch_size, n_pre_neurons]
         de_dv_all = tf.map_fn(per_receptor_grad, 
@@ -191,6 +192,11 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, dense
         # Sum over all receptors
         # de_dv_all: [n_syn_basis, batch_size, n_pre_neurons]
         de_dv = tf.reduce_sum(de_dv_all, axis=0)  # [batch_size, n_pre_neurons]
+        
+        # IMPORTANT: The gradient should reflect the same dampening that was applied 
+        # to rec_z_buf in the forward pass. However, we don't have access to the 
+        # dampening factor here, so the dampening must be applied BEFORE calling 
+        # this function, not within it.
         de_dv = tf.cast(de_dv, dtype=rec_z_buf.dtype)
 
         # # Extract the gradient for this receptor type (shape: [batch_size, n_post_neurons])
@@ -360,7 +366,6 @@ class V1Column(tf.keras.layers.Layer):
         self._hard_reset = hard_reset
         self._current_input = current_input
         self._n_neurons = int(network["n_nodes"])
-        self._bkg_firing_rate = bkg_firing_rate
         self._gauss_std = tf.constant(gauss_std, self.compute_dtype)
         # Determine the membrane time decay constant
         tau = _params["C_m"] / _params["g"]
@@ -535,6 +540,7 @@ class V1Column(tf.keras.layers.Layer):
         del input_indices, input_weights, input_syn_ids, input_delays
 
         ### BKG input connectivity ###
+        self.bkg_spike_prob = tf.constant(bkg_firing_rate * 0.001, dtype=self.compute_dtype)
         self.bkg_input_dense_shape = (self._n_neurons, bkg_input["n_inputs"],)
         bkg_input_indices = np.array(bkg_input['indices'])
         bkg_input_weights = np.array(bkg_input['weights'])
@@ -568,6 +574,8 @@ class V1Column(tf.keras.layers.Layer):
 
     def calculate_input_current_from_spikes(self, x_t):
         # x_t: Shape [batch_size, input_dim]
+        # Cast spikes to compute dtype for calculations
+        # x_t = tf.cast(x_t, self.compute_dtype)
         # batch_size = tf.shape(x_t)[0]
         n_post_neurons = self.lgn_input_dense_shape[0]
         # Find the indices of non-zero inputs
@@ -637,9 +645,12 @@ class V1Column(tf.keras.layers.Layer):
         return i_in_flat
     
     
-    def calculate_noise_current(self, rest_of_brain):
+    def calculate_noise_current(self):
         # x_t: Shape [batch_size, input_dim]
-        batch_size = tf.shape(rest_of_brain)[0]
+        rest_of_brain = tf.random.poisson(shape=(self.batch_size, self.bkg_input_dense_shape[1]), 
+                                    lam=self.bkg_spike_prob, dtype=self.compute_dtype) # this implementation is slower
+
+        # batch_size = tf.shape(rest_of_brain)[0]
         n_post_neurons = self.bkg_input_dense_shape[0]
         # Find the indices of non-zero inputs
         non_zero_indices = tf.where(rest_of_brain > 0)
@@ -655,7 +666,7 @@ class V1Column(tf.keras.layers.Layer):
         post_neuron_indices = new_indices[:, 0]        
         # Compute segment IDs
         segment_ids = batch_indices_per_connection * n_post_neurons + post_neuron_indices
-        num_segments = batch_size * n_post_neurons  
+        num_segments = self.batch_size * n_post_neurons  
         # Get the number of presynaptic spikes
         # n_pre_spikes = tf.cast(tf.gather(rest_of_brain[0, :], new_indices[:, 1]), dtype=self.variable_dtype)
         # Get the number of presynaptic spikes
@@ -748,10 +759,6 @@ class V1Column(tf.keras.layers.Layer):
         state_input = inputs[:, -self._n_neurons:] # dummy zeros
         # batch_size = tf.shape(lgn_input)[0]
 
-        bkg_input = tf.random.poisson(shape=(self.batch_size, self.bkg_input_dense_shape[1]), 
-                                    lam=self._bkg_firing_rate*.001, 
-                                    dtype=self.variable_dtype) # this implementation is slower
-
         if self._spike_gradient:
             state_input = tf.zeros((1,), dtype=self.compute_dtype)
         else:
@@ -760,10 +767,15 @@ class V1Column(tf.keras.layers.Layer):
         # Extract the network variables from the state
         z_buf, v, r, asc, psc_rise, psc = state
         # Get previous spikes
-        prev_z = z_buf[:, :self._n_neurons]  # Shape: [batch_size, n_neurons]
-        # Define the spikes buffer
-        dampened_z_buf = z_buf * self._recurrent_dampening  # dampened version of z_buf 
-        # Now we use tf.stop_gradient to prevent the term (z_buf - dampened_z_buf) to be trained
+        prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
+        
+        # Apply recurrent dampening: This creates the correct forward/backward behavior
+        # Forward pass: uses full spike buffer (z_buf_compute)  
+        # Backward pass: gradients are scaled by recurrent_dampening factor
+        # The key insight is that we need to pass the dampened version to the 
+        # synaptic current calculation so that gradients flow back correctly
+        dampened_z_buf = z_buf * self._recurrent_dampening
+        # Use straight-through estimator: forward pass gets full value, backward gets dampened gradients
         rec_z_buf = (tf.stop_gradient(z_buf - dampened_z_buf) + dampened_z_buf)  
         # Calculate the recurrent postsynaptic currents
         i_rec = self.calculate_i_rec_with_custom_grad(rec_z_buf)
@@ -773,7 +785,7 @@ class V1Column(tf.keras.layers.Layer):
         else:
             external_current = self.calculate_input_current_from_spikes(lgn_input)
 
-        i_noise = self.calculate_noise_current(bkg_input)
+        i_noise = self.calculate_noise_current()
         # Add all the current sources
         rec_inputs = i_rec + external_current + i_noise
         # Reshape i_rec_flat back to [batch_size, num_neurons]
