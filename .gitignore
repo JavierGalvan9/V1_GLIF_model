@@ -40,4 +40,9 @@ lgn_model/data/temporal_kernels_120x80.pkl
 synaptic_data/basis_function_weights_5.csv
 synaptic_data/tau_basis_5.npy
 .gitignore
+Paper_figures
+cuda_ops
+Neuropixels_data/PSP data
 synaptic_data/double_alpha_params_full.csv
+v1_model_utils/test_synaptic_currents_cuda.py
+v1_model_utils/synaptic_currents_triton.py
