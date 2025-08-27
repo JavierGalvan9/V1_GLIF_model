@@ -371,10 +371,10 @@ def main(_):
         ### ANNULUS REGULARIZERS ###
         if annulus_mask is not None:
             annulus_spont_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=True, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
-                                                                                data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32)
+                                                                                data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32, neuropixels_df=flags.neuropixels_df)
             # model.add_loss(lambda: annulus_spont_rate_regularizer(rsnn_layer.output[0][0]))
             annulus_evoked_rate_regularizer = losses.SpikeRateDistributionTarget(network, spontaneous_fr=False, rate_cost=0.1*flags.rate_cost, pre_delay=delays[0], post_delay=delays[1],
-                                                                                data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32)
+                                                                                data_dir=flags.data_dir, core_mask=annulus_mask, seed=flags.seed, dtype=tf.float32, neuropixels_df=flags.neuropixels_df)
             # model.add_loss(lambda: annulus_evoked_rate_regularizer(rsnn_layer.output[0][0]))
 
             # Add OSI/DSI regularizer for the annulus
@@ -383,7 +383,8 @@ def main(_):
                                                                     dtype=tf.float32, core_mask=annulus_mask,
                                                                     method=flags.osi_loss_method,
                                                                     subtraction_ratio=flags.osi_loss_subtraction_ratio,
-                                                                    layer_info=layer_info)
+                                                                    layer_info=layer_info,
+                                                                    neuropixels_df=flags.neuropixels_df)
             # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
             # model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
