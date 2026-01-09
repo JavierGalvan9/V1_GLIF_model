@@ -146,6 +146,18 @@ class LGN(object):
             lgn_node_type_path = os.path.join(network_dir, 'lgn_node_types.csv')
             d = create_lgn_units_info(filename=lgn_data_path, csv_path=lgn_node_type_path, h5_path=lgn_node_path)
                 
+        # CHANGE 1: Apply n_input selection immediately after loading data
+        if n_input is not None and n_input < len(d):
+            # Select first n_input neurons
+            d = d.iloc[:n_input].copy()
+            print(f"Selected first {n_input} LGN units out of {len(d)} available")
+
+        # CHANGE 2: Update cache file names to include n_input
+        n_units = len(d)  # This will be n_input if specified, otherwise full dataset
+        s_path = os.path.join(lgn_data_dir, f'spontaneous_firing_rates_{col_size}x{row_size}_n{n_units}.pkl')
+        t_path = os.path.join(lgn_data_dir, f'temporal_kernels_{col_size}x{row_size}_n{n_units}.pkl')
+        spatial_path = os.path.join(lgn_data_dir, f'spatial_kernels_{col_size}x{row_size}_n{n_units}.pkl')
+
         # Load basic information about the LGN units
         self.dtype = dtype
         model_id = d['model_id'].to_numpy()
@@ -154,7 +166,7 @@ class LGN(object):
         is_composite = np.array([('ON' in mid and 'OFF' in mid) for mid in model_id]).astype(np.float32)
 
         # Load the spontaneous firing rates
-        s_path = os.path.join(lgn_data_dir, f'spontaneous_firing_rates_{col_size}x{row_size}.pkl')
+        # s_path = os.path.join(lgn_data_dir, f'spontaneous_firing_rates_{col_size}x{row_size}.pkl')
         if not os.path.exists(s_path):
             cell_type = [a[:a.find('_')] for a in model_id]
             tf_str = [a[a.find('_') + 1:] for a in model_id]
@@ -176,7 +188,7 @@ class LGN(object):
                 spontaneous_firing_rates = pkl.load(f)
 
         # Load the temporal kernels
-        t_path = os.path.join(lgn_data_dir, f'temporal_kernels_{col_size}x{row_size}.pkl')
+        # t_path = os.path.join(lgn_data_dir, f'temporal_kernels_{col_size}x{row_size}.pkl')
         if not os.path.exists(t_path):
             nkt = 600
             kernel_length = 700
@@ -271,7 +283,13 @@ class LGN(object):
                                                 np.inf)
             # Find the minimum truncation point while ignoring zero filters (set to np.inf to avoid affecting the min calculation)
             dom_truncation = int(np.min(dom_truncation_points))
-            non_dom_truncation = int(np.min(non_dom_truncation_points))
+            # non_dom_truncation = int(np.min(non_dom_truncation_points))
+            # Handle the case where all non-dominant kernels are zero (no composite cells)
+            if np.all(np.isinf(non_dom_truncation_points)):
+                # No composite cells, use only dominant truncation
+                non_dom_truncation = dom_truncation
+            else:
+                non_dom_truncation = int(np.min(non_dom_truncation_points))
             # Apply the truncation to both dominant and non-dominant temporal kernels
             truncation = int(np.min([dom_truncation, non_dom_truncation]))
             # Truncate the kernels from the truncation point onwards
@@ -306,8 +324,9 @@ class LGN(object):
             spontaneous_firing_rates = loaded['spontaneous_firing_rates']
 
         # Load the spatial kernels
-        spatial_path = os.path.join(lgn_data_dir, f'spatial_kernels_{col_size}x{row_size}.pkl')  
+        # spatial_path = os.path.join(lgn_data_dir, f'spatial_kernels_{col_size}x{row_size}.pkl')  
         if not os.path.exists(spatial_path):
+            print('Computing spatial kernels...')
             # Scale x and y within the range
             col_max = float(col_size - 1)
             row_max = float(row_size - 1)
@@ -331,8 +350,9 @@ class LGN(object):
             y_range = np.arange(-50, 51)
             # Load the spatial sizes of the LGN units
             spatial_sizes = d['spatial_size'].to_numpy(dtype=np.float32)
-            if n_input is not None:
-                spatial_sizes = spatial_sizes[:n_input]
+            # Remove this line since we already filtered d:
+            # if n_input is not None:
+            #     spatial_sizes = spatial_sizes[:n_input]
 
             gaussian_filters = []
             # actual_spatial_range = []
@@ -394,39 +414,39 @@ class LGN(object):
             # actual_spatial_range = loaded['actual_spatial_range']
 
         # Preprocess data tensors outside the loop if they don't change
-        if n_input is None:
-            self.x = tf.constant(x, dtype=dtype)
-            self.y = tf.constant(y, dtype=dtype)
-            self.non_dominant_x = tf.constant(non_dominant_x, dtype=dtype)
-            self.non_dominant_y = tf.constant(non_dominant_y, dtype=dtype)
-            self.amplitude = tf.constant(amplitude, dtype=dtype)
-            self.non_dom_amplitude = tf.constant(non_dom_amplitude, dtype=dtype)
-            self.is_composite = tf.constant(is_composite, dtype=dtype)
-            self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates, dtype=dtype)
+        # if n_input is None:
+        self.x = tf.constant(x, dtype=dtype)
+        self.y = tf.constant(y, dtype=dtype)
+        self.non_dominant_x = tf.constant(non_dominant_x, dtype=dtype)
+        self.non_dominant_y = tf.constant(non_dominant_y, dtype=dtype)
+        self.amplitude = tf.constant(amplitude, dtype=dtype)
+        self.non_dom_amplitude = tf.constant(non_dom_amplitude, dtype=dtype)
+        self.is_composite = tf.constant(is_composite, dtype=dtype)
+        self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates, dtype=dtype)
 
-            self.dom_temporal_kernels = tf.cast(dom_temporal_kernels, dtype=dtype)
-            self.non_dom_temporal_kernels = tf.cast(non_dom_temporal_kernels, dtype=dtype)
-            # self.gaussian_filters = gaussian_filters
-            self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
-            self.spatial_range_indices = spatial_range_indices
-            self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
-            # self.actual_spatial_range = actual_spatial_range
-        else:
-            self.x = tf.constant(x[:n_input], dtype=dtype)
-            self.y = tf.constant(y[:n_input], dtype=dtype)
-            self.non_dominant_x = tf.constant(non_dominant_x[:n_input], dtype=dtype)
-            self.non_dominant_y = tf.constant(non_dominant_y[:n_input], dtype=dtype)
-            self.amplitude = tf.constant(amplitude[:n_input], dtype=dtype)
-            self.non_dom_amplitude = tf.constant(non_dom_amplitude[:n_input], dtype=dtype)
-            self.is_composite = tf.constant(is_composite[:n_input], dtype=dtype)
-            self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates[:n_input], dtype=dtype)
+        self.dom_temporal_kernels = tf.cast(dom_temporal_kernels, dtype=dtype)
+        self.non_dom_temporal_kernels = tf.cast(non_dom_temporal_kernels, dtype=dtype)
+        # self.gaussian_filters = gaussian_filters
+        self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
+        self.spatial_range_indices = spatial_range_indices
+        self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
+        # # self.actual_spatial_range = actual_spatial_range
+        # else:
+        #     self.x = tf.constant(x[:n_input], dtype=dtype)
+        #     self.y = tf.constant(y[:n_input], dtype=dtype)
+        #     self.non_dominant_x = tf.constant(non_dominant_x[:n_input], dtype=dtype)
+        #     self.non_dominant_y = tf.constant(non_dominant_y[:n_input], dtype=dtype)
+        #     self.amplitude = tf.constant(amplitude[:n_input], dtype=dtype)
+        #     self.non_dom_amplitude = tf.constant(non_dom_amplitude[:n_input], dtype=dtype)
+        #     self.is_composite = tf.constant(is_composite[:n_input], dtype=dtype)
+        #     self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates[:n_input], dtype=dtype)
 
-            self.dom_temporal_kernels = tf.cast(dom_temporal_kernels[:, :n_input], dtype=dtype)
-            self.non_dom_temporal_kernels = tf.cast(non_dom_temporal_kernels[:, :n_input], dtype=dtype)
-            self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
-            self.spatial_range_indices = spatial_range_indices
-            self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
-            # self.actual_spatial_range = actual_spatial_range
+        #     self.dom_temporal_kernels = tf.cast(dom_temporal_kernels[:, :n_input], dtype=dtype)
+        #     self.non_dom_temporal_kernels = tf.cast(non_dom_temporal_kernels[:, :n_input], dtype=dtype)
+        #     self.gaussian_filters = [tf.cast(gf, dtype=dtype) for gf in gaussian_filters]
+        #     self.spatial_range_indices = spatial_range_indices
+        #     self.sorted_neuron_ids_indices = sorted_neuron_ids_indices
+        #     # self.actual_spatial_range = actual_spatial_range
 
     @tf.function#(jit_compile=True) # for this model it seems to be better without the jit_compile (dont know why)
     def spatial_response(self, movie, bmtk_compat=True):
