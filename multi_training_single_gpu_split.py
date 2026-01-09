@@ -111,7 +111,9 @@ def main(_):
     # strategy = tf.distribute.OneDeviceStrategy(device=device)
     # Use NCCL for multi-GPU all-reduce to avoid CPU fallback
     if len(physical_devices) > 1:
-        strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
+        # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
+        # Use HierarchicalCopyAllReduce to avoid NCCL issues with Blackwell GPUs
+        strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.HierarchicalCopyAllReduce())
     else:
         strategy = tf.distribute.MirroredStrategy()
 
@@ -320,7 +322,7 @@ def main(_):
 
         ### VOLTAGE REGULARIZERS ###
         # voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32, core_mask=core_mask)
-        voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32)
+        voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32, penalty_mode='range')
         # model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
 
         ### SYNCHRONIZATION REGULARIZERS ###
@@ -503,21 +505,22 @@ def main(_):
         # tf.nest.map_structure(lambda a, b: a.assign(b), initial_state, new_state)
         # Calculate the losses and regularization terms
         voltage_loss = voltage_regularizer(_v)  # trim is irrelevant for this
+        regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         
         if spontaneous:
             rate_loss = spont_rate_regularizer(_z, trim)
             osi_dsi_loss = tf.constant(0.0, dtype=tf.float32)
             sync_loss = spont_sync_loss(_z, trim)
-            # sync_loss = tf.constant(0.0, dtype=tf.float32)
+            # regularizers_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         else:
+            rate_loss = evoked_rate_regularizer(_z, trim)
             # update the exponential moving average of the firing rates over drifting gratings presentation
             v1_evoked_rates = tf.reduce_mean(_z[:, delays[0]:seq_len-delays[1], :], (0, 1))
             # Update the EMAs
             v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
-            rate_loss = evoked_rate_regularizer(_z, trim)
             osi_dsi_loss = OSI_DSI_Loss(_z, y, trim, normalizer=v1_ema)
             sync_loss = evoked_sync_loss(_z, trim)
-            # sync_loss = tf.constant(0.0, dtype=tf.float32)
+            # regularizers_loss = tf.constant(0.0, dtype=tf.float32)
 
         if annulus_mask is not None:
             if spontaneous:
@@ -530,15 +533,16 @@ def main(_):
             rate_loss += annulus_rate_loss
             osi_dsi_loss += annulus_osi_dsi_loss
             
-        # osi_dsi_loss = tf.constant(0.0, dtype=dtype)
+        # sync_loss = tf.constant(0.0, dtype=tf.float32)
         # rate_loss = tf.constant(0.0, dtype=dtype)
         # voltage_loss = tf.constant(0.0, dtype=dtype) # voltage_regularizer(_v)
         # sync_loss = spont_sync_loss(_z, trim)  #spont_sync_loss(_z, trim) + evoked_sync_loss(_z, trim)
 
         _aux = dict(rate_loss=rate_loss, voltage_loss=voltage_loss, osi_dsi_loss=osi_dsi_loss, 
-                    sync_loss=sync_loss)
+                    regularizer_loss=regularizers_loss, sync_loss=sync_loss)
         # Rescale the losses based on the number of replicas
-        _loss = tf.nn.scale_regularization_loss(rate_loss + voltage_loss + osi_dsi_loss + sync_loss)
+        # _loss = tf.nn.scale_regularization_loss(rate_loss + voltage_loss + osi_dsi_loss + sync_loss)
+        _loss = tf.nn.scale_regularization_loss(rate_loss + voltage_loss + regularizers_loss + osi_dsi_loss + sync_loss)
         # _loss = osi_dsi_loss + rate_loss + voltage_loss + regularizers_loss + sync_loss
 
         return _out, _loss, _aux
@@ -547,45 +551,63 @@ def main(_):
         use_loss_scaling = (flags.dtype == 'float16' and hasattr(optimizer, 'get_scaled_loss'))
 
         ### Forward propagation of the model
-        with tf.GradientTape() as tape_main:
-            # _out, _p, _loss, _aux, _ = roll_out(x, y, _w, trim=trim, spontaneous=spontaneous)
-            _out, _loss_main, _aux = roll_out(tf.cast(x, dtype), y, state_variables, trim=trim, spontaneous=spontaneous)
-            # Mixed precision scaling
-            loss_main_for_grad = optimizer.get_scaled_loss(_loss_main) if use_loss_scaling else _loss_main
-
-        # REG graph (regularizer on weights only)
-        with tf.GradientTape() as tape_reg:
-            reg_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
-            _aux['regularizer_loss'] = reg_loss
-            reg_loss = tf.nn.scale_regularization_loss(reg_loss)
-            # Mixed precision scaling
-            loss_reg_for_grad = optimizer.get_scaled_loss(reg_loss) if use_loss_scaling else reg_loss
-
-        total_loss = _loss_main + reg_loss
-
-        # Compute gradients
-        grads_main = tape_main.gradient(loss_main_for_grad, model.trainable_variables)
-        grads_reg = tape_reg.gradient(loss_reg_for_grad, model.trainable_variables)
-
+        with tf.GradientTape() as tape:
+            # _out, _p, _loss, _aux, _ = roll_out(_x, _y, _w, trim=trim, spontaneous=spontaneous)
+            _out, _loss, _aux = roll_out(tf.cast(x, dtype), y, state_variables, trim=trim, spontaneous=spontaneous)
+            # Scale the loss for float16         
+            if flags.dtype=='float16':
+                _scaled_loss = optimizer.get_scaled_loss(_loss)
+                loss = _scaled_loss
+            else:
+                loss = _loss
+                
+        total_loss = _loss
+        grad = tape.gradient(loss, model.trainable_variables)
         if use_loss_scaling:
-            grads_main = optimizer.get_unscaled_gradients(grads_main)
-            grads_reg = optimizer.get_unscaled_gradients(grads_reg)           
+            grad = optimizer.get_unscaled_gradients(grad)
 
-        # Combine gradients with None-safe replacement
-        combined_grads = []
-        for v, gm, gr in zip(model.trainable_variables, grads_main, grads_reg):
-            gm = gm if gm is not None else tf.zeros_like(v)
-            gr = gr if gr is not None else tf.zeros_like(v)
-            combined_grads.append(gm + gr)
-        # The optimizer will aggregate the gradients across replicas automatically before applying them by default,
-        # so the losses have to be properly scaled to account for the number of replicas
-        # https://www.tensorflow.org/tutorials/distribute/custom_training
-        # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/optimizer_v2/optimizer_v2.py#L741
-        optimizer.apply_gradients(zip(combined_grads, model.trainable_variables))
-        # Optional debug print; very expensive, keep off in multi-GPU
-        if flags.debug_gradients:
-            for g, v in zip(combined_grads, model.trainable_variables):
-                tf.print(f"Gradient for {v.name}: ", tf.reduce_min(g), tf.reduce_max(g), tf.reduce_mean(g))
+        # with tf.GradientTape() as tape_main:
+        #     # _out, _p, _loss, _aux, _ = roll_out(x, y, _w, trim=trim, spontaneous=spontaneous)
+        #     _out, _loss_main, _aux = roll_out(tf.cast(x, dtype), y, state_variables, trim=trim, spontaneous=spontaneous)
+        #     # Mixed precision scaling
+        #     loss_main_for_grad = optimizer.get_scaled_loss(_loss_main) if use_loss_scaling else _loss_main
+
+        # # REG graph (regularizer on weights only)
+        # with tf.GradientTape() as tape_reg:
+        #     reg_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
+        #     _aux['regularizer_loss'] = reg_loss
+        #     reg_loss = tf.nn.scale_regularization_loss(reg_loss)
+        #     # Mixed precision scaling
+        #     loss_reg_for_grad = optimizer.get_scaled_loss(reg_loss) if use_loss_scaling else reg_loss
+
+        # total_loss = _loss_main + reg_loss
+
+        # # Compute gradients
+        # grads_main = tape_main.gradient(loss_main_for_grad, model.trainable_variables)
+        # grads_reg = tape_reg.gradient(loss_reg_for_grad, model.trainable_variables)
+
+        # if use_loss_scaling:
+        #     grads_main = optimizer.get_unscaled_gradients(grads_main)
+        #     grads_reg = optimizer.get_unscaled_gradients(grads_reg)           
+
+        # # Combine gradients with None-safe replacement
+        # combined_grads = []
+        # for v, gm, gr in zip(model.trainable_variables, grads_main, grads_reg):
+        #     gm = gm if gm is not None else tf.zeros_like(v)
+        #     gr = gr if gr is not None else tf.zeros_like(v)
+        #     combined_grads.append(gm + gr)
+        # # The optimizer will aggregate the gradients across replicas automatically before applying them by default,
+        # # so the losses have to be properly scaled to account for the number of replicas
+        # # https://www.tensorflow.org/tutorials/distribute/custom_training
+        # # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/optimizer_v2/optimizer_v2.py#L741
+        # optimizer.apply_gradients(zip(combined_grads, model.trainable_variables))
+        # # Optional debug print; very expensive, keep off in multi-GPU
+        # if flags.debug_gradients:
+        #     for g, v in zip(combined_grads, model.trainable_variables):
+        
+        optimizer.apply_gradients(zip(grad, model.trainable_variables)) #, experimental_aggregate_gradients=False)
+        # for g, v in zip(grad, model.trainable_variables):
+        #     tf.print(f"Gradient for {v.name}: ", g)
 
         ### Backpropagation of the model
         train_loss.update_state(total_loss * strategy.num_replicas_in_sync)
