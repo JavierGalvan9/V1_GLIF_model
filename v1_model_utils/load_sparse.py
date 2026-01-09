@@ -783,7 +783,7 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
                 flag_str += f'_{name}_{value}'
         # flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_random_weights_{flags.random_weights}_uniform_weights_{flags.uniform_weights}"
     
-    file_dir = os.path.split(__file__)[0]
+    # file_dir = os.path.split(__file__)[0]
     cache_dir = os.path.join(flags.data_dir, "tf_data")
     cache_path = os.path.join(cache_dir, f"V1_network_{flag_str}.pkl")
     print(f"> Looking for cached V1 model in {cache_path}")

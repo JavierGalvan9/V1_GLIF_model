@@ -70,7 +70,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,
                                      current_input=False, regular=False, n_input=17400, dt=1,
-                                     data_dir=None,
+                                     data_dir='GLIF_network_nll',
                                      bmtk_compat=True, return_firing_rates=False, rotation='cw', billeh_phase=False,
                                      dtype=tf.float32):
     """ make a drifting gratings stimulus for FR and OSI tuning."""

@@ -649,9 +649,23 @@ class MetricsBoxplot:
 
     def get_osi_dsi_df(self, metric_file, data_source_name="", feature='', data_dir=""):
         # Load the data csv file and remove rows with empty cell type
-        # if metric_file is a dataframe, then do not load it
+        # Rename the cell types
         if data_dir == "Neuropixels_data":
-            features_to_load = ['ecephys_unit_id', 'cell_type', 'firing_rate_sp', 'Ave_Rate(Hz)', "max_mean_rate(Hz)", "OSI", "DSI"]
+            # First, read the file to check which spontaneous rate column exists
+            temp_df = pd.read_csv(f"{data_dir}/{metric_file}", index_col=0, sep=" ", nrows=0)
+            # Determine which spontaneous rate column name to use
+            if 'firing_rate_sp' in temp_df.columns:
+                spont_rate_col = 'firing_rate_sp'
+            elif 'Spont_Rate(Hz)' in temp_df.columns:
+                spont_rate_col = 'Spont_Rate(Hz)'
+            else:
+                spont_rate_col = None
+            # Build features list based on available columns
+            # features_to_load = ['ecephys_unit_id', 'cell_type', 'firing_rate_ns', 'Ave_Rate(Hz)', "max_mean_rate(Hz)", "OSI", "DSI"]
+            features_to_load = ['ecephys_unit_id', 'cell_type', 'Ave_Rate(Hz)', "max_mean_rate(Hz)", "OSI", "DSI"]
+            if spont_rate_col:
+                features_to_load.append(spont_rate_col)
+            # Read the data file with the required features
             df = pd.read_csv(f"{data_dir}/{metric_file}", index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
             df = df[df['cell_type'].notna()]
             df["cell_type"] = df["cell_type"].apply(self.neuropixels_cell_type_to_cell_type)

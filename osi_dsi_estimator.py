@@ -386,17 +386,14 @@ def main(_):
     spikes = np.zeros((flags.n_trials_per_angle, len(DG_angles), sim_duration, n_tracked_neurons), dtype=np.uint8)
 
     for angle_id, angle in enumerate(DG_angles):
-        print(f'Running angle {angle}...')
-        # load LGN firign rates for the given angle and calculate spiking probability
-        t0 = time()
+        print(f'Running angle {angle}...')        
         # load LGN firing rates for the given angle and calculate spiking probability
         lgn_prob = lgn_firing_probabilities_dict[angle]
         lgn_prob = tf.tile(tf.expand_dims(lgn_prob, axis=0), [per_replica_batch_size, 1, 1])
 
-        for iter_id in range(n_iterations):
-            # Start tracking time for this angle
-            iter_start_time = time()    
+        t0 = time()
 
+        for iter_id in range(n_iterations):
             start_idx = iter_id * per_replica_batch_size
             end_idx = min((iter_id + 1) * per_replica_batch_size, flags.n_trials_per_angle)
             iteration_length = end_idx - start_idx
@@ -415,20 +412,21 @@ def main(_):
                     tracked_spikes = v1_z_chunk.numpy()[:iteration_length, :, :].astype(np.uint8)
                 spikes[start_idx:end_idx, angle_id, i * chunk_size : (i + 1) * chunk_size, :] += tracked_spikes
                 
-            # Track GPU memory and inference time
-            average_rate = np.mean(spikes[start_idx:end_idx, angle_id, :, :].astype(np.float32))
-            callbacks.track_performance(iter_start_time, average_rate=average_rate, gpu_id=0)
-
-            if angle_id == 0:
-                # Raster plot for 0 degree orientation
-                callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
+        # Track GPU memory and inference time
+        # average_rate = np.mean(spikes[start_idx:end_idx, angle_id, :, :].astype(np.float32))
+        average_rate = np.mean(spikes[:, angle_id, :, :].astype(np.float32))
+        callbacks.track_performance(t0, average_rate=average_rate, gpu_id=0)
     
-            print(f'    Angle processing time: {time() - t0:.2f}s')
-            for gpu_id in range(len(strategy.extended.worker_devices)):
-                printgpu(gpu_id=gpu_id)
+        print(f'    Angle processing time: {time() - t0:.2f}s')
+        for gpu_id in range(len(strategy.extended.worker_devices)):
+            printgpu(gpu_id=gpu_id)
 
-            if not flags.calculate_osi_dsi:
-                break
+        if angle_id == 0:
+            # Raster plot for 0 degree orientation
+            callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
+
+        if not flags.calculate_osi_dsi:
+            break
 
     # Save the performance metrics
     callbacks.save_inference_metrics()

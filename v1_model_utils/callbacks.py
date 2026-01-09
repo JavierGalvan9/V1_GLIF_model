@@ -47,7 +47,7 @@ if shutil.which('latex') is not None:
 else:
     use_tex = False
     print("LaTeX not found. Using MathText for rendering.")
-plt.rcParams['text.usetex'] = use_tex
+plt.rcParams['text.usetex'] = False #use_tex
 
 def printgpu(gpu_id=0):
     if tf.config.list_physical_devices('GPU'):
@@ -204,8 +204,8 @@ class OsiDsiCallbacks:
     def save_inference_metrics(self):
         # Calculate training statistics and save to CSV
         # Get the simulation name (last part of logdir)
-        sim_name = os.path.basename(os.path.dirname(os.path.dirname(self.logdir)))
-        
+        sim_name = os.path.dirname(os.path.dirname(os.path.basename(self.logdir)))
+
         # Calculate statistics for step time
         mean_step_time = np.mean(self.inference_times)
         sem_step_time = np.std(self.inference_times) / np.sqrt(len(self.inference_times))
@@ -225,7 +225,7 @@ class OsiDsiCallbacks:
         sem_rate = np.std(self.inference_rates) / np.sqrt(len(self.inference_rates))
 
         # Create a directory for saving statistics if it doesn't exist
-        stats_dir = os.path.dirname(self.logdir)  # Go up to Simulation_results
+        stats_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self.logdir))))  # Go up to Simulation_results
         stats_file = os.path.join(stats_dir, 'performance_statistics.csv')
         
         # Check if file exists to determine if we need to write headers
@@ -1148,7 +1148,7 @@ class Callbacks:
         )
         # Manager for osi/dsi checkpoints 
         self.epoch_manager = tf.train.CheckpointManager(
-            checkpoint, directory=self.logdir + '/Intermediate_checkpoints', max_to_keep=5
+            checkpoint, directory=self.logdir + '/Intermediate_checkpoints', max_to_keep=3
         )
 
     def on_train_begin(self):
@@ -1208,7 +1208,7 @@ class Callbacks:
         sem_rate = np.std(self.step_rate) / np.sqrt(len(self.step_rate))
         
         # Create a directory for saving statistics if it doesn't exist
-        stats_dir = os.path.dirname(self.logdir)  # Go up to Simulation_results
+        stats_dir = os.path.dirname(os.path.dirname(self.logdir))  # Go up to Simulation_results
         stats_file = os.path.join(stats_dir, 'performance_statistics.csv')
         
         # Check if file exists to determine if we need to write headers
