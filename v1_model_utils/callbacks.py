@@ -1374,19 +1374,26 @@ class Callbacks:
         except:
             print("Saving failed. Maybe next time?")
 
-    def plot_losses_curves(self):        
+    def plot_losses_curves(self):
         # Define labels and components
-        labels = ['val_loss', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_osi_dsi_loss', 'val_sync_loss']
-        component_labels = [l for l in labels if l != 'val_loss']
-        
+        labels = [
+            "val_loss",
+            "val_rate_loss",
+            "val_voltage_loss",
+            "val_regularizer_loss",
+            "val_osi_dsi_loss",
+            "val_sync_loss",
+        ]
+        component_labels = [l for l in labels if l != "val_loss"]
+
         # Create descriptive names for the labels
         label_display_names = {
-            'val_rate_loss': 'Rate Loss',
-            'val_voltage_loss': 'Voltage Reg.',
-            'val_regularizer_loss': 'Weight Reg.',
-            'val_osi_dsi_loss': 'OSI/DSI Loss',
-            'val_sync_loss': 'Sync. Loss',
-            'val_loss': 'Total Loss'
+            "val_rate_loss": "Rate Loss",
+            "val_voltage_loss": "Voltage Reg.",
+            "val_regularizer_loss": "Weight Reg.",
+            "val_osi_dsi_loss": "OSI/DSI Loss",
+            "val_sync_loss": "Sync. Loss",
+            "val_loss": "Total Loss",
         }
         
         # Create directory for loss curves
@@ -1396,7 +1403,7 @@ class Callbacks:
         # Normalize loss components
         normalized_data = {}
         for label in labels:
-            if label != 'val_loss' and label in self.epoch_metric_values:
+            if label in self.epoch_metric_values:
                 values = np.array(self.epoch_metric_values[label])
                 if len(values) > 0 and values[0] != 0:  # Avoid division by zero
                     normalized_data[label] = values / values[0]
@@ -1406,130 +1413,121 @@ class Callbacks:
         
         # Create epoch indices
         epochs = np.arange(1, len(next(iter(normalized_data.values()))) + 1)
-                
-        # Create figure with side-by-side layout
-        fig = plt.figure(figsize=(14, 5))
-        gs = GridSpec(1, 2, width_ratios=[1, 1], wspace=0.2)
-        
-        # Use a professional color palette (colorblind-friendly)
-        colors = plt.cm.viridis(np.linspace(0, 0.85, len(component_labels)))
-        
-        # --- SUBPLOT A: NORMALIZED LOSS COMPONENTS ---
-        ax1 = fig.add_subplot(gs[0])
-        
-        # Plot normalized loss components
-        for i, label in enumerate([l for l in component_labels if l in normalized_data]):
+
+        # Create figure with vertical layout (shared x-axis)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 10))
+        plt.subplots_adjust(hspace=0.08)
+
+        # Use a professional colorblind-friendly palette
+        colors = {
+            "val_rate_loss": "#0077BB",  # Blue
+            "val_voltage_loss": "#33BBEE",  # Cyan
+            "val_regularizer_loss": "#009988",  # Teal
+            "val_osi_dsi_loss": "#EE7733",  # Orange
+            "val_sync_loss": "#CC3311",  # Red
+        }
+
+        # --- TOP SUBPLOT: STACKED AREA CHART ---
+        valid_component_labels = [
+            l for l in component_labels if l in self.epoch_metric_values
+        ]
+        data = np.array(
+            [self.epoch_metric_values[label] for label in valid_component_labels]
+        )
+        stack_colors = [colors[l] for l in valid_component_labels]
+
+        ax1.stackplot(
+            epochs,
+            data,
+            labels=[label_display_names[lbl] for lbl in valid_component_labels],
+            colors=stack_colors,
+            alpha=1,
+            edgecolor="white",
+            linewidth=0.5,
+        )
+
+        # Total loss line (thicker, more prominent)
+        if "val_loss" in self.epoch_metric_values:
+            ax1.plot(
+                epochs,
+                self.epoch_metric_values["val_loss"],
+                color="#000000",
+                linewidth=3,
+                linestyle="-",
+                label=label_display_names["val_loss"],
+                zorder=10,
+            )
+
+        ax1.set_ylabel("Absolute Loss", fontsize=26)
+        ax1.set_xlabel("Training Epoch", fontsize=26)
+        ax1.grid(True, linestyle="-", alpha=0.2, color="gray")
+        ax1.set_axisbelow(True)
+        ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+
+        max_y = np.sum(data, axis=0).max() * 1.05 if data.size > 0 else 1
+        ax1.set_ylim(0, min(max_y, 5))
+        ax1.set_xlim(0, 75)
+        ax1.set_xticks([0, 25, 50, 75])
+
+        ax1.tick_params(axis="both", which="major", labelsize=18)
+        ax1.spines["top"].set_visible(False)
+        ax1.spines["right"].set_visible(False)
+
+        # Legend for total loss only on top subplot
+        ax1.legend(
+            loc="upper right",
+            frameon=True,
+            fancybox=False,
+            edgecolor="gray",
+            fontsize=18,
+            ncol=1,
+        )
+
+        # --- BOTTOM SUBPLOT: NORMALIZED LOSS COMPONENTS ---
+        # Plot normalized loss components (thinner, more transparent)
+        for label in [l for l in component_labels if l in normalized_data]:
             display_name = label_display_names.get(label, label)
-            ax1.plot(epochs, normalized_data[label], label=display_name, color=colors[i], linewidth=2.5, alpha=0.8)
-        
-        # Configure first subplot
-        ax1.set_xlabel('Training Epoch', fontweight='bold', fontsize=16)
-        ax1.set_ylabel('Relative Loss (w.r.t. Initial Value)', fontweight='bold', fontsize=16)
-        ax1.set_yscale('log')
-        ax1.grid(True, linestyle='--', alpha=0.3, which='both')
-        ax1.set_axisbelow(True)  # Place grid behind data
-        
-        # Add minor grid lines for log scale
-        ax1.grid(which='minor', linestyle=':', alpha=0.2)
-        
-        # Create legend with columns
-        ax1.legend(loc='upper center', bbox_to_anchor=(0.5, 1.15), 
-                ncol=3, frameon=True, fancybox=True, shadow=True, fontsize=13)
-        
-        # Add panel label
-        ax1.text(-0.12, 1.05, 'A', transform=ax1.transAxes, 
-                fontsize=20, fontweight='bold', va='bottom')
-        
-        # Increase tick label size
-        ax1.tick_params(axis='both', which='major', labelsize=14)
-        
-        # --- SUBPLOT B: STACKED AREA CHART ---
-        ax2 = fig.add_subplot(gs[1])
-        
-        # Get data for stacked area plot
-        valid_component_labels = [l for l in component_labels if l in self.epoch_metric_values]
-        data = np.array([self.epoch_metric_values[label] for label in valid_component_labels])
-        
-        # Create stacked area plot
-        areas = ax2.stackplot(epochs, data, labels=[label_display_names[lbl] for lbl in valid_component_labels], 
-                            colors=colors[:len(valid_component_labels)], alpha=0.8, edgecolor='white', linewidth=0.3)
-        
-        # Add total loss line
-        if 'val_loss' in self.epoch_metric_values:
-            ax2.plot(epochs, self.epoch_metric_values['val_loss'], 
-                    color='black', linewidth=3, linestyle='-', 
-                    label=label_display_names['val_loss'])
-        
-        # Configure second subplot
-        ax2.set_xlabel('Training Epoch', fontweight='bold', fontsize=16)
-        ax2.set_ylabel('Loss Components', fontweight='bold', fontsize=16)
-        ax2.grid(True, linestyle='--', alpha=0.3)
+            ax2.plot(
+                epochs,
+                normalized_data[label],
+                label=display_name,
+                color=colors[label],
+                linestyle="--",
+                linewidth=1.5,
+                alpha=1,
+            )
+
+        # Plot normalized total loss (thicker, more prominent)
+        if "val_loss" in normalized_data:
+            ax2.plot(
+                epochs,
+                normalized_data["val_loss"],
+                label=label_display_names["val_loss"],
+                color="#000000",
+                linewidth=3,
+                linestyle="-",
+                zorder=10,
+            )
+
+        # Configure bottom subplot
+        ax2.set_xlabel("Training Epoch", fontsize=26)
+        ax2.set_ylabel("Relative Loss", fontsize=26)
+        ax2.set_yscale("log")
+        ax2.set_xlim(0, 75)
+        ax2.set_xticks([0, 25, 50, 75])
+        ax2.grid(True, linestyle="-", alpha=0.2, which="major", color="gray")
+        ax2.grid(which="minor", linestyle=":", alpha=0.1, color="gray")
         ax2.set_axisbelow(True)
-        
-        # Format y-axis tick labels to be more readable
-        ax2.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
-        
-        # Set upper limit based on data
-        max_y = np.sum(data, axis=0).max() * 1.1 if data.size > 0 else 1
-        ylimit = min(max_y, 5)  # Adjust as needed, capped at 5
-        ax2.set_ylim(0, ylimit)
-        
-        # More elegant break symbol if needed
-        if max_y > ylimit:
-            break_size = 0.015
-            kwargs = dict(transform=ax2.transAxes, color='black', clip_on=False, linewidth=1.5)
-            ax2.plot((-break_size, +break_size), (1 - break_size, 1 + break_size), **kwargs)
-            ax2.plot((-break_size, +break_size), (1 - 2*break_size, 1), **kwargs)
-            ax2.plot((1 - break_size, 1 + break_size), (1 - break_size, 1 + break_size), **kwargs)
-            ax2.plot((1 - break_size, 1 + break_size), (1 - 2*break_size, 1), **kwargs)
-        
-        # Increase tick label size
-        ax2.tick_params(axis='both', which='major', labelsize=14)
-        
-        # Add annotations for important components in the stack
-        if epochs.size > 0:  # Check if we have epochs to plot
-            middle_epoch = len(epochs) // 2
-            for i, (label, area) in enumerate(zip(valid_component_labels, areas)):
-                # Find y-coordinate in the middle of each area at the middle epoch
-                if i == 0:
-                    y_pos = data[i][middle_epoch] / 2
-                else:
-                    y_pos = sum(data[:i, middle_epoch]) + data[i][middle_epoch] / 2
-                
-                # Only label areas that are visually significant
-                if max(data[i]) > 0.1: #* ylimit:  # Threshold for labeling
-                    # Add a white background to ensure text visibility
-                    bbox_props = dict(
-                        boxstyle="round,pad=0.3", 
-                        fc="white", 
-                        ec="none", 
-                        alpha=0.6
-                    )
-                    
-                    # Create annotation with high z-order and background
-                    ax2.annotate(
-                        label_display_names[label].split()[0],  # Use first word only
-                        xy=(middle_epoch, y_pos),
-                        ha='center', va='center',
-                        color='black',  # Use black for contrast against white background
-                        fontweight='bold', fontsize=14,  # Increased from 12 to 14
-                        bbox=bbox_props,  # Add white background
-                        zorder=1000  # Very high z-order to ensure it's on top
-                    )
-        
-        # Add panel label
-        ax2.text(-0.12, 1.05, 'B', transform=ax2.transAxes, 
-                fontsize=20, fontweight='bold', va='bottom')
-        
-        # Legend for total loss
-        if 'val_loss' in self.epoch_metric_values:
-            total_loss_legend = ax2.legend([ax2.get_lines()[0]], [label_display_names['val_loss']], 
-                                        loc='upper right', frameon=True, fancybox=True, shadow=True, fontsize=13)
-            ax2.add_artist(total_loss_legend)
-        
-        # Tight layout
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(os.path.join(images_dir, f'losses_curves.png'), dpi=300, transparent=False, bbox_inches='tight')
+
+        ax2.tick_params(axis="both", which="major", labelsize=18)
+        ax2.spines["top"].set_visible(False)
+        ax2.spines["right"].set_visible(False)
+
+        plt.tight_layout()
+        # plt.savefig(os.path.join(images_dir, 'losses_curves.pdf'), dpi=300, bbox_inches='tight')
+        plt.savefig(
+            os.path.join(images_dir, "losses_curves.png"), dpi=300, bbox_inches="tight", transparent=False
+        )
         plt.close()
     
     def plot_raster(self, x, v1_spikes, y):
