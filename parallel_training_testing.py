@@ -39,6 +39,7 @@ parser.add_argument('--input_weight_scale', default=1.0, type=float)
 parser.add_argument('--gauss_std', default=0.3, type=float)
 parser.add_argument('--recurrent_weight_regularization', default=0.0, type=float)
 parser.add_argument('--recurrent_weight_regularizer_type', default="emd", type=str)
+parser.add_argument('--voltage_penalty_mode', default='range', type=str)
 parser.add_argument('--lr_scale', default=1.0, type=float)
 # parser.add_argument('--input_f0', default=0.2, type=float)
 parser.add_argument('--temporal_f', default=2.0, type=float)
@@ -145,11 +146,14 @@ def main():
     if flags.low_memory_gpu:
         training_commands = ["run", "-g", "1", "-m", "40", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
     else:
-        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{4 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the L40S GPU with 48GB of memory 
+        # training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{4 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the L40S GPU with 48GB of memory 
+        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtxpro6000", "-c", f"{4 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the rtx6000 GPU with 48GB of memory 
 
     # evaluation_commands = ["run", "-g", "1", "-m", "60", "-c", "4", "-t", "1:00"]
     # evaluation_commands = ["run", "-g", "1", "-m", "100", "-c", "4", "-t", "3:00"]
-    evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
+    evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "80", "-c", "8", "-t", "3:00"]
+    # evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
+
 
     # Define the training and evaluation script calls
     # training_script = "python multi_training.py " 
@@ -220,7 +224,7 @@ def main():
 
     # Final evaluation with the best model
     final_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_final.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_final.err", "-j", f"{sim_name}_test_final"]
-    final_evaluation_script = evaluation_script + f"--track_core_only --track_core_only --seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
+    final_evaluation_script = evaluation_script + f"--track_core_only --seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
     final_evaluation_command = final_evaluation_command + [final_evaluation_script]
     eval_job_id = submit_job(final_evaluation_command)
     eval_job_ids.append(eval_job_id)

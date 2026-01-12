@@ -322,7 +322,7 @@ def main(_):
 
         ### VOLTAGE REGULARIZERS ###
         # voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32, core_mask=core_mask)
-        voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32, penalty_mode='range')
+        voltage_regularizer = losses.VoltageRegularization(rsnn_layer.cell, voltage_cost=flags.voltage_cost, dtype=tf.float32, penalty_mode=flags.voltage_penalty_mode)
         # model.add_loss(lambda: voltage_regularizer(rsnn_layer.output[0][1]))
 
         ### SYNCHRONIZATION REGULARIZERS ###
@@ -1063,6 +1063,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
     absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'mean', 'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, emd')
+    absl.app.flags.DEFINE_string('voltage_penalty_mode', 'range', 'Type of penalization for voltage. Options: range, threshold')
     absl.app.flags.DEFINE_float('lr_scale', 1., '')
     # absl.app.flags.DEFINE_float('p_reappear', .5, '')
     absl.app.flags.DEFINE_float('max_time', -1, '')
