@@ -496,9 +496,9 @@ def main(_):
 
         _z, _v = _out[0]
 
-        if flags.dtype != 'float32':
-            _z = tf.cast(_z, tf.float32)
-            _v = tf.cast(_v, tf.float32)
+        # if flags.dtype != 'float32':
+        #     _z = tf.cast(_z, tf.float32)
+        #     _v = tf.cast(_v, tf.float32)
 
         # # update state_variables with the new model state
         # new_state = tuple(_out[1:])
@@ -515,7 +515,7 @@ def main(_):
         else:
             rate_loss = evoked_rate_regularizer(_z, trim)
             # update the exponential moving average of the firing rates over drifting gratings presentation
-            v1_evoked_rates = tf.reduce_mean(_z[:, delays[0]:seq_len-delays[1], :], (0, 1))
+            v1_evoked_rates = tf.reduce_mean(tf.cast(_z[:, delays[0]:seq_len-delays[1], :], tf.float32), (0, 1))
             # Update the EMAs
             v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
             osi_dsi_loss = OSI_DSI_Loss(_z, y, trim, normalizer=v1_ema)

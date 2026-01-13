@@ -601,6 +601,10 @@ class SpikeRateDistributionTarget:
         #         spikes = spikes[:, :-self._post_delay, :]
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
+
+        if spikes.dtype != self._dtype:
+            spikes = tf.cast(spikes, self._dtype)
+
         rates = tf.reduce_mean(spikes, (0, 1)) # calculate the mean firing rate over time and batch
 
         reg_loss = compute_spike_rate_target_loss(rates, self._target_rates, dtype=self._dtype) 
@@ -637,7 +641,7 @@ class SynchronizationLoss(Layer):
         self._n_samples = n_samples
         self._base_seed = seed
 
-        pop_names = other_v1_utils.pop_names(network)
+        pop_names = other_v1_utils.pop_names(network, data_dir='')
         if self._core_mask is not None:
             pop_names = pop_names[core_mask]
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
@@ -712,7 +716,7 @@ class SynchronizationLoss(Layer):
         sample_counts = tf.clip_by_value(sample_counts, clip_value_min=15, clip_value_max=tf.shape(self.node_id_e)[0]) # clip the values to be between 15 and 14423
         # Randomize the neuron ids
         shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
-        selected_spikes_sample = tf.TensorArray(self._dtype, size=self._n_samples)
+        selected_spikes_sample = tf.TensorArray(spikes.dtype, size=self._n_samples)
         previous_id = tf.constant(0, dtype=tf.int32)
         for i in tf.range(self._n_samples):
             sample_num = sample_counts[i] # 40 #68
@@ -731,6 +735,9 @@ class SynchronizationLoss(Layer):
             selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
         selected_spikes_sample = selected_spikes_sample.stack()
+        if selected_spikes_sample.dtype != self._dtype:
+            selected_spikes_sample = tf.cast(selected_spikes_sample, self._dtype)
+
         fanos_mean = self.pop_fano_tf(selected_spikes_sample, bin_sizes=bin_sizes)
         # # Calculate MSE between the experimental and calculated Fano factors
         mse_loss = tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))
@@ -784,6 +791,9 @@ class VoltageRegularization:
         if self._core_mask is not None:
             voltages = tf.boolean_mask(voltages, self._core_mask, axis=2)
 
+        if voltages.dtype != self._dtype:
+            voltages = tf.cast(voltages, self._dtype)
+
         if self._penalty_mode == "range":
             voltage_loss = self._compute_range_loss(voltages)
         else:  # threshold mode
@@ -801,7 +811,7 @@ class CustomMeanLayer(Layer):
 class OrientationSelectivityLoss:
     def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, 
                  core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None,
-                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv"):
+                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv", data_dir=''):
         
         self._network = network
         self._osi_cost = osi_cost
@@ -813,6 +823,7 @@ class OrientationSelectivityLoss:
         self._subtraction_ratio = subtraction_ratio  # only for crowd_spikes method
         self._tf_pi = tf.constant(np.pi, dtype=dtype)
         self._neuropixels_df = neuropixels_df
+        self.data_dir = data_dir
         if (self._core_mask is not None) and (self._method == "crowd_spikes" or self._method == "crowd_osi"):
             self.np_core_mask = self._core_mask.numpy()
             core_tuning_angles = network['tuning_angle'][self.np_core_mask]
@@ -899,7 +910,7 @@ class OrientationSelectivityLoss:
         osi_target = osi_dsi_df.groupby("cell_type")['OSI'].mean()
         dsi_target = osi_dsi_df.groupby("cell_type")['DSI'].mean()
 
-        original_pop_names = other_v1_utils.pop_names(self._network)
+        original_pop_names = other_v1_utils.pop_names(self._network, data_dir=self.data_dir)
         if self._core_mask is not None:
             original_pop_names = original_pop_names[self.np_core_mask] 
 
@@ -934,7 +945,7 @@ class OrientationSelectivityLoss:
 
             # self._von_mises_params = np.load("GLIF_network/param_dict_orientation.npy")
             # pickle instead
-            with open("GLIF_network/param_dict_orientation.pkl", 'rb') as f:
+            with open(f"{self.data_dir}/param_dict_orientation.pkl", 'rb') as f:
                 self._von_mises_params = pkl.load(f)
             # get the model values with 10 degree increments 
             structure = "VISp"
@@ -951,10 +962,8 @@ class OrientationSelectivityLoss:
         # losses = tf.TensorArray(tf.float32, size=len(self._layer_info))
         losses = []
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
-        
         custom_mean_layer = CustomMeanLayer()
 
-        
         for key, value in self._layer_info.items():
             # first, calculate delta_angle
             
@@ -1098,6 +1107,9 @@ class OrientationSelectivityLoss:
     def __call__(self, spikes, angle, trim, normalizer=None):
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
+
+        if spikes.dtype != self._dtype:
+            spikes = tf.cast(spikes, self._dtype)
 
         if self._method == "crowd_osi":
             return self.crowd_osi_loss(spikes, angle, normalizer=normalizer)

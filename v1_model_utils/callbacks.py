@@ -1335,7 +1335,6 @@ class Callbacks:
 
     def on_step_end(self, train_values, y, verbose=True):
         self.step_running_time.append(time() - self.step_init_time)
-
         self.step_rate.append(train_values[1])
         
         # Capture GPU memory usage using the get_gpu_memory function
@@ -1415,7 +1414,7 @@ class Callbacks:
         epochs = np.arange(1, len(next(iter(normalized_data.values()))) + 1)
 
         # Create figure with vertical layout (shared x-axis)
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 10))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
         plt.subplots_adjust(hspace=0.08)
 
         # Use a professional colorblind-friendly palette
