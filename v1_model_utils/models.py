@@ -5,12 +5,6 @@ import pickle as pkl
 # import subprocess
 from . import other_v1_utils
 
-try:
-    from cuda_ops.synaptic_currents.synaptic_currents_ops import calculate_synaptic_currents_cuda
-except ImportError:
-    calculate_synaptic_currents_cuda = None
-
-calculate_synaptic_currents_cuda = None
 # Define a custom gradient for the spike function.
 # Diverse functions can be used to define the gradient.
 # Here we provide variations of this functions depending on
@@ -137,6 +131,7 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, dense
     # Get the batch size and number of neurons
     batch_size = tf.cast(tf.shape(rec_z_buf)[0], dtype=tf.int64)
     n_post_neurons = tf.cast(dense_shape[0], dtype=tf.int64)
+    n_pre_neurons = tf.cast(dense_shape[1], dtype=tf.int64)
     n_syn_basis = tf.cast(tf.shape(synaptic_basis_weights)[1], dtype=tf.int64)  # Number of receptor types
     # Find the indices of non-zero inputs in x_t
     # non_zero_indices: [num_non_zero_spikes, 2], columns are [batch_index, pre_neuron_index]
@@ -168,30 +163,22 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, dense
     )
 
     def grad(dy):
-        # Reshape gradient dy to match batch x neuron dimensions
-        # dy_reshaped = tf.reshape(dy, [batch_size, n_post_neurons, n_syn_basis])
-        # Define a function to process each receptor type
-        def per_receptor_grad(r_id):
-            # Extract the gradient for this receptor type (shape: [batch_size, n_post_neurons])
+        # Accumulate receptor gradients to avoid allocating [n_syn_basis, batch, n_pre] tensor.
+        def per_receptor_accum(r_id, acc):
             dy_r = tf.reshape(dy[:, r_id], [batch_size, n_post_neurons])
-            # dy_r = dy_reshaped[:, :, r_id]
-            # Compute gradient w.r.t rec_z_buf for this receptor type
             recurrent_weights_factors = tf.gather(synaptic_basis_weights[:, r_id], syn_ids, axis=0)
             weights_syn_receptors = weight_values * recurrent_weights_factors
             sparse_w_rec = tf.sparse.SparseTensor(synapse_indices, weights_syn_receptors, dense_shape)
             de_dv_rid = tf.sparse.sparse_dense_matmul(dy_r, sparse_w_rec, adjoint_a=False)
-            
-            return de_dv_rid  # shape: [batch_size, n_pre_neurons]
-        
-        # Use tf.map_fn to apply per_receptor_grad to each receptor index
-        # tf.map_fn will return a tensor of shape [n_syn_basis, batch_size, n_pre_neurons]
-        de_dv_all = tf.map_fn(per_receptor_grad, 
-                            tf.range(n_syn_basis), 
-                            dtype=dy.dtype,
-                            parallel_iterations=1)
-        # Sum over all receptors
-        # de_dv_all: [n_syn_basis, batch_size, n_pre_neurons]
-        de_dv = tf.reduce_sum(de_dv_all, axis=0)  # [batch_size, n_pre_neurons]
+            return r_id + 1, acc + de_dv_rid
+
+        init_acc = tf.zeros((batch_size, n_pre_neurons), dtype=dy.dtype)
+        _, de_dv = tf.while_loop(
+            lambda r_id, _: r_id < n_syn_basis,
+            per_receptor_accum,
+            [tf.constant(0, dtype=tf.int64), init_acc],
+            parallel_iterations=1
+        )
         
         # IMPORTANT: The gradient should reflect the same dampening that was applied 
         # to rec_z_buf in the forward pass. However, we don't have access to the 
@@ -690,27 +677,16 @@ class V1Column(tf.keras.layers.Layer):
     def calculate_i_rec_with_custom_grad(self, rec_z_buf):    
 
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
-        if calculate_synaptic_currents_cuda is not None:
-            i_rec_flat = calculate_synaptic_currents_cuda(
-                tf.cast(rec_z_buf, dtype=self.variable_dtype), 
-                self.recurrent_indices, 
-                self.recurrent_weight_values, 
-                self.recurrent_dense_shape, 
-                self.synaptic_basis_weights, 
-                tf.cast(self.syn_ids, dtype=tf.int32), 
-                self.pre_ind_table
-            )     
-        else:
-            # Use the CPU implementation if CUDA is not available
-            i_rec_flat = calculate_synaptic_currents(
-                rec_z_buf, 
-                self.recurrent_indices, 
-                self.recurrent_weight_values, 
-                self.recurrent_dense_shape, 
-                self.synaptic_basis_weights, 
-                self.syn_ids, 
-                self.pre_ind_table
-            )
+        # Use the CPU implementation if CUDA is not available
+        i_rec_flat = calculate_synaptic_currents(
+            rec_z_buf, 
+            self.recurrent_indices, 
+            self.recurrent_weight_values, 
+            self.recurrent_dense_shape, 
+            self.synaptic_basis_weights, 
+            self.syn_ids, 
+            self.pre_ind_table
+        )
         
         # Cast i_rec to the compute dtype if necessary
         if i_rec_flat.dtype != self.compute_dtype:
@@ -904,7 +880,7 @@ def create_model(
 
     # Create an input layer for the initial state of the RNN
     state_input_holder = tf.keras.layers.Input(shape=(None, neurons))
-    state_input = tf.cast(tf.identity(state_input_holder), dtype)  
+    state_input = tf.cast(tf.identity(state_input_holder), dtype)
 
     # If batch_size is not provided as an argument, it is automatically inferred from the
     # first dimension of x using tf.shape().
@@ -1027,17 +1003,13 @@ def create_model(
 
     if use_state_input:
         # many_input_model = tf.keras.Model(
-        #     inputs=[x, state_input_holder, initial_state_holder], 
+        #     inputs=[x, initial_state_holder],
         #     outputs=mean_output
         # )
         many_input_model = tf.keras.Model(
-            inputs=[x, state_input_holder,initial_state_holder],
+            inputs=[x, state_input_holder, initial_state_holder],
             outputs=[output])
     else:
-        # many_input_model = tf.keras.Model(
-        #     inputs=[x, state_input_holder], 
-        #     outputs=mean_output
-        # )
         many_input_model = tf.keras.Model(
             inputs=[x, state_input_holder],
             outputs=[output])

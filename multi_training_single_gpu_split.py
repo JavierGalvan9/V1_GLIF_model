@@ -114,8 +114,11 @@ def main(_):
         # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
         # Use HierarchicalCopyAllReduce to avoid NCCL issues with Blackwell GPUs
         strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.HierarchicalCopyAllReduce())
+    elif len(physical_devices) == 1:
+        # strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
+        strategy = tf.distribute.MirroredStrategy() # using single device gpu increases largely the memory required to allocate the pre_ind_table tensor
     else:
-        strategy = tf.distribute.MirroredStrategy()
+        strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
 
     per_replica_batch_size = flags.batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
@@ -406,10 +409,10 @@ def main(_):
         # Provides the opportunity to compute gradients wrt. membrane voltages at all time steps
         # Not important for general use
         zero_state = rsnn_layer.cell.zero_state(per_replica_batch_size, dtype=dtype)
+        dummy_zeros = tf.zeros((per_replica_batch_size, flags.seq_len, network["n_nodes"]), dtype)
         # state_variables = tf.nest.map_structure(lambda a: tf.Variable(
         #     a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
         # ), zero_state)
-        dummy_zeros = tf.zeros((per_replica_batch_size, flags.seq_len, network["n_nodes"]), dtype)
 
         # Add other metrics and losses
         train_loss = tf.keras.metrics.Mean()
@@ -486,7 +489,6 @@ def main(_):
             @tf.recompute_grad
             def roll_out_with_gradient_checkpointing(x, state_vars):
                 # Call extractor model without storing intermediate state variables
-                # dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
                 _out = extractor_model((x, dummy_zeros, state_vars))
                 return _out
 
