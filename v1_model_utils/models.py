@@ -566,7 +566,10 @@ class V1Column(tf.keras.layers.Layer):
         # batch_size = tf.shape(x_t)[0]
         n_post_neurons = self.lgn_input_dense_shape[0]
         # Find the indices of non-zero inputs
-        non_zero_indices = tf.where(x_t > 0)
+        if x_t.dtype == tf.bool:
+            non_zero_indices = tf.where(x_t)
+        else:
+            non_zero_indices = tf.where(x_t > 0)
         batch_indices = non_zero_indices[:, 0]
         pre_neuron_indices = non_zero_indices[:, 1]
         # Get the indices into self.recurrent_indices for each pre_neuron_index
@@ -604,6 +607,8 @@ class V1Column(tf.keras.layers.Layer):
         """
         # batch_size = tf.shape(x_t)[0]
         # This function performs the tensor multiplication to calculate the recurrent currents at each timestep
+        if x_t.dtype != self.variable_dtype:
+            x_t = tf.cast(x_t, dtype=self.variable_dtype)
         i_in = tf.TensorArray(dtype=self.compute_dtype, size=self._n_syn_basis)
         for r_id in range(self._n_syn_basis):
             input_weights_factors = tf.gather(self.synaptic_basis_weights[:, r_id], self.input_syn_ids, axis=0)
@@ -615,7 +620,7 @@ class V1Column(tf.keras.layers.Layer):
             )
             i_receptor = tf.sparse.sparse_dense_matmul(
                                                 sparse_w_in, 
-                                                tf.cast(x_t, dtype=self.variable_dtype), 
+                                                x_t, 
                                                 adjoint_b=True
                                                 )
             # Optionally cast the output back to float16
@@ -731,14 +736,7 @@ class V1Column(tf.keras.layers.Layer):
         # external_current = inputs[:, :self._n_neurons*self._n_syn_basis] # external inputs shape (1, 399804)
         # bkg_noise = inputs[:, self._n_neurons*self._n_syn_basis:-self._n_neurons]
         lgn_input = inputs[:, :self.input_dim]
-        # bkg_input = inputs[:, self.input_dim:-self._n_neurons]
-        state_input = inputs[:, -self._n_neurons:] # dummy zeros
         # batch_size = tf.shape(lgn_input)[0]
-
-        if self._spike_gradient:
-            state_input = tf.zeros((1,), dtype=self.compute_dtype)
-        else:
-            state_input = tf.zeros((4,), dtype=self.compute_dtype)
                 
         # Extract the network variables from the state
         z_buf, v, r, asc, psc_rise, psc = state
@@ -768,8 +766,6 @@ class V1Column(tf.keras.layers.Layer):
         rec_inputs = tf.reshape(rec_inputs, [self.batch_size, self._n_neurons * self._n_syn_basis])
         # Scale with the learning rate
         rec_inputs = rec_inputs * self._lr_scale
-        if constants is not None and not self._spike_gradient:
-            rec_inputs = rec_inputs + state_input * self._lr_scale
 
         # Calculate the new psc variables
         new_psc, new_psc_rise = self.update_psc(psc, psc_rise, rec_inputs)        
@@ -780,8 +776,6 @@ class V1Column(tf.keras.layers.Layer):
         # Calculate the postsynaptic current 
         input_current = tf.reshape(psc, (self.batch_size, self._n_neurons, self._n_syn_basis))
         input_current = tf.reduce_sum(input_current, -1) # sum over receptors
-        if constants is not None and self._spike_gradient:
-            input_current += state_input
 
         # Add all the postsynaptic current sources
         c1 = input_current + tf.reduce_sum(asc, axis=-1) + self.gathered_g
@@ -871,16 +865,22 @@ def create_model(
     batch_size=None,
     pseudo_gauss=False,
     hard_reset=False,
-    current_input=False
+    current_input=False,
+    use_dummy_state_input=False
 ):
 
     # Create the input layer of the model
-    x = tf.keras.layers.Input(shape=(None, n_input,))
+    x = tf.keras.layers.Input(shape=(None, n_input,), dtype=dtype)
     neurons = network["n_nodes"]
 
-    # Create an input layer for the initial state of the RNN
-    state_input_holder = tf.keras.layers.Input(shape=(None, neurons))
-    state_input = tf.cast(tf.identity(state_input_holder), dtype)
+    # Optional dummy input for legacy voltage-gradient experiments.
+    if use_dummy_state_input:
+        state_input_holder = tf.keras.layers.Input(shape=(None, neurons), dtype=dtype)
+        state_input = state_input_holder
+        full_inputs = tf.concat((x, state_input), -1)
+    else:
+        state_input_holder = None
+        full_inputs = x
 
     # If batch_size is not provided as an argument, it is automatically inferred from the
     # first dimension of x using tf.shape().
@@ -926,17 +926,9 @@ def create_model(
         # using tf.nest.map_structure(). This creates a nested structure of tensors with
         # the same shape as the original zero_state structure.
         rnn_initial_state = tf.nest.map_structure(tf.identity, initial_state_holder)
-        # In both cases, the code creates a constants tensor using tf.zeros_like() or
-        # tf.zeros(). This tensor is used to provide constant input to the RNN during
-        # computation. The shape of the constants tensor matches the batch_size.
-        constants = tf.zeros_like(rnn_initial_state[0][:, 0], dtype)
     else:
         rnn_initial_state = zero_state
-        constants = tf.zeros((batch_size,))
-
-    # Concatenate the input layer with the initial state of the RNN
-    # full_inputs = tf.concat((tf.cast(x, dtype), bkg_inputs, state_input), -1) # (None, 600, 5*n_neurons+n_neurons)
-    full_inputs = tf.concat((tf.cast(x, dtype), state_input), -1)
+        initial_state_holder = None
     
     # Create the RNN layer of the model using the V1Column cell
     # The RNN layer returns the output of the RNN layer and the final state of the RNN
@@ -946,7 +938,7 @@ def create_model(
     rnn = tf.keras.layers.RNN(cell, return_sequences=True, return_state=return_state, name="rsnn")
 
     # Apply the rnn layer to the full_inputs tensor
-    rsnn_out = rnn(full_inputs, initial_state=rnn_initial_state, constants=constants)
+    rsnn_out = rnn(full_inputs, initial_state=rnn_initial_state)
 
     # Check if the return_state argument is True or False and assign the output of the
     # RNN layer to the hidden variable accordingly.
@@ -1002,17 +994,17 @@ def create_model(
     #     mean_output = tf.nn.softmax(mean_output)
 
     if use_state_input:
-        # many_input_model = tf.keras.Model(
-        #     inputs=[x, initial_state_holder],
-        #     outputs=mean_output
-        # )
-        many_input_model = tf.keras.Model(
-            inputs=[x, state_input_holder, initial_state_holder],
-            outputs=[output])
+        if use_dummy_state_input:
+            inputs = [x, state_input_holder, initial_state_holder]
+        else:
+            inputs = [x, initial_state_holder]
     else:
-        many_input_model = tf.keras.Model(
-            inputs=[x, state_input_holder],
-            outputs=[output])
+        if use_dummy_state_input:
+            inputs = [x, state_input_holder]
+        else:
+            inputs = [x]
+
+    many_input_model = tf.keras.Model(inputs=inputs, outputs=[output])
 
     if add_metric:
         # add the firing rate of the neurons as a metric to the model

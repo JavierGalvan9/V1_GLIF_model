@@ -141,6 +141,7 @@ def main(_):
             hard_reset=flags.hard_reset,
             add_metric=True,
             max_delay=5,
+            use_dummy_state_input=False,
         )
         
         # Initialize the weights of the model based on the specified input shape. It operates in eager mode.
@@ -274,9 +275,6 @@ def main(_):
         #     rec_weight_loss = rec_weight_regularizer(rsnn_layer.cell.recurrent_weight_values)
         #     return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size) + rec_weight_loss
 
-        # These "dummy" zeros are injected to the models membrane voltage
-        # Provides the opportunity to compute gradients wrt. membrane voltages at all time steps
-        # Not important for general use
         zero_state = rsnn_layer.cell.zero_state(flags.batch_size, dtype=dtype)
         state_variables = tf.nest.map_structure(lambda a: tf.Variable(
             a, trainable=False, synchronization=tf.VariableSynchronization.ON_READ
@@ -308,8 +306,9 @@ def main(_):
     def roll_out(_x, _y, _w, trim=True):
         _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         seq_len = tf.shape(_x)[1]
-        dummy_zeros = tf.zeros((flags.batch_size, seq_len, flags.neurons), dtype)
-        _out, _p, _ = extractor_model((_x, dummy_zeros, _initial_state))
+        if _x.dtype == tf.bool:
+            _x = tf.cast(_x, dtype)
+        _out, _p, _ = extractor_model((_x, _initial_state))
 
         _z, _v, _ = _out[0]
         # update state_variables with the new model state
@@ -318,6 +317,7 @@ def main(_):
         # update the exponential moving average of the firing rates
         v1_evoked_rates = _z[:, delays[0]:seq_len-delays[1], :]
         v1_evoked_rates = tf.reduce_mean(v1_evoked_rates, (0, 1))
+        v1_evoked_rates = tf.stop_gradient(v1_evoked_rates)
         # Update the EMAs
         v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
         # tf.print('V1_ema: ', tf.reduce_mean(v1_ema), tf.reduce_mean(v1_evoked_rates), v1_ema)
@@ -726,4 +726,3 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
 
     absl.app.run(main)
-

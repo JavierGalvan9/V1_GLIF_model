@@ -353,7 +353,8 @@ class EarthMoversDistanceRegularizer(Layer):
 
     @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
     def __call__(self, x):
-        x = tf.cast(x, tf.float32)
+        if x.dtype != tf.float32:
+            x = tf.cast(x, tf.float32)
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
         emd_losses = tf.TensorArray(self._dtype, size=self.num_unique)
@@ -441,8 +442,8 @@ def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
     sorted_rate = tf.sort(_rates)
     # u = target_rate - sorted_rate
     u = sorted_rate - target_rate
-    # tau = (tf.range(target_rate.shape[0]), dtype) + 1) / target_rate.shape[0]
-    tau = (tf.range(target_rate.shape[0]) + 1) / target_rate.shape[0]
+    n = tf.shape(target_rate)[0]
+    tau = (tf.cast(tf.range(n), dtype) + 1) / tf.cast(n, dtype)
     loss = huber_quantile_loss(u, tau, 0.002, dtype=dtype)
     # loss = huber_quantile_loss(u, tau, 0.1, dtype=dtype)
 
@@ -652,8 +653,10 @@ class SynchronizationLoss(Layer):
         # Pre-define bin sizes (same as experimental data)
         bin_sizes = np.logspace(-3, 0, 20)
         # using the simulation length, limit bin_sizes to define at least 2 bins
-        bin_sizes_mask = bin_sizes < (self._t_end - self._t_start)/2
-        self.bin_sizes = bin_sizes[bin_sizes_mask]
+        bin_sizes_mask = bin_sizes < (self._t_end - self._t_start) / 2
+        bin_sizes = bin_sizes[bin_sizes_mask]
+        self._bin_sizes_ms = tuple(max(1, int(round(v * 1000.0))) for v in bin_sizes)
+        self._bin_sizes_ms_tf = tf.constant(self._bin_sizes_ms, dtype=tf.int32)
         self.epsilon = 1e-7  # Small constant to avoid division by zero
 
         # Load the experimental data
@@ -665,11 +668,10 @@ class SynchronizationLoss(Layer):
         experimental_fanos_mean = np.nanmean(experimental_fanos[:, bin_sizes_mask], axis=0)
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean, dtype=self._dtype)
 
-    def pop_fano_tf(self, spikes, bin_sizes):
+    def pop_fano_tf(self, spikes):
         spikes = tf.expand_dims(spikes, axis=-1)
-        fanos = tf.TensorArray(dtype=self._dtype, size=len(bin_sizes))
-        for i, bin_width in enumerate(bin_sizes):
-            bin_size = int(np.round(bin_width * 1000))
+        fanos = tf.TensorArray(dtype=self._dtype, size=len(self._bin_sizes_ms))
+        for i, bin_size in enumerate(self._bin_sizes_ms):
             # Use convolution for efficient binning
             kernel = tf.ones((bin_size, 1, 1), dtype=self._dtype)
             convolved = tf.nn.conv1d(spikes, kernel, stride=bin_size, padding="VALID")
@@ -693,17 +695,13 @@ class SynchronizationLoss(Layer):
 
         if trim:
             spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
-            bin_sizes = self.bin_sizes
-            experimental_fanos_mean = self.experimental_fanos_mean
-        else:
-            t_start = 0
-            t_end = spikes.shape[1] / 1000
-            # using the simulation length, limit bin_sizes to define at least 2 bins
-            bin_sizes_mask = self.bin_sizes < (t_end - t_start)/2
-            bin_sizes = self.bin_sizes[bin_sizes_mask]
-            experimental_fanos_mean = self.experimental_fanos_mean[bin_sizes_mask]
+        duration_ms = tf.cast(tf.shape(spikes)[1], tf.int32)
+        bin_limit_ms = duration_ms // 2
+        bin_sizes_mask = self._bin_sizes_ms_tf < bin_limit_ms
+        experimental_fanos_mean = tf.boolean_mask(self.experimental_fanos_mean, bin_sizes_mask)
         
-        spikes = tf.cast(spikes, self._dtype)  
+        # if spikes.dtype != self._dtype:
+        #     spikes = tf.cast(spikes, self._dtype)
         # choose random trials to sample from (usually we only have 1 trial to sample from)
         n_trials = tf.shape(spikes)[0]
         # increase the base seed to avoid the same random neurons to be selected in every instantiation of the class
@@ -738,9 +736,16 @@ class SynchronizationLoss(Layer):
         if selected_spikes_sample.dtype != self._dtype:
             selected_spikes_sample = tf.cast(selected_spikes_sample, self._dtype)
 
-        fanos_mean = self.pop_fano_tf(selected_spikes_sample, bin_sizes=bin_sizes)
+        fanos_mean = self.pop_fano_tf(selected_spikes_sample)
+        fanos_mean = tf.boolean_mask(fanos_mean, bin_sizes_mask)
         # # Calculate MSE between the experimental and calculated Fano factors
-        mse_loss = tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))
+        def compute_mse():
+            return tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))
+        mse_loss = tf.cond(
+            tf.size(experimental_fanos_mean) > 0,
+            compute_mse,
+            lambda: tf.constant(0.0, dtype=self._dtype),
+        )
         # # Calculate the synchronization loss
         sync_loss = self._sync_cost * mse_loss
 
