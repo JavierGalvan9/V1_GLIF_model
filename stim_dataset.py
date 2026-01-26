@@ -160,6 +160,83 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
     return data_set
 
 
+### GRAY SCREEN STIMULUS GENERATION ###
+def generate_gray_screen_stimulus(seq_len=600, row_size=120, col_size=240,
+                                  current_input=False, n_input=17400, dt=1,
+                                  data_dir='GLIF_network_nll',
+                                  bmtk_compat=True, return_firing_rates=False,
+                                  dtype=tf.float32):
+    """
+    Generate gray screen (spontaneous activity) stimulus for LGN.
+    
+    This function creates LGN firing rates corresponding to a gray screen with no visual stimulus,
+    representing spontaneous activity.
+    
+    Args:
+        seq_len: Total sequence length in milliseconds
+        row_size: Height of the visual field
+        col_size: Width of the visual field
+        current_input: If True, return scaled probabilities instead of spike samples
+        n_input: Number of LGN neurons
+        dt: Time step in milliseconds
+        data_dir: Directory containing LGN model data
+        bmtk_compat: Use BMTK-compatible LGN model
+        return_firing_rates: If True, return firing rates instead of spike samples
+        dtype: TensorFlow data type
+        
+    Returns:
+        TensorFlow dataset yielding gray screen LGN activity
+    """
+    lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input, dtype=dtype, data_dir=data_dir)
+
+    def _g():
+        while True:
+            # Create a gray screen (all zeros)
+            gray_screen = tf.zeros((seq_len, row_size, col_size, 1), dtype=dtype)
+            
+            # Process through LGN spatial filters
+            spatial = lgn.spatial_response(gray_screen, bmtk_compat)
+            del gray_screen
+            
+            # Get firing rates from spatial response
+            firing_rates = lgn.firing_rates_from_spatial(*spatial)
+            
+            if return_firing_rates:
+                yield firing_rates
+            else:
+                del spatial
+                # Sample spikes from firing rates
+                # Assuming dt = 1 ms
+                _p = 1 - tf.exp(-firing_rates / 1000.)  # Probability of spike in dt
+                del firing_rates
+                
+                if current_input:
+                    _z = _p * 1.3
+                else:
+                    _z = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
+                del _p
+                
+                yield _z
+
+    if return_firing_rates:
+        output_dtypes = (dtype)
+        output_shapes = (tf.TensorShape((seq_len, n_input)))
+        data_set = tf.data.Dataset.from_generator(
+            _g, output_dtypes, output_shapes=output_shapes
+        ).map(lambda _a: tf.cast(_a, dtype), num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+        if current_input:
+            data_dtype = dtype
+        else:
+            data_dtype = tf.bool
+        
+        output_dtypes = (data_dtype)
+        output_shapes = (tf.TensorShape((seq_len, n_input)))
+        data_set = tf.data.Dataset.from_generator(
+            _g, output_dtypes, output_shapes=output_shapes
+        ).map(lambda _a: tf.cast(_a, data_dtype), num_parallel_calls=tf.data.AUTOTUNE)
+    
+    return data_set
 
 
 # def generate_drifting_grating(orientation=45, intensity=10, im_slice=100, pre_delay=50, post_delay=50,

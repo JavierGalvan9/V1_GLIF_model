@@ -449,14 +449,10 @@ def main(_):
                 print("Loaded cached spontaneous LGN firing rates.")
             else:
                 # Compute and cache the spontaneous firing rates
-                spontaneous_lgn_firing_rates = stim_dataset.generate_drifting_grating_tuning(
+                spontaneous_lgn_firing_rates = stim_dataset.generate_gray_screen_stimulus(
                     seq_len=flags.seq_len,
-                    pre_delay=flags.seq_len,
-                    post_delay=0,
                     n_input=flags.n_input,
-                    rotation=flags.rotation,
                     data_dir=flags.data_dir,
-                    billeh_phase=True,
                     return_firing_rates=True,
                     dtype=dtype
                 )
@@ -781,13 +777,10 @@ def main(_):
     def get_gray_dataset_fn():
         def _f(input_context):
             batch_size = input_context.get_per_replica_batch_size(global_batch_size)
-            _gray_data_set = (stim_dataset.generate_drifting_grating_tuning(
+            _gray_data_set = (stim_dataset.generate_gray_screen_stimulus(
                 seq_len=flags.seq_len,
-                pre_delay=flags.seq_len,
-                post_delay=0,
                 n_input=flags.n_input,
                 data_dir=flags.data_dir,
-                rotation=flags.rotation,
                 return_firing_rates=True,
                 dtype=dtype
             )

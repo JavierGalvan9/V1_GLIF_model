@@ -440,13 +440,10 @@ def main(_):
 
     def get_gray_dataset_fn():
         def _f(input_context):
-            _gray_data_set = stim_dataset.generate_drifting_grating_tuning(
+            _gray_data_set = stim_dataset.generate_gray_screen_stimulus(
                 seq_len=flags.seq_len,
-                pre_delay=flags.seq_len,
-                post_delay=0,
                 n_input=flags.n_input,
                 data_dir=flags.data_dir,
-                rotation=flags.rotation,
             ).batch(per_replica_batch_size)
                         
             return _gray_data_set
