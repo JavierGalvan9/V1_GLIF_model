@@ -40,9 +40,8 @@ lgn_model/data/temporal_kernels_120x80.pkl
 synaptic_data/basis_function_weights_5.csv
 synaptic_data/tau_basis_5.npy
 .gitignore
-Paper_figures
 cuda_ops
-Neuropixels_data/PSP data
+Neuropixels_data/PSP_data
 synaptic_data/double_alpha_params_full.csv
 Paper_figures
 cuda_ops
@@ -53,4 +52,36 @@ test_synaptic_currents_cuda.py
 v1_model_utils/synaptic_currents_triton.py
 figures
 synaptic_data/tau_basis_3.npy
+synaptic_data/figures
 synaptic_data/basis_function_weights_3.csv
+Loss_curves
+
+# multi_training.sh
+performance_data_simulations.sh
+# parallel_training_testing.py
+performance_statistics.csv
+voltage_loss_fp16_error_test.ipynb
+# mixed_precision_error_audit.ipynb
+emd_loss_fp16_error_test.ipynb
+tests
+!tests/
+!tests/test_runtime_bookkeeping.py
+!tests/test_rate_masking.py
+!tests/run_float32_smoke.py
+!tests/loss_mask_equivalence.ipynb
+.cache
+# Paper
+compare_7m02_vs_oab5_out.ipynb
+current_optimization_tests_old
+mcp_paper_search/server.py
+mcp_paper_search/README.md
+.vscode/settings.json
+.venv
+autoresearch_optimization
+.codex
+.vscode
+optimization_report
+.vscode/settings.json
+tests
+simulations_comparator.ipynb
+Neuropixels

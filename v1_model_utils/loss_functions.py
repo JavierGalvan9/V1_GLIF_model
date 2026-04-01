@@ -3,11 +3,151 @@ import tensorflow as tf
 from tensorflow.keras.layers import Layer
 import pandas as pd
 import pickle as pkl
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except Exception:
+    HAS_NUMBA = False
+
 from math import pi
 import os
 import sys
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
 import other_v1_utils
+
+
+@njit(cache=True)
+def _build_group_order_numba(group_ids, n_groups):
+    """Stable bucket ordering by group id with CSR row_splits."""
+    n = group_ids.shape[0]
+    counts = np.zeros(n_groups, dtype=np.int64)
+    for i in range(n):
+        counts[group_ids[i]] += 1
+
+    row_splits = np.empty(n_groups + 1, dtype=np.int64)
+    row_splits[0] = 0
+    for g in range(n_groups):
+        row_splits[g + 1] = row_splits[g] + counts[g]
+
+    write_ptr = np.empty(n_groups, dtype=np.int64)
+    for g in range(n_groups):
+        write_ptr[g] = row_splits[g]
+
+    order = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        g = group_ids[i]
+        pos = write_ptr[g]
+        order[pos] = i
+        write_ptr[g] = pos + 1
+
+    return order, row_splits
+
+@njit(cache=True)
+def _sort_initial_values_by_group_numba(initial_values, order, row_splits):
+    """Sort initial values independently inside each group segment."""
+    out = np.empty(initial_values.shape[0], dtype=initial_values.dtype)
+    n_groups = row_splits.shape[0] - 1
+    for g in range(n_groups):
+        start = row_splits[g]
+        end = row_splits[g + 1]
+        size = end - start
+        buf = np.empty(size, dtype=initial_values.dtype)
+        for j in range(size):
+            buf[j] = initial_values[order[start + j]]
+        buf.sort()
+        for j in range(size):
+            out[start + j] = buf[j]
+    return out
+
+
+def _build_group_order_numpy(group_ids, n_groups):
+    order = np.argsort(group_ids, kind='stable')
+    counts = np.bincount(group_ids, minlength=n_groups)
+    row_splits = np.empty(n_groups + 1, dtype=np.int64)
+    row_splits[0] = 0
+    np.cumsum(counts, dtype=np.int64, out=row_splits[1:])
+    return order.astype(np.int64, copy=False), row_splits
+
+
+def _sort_initial_values_by_group_numpy(initial_values, order, row_splits):
+    out = np.empty(initial_values.shape[0], dtype=initial_values.dtype)
+    for g in range(row_splits.shape[0] - 1):
+        start = row_splits[g]
+        end = row_splits[g + 1]
+        out[start:end] = np.sort(initial_values[order[start:end]])
+    return out
+
+
+@njit(cache=True)
+def _group_mean_and_count_numba(values, group_ids, n_groups):
+    sums = np.zeros(n_groups, dtype=values.dtype)
+    counts = np.zeros(n_groups, dtype=np.int64)
+    n = values.shape[0]
+    for i in range(n):
+        g = group_ids[i]
+        sums[g] += values[i]
+        counts[g] += 1
+
+    means = np.zeros(n_groups, dtype=values.dtype)
+    for g in range(n_groups):
+        if counts[g] > 0:
+            means[g] = sums[g] / counts[g]
+    return means, counts
+
+
+def _group_mean_and_count_numpy(values, group_ids, n_groups):
+    sums = np.zeros(n_groups, dtype=values.dtype)
+    counts = np.zeros(n_groups, dtype=np.int64)
+    for i in range(values.shape[0]):
+        g = group_ids[i]
+        sums[g] += values[i]
+        counts[g] += 1
+
+    means = np.zeros(n_groups, dtype=values.dtype)
+    non_zero = counts > 0
+    means[non_zero] = sums[non_zero] / counts[non_zero].astype(values.dtype, copy=False)
+    return means, counts
+
+
+@njit(cache=True)
+def _build_lognormal_targets_numba(initial_value, group_ids, n_groups, log_epsilon, std_epsilon):
+    log_initial_value = np.log(np.abs(initial_value) + log_epsilon)
+    log_mean_all, counts = _group_mean_and_count_numba(log_initial_value, group_ids, n_groups)
+
+    squared_diff = np.empty_like(log_initial_value)
+    for i in range(log_initial_value.shape[0]):
+        g = group_ids[i]
+        d = log_initial_value[i] - log_mean_all[g]
+        squared_diff[i] = d * d
+
+    log_var_all, _ = _group_mean_and_count_numba(squared_diff, group_ids, n_groups)
+    log_std_all = np.sqrt(log_var_all + std_epsilon)
+
+    n_valid = 0
+    for g in range(n_groups):
+        if counts[g] > 2:
+            n_valid += 1
+    valid_indices = np.empty(n_valid, dtype=np.int32)
+    j = 0
+    for g in range(n_groups):
+        if counts[g] > 2:
+            valid_indices[j] = g
+            j += 1
+
+    return log_mean_all, log_std_all, counts, valid_indices
+
+
+def _build_lognormal_targets_numpy(initial_value, group_ids, n_groups, log_epsilon, std_epsilon):
+    log_initial_value = np.log(np.abs(initial_value) + log_epsilon).astype(initial_value.dtype, copy=False)
+    log_mean_all, counts = _group_mean_and_count_numpy(log_initial_value, group_ids, n_groups)
+
+    gathered_means = log_mean_all[group_ids]
+    squared_diff = np.square(log_initial_value - gathered_means, dtype=initial_value.dtype)
+    log_var_all, _ = _group_mean_and_count_numpy(squared_diff, group_ids, n_groups)
+    log_std_all = np.sqrt(log_var_all + std_epsilon).astype(initial_value.dtype, copy=False)
+
+    valid_indices = np.where(counts > 2)[0].astype(np.int32, copy=False)
+    return log_mean_all, log_std_all, counts, valid_indices
 
 
 # class StiffRegularizer(tf.keras.regularizers.Regularizer):
@@ -18,7 +158,7 @@ import other_v1_utils
 
 #     def __call__(self, x):
 #         return self._strength * tf.reduce_mean(tf.square(x - self._initial_value))
-    
+
 # class L2Regularizer(tf.keras.regularizers.Regularizer):
 #     def __init__(self, strength, initial_value):
 #         super().__init__()
@@ -30,6 +170,7 @@ import other_v1_utils
 
 class MeanStiffRegularizer(Layer):
     def __init__(self, strength, network, penalize_relative_change=False, dtype=tf.float32):
+        super().__init__()
         self._strength = tf.cast(strength, dtype)
         self._dtype = dtype
         self._penalize_relative_change = penalize_relative_change
@@ -37,10 +178,10 @@ class MeanStiffRegularizer(Layer):
         voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
         # Get the initial weights and properly scale them down
         indices = network["synapses"]["indices"]
-        initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
+        weights = np.array(network["synapses"]["weights"], dtype=np.float32)
         edge_type_ids = network['synapses']['edge_type_ids']
         # Scale initial values by the voltage scale of the node IDs
-        initial_value /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        initial_value = weights / voltage_scale[network['node_type_ids'][indices[:, 0]]]
         # Find unique values and their first occurrence indices
         unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
         # Sort first_occurrence_indices to maintain the order of first appearances
@@ -52,17 +193,20 @@ class MeanStiffRegularizer(Layer):
         if self._penalize_relative_change:
             epsilon = np.float32(1e-4)
             denominator = np.maximum(np.abs(initial_mean_weights), epsilon)
-            self._denominator = tf.constant(denominator, dtype=tf.float32)
+            self._denominator = tf.constant(denominator, dtype=self._dtype)
 
         self.idx = tf.constant(self.idx, dtype=tf.int32)
         self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
-        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=tf.float32)
+        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=self._dtype)
 
     @tf.function(jit_compile=True)
     def __call__(self, x):
 
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
+
+        if x.dtype != self._dtype:
+            x = tf.cast(x, self._dtype)
 
         mean_edge_type_weights = tf.math.unsorted_segment_mean(x, self.idx, self.num_unique)
         if self._penalize_relative_change:
@@ -72,35 +216,36 @@ class MeanStiffRegularizer(Layer):
             reg_loss = tf.sqrt(tf.reduce_mean(tf.square(relative_deviation)))
         else:
             reg_loss = tf.reduce_mean(tf.square(mean_edge_type_weights - self._target_mean_weights))
-        
+
         return tf.cast(reg_loss, dtype=self._dtype) * self._strength
-    
+
 class MeanStdStiffRegularizer(Layer):
-    def __init__(self, strength, network, penalize_relative_change=False, 
+    def __init__(self, strength, network, penalize_relative_change=False,
                     std_weight=0.5, logspace=True, dtype=tf.float32):
+        super().__init__()
         self._strength = tf.cast(strength, dtype)
         self._dtype = dtype
         self._penalize_relative_change = penalize_relative_change
-        self._std_weight = std_weight  # Weight for std deviation component
+        self._std_weight = tf.cast(std_weight, self._dtype)  # Weight for std deviation component
         self._logspace = logspace  # Whether to use logspace for std calculation
-        self._epsilon = tf.constant(1e-6, dtype=dtype)  # Small value to avoid log(0)
-        
+        self._epsilon = tf.constant(1e-6, dtype=self._dtype)  # Small value to avoid log(0)
+
         # Compute voltage scale
         voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
         # Get the initial weights and properly scale them down
         indices = network["synapses"]["indices"]
-        initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
+        weights = np.array(network["synapses"]["weights"], dtype=np.float32)
         edge_type_ids = network['synapses']['edge_type_ids']
         # Scale initial values by the voltage scale of the node IDs
-        initial_value /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        initial_value = weights / voltage_scale[network['node_type_ids'][indices[:, 0]]]
         # Find unique values and their first occurrence indices
         unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
         # Sort first_occurrence_indices to maintain the order of first appearances
-        self.num_unique = unique_edge_types.shape[0]            
+        self.num_unique = unique_edge_types.shape[0]
         sum_weights = np.bincount(self.idx, weights=initial_value, minlength=self.num_unique)
         count_weights = np.bincount(self.idx, minlength=self.num_unique)
         initial_mean_weights = sum_weights / count_weights
-        
+
         # Calculate std deviation per edge type in logspace if requested
         self._target_std_weights = []
         for i in range(self.num_unique):
@@ -113,26 +258,29 @@ class MeanStdStiffRegularizer(Layer):
                 std = np.std(edge_type_weights)
             self._target_std_weights.append(std)
         self._target_std_weights = tf.constant(self._target_std_weights, dtype=self._dtype)
-        
+
         # Determine target mean weights and denominators for relative change
         if self._penalize_relative_change:
             epsilon = np.float32(1e-4)
             denominator = np.maximum(np.abs(initial_mean_weights), epsilon)
-            self._denominator = tf.constant(denominator, dtype=tf.float32)
+            self._denominator = tf.constant(denominator, dtype=self._dtype)
             # Also for std deviation
             epsilon = np.float32(1e-3)
             std_denominator = np.maximum(np.abs(self._target_std_weights.numpy()), epsilon)
-            self._std_denominator = tf.constant(std_denominator, dtype=tf.float32)
+            self._std_denominator = tf.constant(std_denominator, dtype=self._dtype)
 
         self.idx = tf.constant(self.idx, dtype=tf.int32)
         self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
-        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=tf.float32)
+        self._target_mean_weights = tf.constant(initial_mean_weights, dtype=self._dtype)
 
     @tf.function(jit_compile=True)
     def __call__(self, x):
 
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
+
+        if x.dtype != self._dtype:
+            x = tf.cast(x, self._dtype)
 
         # Calculate mean per edge type
         mean_edge_type_weights = tf.math.unsorted_segment_mean(x, self.idx, self.num_unique)
@@ -162,7 +310,7 @@ class MeanStdStiffRegularizer(Layer):
             # Mean deviation component - with safe division
             mean_relative_deviation = (mean_edge_type_weights - self._target_mean_weights) / self._denominator
             mean_loss = tf.sqrt(tf.reduce_mean(tf.square(mean_relative_deviation)))
-            
+
             # Std deviation component - with safe division
             std_relative_deviation = (std_edge_type_weights - self._target_std_weights) / self._std_denominator
             std_loss = tf.sqrt(tf.reduce_mean(tf.square(std_relative_deviation)))
@@ -170,16 +318,16 @@ class MeanStdStiffRegularizer(Layer):
             # Mean deviation component
             mean_squared_error = tf.square(mean_edge_type_weights - self._target_mean_weights)
             mean_loss = tf.reduce_mean(mean_squared_error)
-            
+
             # Std deviation component
             std_squared_error = tf.square(std_edge_type_weights - self._target_std_weights)
             std_loss = tf.reduce_mean(std_squared_error)
-        
+
         # Combine losses with weighting
-        total_loss = (1.0 - self._std_weight) * mean_loss + self._std_weight * std_loss
+        total_loss = (tf.cast(1.0, self._dtype) - self._std_weight) * mean_loss + self._std_weight * std_loss
         return tf.cast(total_loss, dtype=self._dtype) * self._strength
-                
-                    
+
+
 class StiffKLLogNormalRegularizer(Layer):
     """Regularization using KL divergence for log-normal distributions
 
@@ -187,48 +335,56 @@ class StiffKLLogNormalRegularizer(Layer):
         Layer (_type_): _description_
     """
     def __init__(self, strength, network, dtype=tf.float32):
-        self._strength = tf.cast(strength, dtype)
+        super().__init__()
+        # Keep this regularizer in fp32 for numerical stability.
         self._dtype = dtype
-        self.epsilon = tf.constant(1e-8, dtype=dtype)
+        self._strength = tf.cast(strength, self._dtype)
+        self.epsilon = tf.constant(1e-8, dtype=self._dtype)
 
         # Compute voltage scale and rescale initial weights
         voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
-        indices = network["synapses"]["indices"]
-        initial_value = np.array(network["synapses"]["weights"], dtype=np.float32)
-        edge_type_ids = network['synapses']['edge_type_ids']
-        initial_value /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+        indices = np.asarray(network["synapses"]["indices"])
+        weights = np.asarray(network["synapses"]["weights"], dtype=np.float32)
+        edge_type_ids = np.asarray(network['synapses']['edge_type_ids'])
+        initial_value = weights / voltage_scale[np.asarray(network['node_type_ids'])[indices[:, 0]]]
 
         # Edge type indexing
-        unique_edge_types, self.idx = np.unique(edge_type_ids, return_inverse=True)
-        self.idx = tf.constant(self.idx, dtype=tf.int32)
-        self.num_unique = tf.constant(unique_edge_types.shape[0], dtype=tf.int32)
-        # Filter edge types with more than 2 connections
-        count_weights = np.bincount(self.idx, minlength=self.num_unique)
-        self.edges_mask = count_weights > 2
-        # Create indices for valid edge types (for gather operations)
-        self.valid_indices = tf.convert_to_tensor(np.where(self.edges_mask)[0], dtype=tf.int32)
-        self.num_valid = tf.shape(self.valid_indices)[0]
+        _, idx_np = np.unique(edge_type_ids, return_inverse=True)
+        idx_np = idx_np.astype(np.int32, copy=False)
+        n_groups = int(np.max(idx_np) + 1) if idx_np.size else 0
 
-        # Precompute mean and std of log(initial weights) per edge type
-        log_initial_value = np.log(np.abs(initial_value) + 1e-10)  # Add small epsilon in numpy
-        self._target_log_mean_all = tf.math.unsorted_segment_mean(
-            tf.constant(log_initial_value, dtype), self.idx, self.num_unique
-        )
-        # Variance per edge type
-        log_squared_diff = (log_initial_value - self._target_log_mean_all.numpy()[self.idx]) ** 2
-        log_var = tf.math.unsorted_segment_mean(
-            tf.constant(log_squared_diff, dtype), self.idx, self.num_unique
-        )
-        log_std_all = tf.sqrt(log_var + self.epsilon)  # Add epsilon before sqrt
+        if idx_np.size == 0:
+            log_mean_all_np = np.empty((0,), dtype=np.float32)
+            log_std_all_np = np.empty((0,), dtype=np.float32)
+            valid_indices_np = np.empty((0,), dtype=np.int32)
+        else:
+            log_epsilon = np.float32(1e-10)
+            std_epsilon = np.float32(1e-8)
+            if HAS_NUMBA:
+                log_mean_all_np, log_std_all_np, count_weights, valid_indices_np = _build_lognormal_targets_numba(
+                    initial_value, idx_np, n_groups, log_epsilon, std_epsilon
+                )
+            else:
+                log_mean_all_np, log_std_all_np, count_weights, valid_indices_np = _build_lognormal_targets_numpy(
+                    initial_value, idx_np, n_groups, log_epsilon, std_epsilon
+                )
 
-        # Pre-filter target values using gather instead of boolean_mask
-        self._target_log_mean = tf.gather(self._target_log_mean_all, self.valid_indices)
-        self._target_log_std = tf.gather(log_std_all, self.valid_indices)
+        self.idx = tf.constant(idx_np, dtype=tf.int32)
+        self.num_unique = tf.constant(n_groups, dtype=tf.int32)
+        self.valid_indices = tf.constant(valid_indices_np, dtype=tf.int32)
+        self.num_valid = tf.constant(valid_indices_np.size, dtype=tf.int32)
+
+        self._target_log_mean_all = tf.constant(log_mean_all_np, dtype=self._dtype)
+        self._target_log_mean = tf.constant(log_mean_all_np[valid_indices_np], dtype=self._dtype)
+        self._target_log_std = tf.constant(log_std_all_np[valid_indices_np], dtype=self._dtype)
 
     @tf.function(jit_compile=True)
     def __call__(self, x):
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
+
+        if x.dtype != self._dtype:
+            x = tf.cast(x, self._dtype)
 
         # Calculate log of absolute values with epsilon for stability
         log_x = tf.math.log(tf.abs(x) + self.epsilon)
@@ -246,7 +402,7 @@ class StiffKLLogNormalRegularizer(Layer):
         denominator = 2.0 * tf.square(self._target_log_std) + self.epsilon
         std_ratio = tf.square(log_std) / denominator
         diff_ratio = tf.square(log_mean - self._target_log_mean) / denominator
-        
+
         # Combine terms after stable calculations
         kl = log_ratio + std_ratio + diff_ratio - 0.5
         # Use reduce_mean without abs since KL should be positive
@@ -257,8 +413,9 @@ class StiffKLLogNormalRegularizer(Layer):
 class L2Regularizer(tf.keras.regularizers.Regularizer):
     def __init__(self, strength, network, flags, penalize_relative_change=False, dtype=tf.float32):
         super().__init__()
-        self._strength = tf.cast(strength, dtype)
+        # Keep this regularizer in fp32 for numerical stability.
         self._dtype = dtype
+        self._strength = tf.cast(strength, self._dtype)
 
         if penalize_relative_change:
             # Compute voltage scale
@@ -275,17 +432,21 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
             unique_edge_type_ids, inverse_indices = np.unique(edge_type_ids, return_inverse=True)
             mean_weights = np.array([np.mean(initial_value[edge_type_ids == edge_type_id]) for edge_type_id in unique_edge_type_ids])
             # Create target mean weights array based on the edge type indices
-            self._target_mean_weights = tf.constant(mean_weights[inverse_indices], dtype=tf.float32)
-            epsilon = tf.constant(1e-4, dtype=tf.float32)  # A small constant to avoid division by zero
-            self._target_mean_weights = tf.maximum(tf.abs(self._target_mean_weights), epsilon)
+            target_mean_weights = mean_weights[inverse_indices]
+            epsilon = 1e-4
+            target_mean_weights = np.maximum(np.abs(target_mean_weights), epsilon) # Ensure no zero values for stability
+            self._target_mean_weights = tf.constant(target_mean_weights, dtype=self._dtype)
         else:
             self._target_mean_weights = None
 
     @tf.function(jit_compile=True)
     def __call__(self, x):
-        
+
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
+
+        if x.dtype != self._dtype:
+            x = tf.cast(x, self._dtype)
 
         if self._target_mean_weights is None:
             return tf.cast(self._strength * tf.reduce_mean(tf.square(x)), dtype=self._dtype)
@@ -294,79 +455,149 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
             mse = self._strength * tf.reduce_mean(tf.square(relative_deviation))
             return tf.cast(mse, dtype=self._dtype)
 
+# class EarthMoversDistanceRegularizer(Layer):
+#     """
+#     Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
+#     synaptic weight distributions, per edge type, averaged over all edge types.
+#     Uses TF operations for initialization and tf.map_fn in call for memory efficiency.
+#     """
+#     def __init__(self, strength, network, dtype=tf.float32):
+#         super().__init__()
+#         self._strength = tf.cast(strength, dtype)
+#         self._dtype = dtype
+
+#         # --- Original Initialization Logic ---
+#         voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
+#         indices = network["synapses"]["indices"]
+#         initial_value_np = np.array(network["synapses"]["weights"], dtype=np.float32)
+#         # edge_type_ids_np = network['synapses']['edge_type_ids']
+#         # use the connection_type_ids instead
+#         edge_type_ids_np = other_v1_utils.connection_type_ids(network)
+#         initial_value_np /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
+#         n_edges = len(initial_value_np)
+#         # --- End Original Initialization Logic ---
+
+#         # Convert to TF Tensors
+#         self._initial_value = tf.constant(initial_value_np, dtype=self._dtype)
+#         edge_type_ids = tf.constant(edge_type_ids_np, dtype=tf.int32)
+
+#         unique_edge_types, idx = np.unique(edge_type_ids_np, return_inverse=True)
+#         idx = tf.constant(idx, dtype=tf.int32)
+#         self.num_unique = tf.constant(unique_edge_types.shape[0], dtype=tf.int32)
+
+#         # presort the initial value
+#         for i in tf.range(self.num_unique):
+#             mask = tf.equal(idx, i)
+#             y_i = tf.boolean_mask(self._initial_value, mask)
+#             y_i = tf.sort(y_i)
+#             self._initial_value = tf.tensor_scatter_nd_update(self._initial_value, tf.where(mask), y_i)
+
+#         ### 2. Reorder original_indices and initial_value based on sorted edge types
+#         original_indices = tf.range(n_edges, dtype=tf.int32)
+#         sorted_indices = tf.argsort(edge_type_ids)
+#         permuted_original_indices = tf.gather(original_indices, sorted_indices)
+#         sorted_edge_type_ids = tf.gather(edge_type_ids, sorted_indices) # Needed for unique
+
+#         # 3. Build row_splits directly from per-type counts.
+#         # This avoids RaggedTensor.from_value_rowids -> DenseBincount, which raises
+#         # under GPU deterministic mode in TF 2.15.
+#         _, _, counts = tf.unique_with_counts(sorted_edge_type_ids)
+#         row_splits = tf.concat(
+#             [tf.zeros((1,), dtype=counts.dtype), tf.cumsum(counts)],
+#             axis=0,
+#         )
+
+#         # 4. Construct group_indices RaggedTensor (indices into the *original* weight tensor)
+#         self._group_indices = tf.RaggedTensor.from_row_splits(
+#             values=permuted_original_indices,
+#             row_splits=row_splits,
+#             validate=False
+#         )
+
+    # @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
+    # def __call__(self, x):
+    #     if x.dtype != self._dtype:
+    #         x = tf.cast(x, self._dtype)
+    #     if len(x.shape) > 1 and x.shape[1] == 1:
+    #         x = tf.squeeze(x, axis=1)
+    #     emd_losses = tf.TensorArray(self._dtype, size=self.num_unique)
+    #     for i in tf.range(self.num_unique):
+    #         x_i = tf.gather(x, self._group_indices[i])
+    #         y_i = tf.gather(self._initial_value, self._group_indices[i])
+
+    #         # y_i is presorted.
+    #         emd = tf.reduce_mean(tf.abs(tf.sort(x_i) - y_i))
+    #         emd_losses = emd_losses.write(i, emd)
+    #     emd_losses = emd_losses.stack()
+    #     reg_loss = tf.reduce_mean(emd_losses)
+    #     return reg_loss * self._strength
+
+
 class EarthMoversDistanceRegularizer(Layer):
     """
-    Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
+    EMD Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
     synaptic weight distributions, per edge type, averaged over all edge types.
-    Uses TF operations for initialization and tf.map_fn in call for memory efficiency.
+    Uses TF operations for execution and CPU numba for initialization.
     """
+
     def __init__(self, strength, network, dtype=tf.float32):
         super().__init__()
         self._strength = tf.cast(strength, dtype)
         self._dtype = dtype
 
-        # --- Original Initialization Logic ---
         voltage_scale = (network['node_params']['V_th'] - network['node_params']['E_L']).astype(np.float32)
-        indices = network["synapses"]["indices"]
-        initial_value_np = np.array(network["synapses"]["weights"], dtype=np.float32)
+        indices = np.asarray(network['synapses']['indices'])
+        initial_value_np = np.asarray(network['synapses']['weights'], dtype=np.float32).copy()
         # edge_type_ids_np = network['synapses']['edge_type_ids']
         # use the connection_type_ids instead
-        edge_type_ids_np = other_v1_utils.connection_type_ids(network)
-        initial_value_np /= voltage_scale[network['node_type_ids'][indices[:, 0]]]
-        n_edges = len(initial_value_np)
-        # --- End Original Initialization Logic ---
+        edge_type_ids_np = other_v1_utils.connection_type_ids(network).astype(np.int64, copy=False)
+        initial_value_np /= voltage_scale[np.asarray(network['node_type_ids'])[indices[:, 0]]]
 
-        # Convert to TF Tensors
-        initial_value = tf.constant(initial_value_np, dtype=tf.float32)
-        edge_type_ids = tf.constant(edge_type_ids_np, dtype=tf.int32)
-        
-        unique_edge_types, idx = np.unique(edge_type_ids, return_inverse=True)
-        self.num_unique = tf.constant(unique_edge_types.shape[0], dtype=tf.int32)
+        _, group_ids_np = np.unique(edge_type_ids_np, return_inverse=True)
+        n_groups = int(np.max(group_ids_np) + 1) if group_ids_np.size else 0
 
-        self._initial_value = tf.constant(initial_value, dtype=tf.float32)
-        
-        
-        # presort the initial value
-        for i in tf.range(self.num_unique):
-            mask = tf.equal(idx, i)
-            y_i = tf.boolean_mask(self._initial_value, mask)
-            y_i = tf.sort(y_i)
-            self._initial_value = tf.tensor_scatter_nd_update(self._initial_value, tf.where(mask), y_i)
-
-
+        # presort the initial valueby group using the same order as group_ids_np, so that we can directly compare to sorted x_i in the call method without needing to sort y_i there.
         ### 2. Reorder original_indices and initial_value based on sorted edge types
-        original_indices = tf.range(n_edges, dtype=tf.int32)
-        sorted_indices = tf.argsort(edge_type_ids)
-        permuted_original_indices = tf.gather(original_indices, sorted_indices)
-        sorted_edge_type_ids = tf.gather(edge_type_ids, sorted_indices) # Needed for unique
+        if group_ids_np.size == 0:
+            order_np = np.empty((0,), dtype=np.int64)
+            row_splits_np = np.zeros((1,), dtype=np.int64)
+            sorted_initial_flat_np = np.empty((0,), dtype=np.float32)
+        else:
+            if HAS_NUMBA:
+                order_np, row_splits_np = _build_group_order_numba(group_ids_np, n_groups)
+                sorted_initial_flat_np = _sort_initial_values_by_group_numba(initial_value_np, order_np, row_splits_np)
+            else:
+                order_np, row_splits_np = _build_group_order_numpy(group_ids_np, n_groups)
+                sorted_initial_flat_np = _sort_initial_values_by_group_numpy(initial_value_np, order_np, row_splits_np)
 
-        # 3. Find unique edge types and row indices for ragged tensor construction
-        unique_types, row_indices = tf.unique(sorted_edge_type_ids)
-        nrows = tf.shape(unique_types)[0]
+        if order_np.size <= np.iinfo(np.int32).max:
+            order_tf = tf.convert_to_tensor(order_np, dtype=tf.int32)
+        else:
+            order_tf = tf.convert_to_tensor(order_np, dtype=tf.int64)
+        row_splits_tf = tf.convert_to_tensor(row_splits_np, dtype=tf.int32)
+        sorted_initial_tf = tf.convert_to_tensor(sorted_initial_flat_np, dtype=self._dtype)
 
-        # 4. Construct group_indices RaggedTensor (indices into the *original* weight tensor)
-        self._group_indices = tf.RaggedTensor.from_value_rowids(
-            values=permuted_original_indices,
-            value_rowids=row_indices,
-            nrows=nrows
-        )
+        # 3. Build row_splits directly from per-type counts.
+        # This avoids RaggedTensor.from_value_rowids -> DenseBincount, which raises
+        # under GPU deterministic mode in TF 2.15.
+        self.num_unique = tf.constant(n_groups, dtype=tf.int32)
+        self._group_indices = tf.RaggedTensor.from_row_splits(order_tf, row_splits_tf, validate=False)
+        self._sorted_initial_values = tf.RaggedTensor.from_row_splits(sorted_initial_tf, row_splits_tf, validate=False)
 
     @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
     def __call__(self, x):
-        if x.dtype != tf.float32:
-            x = tf.cast(x, tf.float32)
+        if x.dtype != self._dtype:
+            x = tf.cast(x, self._dtype)
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
+
         emd_losses = tf.TensorArray(self._dtype, size=self.num_unique)
         for i in tf.range(self.num_unique):
             x_i = tf.gather(x, self._group_indices[i])
-            y_i = tf.gather(self._initial_value, self._group_indices[i])
-
-            # y_i is presorted.
+            y_i = self._sorted_initial_values[i] # Already presorted during initialization
             emd = tf.reduce_mean(tf.abs(tf.sort(x_i) - y_i))
             emd_losses = emd_losses.write(i, emd)
-        emd_losses = emd_losses.stack()
-        reg_loss = tf.reduce_mean(emd_losses)
+        reg_loss = tf.reduce_mean(emd_losses.stack())
         return reg_loss * self._strength
 
 
@@ -389,7 +620,7 @@ def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     x_rand = rate_rd.uniform(low=0, high=1, size=n_neurons)
     # Use inverse transform sampling: interpolate the uniform values to find the firing rates
     target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
-    # target_firing_rates = np.interp(x_rand, percentiles, sorted_firing_rates)    
+    # target_firing_rates = np.interp(x_rand, percentiles, sorted_firing_rates)
     return target_firing_rates
 
 def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
@@ -429,8 +660,8 @@ def compute_spike_rate_target_loss(rates, target_rates, dtype=tf.float32):
             loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
             total_loss += tf.reduce_sum(loss_type)
             num_neurons += tf.size(neuron_ids)
-        
-    total_loss /= tf.cast(num_neurons, dtype=dtype)  
+
+    total_loss /= tf.cast(num_neurons, dtype=dtype)
 
     return total_loss
 
@@ -489,29 +720,99 @@ def neuropixels_cell_type_to_cell_type(pop_name):
     return f"{layer} {class_name}"
 
 
+CELL_TYPE_QUERY_MAPPING = {
+    "i1H": "L1 Htr3a",
+    "e23": "L2/3 Exc",
+    "i23P": "L2/3 PV",
+    "i23S": "L2/3 SST",
+    "i23V": "L2/3 VIP",
+    "e4": "L4 Exc",
+    "i4P": "L4 PV",
+    "i4S": "L4 SST",
+    "i4V": "L4 VIP",
+    "e5": "L5 Exc",
+    "i5P": "L5 PV",
+    "i5S": "L5 SST",
+    "i5V": "L5 VIP",
+    "e6": "L6 Exc",
+    "i6P": "L6 PV",
+    "i6S": "L6 SST",
+    "i6V": "L6 VIP",
+}
+
+CELL_TYPE_ORDER = tuple(CELL_TYPE_QUERY_MAPPING.values())
+
+
+def _core_mask_to_numpy(core_mask, n_nodes):
+    if core_mask is None:
+        return np.ones(n_nodes, dtype=bool)
+    if hasattr(core_mask, "numpy"):
+        core_mask = core_mask.numpy()
+    core_mask = np.asarray(core_mask, dtype=bool)
+    if core_mask.shape[0] != n_nodes:
+        raise ValueError(
+            f"core_mask has length {core_mask.shape[0]}, expected {n_nodes}."
+        )
+    return core_mask
+
+
+def get_population_neuron_ids(
+    network, data_dir="GLIF_network", core_mask=None, reindex_selected=False
+):
+    pop_names = other_v1_utils.pop_names(network, data_dir=data_dir)
+    np_core_mask = _core_mask_to_numpy(core_mask, len(pop_names))
+    if reindex_selected:
+        selected_ids = np.arange(np.count_nonzero(np_core_mask), dtype=np.int32)
+    else:
+        selected_ids = np.flatnonzero(np_core_mask)
+    selected_pop_names = pop_names[np_core_mask]
+    selected_cell_types = np.array(
+        [
+            other_v1_utils.pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=True)
+            for pop_name in selected_pop_names
+        ]
+    )
+
+    grouped_ids = {}
+    for cell_type in CELL_TYPE_ORDER:
+        grouped_ids[cell_type] = selected_ids[selected_cell_types == cell_type]
+    return grouped_ids
+
+
 class SpikeRateDistributionTarget:
     """ Instead of regularization, treat it as a target.
         The main difference is that this class will calculate the loss
         for each subtypes of the neurons."""
-    def __init__(self, network, spontaneous_fr=False, rate_cost=.5, pre_delay=None, post_delay=None, 
+    def __init__(self, network, stimulus_type='drifting_gratings', rate_cost=.5, pre_delay=None, post_delay=None,
                  data_dir='GLIF_network', core_mask=None, rates_dampening=1.0, seed=42, dtype=tf.float32,
-                 neuropixels_df='Neuropixels_data/v1_OSI_DSI_DF.csv'):
+                 neuropixels_df='Neuropixels_data/v1_OSI_DSI_DF.csv', **kwargs):
         self._network = network
         self._rate_cost = rate_cost
         self._pre_delay = pre_delay
         self._post_delay = post_delay
         self._rates_dampening = rates_dampening
         self._core_mask = core_mask
-        if self._core_mask is not None:
-            self._np_core_mask = self._core_mask.numpy()
         self._data_dir = data_dir
         self._dtype = dtype
         self._seed = seed
         self._neuropixels_df = neuropixels_df
-        if spontaneous_fr:
+
+        # Mapping of stimulus type to neuropixels feature
+        # If deprecated arguments are used, map them to stimulus_type
+        if kwargs.get('spontaneous_fr'):
+            stimulus_type = 'spontaneous'
+        elif kwargs.get('natural_images'):
+            stimulus_type = 'natural_stimuli'
+
+        if stimulus_type in ['spontaneous', 'gray']:
             self.neuropixels_feature = 'firing_rate_sp'
-        else:
+        elif stimulus_type in ['natural_stimuli', 'natural_images']:
+            self.neuropixels_feature = 'firing_rate_ns'
+        elif stimulus_type == 'drifting_gratings':
             self.neuropixels_feature = 'Ave_Rate(Hz)'
+        else:
+            raise ValueError(f"Unknown stimulus_type: {stimulus_type}. Choose among 'spontaneous/gray', 'drifting_gratings', or 'natural_stimuli'.")
+
         self._target_rates = self.get_neuropixels_firing_rates()
 
     def get_neuropixels_firing_rates(self):
@@ -542,57 +843,32 @@ class SpikeRateDistributionTarget:
             np_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
             # Rename the column to match the original
             np_df.rename(columns={'Spont_Rate(Hz)': 'firing_rate_sp'}, inplace=True)
-        area_node_types = pd.read_csv(os.path.join(self._data_dir, f'network/v1_node_types.csv'), sep=" ")
         # Ensure they use the new names
         np_df["cell_type"] = np_df["cell_type"].apply(neuropixels_cell_type_to_cell_type)
-
-        # Define population queries
-        query_mapping = {
-            "i1H": 'L1 Htr3a',
-            "e23": 'L2/3 Exc',
-            "i23P": 'L2/3 PV',
-            "i23S": 'L2/3 SST',
-            "i23V": 'L2/3 VIP',
-            "e4": 'L4 Exc',
-            "i4P": 'L4 PV',
-            "i4S": 'L4 SST',
-            "i4V": 'L4 VIP',
-            "e5": 'L5 Exc',
-            "i5P": 'L5 PV',
-            "i5S": 'L5 SST',
-            "i5V": 'L5 VIP',
-            "e6": 'L6 Exc',
-            "i6P": 'L6 PV',
-            "i6S": 'L6 SST',
-            "i6V": 'L6 VIP'
-        }
-
-        # Define the reverse mapping
-        reversed_query_mapping = {v:k for k, v in query_mapping.items()}
-        # Process rates
         type_rates_dict = {
-                            reversed_query_mapping[cell_type]: np.append(subdf[self.neuropixels_feature].dropna().values / 1000, 0)
-                            # reversed_query_mapping[cell_type]: np.sort(np.append(subdf[self.neuropixels_feature].dropna().values / 1000, 0)) # the rates are sorted again later so is redundant
-                            for cell_type, subdf in np_df.groupby("cell_type")
-                        }
-        # Identify node_type_ids for each population query
-        pop_ids = {query: area_node_types[area_node_types.pop_name.str.contains(query)].index.values for query in query_mapping.keys()}
-        # Create a dictionary with rates and IDs
-        target_firing_rates = {pop_query: {'rates': type_rates_dict[pop_query], 'ids': pop_ids[pop_query]} for pop_query in pop_ids.keys()}
-        
-        for key, value in target_firing_rates.items():
-            # identify tne ids that are included in value["ids"]
-            neuron_ids = np.where(np.isin(self._network["node_type_ids"], value["ids"]))[0]
-            if self._core_mask is not None:
-                # if core_mask is not None, use only neurons in the core
-                neuron_ids = neuron_ids[self._np_core_mask[neuron_ids]]
+            cell_type: np.append(subdf[self.neuropixels_feature].dropna().values / 1000, 0)
+            for cell_type, subdf in np_df.groupby("cell_type")
+        }
+        population_ids = get_population_neuron_ids(
+            self._network, data_dir=self._data_dir, core_mask=self._core_mask
+        )
 
+        target_firing_rates = {}
+        for cell_type in CELL_TYPE_ORDER:
+            rates = type_rates_dict.get(cell_type, np.array([0.0], dtype=np.float32))
+            neuron_ids = population_ids[cell_type]
             type_n_neurons = len(neuron_ids)
-            target_firing_rates[key]['neuron_ids'] = tf.convert_to_tensor(neuron_ids, dtype=tf.int32)
-            sorted_target_rates = self._rates_dampening * sample_firing_rates(value["rates"], type_n_neurons, self._seed)
-            target_firing_rates[key]['sorted_target_rates'] = tf.convert_to_tensor(sorted_target_rates, dtype=self._dtype)
+            target_firing_rates[cell_type] = {
+                "rates": rates,
+                "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
+                "sorted_target_rates": tf.convert_to_tensor(
+                    self._rates_dampening
+                    * sample_firing_rates(rates, type_n_neurons, self._seed),
+                    dtype=self._dtype,
+                ),
+            }
 
-        return target_firing_rates    
+        return target_firing_rates
 
     def __call__(self, spikes, trim=True):
         # if trim:
@@ -608,7 +884,7 @@ class SpikeRateDistributionTarget:
 
         rates = tf.reduce_mean(spikes, (0, 1)) # calculate the mean firing rate over time and batch
 
-        reg_loss = compute_spike_rate_target_loss(rates, self._target_rates, dtype=self._dtype) 
+        reg_loss = compute_spike_rate_target_loss(rates, self._target_rates, dtype=self._dtype)
 
         return reg_loss * self._rate_cost
 
@@ -628,9 +904,25 @@ class SpikeRateDistributionTarget:
 #         return reg_loss
 
 class SynchronizationLoss(Layer):
-    def __init__(self, network, sync_cost=10., t_start=0., t_end=0.5, n_samples=50, data_dir='Synchronization_data', 
-                 session='evoked', dtype=tf.float32, core_mask=None, seed=42, **kwargs):
+    def __init__(self, network, stimulus_type='drifting_gratings', sync_cost=10., t_start=0., t_end=0.5, n_samples=50, neuropixels_data_dir='Synchronization_data',
+                 data_dir='GLIF_network', dtype=tf.float32, core_mask=None, seed=42, **kwargs):
         super(SynchronizationLoss, self).__init__(dtype=dtype, **kwargs)
+
+        # Handle legacy 'session' argument if passed via kwargs
+        if 'session' in kwargs:
+            _session = kwargs.get('session')
+            if _session == 'spont':
+                stimulus_type = 'spontaneous'
+            elif _session == 'evoked':
+                stimulus_type = 'drifting_gratings'
+
+        if stimulus_type in ['spontaneous', 'gray']:
+            session = 'spont'
+        elif stimulus_type == 'drifting_gratings':
+            session = 'evoked'
+        else:
+            raise ValueError(f"Unknown stimulus_type: {stimulus_type}. Choose among 'spontaneous', 'gray', or 'drifting_gratings'.")
+
         self._sync_cost = sync_cost
         self._t_start = t_start
         self._t_end = t_end
@@ -638,11 +930,12 @@ class SynchronizationLoss(Layer):
         self._t_end_seconds = int(t_end * 1000)
         self._core_mask = core_mask
         self._data_dir = data_dir
+        self._neuropixels_data_dir = neuropixels_data_dir
         self._dtype = dtype
         self._n_samples = n_samples
         self._base_seed = seed
 
-        pop_names = other_v1_utils.pop_names(network, data_dir='')
+        pop_names = other_v1_utils.pop_names(network, data_dir=self._data_dir)
         if self._core_mask is not None:
             pop_names = pop_names[core_mask]
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
@@ -657,11 +950,11 @@ class SynchronizationLoss(Layer):
         bin_sizes = bin_sizes[bin_sizes_mask]
         self._bin_sizes_ms = tuple(max(1, int(round(v * 1000.0))) for v in bin_sizes)
         self._bin_sizes_ms_tf = tf.constant(self._bin_sizes_ms, dtype=tf.int32)
-        self.epsilon = 1e-7  # Small constant to avoid division by zero
+        self._epsilon_tf = tf.constant(1e-7, dtype=self._dtype)  # Small constant to avoid division by zero
 
         # Load the experimental data
         duration = str(int((t_end - t_start) * 1000))
-        experimental_data_path = os.path.join(data_dir, f'Fano_factor_v1', f'v1_fano_running_{duration}ms_{session}.npy')
+        experimental_data_path = os.path.join(self._neuropixels_data_dir, f'Fano_factor_v1', f'v1_fano_running_{duration}ms_{session}.npy')
         # experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
         assert os.path.exists(experimental_data_path), f'File not found: {experimental_data_path}'
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
@@ -679,7 +972,7 @@ class SynchronizationLoss(Layer):
             # Compute mean and variance of spike counts
             mean_count = tf.reduce_mean(sp_counts, axis=1)
             var_count = tf.math.reduce_variance(sp_counts, axis=1)
-            mean_count = tf.maximum(mean_count, self.epsilon)
+            mean_count = tf.maximum(mean_count, self._epsilon_tf)
             # fanos.append(tf.reduce_mean(var_count / mean_count))
             fano_per_sample = var_count / mean_count  # => [n_samples]
             fano = tf.reduce_mean(fano_per_sample)
@@ -699,7 +992,7 @@ class SynchronizationLoss(Layer):
         bin_limit_ms = duration_ms // 2
         bin_sizes_mask = self._bin_sizes_ms_tf < bin_limit_ms
         experimental_fanos_mean = tf.boolean_mask(self.experimental_fanos_mean, bin_sizes_mask)
-        
+
         # if spikes.dtype != self._dtype:
         #     spikes = tf.cast(spikes, self._dtype)
         # choose random trials to sample from (usually we only have 1 trial to sample from)
@@ -728,7 +1021,7 @@ class SynchronizationLoss(Layer):
                 previous_id = tf.constant(0, dtype=tf.int32)
             sample_ids = shuffled_e_ids[previous_id:previous_id+sample_num]
             previous_id += sample_num
-            
+
             selected_spikes = tf.reduce_sum(tf.gather(spikes[sample_trial], sample_ids, axis=1), axis=-1)
             selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
@@ -747,16 +1040,15 @@ class SynchronizationLoss(Layer):
             lambda: tf.constant(0.0, dtype=self._dtype),
         )
         # # Calculate the synchronization loss
-        sync_loss = self._sync_cost * mse_loss
 
-        return sync_loss
-   
+        return self._sync_cost * mse_loss
+
 
 class VoltageRegularization:
     def __init__(self, cell, voltage_cost=1e-5, dtype=tf.float32, core_mask=None, penalty_mode="range"):
         """
         Voltage regularization with two penalty modes.
-        
+
         Args:
             cell: The cell model
             voltage_cost: Regularization coefficient
@@ -766,38 +1058,58 @@ class VoltageRegularization:
                 - "range": Penalizes voltages outside [0, 1] range
                 - "threshold": Penalizes distance from threshold (1.0)
         """
-        self._voltage_cost = tf.constant(voltage_cost, dtype=dtype)
+        # Keep the scalar coefficient in fp32 to avoid fp16 overflow/underflow during backprop.
+        self._voltage_cost = tf.constant(voltage_cost, dtype=tf.float32)
         self._cell = cell
         self._dtype = dtype
         self._penalty_mode = penalty_mode
         self._core_mask = core_mask
-        
+
+    @tf.function(jit_compile=True)
+    def _safe_global_mean(self, penalty):
+        """
+        Compute a global mean without triggering fp16 MeanGrad overflow.
+
+        Why this is needed:
+        - tf.reduce_mean in fp16 builds a gradient scale factor 1/N.
+        - If N > 65504, TensorFlow casts N to fp16 and overflows, causing RuntimeWarning.
+
+        Strategy:
+        - Keep elementwise-heavy math in fp16.
+        - Reduce batch/time first in fp16 (small divisors).
+        - Reduce the final neuron axis in fp32 (small intermediate tensor).
+        """
+        penalty = tf.reduce_mean(penalty, axis=0)  # divide by batch size (tipically  < 65504)
+        penalty = tf.reduce_mean(penalty, axis=0)  # divide by sequence length (tipically  < 65504)
+        return tf.reduce_mean(tf.cast(penalty, tf.float32), axis=0)  # divide by number of neurons (tipically > 65504, thus in fp32)
+
     @tf.function(jit_compile=True)
     def _compute_range_loss(self, voltages):
         """
         JIT-compiled range loss computation.
-        
+
         Fuses all operations into a single kernel, avoiding intermediate tensor allocations.
         This is ~2-3x faster than the unfused version for large tensors.
         """
-        # Single-pass computation: for each element, compute max(0, v-1)^2 + max(0, -v)^2
-        # This avoids creating separate intermediate tensors
-        upper_sq = tf.square(tf.nn.relu(voltages - 1.0))
-        lower_sq = tf.square(tf.nn.relu(-voltages))
-        return tf.reduce_mean(upper_sq + lower_sq)
-    
+        # Equivalent single-branch form of max(0, v-1)^2 + max(0, -v)^2.
+        # Keeping it as one branch can reduce intermediate tensor pressure.
+        penalty = tf.square(tf.nn.relu(tf.abs(voltages - 0.5) - 0.5))
+        return self._safe_global_mean(penalty)
+
     @tf.function(jit_compile=True)
     def _compute_threshold_loss(self, voltages):
         """JIT-compiled threshold loss computation."""
-        return tf.reduce_mean(tf.square(voltages - 1.0))
-        
+        penalty = tf.square(voltages - 1.0)
+        return self._safe_global_mean(penalty)
+
     def __call__(self, voltages):
 
         if self._core_mask is not None:
             voltages = tf.boolean_mask(voltages, self._core_mask, axis=2)
 
-        if voltages.dtype != self._dtype:
-            voltages = tf.cast(voltages, self._dtype)
+        # No need to cast voltages to self._dtype for the loss computation, since the loss is computed in fp32 anyway. Just ensure it's in a floating point format.
+        # if voltages.dtype != self._dtype:
+        #     voltages = tf.cast(voltages, self._dtype)
 
         if self._penalty_mode == "range":
             voltage_loss = self._compute_range_loss(voltages)
@@ -805,6 +1117,7 @@ class VoltageRegularization:
             voltage_loss = self._compute_threshold_loss(voltages)
 
         return voltage_loss * self._voltage_cost
+
 
 class CustomMeanLayer(Layer):
     def call(self, inputs):
@@ -814,10 +1127,10 @@ class CustomMeanLayer(Layer):
 
 
 class OrientationSelectivityLoss:
-    def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32, 
-                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0, layer_info=None,
+    def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32,
+                 core_mask=None, method="crowd_osi", subtraction_ratio=1.0,
                  neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv", data_dir=''):
-        
+
         self._network = network
         self._osi_cost = osi_cost
         self._pre_delay = pre_delay
@@ -835,12 +1148,12 @@ class OrientationSelectivityLoss:
             self._tuning_angles = tf.constant(core_tuning_angles, dtype=dtype)
         else:
             self._tuning_angles = tf.constant(network['tuning_angle'], dtype=dtype)
-        
+
         if self._method == "neuropixels_fr":
-            self._layer_info = layer_info  # needed for neuropixels_fr method
+            self._layer_info = other_v1_utils.get_layer_info(network)  # needed for neuropixels_fr method
             # the layer_info should be a dictionary that contains
             # the cell id of the corresponding layer.
-            # the keys should be something like "EXC_L23" or "PV_L5"   
+            # the keys should be something like "EXC_L23" or "PV_L5"
 
         elif self._method == "crowd_osi":
             # Get the target OSI
@@ -886,7 +1199,7 @@ class OrientationSelectivityLoss:
         delta_angle = tf.where(delta_angle < -90, delta_angle + 180, delta_angle)
 
         return delta_angle
-    
+
     def get_neuropixels_osi_dsi(self):
         """
         Processes neuropixels data to obtain neurons average firing rates.
@@ -905,7 +1218,7 @@ class OrientationSelectivityLoss:
             print(f"Using custom neuropixels data file for OSI/DSI loss: {neuropixels_data_path}")
         features_to_load = ['ecephys_unit_id', 'cell_type', 'OSI', 'DSI', "Ave_Rate(Hz)", "max_mean_rate(Hz)"]
         osi_dsi_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
-        
+
         nonresponding = osi_dsi_df["max_mean_rate(Hz)"] < 0.5
         osi_dsi_df.loc[nonresponding, "OSI"] = np.nan
         osi_dsi_df.loc[nonresponding, "DSI"] = np.nan
@@ -915,22 +1228,24 @@ class OrientationSelectivityLoss:
         osi_target = osi_dsi_df.groupby("cell_type")['OSI'].mean()
         dsi_target = osi_dsi_df.groupby("cell_type")['DSI'].mean()
 
-        original_pop_names = other_v1_utils.pop_names(self._network, data_dir=self.data_dir)
-        if self._core_mask is not None:
-            original_pop_names = original_pop_names[self.np_core_mask] 
-
-        cell_types = np.array([other_v1_utils.pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=True) for pop_name in original_pop_names])
-        node_ids = np.arange(len(cell_types))
-        cell_ids = {key: node_ids[cell_types == key] for key in set(osi_dsi_df['cell_type'])}
+        cell_ids = get_population_neuron_ids(
+            self._network,
+            data_dir=self.data_dir,
+            core_mask=self._core_mask,
+            reindex_selected=True,
+        )
 
         # osi_target = osi_df.groupby("cell_type")['OSI'].mean()
         # osi_target = osi_df.groupby("cell_type")['OSI'].median()
         # osi_df.groupby("cell_type")['OSI'].median()
         # convert to dict
-        osi_dsi_exp_dict = {key: {'OSI': val, 'DSI': dsi_target[key], 'ids': cell_ids[key]} for key, val in osi_target.to_dict().items()}
+        osi_dsi_exp_dict = {
+            key: {"OSI": val, "DSI": dsi_target[key], "ids": cell_ids.get(key, np.empty(0, dtype=np.int32))}
+            for key, val in osi_target.to_dict().items()
+        }
 
         return osi_dsi_exp_dict
-        
+
     def vonmises_model_fr(self, structure, population):
         from scipy.stats import vonmises
         paramdic = self._von_mises_params
@@ -938,12 +1253,12 @@ class OrientationSelectivityLoss:
         if len(_params) == 4:
             mu, kappa, a, b = _params
         vonmises_pdf = vonmises(kappa, loc=mu).pdf
-        
+
         angles = np.deg2rad(np.arange(-85, 86, 10)) * 2  # *2 needed to make it proper model
         model_fr = a + b * vonmises_pdf(angles)
 
         return model_fr
-    
+
     def neuropixels_fr_loss(self, spikes, angle):
         # if the trget fr is not set, construct them
         if not hasattr(self, "_target_frs"):
@@ -952,13 +1267,13 @@ class OrientationSelectivityLoss:
             # pickle instead
             with open(f"{self.data_dir}/param_dict_orientation.pkl", 'rb') as f:
                 self._von_mises_params = pkl.load(f)
-            # get the model values with 10 degree increments 
+            # get the model values with 10 degree increments
             structure = "VISp"
             self._target_frs = {}
             for key in self._layer_info.keys():
                 self._target_frs[key] = self.vonmises_model_fr(structure, key)
                 # TODO: convert it to tensor if needed.
-        
+
         # assuming 1 ms bins
         spike_rates = tf.reduce_mean(spikes, axis=[0, 1]) / spikes.shape[1] * 1000
         angle_bins = tf.constant(np.arange(-90, 91, 10), dtype=self._dtype)
@@ -971,7 +1286,7 @@ class OrientationSelectivityLoss:
 
         for key, value in self._layer_info.items():
             # first, calculate delta_angle
-            
+
             # rates = tf.TensorArray(tf.float32, size=nbins)
             rates_list = []
             for i in range(nbins):
@@ -997,34 +1312,34 @@ class OrientationSelectivityLoss:
                 # tf.print("target: ", self._target_frs[key])
             # losses = losses.write(i, loss)
             losses.append(loss)
-        
+
         # final_loss = tf.reduce_sum(losses.stack()) * self._osi_cost
         final_loss = tf.reduce_mean(tf.stack(losses)) * self._osi_cost
         return final_loss
-        
+
     def crowd_spikes_loss(self, spikes, angle):
         # I need to access the tuning angle. of all the neurons.
         angle = tf.cast(angle, self._dtype)
 
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
-            
+
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
         # sum spikes in _z, and multiply with delta_angle.
-        mean_spikes = tf.reduce_mean(spikes, axis=[1]) 
+        mean_spikes = tf.reduce_mean(spikes, axis=[1])
         mean_angle = mean_spikes * delta_angle
         # Here, the expected value with random firing to subtract
         # (this prevents the osi loss to drive the firing rates to go to zero.)
         expected_sum_angle = tf.reduce_mean(mean_spikes) * 45
-        
+
         angle_loss = tf.reduce_mean(tf.abs(mean_angle)) - expected_sum_angle * self._subtraction_ratio
-        
+
         return angle_loss * self._osi_cost
-    
+
     @tf.function(jit_compile=True)
     def _compute_osi_dsi_core(self, rates, radians_delta_angle, batch_size, node_type_ids, n_node_types):
         """JIT-compiled core computation for OSI/DSI loss.
-        
+
         Fuses segment operations and cosine computations for faster execution.
         """
         # Compute weighted responses using fused cos operations
@@ -1072,13 +1387,13 @@ class OrientationSelectivityLoss:
 
         return osi_approx_type, dsi_approx_type
 
-    def crowd_osi_loss(self, spikes, angle, normalizer=None):  
+    def crowd_osi_loss(self, spikes, angle, normalizer=None):
         # Ensure angle is [batch_size] and cast to correct dtype
         angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)  # [batch_size]
         # Compute delta_angle with broadcasting
         delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]  # [batch_size, n_neurons_core]
         radians_delta_angle = delta_angle * (self._tf_pi / 180)
-            
+
         # Compute rates over time dimension
         rates = tf.reduce_mean(spikes, axis=1)  # [batch_size, n_neurons]
         if self._core_mask is not None:
@@ -1091,17 +1406,17 @@ class OrientationSelectivityLoss:
             rates = rates / normalizer
 
         batch_size = tf.shape(rates)[0]
-        
+
         # Use JIT-compiled core computation
         osi_approx_type, dsi_approx_type = self._compute_osi_dsi_core(
-            rates, radians_delta_angle, batch_size, 
+            rates, radians_delta_angle, batch_size,
             self.node_type_ids, self._n_node_types
         )
 
         # Compute losses
         osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values)
         dsi_loss_type = tf.math.square(dsi_approx_type - self.dsi_target_values)
-    
+
         numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)
         denominator = tf.reduce_sum(self.cell_type_count)
 

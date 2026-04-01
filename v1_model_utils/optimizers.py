@@ -1,5 +1,6 @@
-import tensorflow as tf
 
+import tensorflow as tf
+from math import pi
 
 # import tensorflow.compat.v2 as tf
 
@@ -8,6 +9,146 @@ import tensorflow as tf
 
 # # Same TF2.15 / Keras 2.12 public export for consistency
 # from tensorflow.python.util.tf_export import keras_export
+
+
+def build_learning_rate(flags):
+    if flags.lr_schedule == "none":
+        print(f"Learning-rate schedule: none (constant lr={flags.learning_rate:.6g})")
+        return flags.learning_rate
+
+    if flags.lr_schedule == "warmup_cosine":
+        schedule = LinearWarmupCosineDecay(
+            warmup_start_lr=flags.lr_warmup_start_lr,
+            warmup_target_lr=flags.lr_warmup_target_lr,
+            warmup_steps=flags.lr_warmup_steps,
+            cosine_steps=flags.lr_cosine_steps,
+            min_lr=flags.lr_cosine_min_lr,
+        )
+        print(
+            "Learning-rate schedule: warmup_cosine "
+            f"(warmup: {flags.lr_warmup_start_lr:.6g}->{flags.lr_warmup_target_lr:.6g} "
+            f"in {flags.lr_warmup_steps} steps, cosine: "
+            f"{flags.lr_warmup_target_lr:.6g}->{flags.lr_cosine_min_lr:.6g} "
+            f"in {flags.lr_cosine_steps} steps)"
+        )
+        return schedule
+
+    raise ValueError(
+        f"Invalid lr_schedule '{flags.lr_schedule}'. "
+        "Supported values are: 'none', 'warmup_cosine'."
+    )
+
+
+def create_optimizer(flags, learning_rate, trainable_variables, mixed_precision_module=None):
+    if flags.optimizer == "adam":
+        base_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate, epsilon=1e-11)
+    elif flags.optimizer == "exp_adam":
+        base_optimizer = ExponentiatedAdam(learning_rate=learning_rate, epsilon=1e-11)
+    elif flags.optimizer == "sgd":
+        base_optimizer = tf.keras.optimizers.SGD(
+            learning_rate=learning_rate, momentum=0.0, nesterov=False
+        )
+    else:
+        print(f"Invalid optimizer: {flags.optimizer}")
+        raise ValueError
+
+    # The base optimizer needs to be built before restoring from checkpoint.
+    base_optimizer.build(trainable_variables)
+
+    if flags.dtype == "float16":
+        # Prevent gradient underflow in mixed-float16 training.
+        if mixed_precision_module is None:
+            from tensorflow.keras import mixed_precision as mixed_precision_module
+
+        base_optimizer = mixed_precision_module.LossScaleOptimizer(base_optimizer)
+
+    return base_optimizer
+
+
+def optimizer_supports_loss_scaling(optimizer):
+    return hasattr(optimizer, "get_scaled_loss") and hasattr(optimizer, "get_unscaled_gradients")
+
+
+def scale_loss_for_optimizer(optimizer, loss):
+    if optimizer_supports_loss_scaling(optimizer):
+        return optimizer.get_scaled_loss(loss)
+    return loss
+
+
+def unscale_gradients_for_optimizer(optimizer, gradients):
+    if optimizer_supports_loss_scaling(optimizer):
+        return optimizer.get_unscaled_gradients(gradients)
+    return gradients
+
+
+@tf.keras.utils.register_keras_serializable(package="V1GLIF")
+class LinearWarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warmup followed by cosine decay."""
+
+    def __init__(
+        self,
+        warmup_start_lr=0.1,
+        warmup_target_lr=0.05,
+        warmup_steps=100,
+        cosine_steps=900,
+        min_lr=0.001,
+        name="LinearWarmupCosineDecay",
+    ):
+        super().__init__()
+        self.warmup_start_lr = float(warmup_start_lr)
+        self.warmup_target_lr = float(warmup_target_lr)
+        self.warmup_steps = int(warmup_steps)
+        self.cosine_steps = int(cosine_steps)
+        self.min_lr = float(min_lr)
+        self.name = name
+
+        if self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}.")
+        if self.cosine_steps <= 0:
+            raise ValueError(f"cosine_steps must be > 0, got {self.cosine_steps}.")
+        if self.min_lr < 0.0:
+            raise ValueError(f"min_lr must be >= 0, got {self.min_lr}.")
+
+        # Pre-create scalar constants once to avoid rebuilding/casting every call.
+        self._warmup_start_lr_tf = tf.constant(self.warmup_start_lr, dtype=tf.float32)
+        self._warmup_target_lr_tf = tf.constant(self.warmup_target_lr, dtype=tf.float32)
+        self._min_lr_tf = tf.constant(self.min_lr, dtype=tf.float32)
+        self._warmup_steps_tf = tf.constant(float(self.warmup_steps), dtype=tf.float32)
+        self._warmup_den_tf = tf.constant(float(max(1, self.warmup_steps - 1)), dtype=tf.float32)
+        self._cosine_steps_tf = tf.constant(float(self.cosine_steps), dtype=tf.float32)
+        self._pi_tf = tf.constant(pi, dtype=tf.float32)
+
+    def __call__(self, step):
+        with tf.name_scope(self.name):
+            step = tf.cast(step, tf.float32)
+
+            def warmup_branch():
+                if self.warmup_steps > 1:
+                    warmup_progress = tf.clip_by_value(step / self._warmup_den_tf, 0.0, 1.0)
+                    return self._warmup_start_lr_tf + (
+                        self._warmup_target_lr_tf - self._warmup_start_lr_tf
+                    ) * warmup_progress
+                return self._warmup_target_lr_tf
+
+            def cosine_branch():
+                cosine_step = tf.maximum(step - self._warmup_steps_tf, 0.0)
+                cosine_progress = tf.clip_by_value(cosine_step / self._cosine_steps_tf, 0.0, 1.0)
+                cosine_decay = 0.5 * (1.0 + tf.cos(self._pi_tf * cosine_progress))
+                return self._min_lr_tf + (self._warmup_target_lr_tf - self._min_lr_tf) * cosine_decay
+
+            if self.warmup_steps > 0:
+                return tf.cond(step < self._warmup_steps_tf, warmup_branch, cosine_branch)
+            return cosine_branch()
+
+    def get_config(self):
+        return {
+            "warmup_start_lr": self.warmup_start_lr,
+            "warmup_target_lr": self.warmup_target_lr,
+            "warmup_steps": self.warmup_steps,
+            "cosine_steps": self.cosine_steps,
+            "min_lr": self.min_lr,
+            "name": self.name,
+        }
 
 
 class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
@@ -104,9 +245,30 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
                     )
                 )
 
+    def _coalesce_indexed_slices(self, grad, variable_dtype=None, index_dtype=tf.int32):
+        """Coalesce duplicate indices in an IndexedSlices gradient."""
+        indices = tf.cast(grad.indices, index_dtype)
+        values = grad.values
+        if variable_dtype is not None and values.dtype != variable_dtype:
+            values = tf.cast(values, variable_dtype)
+
+        unique_idx, inverse_pos = tf.unique(indices, out_idx=tf.int32)
+        num_unique = tf.shape(unique_idx, out_type=tf.int32)[0]
+        coalesced_values = tf.math.unsorted_segment_sum(values, inverse_pos, num_unique)
+
+        dense_shape = grad.dense_shape
+        if dense_shape is None:
+            dense_shape = tf.cast(tf.shape(values)[0:1], index_dtype)
+        else:
+            dense_shape = tf.cast(dense_shape, index_dtype)
+
+        return tf.IndexedSlices(coalesced_values, unique_idx, dense_shape)
+
     @tf.function(jit_compile=True)
     def update_step(self, gradient, variable):
         """Update step given gradient and the associated model variable."""
+        # if isinstance(gradient, tf.IndexedSlices):
+        #     gradient = tf.convert_to_tensor(gradient)
         # Get current iteration
         local_step = tf.cast(self.iterations + 1, variable.dtype)
         # Compute powers of beta_1 and beta_2
@@ -129,6 +291,12 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
         # Sparse vs. Dense branch
         # ------------------------
         if isinstance(gradient, tf.IndexedSlices):
+            gradient = self._coalesce_indexed_slices(
+                gradient,
+                variable_dtype=variable.dtype,
+                index_dtype=tf.int32,
+            )
+
             # Sparse gradient
             # 1) Update m (first moment)
             m.assign_add(-m * (1 - beta_1_t))  # Decay existing m
@@ -221,103 +389,3 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
             }
         )
         return config
-
-
-# This may work with Keras 3.3.0, but it's not guaranteed.
-# class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
-#     """
-#     Adam-like optimizer with exponentiated gradient updates,
-#     incorporating the sign of w into the exponent.
-#     """
-#     def __init__(
-#         self,
-#         learning_rate=0.001,
-#         beta_1=0.9,
-#         beta_2=0.999,
-#         epsilon=1e-7,
-#         amsgrad=False,
-#         name="ExponentiatedAdam",
-#         **kwargs
-#     ):
-#         super().__init__(name, **kwargs)
-#         # self._set_hyper("learning_rate", learning_rate)
-#         # self._set_hyper("beta_1", beta_1)
-#         # self._set_hyper("beta_2", beta_2)
-#         self.epsilon = epsilon
-#         self.amsgrad = amsgrad
-
-#     def _create_slots(self, var_list):
-#         # Create Adam-like slot variables for first and second moments.
-#         for var in var_list:
-#             self.add_slot(var, "m")  # momentum
-#             self.add_slot(var, "v")  # velocity
-#             if self.amsgrad:
-#                 self.add_slot(var, "vhat")  # for AMSGrad
-
-#     @tf.function
-#     def _resource_apply_dense(self, grad, var):
-#         # Gather hyperparameters
-#         var_dtype = var.dtype.base_dtype
-#         lr_t = self._decayed_lr(var_dtype)  # handles learning rate schedules
-#         beta_1_t = self._get_hyper("beta_1", var_dtype)
-#         beta_2_t = self._get_hyper("beta_2", var_dtype)
-
-#         local_step = tf.cast(self.iterations + 1, var_dtype)
-#         beta_1_power = tf.pow(beta_1_t, local_step)
-#         beta_2_power = tf.pow(beta_2_t, local_step)
-
-#         # Fetch existing slot variables
-#         m = self.get_slot(var, "m")
-#         v = self.get_slot(var, "v")
-
-#         # Update first moment estimate
-#         m_t = m.assign(
-#             beta_1_t * m + (1.0 - beta_1_t) * grad,
-#             use_locking=self._use_locking
-#         )
-#         # Update second moment estimate
-#         v_t = v.assign(
-#             beta_2_t * v + (1.0 - beta_2_t) * tf.square(grad),
-#             use_locking=self._use_locking
-#         )
-
-#         # Possibly AMSGrad
-#         if self.amsgrad:
-#             vhat = self.get_slot(var, "vhat")
-#             vhat_t = vhat.assign(tf.maximum(vhat, v_t), use_locking=self._use_locking)
-#             v_used = vhat_t
-#         else:
-#             v_used = v_t
-
-#         # Compute the "Adam gradient" = (m / (sqrt(v) + eps)) with bias correction:
-#         # alpha = lr_t * sqrt(1 - beta_2_power) / (1 - beta_1_power)
-#         alpha_t = lr_t * tf.sqrt(1 - beta_2_power) / (1 - beta_1_power)
-#         adam_grad = m_t / (tf.sqrt(v_used) + self.epsilon)
-        
-#         # Now incorporate sign(w). sign(0) -> +1 to avoid 0 being stuck
-#         sign_w = tf.sign(var)
-#         sign_w = tf.where(tf.equal(sign_w, 0), tf.ones_like(sign_w), sign_w)
-
-#         # Exponent = -alpha_t * adam_grad * sign(w)
-#         exponent = -alpha_t * adam_grad * sign_w
-
-#         # Exponentiated update: w <- w * exp(exponent)
-#         var_update = var.assign(var * tf.exp(exponent), use_locking=self._use_locking)
-
-#         return tf.group(var_update, m_t, v_t)
-
-#     def _resource_apply_sparse(self, grad, var, indices):
-#         # If you have embeddings/sparse updates, implement similarly
-#         # or raise NotImplementedError
-#         raise NotImplementedError("Sparse gradient updates are not implemented.")
-
-#     def get_config(self):
-#         config = super().get_config()
-#         config.update({
-#             "learning_rate": self._serialize_hyperparameter("learning_rate"),
-#             "beta_1": self._serialize_hyperparameter("beta_1"),
-#             "beta_2": self._serialize_hyperparameter("beta_2"),
-#             "epsilon": self.epsilon,
-#             "amsgrad": self.amsgrad,
-#         })
-#         return config

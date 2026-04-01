@@ -3,9 +3,6 @@ import json
 import os
 import re
 import argparse
-# import numpy as np
-# import tensorflow as tf
-# import tensorflow as tf
 from v1_model_utils import toolkit
 # # script_path = "bash d
 
@@ -20,26 +17,33 @@ parser.add_argument('--restore_from', default='', type=str)
 parser.add_argument('--comment', default='', type=str)
 parser.add_argument('--delays', default='50,0', type=str)
 parser.add_argument('--scale', default='2,2', type=str)
-parser.add_argument('--dtype', default='float32', type=str)
+parser.add_argument('--dtype', default='float32', type=str, choices=['float16', 'float32', 'bfloat16'])
 
-parser.add_argument('--optimizer', default='adam', type=str)
+parser.add_argument('--optimizer', default='exp_adam', type=str, choices=['adam', 'sgd', 'exp_adam'])
 parser.add_argument('--learning_rate', default=0.001, type=float)
+parser.add_argument('--lr_schedule', default='warmup_cosine', type=str, choices=['none', 'warmup_cosine'])
+parser.add_argument('--lr_warmup_start_lr', default=0.08, type=float)
+parser.add_argument('--lr_warmup_target_lr', default=0.04, type=float)
+parser.add_argument('--lr_warmup_steps', default=120, type=int)
+parser.add_argument('--lr_cosine_min_lr', default=0.001, type=float)
+parser.add_argument('--lr_cosine_steps', default=880, type=int)
 parser.add_argument('--rate_cost', default=100., type=float) #100
 parser.add_argument('--voltage_cost', default=1., type=float)
 parser.add_argument('--sync_cost', default=1., type=float)
 parser.add_argument('--osi_cost', default=1., type=float)
 parser.add_argument('--osi_loss_subtraction_ratio', default=0., type=float)
-parser.add_argument('--osi_loss_method', default='crowd_osi', type=str)
+parser.add_argument('--osi_loss_method', default='crowd_osi', type=str, choices=['crowd_osi', 'crowd_spikes', 'neuropixels_fr'])
 
-parser.add_argument('--dampening_factor', default=0.1, type=float)
-parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
+parser.add_argument('--dampening_factor', default=1, type=float) #0.1
+parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float) #0.1
+parser.add_argument('--voltage_gradient_dampening', default=0.5, type=float)
 # parser.add_argument('--dampening_factor', default=0.5, type=float)
 # parser.add_argument('--recurrent_dampening_factor', default=0.5, type=float)
 parser.add_argument('--input_weight_scale', default=1.0, type=float)
 parser.add_argument('--gauss_std', default=0.3, type=float)
 parser.add_argument('--recurrent_weight_regularization', default=0.0, type=float)
-parser.add_argument('--recurrent_weight_regularizer_type', default="emd", type=str)
-parser.add_argument('--voltage_penalty_mode', default='range', type=str)
+parser.add_argument('--recurrent_weight_regularizer_type', default="emd", type=str, choices=['mean', 'emd'])
+parser.add_argument('--voltage_penalty_mode', default='range', type=str, choices=['range', 'threshold'])
 parser.add_argument('--lr_scale', default=1.0, type=float)
 # parser.add_argument('--input_f0', default=0.2, type=float)
 parser.add_argument('--temporal_f', default=2.0, type=float)
@@ -93,12 +97,12 @@ parser.add_argument('--uniform_weights', default=False, action='store_true')
 parser.add_argument('--gradient_checkpointing', default=True, action='store_true')
 parser.add_argument('--nogradient_checkpointing', dest='gradient_checkpointing', action='store_false')
 
-parser.add_argument('--rotation', default='ccw', type=str)
+parser.add_argument('--rotation', default='ccw', type=str, choices=['cw', 'ccw'])
 parser.add_argument('--neuropixels_df', default='Neuropixels_data/v1_OSI_DSI_DF.csv', type=str, help='File name of the Neuropixels DataFrame for OSI/DSI analysis')
 
 
 def submit_job(command):
-    """ 
+    """
     Submit a job to the cluster using the command provided.
     """
     result = subprocess.run(command, capture_output=True, text=True)
@@ -107,10 +111,10 @@ def submit_job(command):
 
     return job_id
 
-def main():                
+def main():
     # Initialize the flags and customize the simulation main characteristics
     flags = parser.parse_args()
-        
+
     # Get the neurons of each column of the network
     v1_neurons = flags.neurons
 
@@ -135,7 +139,7 @@ def main():
         initial_benchmark_model = ''
     else:
         sim_name = os.path.basename(os.path.dirname(flags.restore_from))
-        logdir = os.path.dirname(flags.restore_from) 
+        logdir = os.path.dirname(flags.restore_from)
         initial_benchmark_model = flags.restore_from
 
     # logdir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_65871/b_xwue'
@@ -144,30 +148,22 @@ def main():
 
     # Define the job submission commands for the training and evaluation scripts
     if flags.low_memory_gpu:
-        training_commands = ["run", "-g", "1", "-m", "40", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
+        training_commands = ["run", "-g", "1", "-m", "48", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
     else:
-        # training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{4 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the L40S GPU with 48GB of memory 
-        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtxpro6000", "-c", f"{4 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the rtx6000 GPU with 48GB of memory 
+        # training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{16 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the L40S GPU with 48GB of memory
+        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtxpro6000", "-c", f"{16 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the rtx6000 GPU with 48GB of memory
 
-    # evaluation_commands = ["run", "-g", "1", "-m", "60", "-c", "4", "-t", "1:00"]
-    # evaluation_commands = ["run", "-g", "1", "-m", "100", "-c", "4", "-t", "3:00"]
-    evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "80", "-c", "8", "-t", "3:00"]
-    # evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
-
+    evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
+    # evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "80", "-c", "8", "-t", "3:00"]
 
     # Define the training and evaluation script calls
-    # training_script = "python multi_training.py " 
-    training_script = "python multi_training_single_gpu_split.py " 
-    evaluation_script = "python osi_dsi_estimator.py " 
-
-    # initial_benchmark_model = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_65871/b_xwue/Intermediate_checkpoints'
-    # initial_benchmark_model = ''
+    # training_script = "python multi_training.py "
+    training_script = "python multi_training.py "
+    evaluation_script = "python osi_dsi_estimator.py "
 
     # Append each flag to the string
     for name, value in vars(flags).items():
-        # if value != parser.get_default(name) and name in ['learning_rate', 'rate_cost', 'voltage_cost', 'osi_cost', 'temporal_f', 'n_input', 'seq_len']:
-        # if value != parser.get_default(name):
-        if name not in ['seed', 'n_gpus', 'low_memory_gpu']: 
+        if name not in ['seed', 'n_gpus', 'low_memory_gpu']:
             if type(value) == bool and value == False:
                 training_script += f"--no{name} "
                 evaluation_script += f"--no{name} "
@@ -183,12 +179,11 @@ def main():
 
     # Initial OSI/DSI test
     initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
-    # initial_evaluation_command = evaluation_commands + ["-o", f"Out/initial_test.out", "-e", f"Error/initial_test.err", "-j", f"initial_test"]
 
     if initial_benchmark_model:
-        initial_evaluation_script = evaluation_script + f"--track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
+        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
     else:
-        initial_evaluation_script = evaluation_script + f"--track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
+        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
 
     initial_evaluation_command = initial_evaluation_command + [initial_evaluation_script]
     eval_job_id = submit_job(initial_evaluation_command)
@@ -198,7 +193,6 @@ def main():
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...
         if i == 0:
             new_training_command = training_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-j", f"{sim_name}_train_{i}"]
-            # new_training_command = training_commands + ["-o", f"Out/gordito_train_{i}.out", "-e", f"Error/gordito_train_{i}.err", "-j", f"gordito_train_{i}"]
             if initial_benchmark_model:
                 new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i} --restore_from {initial_benchmark_model} "
             else:
@@ -207,7 +201,6 @@ def main():
             job_id = submit_job(new_training_command)
         else:
             new_training_command = training_commands + ['-d', job_ids[i-1], "-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-j", f"{sim_name}_train_{i}"]
-            # new_training_script = training_script + f"--osi_cost 0.1 --rate_cost 10 --seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
             new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
             new_training_command = new_training_command + [new_training_script]
             job_id = submit_job(new_training_command)
@@ -217,14 +210,14 @@ def main():
             continue
         else:
             new_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-j", f"{sim_name}_test_{i}"]
-            new_evaluation_script = evaluation_script + f"--track_core_only --seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
+            new_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
             new_evaluation_command = new_evaluation_command + [new_evaluation_script]
             eval_job_id = submit_job(new_evaluation_command)
             eval_job_ids.append(eval_job_id)
 
     # Final evaluation with the best model
     final_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_final.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_final.err", "-j", f"{sim_name}_test_final"]
-    final_evaluation_script = evaluation_script + f"--track_core_only --seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
+    final_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
     final_evaluation_command = final_evaluation_command + [final_evaluation_script]
     eval_job_id = submit_job(final_evaluation_command)
     eval_job_ids.append(eval_job_id)

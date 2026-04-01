@@ -53,21 +53,21 @@ plt.rcParams['text.usetex'] = shutil.which('latex') is not None
 
 def calculate_Firing_Rate(z, stimulus_init=500, stimulus_end=2500, temporal_axis=2):
     # Select the relevant portion of the data along the temporal axis
-    dg_spikes = np.take(z, range(stimulus_init, stimulus_end), axis=temporal_axis)   
+    dg_spikes = np.take(z, range(stimulus_init, stimulus_end), axis=temporal_axis)
     # Calculate the mean along the temporal axis
     mean_dg_spikes = np.mean(dg_spikes, axis=temporal_axis)
     # Sum along the temporal axis and divide by the duration in seconds to get the firing rate
     mean_firing_rates = mean_dg_spikes * 1000
-    
+
     return mean_firing_rates
 
-def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angles=range(0,360, 45), 
-                      n_selected_neurons=None, core_radius=None, remove_zero_rate_neurons=False, 
+def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angles=range(0,360, 45),
+                      n_selected_neurons=None, core_radius=None, remove_zero_rate_neurons=False,
                       directory='', save_df=False):
-    
+
     # Get the pop names of the neurons
     if n_selected_neurons is not None:
-        pop_names = other_v1_utils.pop_names(network, n_selected_neurons=n_selected_neurons) 
+        pop_names = other_v1_utils.pop_names(network, n_selected_neurons=n_selected_neurons)
     elif core_radius is not None and core_radius > 0:
         pop_names = other_v1_utils.pop_names(network, core_radius=core_radius)
     else:
@@ -81,7 +81,7 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
     n_trials, n_angles, n_neurons = firingRates.shape
     all_direction_rates = np.mean(firingRates, axis=0)
     average_all_direction_rates = np.mean(all_direction_rates, axis=0)
-    
+
     # Save the results in a dataframe
     if os.path.exists(os.path.join(directory, f"v1_features_df.csv")):
         osi_dsi_df = pd.read_csv(os.path.join(directory, f"v1_features_df.csv"), sep=" ")
@@ -110,12 +110,12 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
             # Ensure phase_rad is a 2D array with shape (8, 1) for broadcasting
             phase_rad = phase_rad[:, np.newaxis]
             denominator = np.sum(all_direction_rates, axis=0)
-            dsi = np.where(denominator != 0, 
-                    np.abs((all_direction_rates * np.exp(1j * phase_rad)).sum(axis=0)) / denominator, 
+            dsi = np.where(denominator != 0,
+                    np.abs((all_direction_rates * np.exp(1j * phase_rad)).sum(axis=0)) / denominator,
                     np.nan)
             osi = np.where(denominator != 0,
                         np.abs((all_direction_rates * np.exp(2j * phase_rad)).sum(axis=0)) / denominator,
-                        np.nan)        
+                        np.nan)
             osi_dsi_df['OSI'] = osi
             osi_dsi_df['DSI'] = dsi
         else:
@@ -196,7 +196,7 @@ def draw_borders(ax, borders, ylim):
         ax.add_patch(
             Rectangle((borders[i], ylim[0]), w, h, alpha=0.08, color="k", zorder=-10)
         )
-    return ax   
+    return ax
 
 @njit
 def ang_dir(angle1, angle2):
@@ -204,12 +204,12 @@ def ang_dir(angle1, angle2):
     Calculate the minimum angular distance between two angles.
     Returns the smaller of the two possible angle differences (clockwise or counterclockwise).
     All angles are in degrees.
-    
+
     Parameters:
     -----------
     angle1, angle2 : float or numpy.ndarray
         Angles in degrees
-        
+
     Returns:
     --------
     float or numpy.ndarray
@@ -218,10 +218,10 @@ def ang_dir(angle1, angle2):
     # Ensure angles are in the range [0, 360)
     angle1 = np.mod(angle1, 360)
     angle2 = np.mod(angle2, 360)
-    
+
     # Calculate absolute difference
     diff = np.abs(angle1 - angle2)
-    
+
     # Compare with the complementary angle (360 - diff)
     # and take the minimum - this avoids the list construction and axis parameter
     return np.minimum(diff, 360 - diff)
@@ -232,27 +232,27 @@ def double_gaussian(theta, C, Rp, Rn, theta_pref, sigma):
     result = np.empty_like(theta, dtype=np.float64)
     sigma_sq_2 = 2.0 * sigma * sigma  # Pre-compute denominator
     theta_pref_180 = theta_pref - 180.0  # Pre-compute offset
-    
+
     for i in range(theta.size):
         # Calculate angular distances more efficiently
         diff1 = abs(theta[i] - theta_pref)
         delta_theta = min(diff1, 360.0 - diff1)
-        
-        diff2 = abs(theta[i] - theta_pref_180)  
+
+        diff2 = abs(theta[i] - theta_pref_180)
         delta_theta2 = min(diff2, 360.0 - diff2)
-        
+
         # Compute exponentials
         exp_term1 = Rp * np.exp(-(delta_theta * delta_theta) / sigma_sq_2)
         exp_term2 = Rn * np.exp(-(delta_theta2 * delta_theta2) / sigma_sq_2)
         result[i] = C + exp_term1 + exp_term2
-    
+
     return result
 
 
 class PreferredTuningAngleAnalysis:
     def __init__(self, firing_rates, orientations):
         """
-        This class determines the preferred tuning angle of each neuron in the network according to their responses 
+        This class determines the preferred tuning angle of each neuron in the network according to their responses
         to different orientations. The preferred tuning angle is determined by fitting the responses to a double
         gaussian function and finding the peak of the fit. Responsive neurons are identified using the Hotelling T2 test.
         For more details check:
@@ -298,7 +298,7 @@ class PreferredTuningAngleAnalysis:
             [-M, 0, 0, 0, self.alpha/2],  # Lower bounds
             [M, 3*M, 3*M, 360, np.inf]  # Upper bounds
         )
-    
+
     def calculate_orientation_vectors(self, responses, orientations):
         # Calculate orientation vectors for each trial.
         theta_rad = np.deg2rad(2 * orientations)
@@ -310,13 +310,13 @@ class PreferredTuningAngleAnalysis:
         orientation_vectors_y = np.dot(responses, sin_theta)
         # Stack the results into a single array
         orientation_vectors = np.stack((orientation_vectors_x, orientation_vectors_y), axis=-1)
-        
+
         return orientation_vectors
 
     def fit_neuron_tuning(self, neuron_responses, orientations, alpha):
         """
         Helper function to fit double Gaussian to neuron responses.
-        
+
         Returns:
         --------
         tuple: (best_fit_params, best_error) or (None, np.inf) if fitting fails
@@ -324,11 +324,11 @@ class PreferredTuningAngleAnalysis:
         # Skip fitting if responses are all zeros
         if np.sum(neuron_responses) == 0:
             return None, np.inf
-        
+
         # Prepare for curve fitting
         M = np.max(neuron_responses)
         M_orientation = orientations[np.argmax(neuron_responses)]
-        
+
         # Initial guess for the fit parameters
         initial_guess = [
             0,  # C (baseline)
@@ -337,7 +337,7 @@ class PreferredTuningAngleAnalysis:
             M_orientation,  # theta_pref (preferred orientation)
             alpha / 2,  # sigma (tuning width)
         ]
-        
+
         # Explore several initial values for sigma and theta_pref
         initial_sigmas = [alpha/2, alpha, 2*alpha]
         # If the maximum is at 0, we also try 360
@@ -348,15 +348,15 @@ class PreferredTuningAngleAnalysis:
 
         bounds = self.get_bounds(M)
         best_fit = None
-        best_error = np.inf   
+        best_error = np.inf
 
         # Try different initial conditions to find best fit
         for pref_orientation in initial_pref_orientations:
-            initial_guess[3] = pref_orientation      
+            initial_guess[3] = pref_orientation
             for sigma in initial_sigmas:
                 initial_guess[4] = sigma
                 try:
-                    popt, _ = curve_fit(double_gaussian, orientations, neuron_responses, 
+                    popt, _ = curve_fit(double_gaussian, orientations, neuron_responses,
                                         p0=initial_guess, bounds=bounds, ftol=1e-4, maxfev=1000)
                     fit_error = np.sum((double_gaussian(orientations, *popt) - neuron_responses) ** 2)
                     if fit_error < best_error:
@@ -373,7 +373,7 @@ class PreferredTuningAngleAnalysis:
         boot_trial_indices = np.random.choice(n_trials, size=n_trials, replace=True)
         boot_responses_all_trials = neuron_responses_all_trials[boot_trial_indices, :]
         boot_responses = np.mean(boot_responses_all_trials, axis=0)
-        
+
         # Fit double Gaussian to bootstrap sample
         boot_fit, _ = self.fit_neuron_tuning(boot_responses, orientations, alpha)
 
@@ -411,9 +411,9 @@ class PreferredTuningAngleAnalysis:
 
     def calculate_tuning_angles(self, firing_rates, orientations, n_bootstrap=None, confidence_level=0.95, n_jobs=-1):
         """
-        Calculate tuning angles for neurons with bootstrap confidence intervals for neurons 
+        Calculate tuning angles for neurons with bootstrap confidence intervals for neurons
         that pass the Hotelling T2 test.
-        
+
         Parameters:
         -----------
         firing_rates : numpy.ndarray
@@ -424,7 +424,7 @@ class PreferredTuningAngleAnalysis:
             Number of bootstrap samples (default: 1000)
         confidence_level : float
             Confidence level for error estimation (default: 0.95)
-        
+
         Returns:
         --------
         tuple
@@ -432,7 +432,7 @@ class PreferredTuningAngleAnalysis:
         """
         n_trials, n_orientations, n_neurons = firing_rates.shape
         alpha = orientations[1] - orientations[0]
-        
+
         # Initialize output arrays
         osi_p_values = []
         new_tuning_angles = []
@@ -440,7 +440,7 @@ class PreferredTuningAngleAnalysis:
         angle_errors_lower = []
         angle_errors_upper = []
         half_widths = []
-        
+
         for neuron_idx in range(n_neurons):
             neuron_responses_all_trials = firing_rates[:, :, neuron_idx]
             neuron_responses = np.mean(neuron_responses_all_trials, axis=0)
@@ -453,12 +453,12 @@ class PreferredTuningAngleAnalysis:
                 angle_errors_upper.append(np.nan)
                 half_widths.append(np.nan)
                 continue
-            
+
             # Test for significant orientation tuning
             orientation_vectors = self.calculate_orientation_vectors(neuron_responses_all_trials, orientations)
             p_value = self.hotelling_t2_test(orientation_vectors)
             osi_p_values.append(p_value)
-            
+
             if p_value >= 0.05:
                 new_tuning_angles.append(np.nan)
                 max_firing_rates.append(np.max(neuron_responses))
@@ -466,9 +466,9 @@ class PreferredTuningAngleAnalysis:
                 angle_errors_upper.append(np.nan)
                 half_widths.append(np.nan)
                 continue
-            
-            # **PARALLELIZED BOOTSTRAP SECTION**  
-            if n_bootstrap is not None:     
+
+            # **PARALLELIZED BOOTSTRAP SECTION**
+            if n_bootstrap is not None:
                 # Parallel bootstrap computation
                 bootstrap_results = Parallel(n_jobs=n_jobs, verbose=0)(
                     delayed(self.bootstrap_single_iteration)(
@@ -482,7 +482,7 @@ class PreferredTuningAngleAnalysis:
                     if boot_pref_angle is not None:
                         bootstrap_pref_angles.append(boot_pref_angle)
                         bootstrap_max_responses.append(boot_max_response)
-            
+
                 # Calculate bootstrap statistics (same as before)
                 if len(bootstrap_pref_angles) > 0:
                     final_max_response = np.mean(bootstrap_max_responses)
@@ -515,15 +515,15 @@ class PreferredTuningAngleAnalysis:
                 angle_errors_upper.append(np.nan)
                 half_widths.append(np.nan)
 
-        return (np.array(new_tuning_angles), np.array(max_firing_rates), 
-                np.array(osi_p_values), np.array(angle_errors_lower), 
+        return (np.array(new_tuning_angles), np.array(max_firing_rates),
+                np.array(osi_p_values), np.array(angle_errors_lower),
                 np.array(angle_errors_upper), np.array(half_widths))
-    
+
     # define a call method to use the class directly
     def __call__(self, n_bootstrap=None, confidence_level=0.95, n_jobs=-1):
         """
         Call method to calculate tuning angles and other metrics.
-        
+
         Parameters:
         -----------
         firing_rates : numpy.ndarray
@@ -534,28 +534,28 @@ class PreferredTuningAngleAnalysis:
             Number of bootstrap samples (default: 1000)
         confidence_level : float
             Confidence level for error estimation (default: 0.95)
-        
+
         Returns:
         --------
         tuple
             (new_tuning_angles, max_firing_rates, osi_p_values, angle_errors_lower, angle_errors_upper, half_widths)
         """
         return self.calculate_tuning_angles(self.firing_rates, self.orientations, n_bootstrap, confidence_level, n_jobs)
-    
 
-class ModelMetricsAnalysis:    
 
-    def __init__(self, spikes, DG_angles, network, data_dir='GLIF_network', 
+class ModelMetricsAnalysis:
+
+    def __init__(self, spikes, DG_angles, network, data_dir='GLIF_network',
                  drifting_gratings_init=None, drifting_gratings_end=None, spontaneous_init=None, spontaneous_end=None,
                  core_radius=400, save_df=False, df_directory='Metrics_analysis', neuropixels_df='v1_OSI_DSI_DF.csv'):
         self.n_neurons = network['n_nodes']
         self.network = network
-        self.data_dir = data_dir 
+        self.data_dir = data_dir
         self.drifting_gratings_init = drifting_gratings_init
         self.drifting_gratings_end = drifting_gratings_end
         self.spontaneous_init = spontaneous_init
         self.spontaneous_end = spontaneous_end
-        
+
         # Handle both full paths and just filenames for neuropixels_df
         if os.path.isabs(neuropixels_df) or os.path.exists(neuropixels_df):
             self.neuropixels_df = os.path.basename(neuropixels_df)  # Extract just the filename
@@ -567,14 +567,14 @@ class ModelMetricsAnalysis:
             spikes = np.expand_dims(spikes, axis=0)
         elif len(spikes.shape) == 2:
             spikes = np.expand_dims(np.expand_dims(spikes, axis=0), axis=0)
-            
+
         # self.analyze_core_only = analyze_core_only
         self.core_radius = core_radius
         # Isolate the core neurons if necessary
         if self.core_radius > 0:
             self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
             if spikes.shape[3] != np.sum(self.core_mask) and spikes.shape[3] == len(self.core_mask):
-                spikes = spikes[:, :, :, self.core_mask]           
+                spikes = spikes[:, :, :, self.core_mask]
             n_neurons_plot = np.sum(self.core_mask)
         else:
             self.core_mask = np.full(self.n_neurons, True)
@@ -582,7 +582,7 @@ class ModelMetricsAnalysis:
             n_neurons_plot = self.n_neurons
 
         if self.drifting_gratings_init is not None:
-            firingRates = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init, 
+            firingRates = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init,
                                                 stimulus_end=self.drifting_gratings_end, temporal_axis=2)
             self.metrics_df = calculate_OSI_DSI(firingRates, self.network, session='drifting_gratings', DG_angles=DG_angles, n_selected_neurons=n_neurons_plot,
                                                 core_radius=self.core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df)
@@ -593,14 +593,14 @@ class ModelMetricsAnalysis:
             self.metrics_df = calculate_OSI_DSI(spontaneous_firingRates, self.network, session='spontaneous', DG_angles=DG_angles,
                                                 n_selected_neurons=n_neurons_plot, core_radius=self.core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df)
 
-    def __call__(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], axis=None, 
+    def __call__(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], axis=None,
                  directory='', filename=''):
 
         boxplot = MetricsBoxplot(save_dir=directory, filename=filename)
         # boxplot.plot(metrics=metrics, metrics_df=metrics_df, additional_dfs=[osi_approx_real_df], additional_dfs_labels=['Approximation'], axis=axis)
         boxplot.plot(metrics=metrics, metrics_df=self.metrics_df, neuropixels_df=self.neuropixels_df, axis=axis)
 
-    
+
 class MetricsBoxplot:
     def __init__(self, save_dir='Metrics_analysis', filename=''):
         self.save_dir = save_dir
@@ -669,10 +669,10 @@ class MetricsBoxplot:
             df = pd.read_csv(f"{data_dir}/{metric_file}", index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
             df = df[df['cell_type'].notna()]
             df["cell_type"] = df["cell_type"].apply(self.neuropixels_cell_type_to_cell_type)
-        elif data_dir == 'Billeh_column_metrics':
+        elif data_dir == 'Benchmarks_metrics/Billeh_column_metrics':
             df = pd.read_csv(f"{data_dir}/{metric_file}", sep=" ")
             df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
-        elif data_dir == "NEST_metrics":
+        elif data_dir == "Benchmarks_metrics/NEST_metrics":
             df = pd.read_csv(f"{data_dir}/{metric_file}", sep=" ")
             df["cell_type"] = df["pop_name"].apply(self.pop_name_to_cell_type)
             # plot only neurons within 200 um.
@@ -688,12 +688,12 @@ class MetricsBoxplot:
             nonresponding = df["Rate at preferred direction (Hz)"] < 0.5
             df.loc[nonresponding, "OSI"] = np.nan
             df.loc[nonresponding, "DSI"] = np.nan
-        
+
         if 'firing_rate_sp' in df.columns:
-            df.rename(columns={"firing_rate_sp": "Spontaneous rate (Hz)"}, inplace=True)  
+            df.rename(columns={"firing_rate_sp": "Spontaneous rate (Hz)"}, inplace=True)
         elif 'Spont_Rate(Hz)' in df.columns:
             df.rename(columns={"Spont_Rate(Hz)": "Spontaneous rate (Hz)"}, inplace=True)
-        
+
         if 'Ave_Rate(Hz)' in df.columns:
             df.rename(columns={"Ave_Rate(Hz)": "Evoked rate (Hz)"}, inplace=True)
 
@@ -717,14 +717,14 @@ class MetricsBoxplot:
         return df
 
     def plot(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], metrics_df=None, neuropixels_df="v1_OSI_DSI_DF.csv", axis=None):
-        # Get the dataframes for the model and Neuropixels OSI and DSI 
+        # Get the dataframes for the model and Neuropixels OSI and DSI
         if metrics_df is None:
             metrics_df = f"v1_OSI_DSI_DF.csv"
 
-        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF_pop_name.csv", data_source_name="Untrained model", data_dir='NEST_metrics'))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Untrained model", data_dir='Benchmarks_metrics/NEST_metrics'))
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"OSI_DSI_neuropixels_v4.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
-        # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Billeh_column_metrics'))
+        # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Benchmarks_metrics/Billeh_column_metrics'))
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(neuropixels_df, data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         df = pd.concat(self.osi_dsi_dfs, ignore_index=True)
 
@@ -839,19 +839,19 @@ def plot_one_metric(ax, df, metric_name, ylim, cpal=None, cell_type_order=None, 
     ax.get_legend().remove()
     # Add the average similarity score to the legend
     if initial_similarity_score is not None and final_similarity_score is not None:
-        ax.text(0.05, 0.9, r'$S_0$' + f': {initial_similarity_score:.2f}\n' + r'$S_f$' + f': {final_similarity_score:.2f}', 
-                transform=ax.transAxes, fontsize=20, verticalalignment='top', 
-                bbox=dict(boxstyle='round', facecolor='white', 
+        ax.text(0.05, 0.9, r'$S_0$' + f': {initial_similarity_score:.2f}\n' + r'$S_f$' + f': {final_similarity_score:.2f}',
+                transform=ax.transAxes, fontsize=20, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white',
                         edgecolor='black', alpha=0.7, linewidth=1.))
-                
+
     return ax
 
 class OneShotTuningAnalysis:
-    def __init__(self, network, data_dir='GLIF_network', directory='', drifting_gratings_init=50, 
+    def __init__(self, network, data_dir='GLIF_network', directory='', drifting_gratings_init=50,
                  drifting_gratings_end=550, core_radius=400):
         self.n_neurons = network['n_nodes']
         self.network = network
-        self.data_dir = data_dir 
+        self.data_dir = data_dir
         self.drifting_gratings_init = drifting_gratings_init
         self.drifting_gratings_end = drifting_gratings_end
         # self.analyze_core_only = analyze_core_only
@@ -861,7 +861,7 @@ class OneShotTuningAnalysis:
 
     def __call__(self, spikes, current_orientation):
         self.current_orientation = current_orientation[0][0]
-        
+
         # Isolate the core neurons if necessary
         if self.core_radius > 0:
             self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
@@ -872,7 +872,7 @@ class OneShotTuningAnalysis:
 
         spikes = spikes[:, :, :, self.core_mask]
         # Calculate the firing rates for each neuron in the given configuration
-        self.firing_rate = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init, stimulus_end=self.drifting_gratings_end, 
+        self.firing_rate = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init, stimulus_end=self.drifting_gratings_end,
                                                 temporal_axis=2)
         # self firing_rate has shape (1, 1, n_neurons), we need to remove the first two dimensions
         self.firing_rate = self.firing_rate[0, 0, :]
@@ -884,7 +884,7 @@ class OneShotTuningAnalysis:
         self.orientation_angles, self.orientation_assignments = self.assign_orientation(self.tuning_angles, n_neurons_plot)
 
     def assign_orientation(self, tuning_angles, n_neurons):
-        # Assign each neuron to an orientation based on its preferred angle 
+        # Assign each neuron to an orientation based on its preferred angle
         orientation_angles = np.arange(0, 360, 45)
         n_angles = len(orientation_angles)
         orientation_assignments = np.zeros((n_neurons, n_angles)).astype(np.bool_)
@@ -921,9 +921,9 @@ class OneShotTuningAnalysis:
                     zero_rate_mask = firing_rates_at_angle != 0
                     firing_rates_at_angle = firing_rates_at_angle[zero_rate_mask]
                     # fr_std = fr_std[zero_rate_mask]
-                    # filtered_orientation_angles = np.array(self.orientation_angles)[zero_rate_mask]   
+                    # filtered_orientation_angles = np.array(self.orientation_angles)[zero_rate_mask]
                 # else:
-                #     filtered_orientation_angles = self.orientation_angles   
+                #     filtered_orientation_angles = self.orientation_angles
                 # Calculate the mean and standard deviation of firing rates for the current orientation angle
                 orientation_firing_rates_dict[angle] = np.mean(firing_rates_at_angle)
                 orientation_firing_rates_std_dict[angle] = np.std(firing_rates_at_angle)
@@ -936,9 +936,9 @@ class OneShotTuningAnalysis:
             #     zero_rate_mask = fr != 0
             #     fr = fr[zero_rate_mask]
             #     fr_std = fr_std[zero_rate_mask]
-            #     filtered_orientation_angles = np.array(self.orientation_angles)[zero_rate_mask]   
+            #     filtered_orientation_angles = np.array(self.orientation_angles)[zero_rate_mask]
             # else:
-            #     filtered_orientation_angles = self.orientation_angles   
+            #     filtered_orientation_angles = self.orientation_angles
 
             # Plot the tuning curve as a line plot with error bars on the respective subplot
             ax = axs[cell_id]
@@ -947,18 +947,18 @@ class OneShotTuningAnalysis:
             # Add vertical line for the current orientation
             ax.axvline(x=self.current_orientation, color='red', linestyle='--', label=f'Current orientation: {self.current_orientation:.2f}\u00b0')
             ax.legend()  # Show legend
-            
+
             # Set the x-axis tick positions and labels to be the orientation angles
             ax.set_xticks(self.orientation_angles)
             ax.set_xlabel('Tuning angle')
             ax.set_ylim(bottom=0)
-            
+
             # Set the title of the plot using the area and current cell type
             ax.set_title(f'{cell_type}')
-            
+
             # Set the y-axis label
             ax.set_ylabel('Firing rate (Hz)')
-            
+
         # Hide the unused subplots
         for i in range(len(unique_cell_types), nrows * ncols):
             fig.delaxes(axs[i])
@@ -977,7 +977,7 @@ class OneShotTuningAnalysis:
         circular_diff = np.abs(np.minimum(circular_diff, 360 - circular_diff))
         # Isolate neurons that prefer the current orientation
         preferred_mask = (np.abs(circular_diff) < 10).astype(np.bool_)
-        
+
         # Iterate over unique cell types to calculate preferred firing rates and store them in the DataFrame.
         unique_cell_types = sorted(set(self.cell_types))
         for i, cell_type in enumerate(unique_cell_types):

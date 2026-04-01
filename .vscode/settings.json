@@ -2,5 +2,49 @@
     "[python]": {
         "editor.defaultFormatter": "ms-python.autopep8"
     },
-    "python.formatting.provider": "none"
+    "python.formatting.provider": "none",
+    // ===== LaTeX Workshop =====
+    "latex-workshop.view.pdf.viewer": "tab", // built-in viewer
+    "latex-workshop.latex.autoBuild.run": "onSave", // build on Ctrl+S
+    "latex-workshop.latex.outDir": "%DIR%/out", // keep aux files out of repo
+    "latex-workshop.latex.clean.subfolder.enabled": true,
+    "latex-workshop.latex.recipe.default": "latexmk",
+    // latexmk is the most robust default builder
+    "latex-workshop.latex.tools": [
+        {
+            "name": "latexmk",
+            "command": "latexmk",
+            "args": [
+                "-shell-escape",
+                "-synctex=1",
+                "-interaction=nonstopmode",
+                "-file-line-error",
+                "-pdf",
+                "-outdir=%OUTDIR%",
+                "%DOC%"
+            ]
+        }
+    ],
+    "latex-workshop.latex.recipes": [
+        {
+            "name": "latexmk",
+            "tools": [
+                "latexmk"
+            ]
+        }
+    ],
+    // ===== Formatting (latexindent) =====
+    "latex-workshop.formatting.latex": "latexindent",
+    // "editor.formatOnSave": true, # dont use it
+    "[latex]": {
+        "editor.defaultFormatter": "James-Yu.latex-workshop"
+    },
+    "latex-workshop.latexindent.enabled": true,
+    // ===== Linting (ChkTeX) =====
+    "latex-workshop.linting.chktex.enabled": true,
+    // ===== Quality-of-life =====
+    "files.trimTrailingWhitespace": true,
+    "editor.wordWrap": "on",
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

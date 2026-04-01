@@ -729,7 +729,13 @@ def load_v1(flags, n_neurons, flag_str=''):
     print(f"> Number of L5e Neurons: {np.sum(l5e_neuron_sel)}")
 
     # assert that you have enough l5 neurons for all the outputs and then choose n_output * neurons_per_output random neurons
-    assert np.sum(l5e_neuron_sel) > flags.n_output * flags.neurons_per_output
+    n_available_l5e = int(np.sum(l5e_neuron_sel))
+    n_required_readout = int(flags.n_output * flags.neurons_per_output)
+    if n_available_l5e < n_required_readout:
+        raise ValueError(
+            f"Not enough L5e neurons for readout selection: "
+            f"required={n_required_readout}, available={n_available_l5e}."
+        )
     rd = np.random.RandomState(seed=flags.seed)
     l5e_neuron_indices = np.where(l5e_neuron_sel)[0]
     readout_neurons = rd.choice(
@@ -810,4 +816,3 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
         print(f"> Cached V1 model in {cache_path}")
 
     return network, lgn_input, bkg_input
-

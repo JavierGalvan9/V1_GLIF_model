@@ -1,23 +1,42 @@
-# import os
+import os
 # import h5py
 import numpy as np
-# import pickle as pkl
+from pathlib import Path
+import pickle as pkl
+from time import time
 import tensorflow as tf
 import lgn_model.lgn as lgn_module
+from v1_model_utils.callbacks import printgpu
 # from memory_profiler import profile
 # from pympler.asizeof import asizeof, asized
 # from time import time
 
+
+def _stateless_seed_pair(seed, salt=0):
+    if seed is None:
+        return None
+    max_int32 = 2**31 - 1
+    seed_int = int(seed) % max_int32
+    salt_int = int(salt) % max_int32
+    return tf.constant([seed_int, (seed_int + salt_int) % max_int32], dtype=tf.int32)
+
+
+def _fold_in_seed(seed_pair, value):
+    return tf.random.experimental.stateless_fold_in(
+        seed_pair, tf.cast(value, tf.int32)
+    )
+
+
 ### GENERAL FUNCTIONS ###
 @tf.function(jit_compile=True)
-def movies_concat(movie, pre_delay, post_delay, dtype=tf.float32):       
+def movies_concat(movie, pre_delay, post_delay, dtype=tf.float32):
     # add an gray screen period before and after the movie
     z1 = tf.zeros((pre_delay, movie.shape[1], movie.shape[2], movie.shape[3]), dtype=dtype)
     z2 = tf.zeros((post_delay, movie.shape[1], movie.shape[2], movie.shape[3]), dtype=dtype)
     videos = tf.concat((z1, movie, z2), 0)
     return videos
 
-@tf.function(jit_compile=True)
+@tf.function(jit_compile=True) # using jit_compile can cause error with input shapes
 def make_drifting_grating_stimulus(row_size=80, col_size=120, moving_flag=True, image_duration=100, cpd=0.05,
                                    temporal_f=2, theta=0, phase=0, contrast=1.0, dtype=tf.float32):
     '''
@@ -33,9 +52,10 @@ def make_drifting_grating_stimulus(row_size=80, col_size=120, moving_flag=True, 
     #  kernel size.
     # row_size = row_size*2 # somehow, Franz's code only accept larger size; thus, i did the mulitplication
     # col_size = col_size*2
-    frame_rate = 1000  # Hz
+    frame_rate = tf.constant(1000, dtype=dtype)  # Hz
     # t_min = 0
-    t_max = tf.cast(image_duration, tf.float32) / 1000
+    # t_max = tf.cast(image_duration, tf.float32) / 1000
+    image_duration_f = tf.cast(image_duration, dtype=dtype)
     pi = tf.constant(np.pi, dtype=dtype)
 
     # assert contrast <= 1, "Contrast must be <= 1"
@@ -44,12 +64,20 @@ def make_drifting_grating_stimulus(row_size=80, col_size=120, moving_flag=True, 
     # tf.debugging.assert_greater(contrast, 0.0, message="Contrast must be > 0")
 
     # physical_spacing = 1. / (float(cpd) * 10)    #To make sure no aliasing occurs
-    physical_spacing = 1.0  # 1 degree, fixed for now. tf version lgn model need this to keep true cpd;
-    row_range = tf.cast(tf.linspace(0.0, row_size, tf.cast(row_size / physical_spacing, tf.int32)), dtype=dtype)
-    col_range = tf.cast(tf.linspace(0.0, col_size, tf.cast(col_size / physical_spacing, tf.int32)), dtype=dtype)
+    # 1 degree per pixel; LGN x/y are in pixel coords [0, size-1], so avoid linspace endpoint overshoot.
+    # If you ever set physical_spacing != 1, you’ll need to rescale LGN x,y or change the stimulus grid size to keep alignment.
+    # Otherwise, the movie shape and LGN coordinates will no longer match.
+    physical_spacing = 1.0 # 1 degree, fixed for now. tf version lgn model need this to keep true cpd;
+    # row_range = tf.cast(tf.linspace(0.0, row_size, tf.cast(row_size / physical_spacing, tf.int32)), dtype=dtype)
+    # col_range = tf.cast(tf.linspace(0.0, col_size, tf.cast(col_size / physical_spacing, tf.int32)), dtype=dtype)
+    row_range = tf.cast(tf.range(0.0, tf.cast(row_size, dtype=tf.int32), delta=int(physical_spacing)), dtype=dtype)
+    col_range = tf.cast(tf.range(0.0, tf.cast(col_size, dtype=tf.int32), delta=int(physical_spacing)), dtype=dtype)
     # number_frames_needed = int(round(frame_rate * t_max))
-    number_frames_needed = tf.cast(tf.math.round(frame_rate * t_max), tf.int32)
-    time_range = tf.cast(tf.linspace(0.0, t_max, number_frames_needed), dtype=dtype)
+    # number_frames_needed = tf.cast(tf.math.round(frame_rate * t_max), tf.int32)
+    # time_range = tf.cast(tf.linspace(0.0, t_max, number_frames_needed), dtype=dtype)
+    number_frames_needed = tf.cast(tf.math.round(image_duration_f), tf.int32)
+    time_range = tf.cast(tf.range(number_frames_needed), dtype=dtype) / frame_rate
+
     tt, yy, xx = tf.meshgrid(time_range, row_range, col_range, indexing='ij')
 
     # theta_rad = tf.constant(np.pi * (180 - theta) / 180.0, dtype=dtype) #Add negative here to match brain observatory angles!
@@ -60,53 +88,80 @@ def make_drifting_grating_stimulus(row_size=80, col_size=120, moving_flag=True, 
     xy = xx * tf.cos(theta_rad) + yy * tf.sin(theta_rad)
     data = contrast * tf.sin(2 * pi * (cpd * xy + temporal_f * tt) + phase_rad)
 
-    if moving_flag: # decide whether the gratings drift or they are static 
+    if moving_flag: # decide whether the gratings drift or they are static
         return data
     else:
         return tf.tile(data[0][tf.newaxis, ...], (image_duration, 1, 1))
 
 
-def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8, 
+def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8,
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,
                                      current_input=False, regular=False, n_input=17400, dt=1,
                                      data_dir='GLIF_network_nll',
                                      bmtk_compat=True, return_firing_rates=False, rotation='cw', billeh_phase=False,
-                                     dtype=tf.float32):
-    """ make a drifting gratings stimulus for FR and OSI tuning."""
+                                     dtype=tf.float32, seed=None):
+    """ make a drifting gratings stimulus for FR and OSI tuning.
+
+    If `seed` is provided, orientation/phase/spike sampling is stateless and reproducible.
+    """
 
     lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input, dtype=dtype, data_dir=data_dir)
 
     # seq_len = pre_delay + duration + post_delay
     duration =  seq_len - pre_delay - post_delay
+    base_seed = _stateless_seed_pair(seed, salt=1001)
 
     def _g():
         if regular:
             theta = -45  # to make the first one 0
+        sample_idx = 0
         while True:
+            phase_seed = None
+            orientation_seed = None
+            spike_seed = None
+            if base_seed is not None:
+                sample_seed = _fold_in_seed(base_seed, sample_idx)
+                orientation_seed = _fold_in_seed(sample_seed, 0)
+                phase_seed = _fold_in_seed(sample_seed, 1)
+                spike_seed = _fold_in_seed(sample_seed, 2)
+
             if orientation is None:
                 # generate randdomly.
                 if regular:
                     theta = (theta + 45) % 360
                 else:
-                    theta = tf.random.uniform(shape=(1,), minval=0, maxval=360, dtype=dtype)
+                    if orientation_seed is None:
+                        theta = tf.random.uniform(shape=(), minval=0, maxval=360, dtype=dtype)
+                    else:
+                        theta = tf.random.stateless_uniform(
+                            shape=(),
+                            seed=orientation_seed,
+                            minval=0,
+                            maxval=360,
+                            dtype=dtype,
+                        )
             else:
                 theta = orientation
 
-            if rotation == "cw":
-                mov_theta = theta
-            if rotation == "ccw":
-                mov_theta = -theta # flip the sign
+            mov_theta = theta if rotation == "cw" else -theta  # flip the sign for ccw
 
             if billeh_phase:
                 mov_theta += 180
+            # Ensure theta is a Tensor to avoid tf.function retracing on Python scalars.
+            mov_theta = tf.cast(mov_theta, dtype)
 
             # Generate a random phase
-            phase = tf.random.uniform(shape=(1,), minval=0, maxval=360, dtype=dtype)
+            if phase_seed is None:
+                phase = tf.random.uniform(shape=(), minval=0, maxval=360, dtype=dtype)
+            else:
+                phase = tf.random.stateless_uniform(
+                    shape=(), seed=tf.cast(phase_seed, tf.int32), minval=0, maxval=360, dtype=dtype
+                )
 
-            movie = make_drifting_grating_stimulus(row_size=row_size, col_size=col_size, moving_flag=True, 
-                                                    image_duration=duration, cpd=cpd, temporal_f=temporal_f, theta=mov_theta, 
-                                                   phase=phase, contrast=contrast, dtype=dtype)
+            movie = make_drifting_grating_stimulus(row_size=row_size, col_size=col_size, moving_flag=True,
+                                                image_duration=duration, cpd=cpd, temporal_f=temporal_f, theta=mov_theta,
+                                                phase=phase, contrast=contrast, dtype=dtype)
             movie = tf.expand_dims(movie, axis=-1)
             # Add an empty gray screen period before and after the movie
             videos = movies_concat(movie, pre_delay, post_delay, dtype=dtype)
@@ -130,7 +185,12 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
                 if current_input:
                     _z = _p * 1.3
                 else:
-                    _z = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
+                    if spike_seed is None:
+                        _z = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
+                    else:
+                        _z = tf.random.stateless_uniform(
+                            tf.shape(_p), seed=spike_seed, dtype=dtype
+                        ) < _p
                 del _p
 
                 # downsample
@@ -138,6 +198,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
 
                 yield _z, tf.constant(theta, dtype=dtype, shape=(1,)), tf.constant(contrast, dtype=dtype, shape=(1,)), tf.constant(duration, dtype=dtype, shape=(1,))
                 # yield _z, np.array([theta], dtype=np.float32)
+            sample_idx += 1
 
     if return_firing_rates:
         output_dtypes = (dtype)
@@ -156,22 +217,26 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
         output_shapes = (tf.TensorShape((seq_len, n_input)), tf.TensorShape((1)), tf.TensorShape((1)), tf.TensorShape((1)))
         data_set = tf.data.Dataset.from_generator(_g, output_dtypes, output_shapes=output_shapes).map(lambda _a, _b, _c, _d:
                     (tf.cast(_a, data_dtype), tf.cast(_b, dtype), tf.cast(_c, dtype), tf.cast(_d, dtype)), num_parallel_calls=tf.data.AUTOTUNE)
-        
+
+    data_options = tf.data.Options()
+    data_options.deterministic = True
+    data_set = data_set.with_options(data_options)
+
     return data_set
 
 
 ### GRAY SCREEN STIMULUS GENERATION ###
-def generate_gray_screen_stimulus(seq_len=600, row_size=120, col_size=240,
+def generate_gray_screen_stimulus(seq_len=600, row_size=80, col_size=120,
                                   current_input=False, n_input=17400, dt=1,
                                   data_dir='GLIF_network_nll',
                                   bmtk_compat=True, return_firing_rates=False,
-                                  dtype=tf.float32):
+                                  dtype=tf.float32, seed=None):
     """
     Generate gray screen (spontaneous activity) stimulus for LGN.
-    
+
     This function creates LGN firing rates corresponding to a gray screen with no visual stimulus,
     representing spontaneous activity.
-    
+
     Args:
         seq_len: Total sequence length in milliseconds
         row_size: Height of the visual field
@@ -183,24 +248,32 @@ def generate_gray_screen_stimulus(seq_len=600, row_size=120, col_size=240,
         bmtk_compat: Use BMTK-compatible LGN model
         return_firing_rates: If True, return firing rates instead of spike samples
         dtype: TensorFlow data type
-        
+        seed: Optional integer seed for reproducible stateless spike sampling
+
     Returns:
         TensorFlow dataset yielding gray screen LGN activity
     """
     lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input, dtype=dtype, data_dir=data_dir)
+    base_seed = _stateless_seed_pair(seed, salt=2001)
 
     def _g():
+        sample_idx = 0
         while True:
+            spike_seed = None
+            if base_seed is not None:
+                sample_seed = _fold_in_seed(base_seed, sample_idx)
+                spike_seed = _fold_in_seed(sample_seed, 0)
+
             # Create a gray screen (all zeros)
             gray_screen = tf.zeros((seq_len, row_size, col_size, 1), dtype=dtype)
-            
+
             # Process through LGN spatial filters
             spatial = lgn.spatial_response(gray_screen, bmtk_compat)
             del gray_screen
-            
+
             # Get firing rates from spatial response
             firing_rates = lgn.firing_rates_from_spatial(*spatial)
-            
+
             if return_firing_rates:
                 yield firing_rates
             else:
@@ -209,14 +282,20 @@ def generate_gray_screen_stimulus(seq_len=600, row_size=120, col_size=240,
                 # Assuming dt = 1 ms
                 _p = 1 - tf.exp(-firing_rates / 1000.)  # Probability of spike in dt
                 del firing_rates
-                
+
                 if current_input:
                     _z = _p * 1.3
                 else:
-                    _z = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
+                    if spike_seed is None:
+                        _z = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
+                    else:
+                        _z = tf.random.stateless_uniform(
+                            tf.shape(_p), seed=spike_seed, dtype=dtype
+                        ) < _p
                 del _p
-                
+
                 yield _z
+            sample_idx += 1
 
     if return_firing_rates:
         output_dtypes = (dtype)
@@ -229,13 +308,337 @@ def generate_gray_screen_stimulus(seq_len=600, row_size=120, col_size=240,
             data_dtype = dtype
         else:
             data_dtype = tf.bool
-        
+
         output_dtypes = (data_dtype)
         output_shapes = (tf.TensorShape((seq_len, n_input)))
         data_set = tf.data.Dataset.from_generator(
             _g, output_dtypes, output_shapes=output_shapes
         ).map(lambda _a: tf.cast(_a, data_dtype), num_parallel_calls=tf.data.AUTOTUNE)
-    
+
+    data_options = tf.data.Options()
+    data_options.deterministic = True
+    data_set = data_set.with_options(data_options)
+
+    return data_set
+
+
+def load_or_compute_spontaneous_lgn_probabilities(
+    seq_len=600,
+    n_input=17400,
+    data_dir='GLIF_network_nll',
+    bmtk_compat=True,
+    seed=None,
+    output_dtype=tf.float32,
+):
+    """Load cached gray-screen LGN spike probabilities or compute and cache them."""
+    cache_dir = os.path.join(data_dir, "tf_data")
+    cache_file = os.path.join(
+        cache_dir,
+        f"spontaneous_lgn_probabilities_n_input_{n_input}_seqlen_{seq_len}.pkl",
+    )
+
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            probs = pkl.load(f)
+        print("Loaded cached spontaneous LGN firing rates.")
+    else:
+        rates = next(
+            iter(
+                generate_gray_screen_stimulus(
+                    seq_len=seq_len,
+                    n_input=n_input,
+                    return_firing_rates=True,
+                    data_dir=data_dir,
+                    bmtk_compat=bmtk_compat,
+                    dtype=tf.float32,
+                    seed=seed,
+                )
+            )
+        )
+        probs = 1 - tf.exp(-tf.cast(rates, tf.float32) / 1000.0)
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, "wb") as f:
+            pkl.dump(probs.numpy().astype(np.float32), f)
+        print("Computed and cached spontaneous LGN firing rates.")
+
+    probs = tf.convert_to_tensor(probs)
+    return tf.cast(probs, output_dtype)
+
+
+def load_or_compute_osi_dsi_lgn_probabilities(
+    seq_len=600,
+    spont_duration=2000,
+    evoked_duration=2000,
+    n_input=17400,
+    data_dir='GLIF_network_nll',
+    rotation='cw',
+    seed=None,
+    output_dtype=tf.float32,
+    angles=None,
+    strategy=None,
+):
+    """Load cached OSI/DSI LGN spike probabilities or compute and cache them."""
+    if angles is None:
+        angles = np.arange(0, 360, 45)
+
+    cache_dir = os.path.join(data_dir, "tf_data")
+    stim_duration = int(spont_duration) + int(evoked_duration)
+    seq_len = int(seq_len)
+    osi_seq_len = int(np.ceil(stim_duration / seq_len)) * seq_len
+    post_delay = osi_seq_len - stim_duration
+    cache_file = os.path.join(
+        cache_dir,
+        f"osi_dsi_lgn_probabilities_n_input_{n_input}_seqlen_{osi_seq_len}.pkl",
+    )
+
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            lgn_firing_probabilities_dict = pkl.load(f)
+        print("Loaded cached OSI/DSI LGN firing rates dataset.")
+    else:
+        print("Creating OSI/DSI dataset...")
+        lgn_firing_rates = generate_drifting_grating_tuning(
+            seq_len=osi_seq_len,
+            pre_delay=spont_duration,
+            post_delay=post_delay,
+            n_input=n_input,
+            data_dir=data_dir,
+            regular=True,
+            return_firing_rates=True,
+            rotation=rotation,
+            dtype=tf.float32,
+            seed=seed,
+        )
+
+        osi_dsi_data_set = iter(lgn_firing_rates)
+        lgn_firing_probabilities_dict = {}
+        for angle in angles:
+            t0 = time()
+            angle_lgn_firing_rates = next(osi_dsi_data_set)
+            lgn_prob = 1 - tf.exp(-tf.cast(angle_lgn_firing_rates, tf.float32) / 1000.0)
+            lgn_firing_probabilities_dict[int(angle)] = lgn_prob.numpy().astype(np.float32)
+            print(f"Angle {angle} done.")
+            print(f"    LGN running time: {time() - t0:.2f}s")
+            if strategy is not None:
+                for gpu_id in range(len(strategy.extended.worker_devices)):
+                    printgpu(gpu_id=gpu_id)
+            else:
+                printgpu(gpu_id=0)
+
+
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, "wb") as f:
+            pkl.dump(lgn_firing_probabilities_dict, f)
+        print("OSI/DSI dataset created and cached successfully!")
+
+    return {
+        angle: tf.convert_to_tensor(probs, dtype=output_dtype)
+        for angle, probs in lgn_firing_probabilities_dict.items()
+    }
+
+
+### NATURAL SCENES STIMULUS GENERATION ###
+def load_via_allensdk(cache_dir: Path, experiment_id: int = 501498760) -> np.ndarray:
+    """
+    Load Brain Observatory natural-scene templates using AllenSDK.
+
+    Args:
+        cache_dir: Local AllenSDK cache directory.
+        experiment_id: Ophys experiment id used to access the NWB file.
+
+    Returns:
+        ndarray with shape [n_scenes, H, W] and raw pixel values in [0, 255].
+    """
+    try:
+        from allensdk.core.brain_observatory_cache import BrainObservatoryCache
+    except ImportError as e:
+        raise SystemExit(
+            "Missing dependency: allensdk\n"
+            "Install with: pip install allensdk"
+        ) from e
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = cache_dir / "brain_observatory_manifest.json"
+
+    boc = BrainObservatoryCache(manifest_file=str(manifest_file))
+    data_set = boc.get_ophys_experiment_data(experiment_id)
+    scenes = data_set.get_stimulus_template("natural_scenes")
+    scenes = np.asarray(scenes)
+    return scenes
+
+
+def _resize_natural_scenes_to_lgn(scenes, row_size, col_size, dtype=tf.float32):
+    """Resize natural scenes to LGN spatial dimensions while preserving [0, 255] scale."""
+    scenes = np.asarray(scenes)
+    if scenes.ndim != 3:
+        raise ValueError(
+            f"Expected scenes with shape [n_scenes, H, W], got shape {scenes.shape}."
+        )
+
+    scenes_tf = tf.cast(scenes[..., None], dtype=dtype)
+    resized = tf.image.resize(
+        scenes_tf,
+        size=(row_size, col_size),
+        method="bilinear",
+        antialias=True,
+    )
+    # resized = tf.clip_by_value(resized, clip_value_min=0.0, clip_value_max=255.0) # if using lanczos5, clipping between [-1, 1] is needed after resizing
+    # Normalize to [-1, 1] for LGN model compatibility
+    resized = tf.cast(resized, dtype) / 255.0
+    resized = resized * 2.0 - 1.0
+    resized = tf.clip_by_value(resized, -1.0, 1.0)
+
+    return resized
+
+
+def generate_natural_scenes_stimulus(
+    seq_len=600,
+    pre_delay=50,
+    post_delay=50,
+    row_size=80,
+    col_size=120,
+    current_input=False,
+    n_input=17400,
+    data_dir='GLIF_network_nll',
+    bmtk_compat=True,
+    return_firing_rates=False,
+    return_scene_id=False,
+    scenes=None,
+    cache_dir='.cache',
+    experiment_id=501498760,
+    dtype=tf.float32,
+    seed=None,
+):
+    """
+    Generate LGN responses from random natural scenes in Allen Brain Observatory.
+
+    For each sample, one scene is drawn uniformly at random, resized to LGN
+    dimensions, presented for `seq_len - pre_delay - post_delay` milliseconds,
+    and padded by gray screens before/after.
+
+    Args:
+        seq_len: Total sequence length in milliseconds.
+        pre_delay: Gray-screen frames before the scene.
+        post_delay: Gray-screen frames after the scene.
+        row_size: LGN image height.
+        col_size: LGN image width.
+        current_input: If True, return scaled probabilities instead of spikes.
+        n_input: Number of LGN neurons.
+        data_dir: Directory with LGN assets.
+        bmtk_compat: Use BMTK-compatible edge normalization in spatial filtering.
+        return_firing_rates: If True, return rates in Hz.
+        return_scene_id: If True, include the sampled scene index in output.
+        scenes: Optional preloaded scenes [n_scenes, H, W]. If None, use AllenSDK.
+        cache_dir: AllenSDK cache directory when `scenes is None`.
+        experiment_id: Brain Observatory ophys experiment id for scene loading.
+        dtype: TensorFlow dtype for floating outputs.
+        seed: Optional integer seed for reproducible scene/spike sampling.
+
+    Returns:
+        tf.data.Dataset yielding:
+        - spikes/current/firing_rates with shape [seq_len, n_input]
+        - optional scene_id scalar (int32) when `return_scene_id=True`.
+    """
+    image_duration = seq_len - pre_delay - post_delay
+    if image_duration <= 0:
+        raise ValueError(
+            f"`seq_len` must be larger than `pre_delay + post_delay` "
+            f"(got seq_len={seq_len}, pre_delay={pre_delay}, post_delay={post_delay})."
+        )
+
+    # check if scenes exists in cache_dir; if so load from there; if not, load via allensdk and save to cache_dir for future use
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    scenes_path = cache_dir / "natural_scenes.npy"
+    print(f"Loading natural scenes from {scenes_path}...")
+    if scenes_path.exists():
+        print("Found cached scenes, loading from disk...")
+        scenes = np.load(scenes_path)
+    else:
+        print("No cached scenes found, loading from AllenSDK...")
+        scenes = load_via_allensdk(Path(cache_dir), experiment_id=experiment_id)
+        np.save(scenes_path, scenes)
+
+    # resize scenes to LGN dimensions and convert to TensorFlow tensor; keep pixel values in [0, 1] range for LGN model compatibility
+    resized_scenes = _resize_natural_scenes_to_lgn(
+        scenes, row_size=row_size, col_size=col_size, dtype=dtype
+    )
+    n_scenes = int(np.asarray(scenes).shape[0])
+    if n_scenes <= 0:
+        raise ValueError("No natural scenes available to sample from.")
+
+    lgn = lgn_module.LGN(
+        row_size=row_size,
+        col_size=col_size,
+        n_input=n_input,
+        dtype=dtype,
+        data_dir=data_dir,
+    )
+    base_seed = _stateless_seed_pair(seed, salt=3001)
+
+    def _g():
+        sample_idx = 0
+        while True:
+            scene_seed = None
+            spike_seed = None
+            if base_seed is not None:
+                sample_seed = _fold_in_seed(base_seed, sample_idx)
+                scene_seed = _fold_in_seed(sample_seed, 0)
+                spike_seed = _fold_in_seed(sample_seed, 1)
+
+            if scene_seed is None:
+                scene_id = tf.random.uniform(
+                    shape=(), minval=0, maxval=n_scenes, dtype=tf.int32
+                )
+            else:
+                scene_id = tf.random.stateless_uniform(
+                    shape=(), seed=scene_seed, minval=0, maxval=n_scenes, dtype=tf.int32
+                )
+            img = tf.gather(resized_scenes, scene_id)  # [row, col, 1], values in [0, 255]
+            movie = tf.tile(img[None, ...], (image_duration, 1, 1, 1))
+            videos = movies_concat(movie, pre_delay=pre_delay, post_delay=post_delay, dtype=dtype)
+
+            spatial = lgn.spatial_response(videos, bmtk_compat)
+            firing_rates = lgn.firing_rates_from_spatial(*spatial)
+
+            if return_firing_rates:
+                out = tf.cast(firing_rates, dtype)
+            else:
+                p_spike = 1 - tf.exp(-firing_rates / 1000.0)
+                if current_input:
+                    out = tf.cast(p_spike * 1.3, dtype)
+                else:
+                    if spike_seed is None:
+                        out = tf.random.uniform(tf.shape(p_spike), dtype=dtype) < p_spike
+                    else:
+                        out = tf.random.stateless_uniform(
+                            tf.shape(p_spike), seed=spike_seed, dtype=dtype
+                        ) < p_spike
+
+            if return_scene_id:
+                yield out, scene_id
+            else:
+                yield out
+            sample_idx += 1
+
+    if return_firing_rates:
+        output_dtype = dtype
+    else:
+        output_dtype = dtype if current_input else tf.bool
+
+    if return_scene_id:
+        output_signature = (
+            tf.TensorSpec(shape=(seq_len, n_input), dtype=output_dtype),
+            tf.TensorSpec(shape=(), dtype=tf.int32),
+        )
+    else:
+        output_signature = tf.TensorSpec(shape=(seq_len, n_input), dtype=output_dtype)
+
+    data_set = tf.data.Dataset.from_generator(_g, output_signature=output_signature)
+    data_options = tf.data.Options()
+    data_options.deterministic = True
+    data_set = data_set.with_options(data_options)
     return data_set
 
 

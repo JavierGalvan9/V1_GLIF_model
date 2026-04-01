@@ -38,8 +38,9 @@ This model simulates a cortical column in mouse V1, processing visual inputs fro
   - `other_v1_utils.py`: Various utility functions
 - `stim_dataset.py`: Functions for generating visual stimuli (drifting gratings, etc.)
 - `drifting_gratings.py`: Script to run the model with drifting grating stimuli
-- `multi_training_single_gpu_split.py`: Distributed-GPU training implementation
+- `multi_training.py`: Distributed-GPU training implementation
 - `osi_dsi_estimator.py`: Tool for measuring orientation and direction selectivity
+- `METHODS_V1_MODEL_AND_TRAINING.md`: Paper-oriented inventory of model/training methodologies used in code
 - `Neuropixels_data/`: Reference data from Neuropixels recordings for comparison
 
 ## Getting Started
@@ -87,14 +88,14 @@ Parameters:
 - `--seq_len`: Length of simulation in milliseconds
 - `--gratings_orientation`: Orientation angle in degrees
 - `--gratings_frequency`: Temporal frequency in Hz
-- `--hard_reset`: Use hard reset for neurons (default: True)
+- `--hard_reset`: Use hard reset for neurons (default: False)
 
 #### Training the Model
 
 To train the model to match experimental V1 tuning properties:
 
 ```bash
-python multi_training_single_gpu_split.py --neurons 65871 --n_input 17400 \
+python multi_training.py --neurons 65871 --n_input 17400 \
     --seq_len 200 --loss_core_radius 200 --rate_cost 100.0 --voltage_cost 1.0 \
     --osi_cost 1.0 --train_recurrent --train_noise
 ```
@@ -136,7 +137,7 @@ The model provides several analysis tools:
 
 ## Simulation Results
 
-Results are saved in the `Simulation_results` directory. 
+Results are saved in the `Simulation_results` directory.
  <!-- with the following structure:
 - `Images_general/`: Visualization plots
 - `Data/`: Raw simulation data

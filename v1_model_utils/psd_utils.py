@@ -7,8 +7,8 @@ import matplotlib.patches as patches
 from scipy import signal, stats
 from collections import defaultdict
 from statsmodels.stats.multitest import multipletests
+from v1_model_utils import other_v1_utils
 import pandas as pd
-import other_v1_utils
 import shutil
 
 # Set style parameters for publication quality
@@ -40,26 +40,30 @@ def compute_band_power(freqs, psd, band):
     idx = (freqs >= band[0]) & (freqs <= band[1])
     return np.trapz(psd[idx], freqs[idx])
 
+
 def bootstrap_relative_change(stim_trials, spont_trials, n_boot=1000):
     np.random.seed(42)
     boot_deltas = []
     for _ in range(n_boot):
-        stim_sample = np.random.choice(stim_trials, size=len(stim_trials), replace=True)
-        spont_sample = np.random.choice(spont_trials, size=len(spont_trials), replace=True)
-        
+        stim_sample = np.random.choice(
+            stim_trials, size=len(stim_trials), replace=True)
+        spont_sample = np.random.choice(
+            spont_trials, size=len(spont_trials), replace=True)
+
         # Handle division by zero by checking if spont_sample mean is close to zero
         spont_mean = np.mean(spont_sample)
         if np.abs(spont_mean) < 1e-10:  # Very small number to avoid division by zero
             delta = 0.0  # Set to 0 if denominator is effectively zero
         else:
             delta = (np.mean(stim_sample) - spont_mean) / spont_mean
-        
+
         # Handle infinite values
         if np.isinf(delta) or np.isnan(delta):
             delta = 0.0
-            
+
         boot_deltas.append(delta)
     return np.mean(boot_deltas), np.percentile(boot_deltas, [2.5, 97.5])
+
 
 def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, save_path=None):
     layer_order = ["L1", "L2/3", "L4", "L5", "L6"]
@@ -88,17 +92,21 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
             for trial in stim_trials_list:
                 freqs = trial[cell_type]['frequencies']
                 psd = trial[cell_type]['psd']
-                stim_band_vals.append(compute_band_power(freqs, psd, band_range))
+                stim_band_vals.append(
+                    compute_band_power(freqs, psd, band_range))
 
             for trial in spont_trials_list:
                 freqs = trial[cell_type]['frequencies']
                 psd = trial[cell_type]['psd']
-                spont_band_vals.append(compute_band_power(freqs, psd, band_range))
+                spont_band_vals.append(
+                    compute_band_power(freqs, psd, band_range))
 
-            mean_delta, ci = bootstrap_relative_change(stim_band_vals, spont_band_vals)
+            mean_delta, ci = bootstrap_relative_change(
+                stim_band_vals, spont_band_vals)
 
             try:
-                stat, pval = stats.wilcoxon(np.array(stim_band_vals) - np.array(spont_band_vals))
+                stat, pval = stats.wilcoxon(
+                    np.array(stim_band_vals) - np.array(spont_band_vals))
             except ValueError:
                 pval = np.nan
 
@@ -118,12 +126,15 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
     df = df[np.isfinite(df["CI lower"])]
     df = df[np.isfinite(df["CI upper"])]
 
-    reject, pvals_corrected, _, _ = multipletests(df["p-value"].fillna(1.0), method='fdr_bh')
+    reject, pvals_corrected, _, _ = multipletests(
+        df["p-value"].fillna(1.0), method='fdr_bh')
     df["p-adj"] = pvals_corrected
     df["Significant"] = reject
 
-    df["Layer"] = df["Cell Type"].apply(lambda x: x.split()[0] if x.startswith("L") else "Other")
-    df = df.sort_values(by=["Layer", "Cell Type"], key=lambda col: col.map({k: i for i, k in enumerate(layer_order)}) if col.name == "Layer" else col, ascending=False)
+    df["Layer"] = df["Cell Type"].apply(
+        lambda x: x.split()[0] if x.startswith("L") else "Other")
+    df = df.sort_values(by=["Layer", "Cell Type"], key=lambda col: col.map(
+        {k: i for i, k in enumerate(layer_order)}) if col.name == "Layer" else col, ascending=False)
 
     max_abs = np.nanmax(np.abs(df[["CI lower", "CI upper"]].values))
 
@@ -151,7 +162,8 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
                 capsize=3, alpha=0.7
             )
             if row["Significant"]:
-                ax.text(max_abs * 1.05, idx, '*', fontsize=14, va='center', ha='left', color='black')
+                ax.text(max_abs * 1.05, idx, '*', fontsize=14,
+                        va='center', ha='left', color='black')
 
         ax.axvline(0, color='gray', linestyle='--')
         ax.set_yticks(range(len(subdf)))
@@ -185,8 +197,10 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
     # fig.suptitle("Relative Change in Band Power with 95% CI and FDR-Corrected Significance (*q < 0.05)", fontsize=24)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     if save_path is not None:
-        plt.savefig(os.path.join(save_path, f'relative_band_power_comparison.png'), dpi=300, bbox_inches='tight', transparent=False)
+        plt.savefig(os.path.join(save_path, f'relative_band_power_comparison.png'),
+                    dpi=300, bbox_inches='tight', transparent=False)
     plt.close()
+
 
 def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_path=None):
 
@@ -231,15 +245,18 @@ def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_pa
             for trial in stim_trials_list:
                 freqs = trial[cell_type]['frequencies']
                 psd = trial[cell_type]['psd']
-                stim_band_vals.append(compute_band_power(freqs, psd, band_range))
+                stim_band_vals.append(
+                    compute_band_power(freqs, psd, band_range))
 
             for trial in spont_trials_list:
                 freqs = trial[cell_type]['frequencies']
                 psd = trial[cell_type]['psd']
-                spont_band_vals.append(compute_band_power(freqs, psd, band_range))
+                spont_band_vals.append(
+                    compute_band_power(freqs, psd, band_range))
 
             try:
-                stat, pval = stats.wilcoxon(np.array(stim_band_vals) - np.array(spont_band_vals))
+                stat, pval = stats.wilcoxon(
+                    np.array(stim_band_vals) - np.array(spont_band_vals))
             except ValueError:
                 pval = 1.0
 
@@ -262,15 +279,18 @@ def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_pa
                 "pval": pval
             })
 
-    reject, pvals_corrected, _, _ = multipletests(pvals, method='fdr_bh', alpha=0.01)
+    reject, pvals_corrected, _, _ = multipletests(
+        pvals, method='fdr_bh', alpha=0.01)
 
     for i, row in enumerate(data):
         row['p-adj'] = pvals_corrected[i // 2]
         row['Significant'] = reject[i // 2]
 
     df = pd.DataFrame(data)
-    df["Layer"] = df["Cell Type"].apply(lambda x: x.split()[0] if x.startswith("L") else "Other")
-    df = df.sort_values(by=["Layer", "Cell Type", "Condition"], key=lambda col: col.map({k: i for i, k in enumerate(layer_order[::-1])}) if col.name == "Layer" else col, ascending=False)
+    df["Layer"] = df["Cell Type"].apply(
+        lambda x: x.split()[0] if x.startswith("L") else "Other")
+    df = df.sort_values(by=["Layer", "Cell Type", "Condition"], key=lambda col: col.map(
+        {k: i for i, k in enumerate(layer_order[::-1])}) if col.name == "Layer" else col, ascending=False)
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 16), sharex=False, sharey=True)
     axes = axes.flatten()
@@ -317,7 +337,8 @@ def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_pa
             if row['Condition'] == 'Stimulus' and row['Significant']:
                 y = ypos[(row["Cell Type"], "Stimulus")]
                 stars = pval_to_asterisks(row['p-adj'])
-                ax.text(max_x * 1.02, y, stars, fontsize=20, va='center', ha='left', color='black')
+                ax.text(max_x * 1.02, y, stars, fontsize=20,
+                        va='center', ha='left', color='black')
 
         yticks = [ypos[(ct, "Spontaneous")] + 0.5 for ct in cell_types]
         ax.set_yticks(yticks)
@@ -357,8 +378,10 @@ def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_pa
     # fig.suptitle("Mean Band Power Across Conditions with SEM and FDR-Corrected Significance (* p < 0.05, ** p < 0.01, *** p < 0.001)", fontsize=22)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     if save_path is not None:
-        plt.savefig(os.path.join(save_path, f'absolute_band_power.png'), dpi=300, bbox_inches='tight', transparent=False)
+        plt.savefig(os.path.join(save_path, f'absolute_band_power.png'),
+                    dpi=300, bbox_inches='tight', transparent=False)
     plt.close()
+
 
 def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=True, title_suffix="Spontaneous", save_path=None):
     colors = {
@@ -390,8 +413,9 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=Tr
             values = data['mean_psd'] + data['sem_psd']  # Upper bound
             y_max = max(y_max, np.max(values))
             values = data['mean_psd'] - data['sem_psd']  # Lower bound
-            y_min = min(y_min, np.min(values[values > 0]))  # Exclude negative or zero values for log scale
-    
+            # Exclude negative or zero values for log scale
+            y_min = min(y_min, np.min(values[values > 0]))
+
     # Add some margin
     y_min *= 0.8
     y_max *= 1.2
@@ -416,7 +440,7 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=Tr
         else:
             # Share y-axis with the first subplot
             ax = fig.add_subplot(pos, sharey=first_ax)
-        
+
         all_axes.append(ax)
 
         for cell_type in layer_cell_types[layer]:
@@ -425,8 +449,10 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=Tr
                     color=color, linewidth=3, label=cell_type)
             ax.fill_between(
                 psd_dict[cell_type]['frequencies'],
-                psd_dict[cell_type]['mean_psd'] - psd_dict[cell_type]['sem_psd'],
-                psd_dict[cell_type]['mean_psd'] + psd_dict[cell_type]['sem_psd'],
+                psd_dict[cell_type]['mean_psd'] -
+                psd_dict[cell_type]['sem_psd'],
+                psd_dict[cell_type]['mean_psd'] +
+                psd_dict[cell_type]['sem_psd'],
                 color=color, alpha=0.2
             )
 
@@ -444,13 +470,18 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=Tr
             intercept = np.mean(log_psd - slope * log_freqs)
             # Generate the fitted curve
             fitted_curve = 10**intercept * freqs**slope
-            ax.plot(freqs[mask], fitted_curve[mask], color='black', linestyle='--', linewidth=2, label='1/f Fit')
+            ax.plot(freqs[mask], fitted_curve[mask], color='black',
+                    linestyle='--', linewidth=2, label='1/f Fit')
 
         is_first = (layer == 'L1')
-        ax.axvspan(4, 8, alpha=0.1, color="blue", label="Theta (4-8 Hz)" if is_first else "_nolegend_")
-        ax.axvspan(8, 12, alpha=0.1, color="green", label="Alpha (8-12 Hz)" if is_first else "_nolegend_")
-        ax.axvspan(12, 30, alpha=0.1, color="orange", label="Beta (12-30 Hz)" if is_first else "_nolegend_")
-        ax.axvspan(30, 80, alpha=0.1, color="red", label="Gamma (30-80 Hz)" if is_first else "_nolegend_")
+        ax.axvspan(4, 8, alpha=0.1, color="blue",
+                   label="Theta (4-8 Hz)" if is_first else "_nolegend_")
+        ax.axvspan(8, 12, alpha=0.1, color="green",
+                   label="Alpha (8-12 Hz)" if is_first else "_nolegend_")
+        ax.axvspan(12, 30, alpha=0.1, color="orange",
+                   label="Beta (12-30 Hz)" if is_first else "_nolegend_")
+        ax.axvspan(30, 80, alpha=0.1, color="red",
+                   label="Gamma (30-80 Hz)" if is_first else "_nolegend_")
 
         ax.set_xscale('log')
         ax.set_yscale('log')
@@ -472,7 +503,8 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=Tr
         ax.grid(True, which='both', linestyle='--', alpha=0.4, linewidth=1)
 
         if layer == 'L1' or layer_cell_types[layer]:
-            leg = ax.legend(loc='lower left', fontsize=16, frameon=True, framealpha=0.8, ncol=2)
+            leg = ax.legend(loc='lower left', fontsize=16,
+                            frameon=True, framealpha=0.8, ncol=2)
             leg.get_frame().set_edgecolor('black')
             leg.get_frame().set_linewidth(1.5)
 
@@ -481,11 +513,12 @@ def plot_psd_by_layer(psd_dict, normalize=False, normalize_by_n2=True, add_1f=Tr
         ax.set_ylim(y_min, y_max)
 
     # fig.suptitle(f"{'Normalized ' if normalize else ''}Power Spectral Density by Cell Type for {title_suffix}",
-                #  fontsize=28, fontweight='bold', y=0.98)
+        #  fontsize=28, fontweight='bold', y=0.98)
     plt.tight_layout()
     plt.subplots_adjust(top=0.93)
     if save_path is not None:
-        plt.savefig(os.path.join(save_path, f'psd_by_layer_{title_suffix}.png'), dpi=300, bbox_inches='tight', transparent=False)
+        plt.savefig(os.path.join(
+            save_path, f'psd_by_layer_{title_suffix}.png'), dpi=300, bbox_inches='tight', transparent=False)
     plt.close()
 
 
@@ -494,17 +527,21 @@ class PSDAnalyzer:
                  save_path=None, data_dir='GLIF_network', radius=200):
 
         if analyze_core_only:
-            pop_names = other_v1_utils.pop_names(network, core_radius=radius, data_dir=data_dir)
+            pop_names = other_v1_utils.pop_names(
+                network, core_radius=radius, data_dir=data_dir)
             # Isolate the core neurons
-            self.core_mask = other_v1_utils.isolate_core_neurons(network, radius=radius, data_dir=data_dir)
+            self.core_mask = other_v1_utils.isolate_core_neurons(
+                network, radius=radius, data_dir=data_dir)
             self.n_neurons = np.sum(self.core_mask)
         else:
             pop_names = other_v1_utils.pop_names(network, data_dir=data_dir)
             self.n_neurons = len(pop_names)
             self.core_mask = np.ones(self.n_neurons, dtype=bool)
 
-        cell_types = [other_v1_utils.pop_name_to_cell_type(name) for name in pop_names]
-        self.cell_types_map = {i: cell_types[i] for i in range(len(cell_types))}
+        cell_types = [other_v1_utils.pop_name_to_cell_type(
+            name) for name in pop_names]
+        self.cell_types_map = {i: cell_types[i]
+                               for i in range(len(cell_types))}
         self.fs = fs
         self.population_average = population_average
         self.normalize = normalize
@@ -516,11 +553,11 @@ class PSDAnalyzer:
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
         self.BANDS = {
-                        "Theta (4-8 Hz)": (4, 8),
-                        "Alpha (8-12 Hz)": (8, 12),
-                        "Beta (12-30 Hz)": (12, 30),
-                        "Gamma (30-80 Hz)": (30, 80)
-                    }
+            "Theta (4-8 Hz)": (4, 8),
+            "Alpha (8-12 Hz)": (8, 12),
+            "Beta (12-30 Hz)": (12, 30),
+            "Gamma (30-80 Hz)": (30, 80)
+        }
 
     def calculate_power_spectrum(self, spike_times, t_start, t_end, nperseg=1000, noverlap=500):
         duration = t_end - t_start
@@ -561,7 +598,8 @@ class PSDAnalyzer:
                 continue
 
             if self.population_average:
-                freqs, psd = self.calculate_power_spectrum(all_spikes, t_start, t_end)
+                freqs, psd = self.calculate_power_spectrum(
+                    all_spikes, t_start, t_end)
                 if self.normalize_by_n2:
                     psd /= len(spike_lists) ** 2
                 if self.normalize_by_rate and len(all_spikes) > 0:
@@ -571,7 +609,8 @@ class PSDAnalyzer:
                     self.calculate_power_spectrum(spikes, t_start, t_end)[1] for spikes in spike_lists if spikes
                 ]
                 psd = np.mean(individual_psds, axis=0)
-                freqs = self.calculate_power_spectrum(spike_lists[0], t_start, t_end)[0]
+                freqs = self.calculate_power_spectrum(
+                    spike_lists[0], t_start, t_end)[0]
 
             spectra[cell_type] = {
                 'frequencies': freqs,
@@ -619,22 +658,26 @@ class PSDAnalyzer:
         # Mask core neurons
         if len(spikes.shape) == 4:  # Shape: [trials, angles, time, neurons]
             # Reshape spikes from [trials, angles, time, neurons] to [trials*angles, time, neurons]
-            spikes = np.reshape(spikes, [spikes.shape[0] * spikes.shape[1], spikes.shape[2], spikes.shape[3]])
+            spikes = np.reshape(
+                spikes, [spikes.shape[0] * spikes.shape[1], spikes.shape[2], spikes.shape[3]])
         else:
-            raise ValueError(f"Unexpected spike array shape: {spikes.shape}. Expected 3D or 4D array.")
+            raise ValueError(
+                f"Unexpected spike array shape: {spikes.shape}. Expected 3D or 4D array.")
 
         # Mask core neurons (which still may be the full set of neurons)
-        if spikes.shape[2] != self.n_neurons and spikes.shape[2] == len(self.core_mask):    
+        if spikes.shape[2] != self.n_neurons and spikes.shape[2] == len(self.core_mask):
             spikes = spikes[:, :, self.core_mask]
-        
+
         # Process evoked trials if time window is provided
         evoked_psds = None
         evoked_power_spectrum_dict = None
         if t_evoked_start is not None and t_evoked_end is not None and t_evoked_end > t_evoked_start:
-            evoked_psds = self.process_trials(spikes, t_evoked_start, t_evoked_end)
-            evoked_power_spectrum_dict = self.average_psd_over_trials(evoked_psds)
-            plot_psd_by_layer(evoked_power_spectrum_dict, normalize=self.normalize, normalize_by_n2=self.normalize_by_n2, 
-                            title_suffix='Evoked', save_path=self.save_path)
+            evoked_psds = self.process_trials(
+                spikes, t_evoked_start, t_evoked_end)
+            evoked_power_spectrum_dict = self.average_psd_over_trials(
+                evoked_psds)
+            plot_psd_by_layer(evoked_power_spectrum_dict, normalize=self.normalize, normalize_by_n2=self.normalize_by_n2,
+                              title_suffix='Evoked', save_path=self.save_path)
         else:
             print("Skipping evoked analysis: Invalid time window provided.")
 
@@ -642,16 +685,19 @@ class PSDAnalyzer:
         spont_psds = None
         spont_power_spectrum_dict = None
         if t_spont_start is not None and t_spont_end is not None and t_spont_end > t_spont_start:
-            spont_psds = self.process_trials(spikes, t_spont_start, t_spont_end)
-            spont_power_spectrum_dict = self.average_psd_over_trials(spont_psds)
-            plot_psd_by_layer(spont_power_spectrum_dict, normalize=self.normalize, normalize_by_n2=self.normalize_by_n2, 
-                            title_suffix='Spontaneous', save_path=self.save_path)
+            spont_psds = self.process_trials(
+                spikes, t_spont_start, t_spont_end)
+            spont_power_spectrum_dict = self.average_psd_over_trials(
+                spont_psds)
+            plot_psd_by_layer(spont_power_spectrum_dict, normalize=self.normalize, normalize_by_n2=self.normalize_by_n2,
+                              title_suffix='Spontaneous', save_path=self.save_path)
 
         else:
             print("Skipping spontaneous analysis: Invalid time window provided.")
-    
+
         # Compare evoked vs spontaneous data if both are available
         if evoked_psds is not None and spont_psds is not None:
-            compare_band_power_bootstrap(evoked_psds, spont_psds, self.BANDS, save_path=self.save_path)
-            plot_absolute_band_power(evoked_psds, spont_psds, self.BANDS, save_path=self.save_path)
-            
+            compare_band_power_bootstrap(
+                evoked_psds, spont_psds, self.BANDS, save_path=self.save_path)
+            plot_absolute_band_power(
+                evoked_psds, spont_psds, self.BANDS, save_path=self.save_path)

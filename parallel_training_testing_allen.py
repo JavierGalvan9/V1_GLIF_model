@@ -24,6 +24,12 @@ parser.add_argument('--dtype', default='float32', type=str)
 
 parser.add_argument('--optimizer', default='adam', type=str)
 parser.add_argument('--learning_rate', default=0.001, type=float)
+parser.add_argument('--lr_schedule', default='warmup_cosine', type=str)
+parser.add_argument('--lr_warmup_start_lr', default=0.08, type=float)
+parser.add_argument('--lr_warmup_target_lr', default=0.04, type=float)
+parser.add_argument('--lr_warmup_steps', default=120, type=int)
+parser.add_argument('--lr_cosine_min_lr', default=0.001, type=float)
+parser.add_argument('--lr_cosine_steps', default=880, type=int)
 parser.add_argument('--rate_cost', default=100., type=float) #100
 parser.add_argument('--voltage_cost', default=1., type=float)
 parser.add_argument('--sync_cost', default=1., type=float)
@@ -33,6 +39,7 @@ parser.add_argument('--osi_loss_method', default='crowd_osi', type=str)
 
 parser.add_argument('--dampening_factor', default=0.1, type=float)
 parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
+parser.add_argument('--voltage_gradient_dampening', default=0.5, type=float)
 # parser.add_argument('--dampening_factor', default=0.5, type=float)
 # parser.add_argument('--recurrent_dampening_factor', default=0.5, type=float)
 parser.add_argument('--input_weight_scale', default=1.0, type=float)
@@ -98,7 +105,7 @@ parser.add_argument('--neuropixels_df', default='Neuropixels_data/v1_OSI_DSI_DF.
 
 
 def submit_job(command, print_only=False):
-    """ 
+    """
     Submit a job to the cluster using the command provided.
     If print_only is True, just print the command without submitting.
     """
@@ -113,17 +120,17 @@ def submit_job(command, print_only=False):
                 print(command[wrap_index + 1])
         # Return a dummy job ID for print-only mode
         return "DUMMY_JOB_ID"
-    
+
     # Actually submit the job
     result = subprocess.run(command, capture_output=True, text=True)
     job_id = re.search(r'\d+', result.stdout.strip())
     job_id = job_id.group()
     return job_id
 
-def main():                
+def main():
     # Initialize the flags and customize the simulation main characteristics
     flags = parser.parse_args()
-        
+
     # Get the neurons of each column of the network
     v1_neurons = flags.neurons
 
@@ -147,7 +154,7 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    # training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "48", "-t", "1:30"] # choose the L40S GPU with 48GB of memory 
+    # training_commands = ["run", "-g", "1", "-G", "L40S", "-m", "48", "-t", "1:30"] # choose the L40S GPU with 48GB of memory
     # evaluation_commands = ["run", "-g", "1", "-m", "65", "-t", "2:00"]
     training_commands = [
         "sbatch",
@@ -170,9 +177,9 @@ def main():
 
 
     # Define the training and evaluation script calls
-    # training_script = "python multi_training.py " 
-    training_script = "python -u multi_training_single_gpu_split.py " 
-    evaluation_script = "python -u osi_dsi_estimator.py " 
+    # training_script = "python multi_training.py "
+    training_script = "python -u multi_training.py "
+    evaluation_script = "python -u osi_dsi_estimator.py "
 
     # initial_benchmark_model = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_30000/b_3jo7/Best_model'
     initial_benchmark_model = ''
@@ -181,7 +188,7 @@ def main():
     for name, value in vars(flags).items():
         # if value != parser.get_default(name) and name in ['learning_rate', 'rate_cost', 'voltage_cost', 'osi_cost', 'temporal_f', 'n_input', 'seq_len']:
         # if value != parser.get_default(name):
-        if name not in ['seed', 'print_only']: 
+        if name not in ['seed', 'print_only']:
             if type(value) == bool and value == False:
                 training_script += f"--no{name} "
                 evaluation_script += f"--no{name} "
