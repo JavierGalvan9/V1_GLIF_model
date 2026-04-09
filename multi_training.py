@@ -1038,12 +1038,12 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
-    absl.app.flags.DEFINE_string('optimizer', 'adam', '')
+    absl.app.flags.DEFINE_string('optimizer', 'exp_adam', '')
     absl.app.flags.DEFINE_string('neuropixels_df', 'Neuropixels_data/v1_OSI_DSI_DF.csv',
                                  'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
 
-    absl.app.flags.DEFINE_float('learning_rate', .001, '')
-    absl.app.flags.DEFINE_string('lr_schedule', 'warmup_cosine',
+    absl.app.flags.DEFINE_float('learning_rate', .005, '')
+    absl.app.flags.DEFINE_string('lr_schedule', 'none',
         "Learning-rate schedule. Options: 'none' or 'warmup_cosine'.",
     )
     absl.app.flags.DEFINE_float('lr_warmup_start_lr', 0.08,
@@ -1061,18 +1061,18 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('lr_cosine_steps', 880,
         'Number of cosine decay steps after warmup (used when lr_schedule=warmup_cosine).',
     )
-    absl.app.flags.DEFINE_float('rate_cost', 100., '')
-    absl.app.flags.DEFINE_float('sync_cost', 1., '')
-    absl.app.flags.DEFINE_float('voltage_cost', 1.5, '')
-    absl.app.flags.DEFINE_float('osi_cost', 1., '')
+    absl.app.flags.DEFINE_float('rate_cost', 10000., '')
+    absl.app.flags.DEFINE_float('sync_cost', 1.5, '')
+    absl.app.flags.DEFINE_float('voltage_cost', 1., '')
+    absl.app.flags.DEFINE_float('osi_cost', 20., '')
     absl.app.flags.DEFINE_float('annulus_loss_weight', 0.1, '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
-    absl.app.flags.DEFINE_float('dampening_factor', 0.1, '')
-    absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.1, "")
+    absl.app.flags.DEFINE_float('dampening_factor', .1, '')
+    absl.app.flags.DEFINE_float("recurrent_dampening_factor", .1, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
-    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'mean',
+    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'emd',
                                  'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, emd')
     absl.app.flags.DEFINE_string('voltage_penalty_mode', 'range',
                                  'Type of penalization for voltage. Options: range, threshold')
@@ -1090,20 +1090,20 @@ if __name__ == '__main__':
 
     absl.app.flags.DEFINE_integer('n_runs', 1, '')
     absl.app.flags.DEFINE_integer('run_session', 0, '')
-    absl.app.flags.DEFINE_integer('n_epochs', 50, '')
+    absl.app.flags.DEFINE_integer('n_epochs', 75, '')
     # number of epochs for osi/dsi evaluation if n_runs = 1
     absl.app.flags.DEFINE_integer('osi_dsi_eval_period', 1, '')
     absl.app.flags.DEFINE_integer('batch_size', 1, '')
     absl.app.flags.DEFINE_integer('neurons', 0, '')  # 0 to take all neurons
     absl.app.flags.DEFINE_integer("n_input", 17400, "")
-    absl.app.flags.DEFINE_integer('seq_len', 600, '')
+    absl.app.flags.DEFINE_integer('seq_len', 500, '')
     # absl.app.flags.DEFINE_integer('im_slice', 100, '')
     absl.app.flags.DEFINE_integer('seed', 3000, '')
     # absl.app.flags.DEFINE_integer('port', 12778, '')
     absl.app.flags.DEFINE_integer("n_output", 2, "")
     absl.app.flags.DEFINE_integer('neurons_per_output', 16, '')
     # EA and garret dose not need this many but pure classification needs 781 = int(50000/64)
-    absl.app.flags.DEFINE_integer('steps_per_epoch', 20, '')
+    absl.app.flags.DEFINE_integer('steps_per_epoch', 25, '')
     # EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
     absl.app.flags.DEFINE_integer('val_steps', 1, '')
     # absl.app.flags.DEFINE_integer('max_delay', 5, '')

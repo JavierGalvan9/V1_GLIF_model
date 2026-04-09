@@ -1,25 +1,26 @@
 name: tf215
 channels:
     - conda-forge
+    - kaeldai
     - defaults
 dependencies:
     - pandas
     - matplotlib
-    - tensorflow-gpu
     - tensorboard
-    - cudtoolkit
-    - cudtoolkit-dev
     - numba
-    - numpy
+    - numpy=1.23.5
+    - seaborn
     - h5py
+    - joblib
     - memory_profiler
     - pympler
     - scipy
     - lz4
+    - bmtk
     - pip
     - pip:
+        - tensorflow[and-cuda]==2.15.0.post1
         - tensorboard-plugin-profile
-        - bmtk
 
 
 # Optional dependencies that may be useful

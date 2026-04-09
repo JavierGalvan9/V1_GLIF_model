@@ -5,7 +5,7 @@ import pickle as pkl
 import random
 import ctypes.util
 import gc
-from toolkit import get_random_identifier
+from v1_model_utils.toolkit import get_random_identifier
 import numpy as np
 import tensorflow as tf
 from packaging import version

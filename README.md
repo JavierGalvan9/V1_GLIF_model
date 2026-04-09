@@ -55,16 +55,20 @@ This model simulates a cortical column in mouse V1, processing visual inputs fro
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/username/V1_GLIF_model.git
+git clone https://github.com/JavierGalvan9/V1_GLIF_model.git
 cd V1_GLIF_model
 ```
 
-2. Install dependencies using pip:
+2. Create the conda environment from `environment.yml`:
 ```bash
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate tf215
 ```
 
-3. Install LaTeX (optional, for publication-quality plots):
+3. Make the SONATA network available as `GLIF_network/` in the repository root, or point `--data_dir` at the network directory you built or downloaded by following the main repo instructions.
+   The network should contain the usual SONATA subdirectories such as `network/` and `components/`.
+
+4. Install LaTeX (optional, for publication-quality plots):
    - Ubuntu/Debian: `sudo apt-get install texlive-latex-base texlive-fonts-recommended`
    - Fedora/RHEL/CentOS: `sudo dnf install texlive-latex`
    - Arch Linux: `sudo pacman -S texlive-core`
@@ -75,45 +79,52 @@ pip install -r requirements.txt
 
 #### Testing with Drifting Gratings
 
-To run a simulation with drifting grating stimuli:
+To run a short smoke test against the full V1 network, use the network you built or downloaded via the main repo instructions and keep the simulated branch duration short:
 
 ```bash
-python drifting_gratings.py --neurons 65871 --n_input 17400 --seq_len 2500 \
-    --gratings_orientation 0 --gratings_frequency 2 --batch_size 1
+python osi_dsi_estimator.py --data_dir GLIF_network \
+    --results_dir Simulation_results/smoke_osi --neurons 0 --n_trials_per_angle 1 \
+    --seq_len 50 --spont_duration 50 --evoked_duration 50 --n_runs 1 --n_epochs 1 \
+    --batch_size 1 --nocalculate_osi_dsi --restore_from ''
 ```
 
 Parameters:
-- `--neurons`: Number of V1 neurons to simulate (e.g., 65871 for full core model)
-- `--n_input`: Number of LGN input neurons (default: 17400)
-- `--seq_len`: Length of simulation in milliseconds
-- `--gratings_orientation`: Orientation angle in degrees
-- `--gratings_frequency`: Temporal frequency in Hz
-- `--hard_reset`: Use hard reset for neurons (default: False)
+- `--data_dir`: Path to the SONATA network directory
+- `--results_dir`: Output directory for checkpoints and metrics
+- `--neurons`: Number of V1 neurons to simulate (`0` means all neurons)
+- `--n_trials_per_angle`: Number of trials per orientation
+- `--seq_len`: Length of each simulated branch in milliseconds
+- `--spont_duration` / `--evoked_duration`: Duration of the spontaneous and evoked windows
+- `--nocalculate_osi_dsi`: Skip the final OSI/DSI plotting pass for a smoke test
 
 #### Training the Model
 
 To train the model to match experimental V1 tuning properties:
 
 ```bash
-python multi_training.py --neurons 65871 --n_input 17400 \
-    --seq_len 200 --loss_core_radius 200 --rate_cost 100.0 --voltage_cost 1.0 \
-    --osi_cost 1.0 --train_recurrent --train_noise
+python multi_training.py --data_dir GLIF_network \
+    --neurons 0 --seq_len 500 --n_epochs 75 --steps_per_epoch 25 \
+    --batch_size 1 --optimizer exp_adam --learning_rate 0.005 \
+    --rate_cost 10000 --voltage_cost 1 --sync_cost 1.5 --osi_cost 20 \
+    --train_recurrent
 ```
 
 Parameters:
-- `--rate_cost`: Cost weight for firing rate regularization
+- `--rate_cost`: Cost weight for firing-rate regularization
 - `--voltage_cost`: Cost weight for voltage dynamics
+- `--sync_cost`: Cost weight for synchronization regularization
 - `--osi_cost`: Cost weight for matching orientation/direction selectivity to experimental data
 - `--train_recurrent`: Enable training of recurrent connections
-- `--train_noise`: Enable training of noise input scaling
+- `--optimizer`: Optimizer used for the paper-aligned runs (`exp_adam`)
+- `--learning_rate`: Learning rate used in the reported configuration (`0.005`)
 
 #### Evaluating Orientation and Direction Selectivity
 
-To evaluate OSI/DSI metrics after training:
+To evaluate OSI/DSI metrics after training, or to rerun a checkpointed model:
 
 ```bash
-python osi_dsi_estimator.py --neurons 65871 --n_trials_per_angle 10 \
-    --restore_from "/path/to/model/checkpoint"
+python osi_dsi_estimator.py --data_dir GLIF_network \
+    --neurons 0 --n_trials_per_angle 10 --restore_from "/path/to/model/checkpoint"
 ```
 
 ## Visual Stimuli
