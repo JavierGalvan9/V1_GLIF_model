@@ -1,26 +1,20 @@
 # V1_GLIF_model
 
-A TensorFlow implementation of a biologically plausible model of mouse primary visual cortex (V1) with Lateral Geniculate Nucleus (LGN) input, based on Allen Institute models. This project simulates V1 neurons' responses to visual stimuli using Generalized Leaky Integrate and Fire (GLIF) neurons.
-This is a successor project of making a model of the mouse primary visual cortex (https://portal.brain-map.org/explore/models/mv1-all-layers)
-
-The improvements will be:
-
-- Connection probability and weights are derived from coherent datasets, including the Allen Institute synaptic physiology data and MICrONS electron microscopy connectomics dataset (instead from the literature).
-- Synaptic connections are now expressed by double alpha functions and the receptor types are more elaborated.
-- Segregation of the L5 excitatory cells into IT, ET, and NP types.
-- More GLIF cell models are used.
-- Only PointNet version is available as of now.
+A TensorFlow implementation of a biologically realistic mouse primary visual cortex (V1) model with Lateral Geniculate Nucleus (LGN) input, based on Allen Institute models. This project simulates V1 neurons' responses to visual stimuli using Generalized Leaky Integrate-and-Fire (GLIF; specifically the GLIF_3 variant) neurons.
 
 ![Fig1](https://github.com/user-attachments/assets/167be7dd-4723-48db-9166-4e5b38df8c23)
 
+The software in this repository requires SONATA format network files. These can be either
+generated or downloaded. Please refer to the main repository of the project, [biorealistic-v1-model](https://github.com/AllenInstitute/biorealistic-v1-model), for network-building instructions and download links.
+
 ## Model Overview
 
-This model simulates a cortical column in mouse V1, processing visual inputs from LGN and with background activity. Key features include:
+This model simulates a cortical column in mouse V1, processing LGN input together with background activity. Key features include:
 
-- **LGN input processing**: Visual stimuli converted to neural activity patterns in LGN
-- **Poisson background activity**: 100 Poisson nodes providing background noise
+- **LGN input processing**: Visual stimuli converted into neural activity patterns in LGN
+- **Poisson background activity**: 100 Poisson nodes provide background noise
 - **Different cell types**: Excitatory and inhibitory neurons across cortical layers
-- **Synaptic double alpha implementation**: Realistic synaptic dynamics modeling
+- **Synaptic double-alpha implementation**: Realistic synaptic dynamics modeling
 - **Orientation and direction selectivity**: Analysis tools for measuring tuning properties
 - **Neural population analysis**: Tools for visualizing and measuring neural activity
 
@@ -65,7 +59,7 @@ conda env create -f environment.yml
 conda activate tf215
 ```
 
-3. Make the SONATA network available as `GLIF_network/` in the repository root, or point `--data_dir` at the network directory you built or downloaded by following the main repo instructions.
+3. Make the SONATA network available as `GLIF_network/` in the repository root, or point `--data_dir` to the network directory you built or downloaded by following the main repo instructions.
    The network should contain the usual SONATA subdirectories such as `network/` and `components/`.
 
 4. Install LaTeX (optional, for publication-quality plots):
