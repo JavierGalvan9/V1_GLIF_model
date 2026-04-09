@@ -172,7 +172,7 @@ The model requires specific package versions. Key dependencies include:
 - TensorFlow 2.15.0
 - NumPy 1.23.5
 - BMTK 1.0.8+ (Brain Modeling Toolkit)
-- See `requirements.txt` for the complete list
+- See `environment.yml` for the complete list
 
 ## Citations
 
