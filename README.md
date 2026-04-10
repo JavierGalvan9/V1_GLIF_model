@@ -94,10 +94,12 @@ To train the model to match experimental V1 tuning properties:
 ```bash
 python multi_training.py --data_dir GLIF_network \
     --neurons 0 --seq_len 500 --n_epochs 75 --steps_per_epoch 25 \
-    --batch_size 1 --optimizer exp_adam --learning_rate 0.005 \
+    --batch_size 5 --optimizer exp_adam --learning_rate 0.005 \
     --rate_cost 10000 --voltage_cost 1 --sync_cost 1.5 --osi_cost 20 \
     --train_recurrent
 ```
+
+Note: Running with batch size 5 requires ~40 GB of VRAM. If you have less VRAM, reduce the batch size.
 
 Parameters:
 - `--rate_cost`: Cost weight for firing-rate regularization
