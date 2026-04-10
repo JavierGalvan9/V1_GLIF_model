@@ -2,8 +2,6 @@
 
 A TensorFlow implementation of a biologically realistic mouse primary visual cortex (V1) model with Lateral Geniculate Nucleus (LGN) input, based on Allen Institute models. This project simulates V1 neurons' responses to visual stimuli using Generalized Leaky Integrate-and-Fire (GLIF; specifically the GLIF_3 variant) neurons.
 
-![Fig1](https://github.com/user-attachments/assets/167be7dd-4723-48db-9166-4e5b38df8c23)
-
 The software in this repository requires SONATA format network files. These can be either
 generated or downloaded. Please refer to the main repository of the project, [biorealistic-v1-model](https://github.com/AllenInstitute/biorealistic-v1-model), for network-building instructions and download links.
 
