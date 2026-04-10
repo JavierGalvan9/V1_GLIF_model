@@ -1072,7 +1072,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", .1, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
-    absl.app.flags.DEFINE_float('recurrent_weight_regularization', 1., '')
+    absl.app.flags.DEFINE_float('recurrent_weight_regularization', 10., '')
     absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'emd',
                                  'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, emd')
     absl.app.flags.DEFINE_string('voltage_penalty_mode', 'threshold',
@@ -1089,9 +1089,9 @@ if __name__ == '__main__':
     # 0 is not using core plot
     absl.app.flags.DEFINE_float('plot_core_radius', 200.0, '')
 
-    absl.app.flags.DEFINE_integer('n_runs', 1, '')
+    absl.app.flags.DEFINE_integer('n_runs', 3, '')
     absl.app.flags.DEFINE_integer('run_session', 0, '')
-    absl.app.flags.DEFINE_integer('n_epochs', 75, '')
+    absl.app.flags.DEFINE_integer('n_epochs', 25, '')
     # number of epochs for osi/dsi evaluation if n_runs = 1
     absl.app.flags.DEFINE_integer('osi_dsi_eval_period', 1, '')
     absl.app.flags.DEFINE_integer('batch_size', 3, '')
@@ -1132,7 +1132,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('all_neuron_rate_loss', False, '')
     # absl.app.flags.DEFINE_boolean('train_input', True, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')
-    absl.app.flags.DEFINE_boolean('train_noise', False, '')
+    absl.app.flags.DEFINE_boolean('train_noise', True, '')
     absl.app.flags.DEFINE_boolean('train_recurrent', True, '')
     absl.app.flags.DEFINE_boolean('train_recurrent_per_type', False, '')
     absl.app.flags.DEFINE_boolean('connected_selection', True, '')
