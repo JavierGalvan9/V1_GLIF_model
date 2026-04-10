@@ -1016,15 +1016,17 @@ if __name__ == '__main__':
     # make a condition for different machines. The allen institute has
     # cluster host name to be n??? where ??? is 3 digit number.
     # let's make regex for that.
-    if hostname.count('alleninstitute') > 0 or re.search(r'n\d{3}', hostname) is not None:
-        _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
-        _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/Simulation_results'
-    else:
-        _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
-        _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results'
+    # if hostname.count('alleninstitute') > 0 or re.search(r'n\d{3}', hostname) is not None:
+    #     _data_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/GLIF_network'
+    #     _results_dir = '/allen/programs/mindscope/workgroups/realistic-model/shinya.ito/tensorflow_new/V1_GLIF_model/Simulation_results'
+    # else:
+    #     _data_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network'
+    #     _results_dir = '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results'
 
-    absl.app.flags.DEFINE_string('data_dir', _data_dir, '')
-    absl.app.flags.DEFINE_string('results_dir', _results_dir, '')
+    # absl.app.flags.DEFINE_string('data_dir', _data_dir, '')
+    absl.app.flags.DEFINE_string('data_dir', 'GLIF_network', '')
+    # absl.app.flags.DEFINE_string('results_dir', _results_dir, '')
+    absl.app.flags.DEFINE_string('results_dir', 'Simulation_results', '')
     absl.app.flags.DEFINE_string(
         'task_name', 'drifting_gratings_firing_rates_distr', '')
 
