@@ -1067,7 +1067,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('voltage_cost', 1., '')
     absl.app.flags.DEFINE_float('osi_cost', 20., '')
     absl.app.flags.DEFINE_float('annulus_loss_weight', 0.1, '')
-    absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
+    absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 0., '')
     absl.app.flags.DEFINE_float('dampening_factor', .1, '')
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", .1, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
