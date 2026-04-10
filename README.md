@@ -1,9 +1,8 @@
 # V1_GLIF_model
 
-A TensorFlow implementation of a biologically realistic mouse primary visual cortex (V1) model with Lateral Geniculate Nucleus (LGN) input, based on Allen Institute models. This project simulates V1 neurons' responses to visual stimuli using Generalized Leaky Integrate-and-Fire (GLIF; specifically the GLIF_3 variant) neurons.
+A TensorFlow implementation of a biologically realistic mouse primary visual cortex (V1) model with Lateral Geniculate Nucleus (LGN) input, based on Allen Institute models. It simulates V1 neurons' responses to visual stimuli using Generalized Leaky Integrate-and-Fire (GLIF; specifically the GLIF_3 variant) neurons.
 
-The software in this repository requires SONATA format network files. These can be either
-generated or downloaded. Please refer to the main repository of the project, [biorealistic-v1-model](https://github.com/AllenInstitute/biorealistic-v1-model), for network-building instructions and download links.
+This repository requires SONATA-format network files, which can be generated or downloaded. Please refer to the main repository of the project, [biorealistic-v1-model](https://github.com/AllenInstitute/biorealistic-v1-model), for network-building instructions and download links.
 
 ## Model Overview
 
@@ -28,11 +27,10 @@ This model simulates a cortical column in mouse V1, processing LGN input togethe
   - `plotting_utils.py`: Visualization tools
   - `model_metrics_analysis.py`: Analysis functions for model output
   - `other_v1_utils.py`: Various utility functions
-- `stim_dataset.py`: Functions for generating visual stimuli (drifting gratings, etc.)
-- `drifting_gratings.py`: Script to run the model with drifting grating stimuli
+- `stim_dataset.py`: Functions for generating visual stimuli, including drifting and static gratings
 - `multi_training.py`: Distributed-GPU training implementation
-- `osi_dsi_estimator.py`: Tool for measuring orientation and direction selectivity
-- `METHODS_V1_MODEL_AND_TRAINING.md`: Paper-oriented inventory of model/training methodologies used in code
+- `osi_dsi_estimator.py`: Tool for evaluating orientation and direction selectivity after training or as a smoke test
+- `osi_dsi_analysis.ipynb`: Notebook for exploring OSI/DSI analysis and tuning-angle statistics
 - `Neuropixels_data/`: Reference data from Neuropixels recordings for comparison
 
 ## Getting Started
@@ -121,10 +119,10 @@ python osi_dsi_estimator.py --data_dir GLIF_network \
 
 ## Visual Stimuli
 
-The model supports various visual stimuli for testing V1 responses:
+The model currently supports grating stimuli for testing V1 responses:
 
 - **Drifting gratings**: Sinusoidal gratings moving in different directions
-  - Control parameters: orientation, spatial frequency, temporal frequency, contrast
+  - Control parameters: orientation, spatial frequency, temporal frequency, and contrast
 - **Static gratings**: Non-moving sinusoidal gratings
 <!-- - **Natural images**: Support for natural image processing (partial implementation) -->
 
@@ -133,6 +131,7 @@ The model supports various visual stimuli for testing V1 responses:
 The model provides several analysis tools:
 
 - `v1_model_utils/model_metrics_analysis.py`: Calculate metrics like OSI/DSI
+- `osi_dsi_analysis.ipynb`: Notebook for exploring OSI/DSI analysis and tuning-angle statistics
 - `v1_model_utils/plotting_utils.py`: Visualization of neural activity
   - `LaminarPlot`: Plot activity across cortical layers
   - `PopulationActivity`: Plot population activity over time
