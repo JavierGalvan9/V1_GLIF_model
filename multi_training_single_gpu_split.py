@@ -1033,7 +1033,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('run_session', 0, '')
     absl.app.flags.DEFINE_integer('n_epochs', 25, '')
     absl.app.flags.DEFINE_integer('osi_dsi_eval_period', 1, '') # number of epochs for osi/dsi evaluation if n_runs = 1
-    absl.app.flags.DEFINE_integer('batch_size', 3, '')
+    absl.app.flags.DEFINE_integer('batch_size', 5, '')
     absl.app.flags.DEFINE_integer('neurons', 0, '')  # 0 to take all neurons
     absl.app.flags.DEFINE_integer("n_input", 17400, "")  
     absl.app.flags.DEFINE_integer('seq_len', 500, '')
