@@ -1018,7 +1018,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 10., '')
-    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'mean', 'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, earth_movers')
+    absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'emd', 'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, earth_movers')
     absl.app.flags.DEFINE_float('lr_scale', 1., '')
     # absl.app.flags.DEFINE_float('p_reappear', .5, '')
     absl.app.flags.DEFINE_float('max_time', -1, '')
@@ -1084,7 +1084,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('random_weights', False, '')
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
-    absl.app.flags.DEFINE_boolean("gradient_checkpointing", False, "")
+    absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
 
     absl.app.run(main)
 
