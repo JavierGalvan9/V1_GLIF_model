@@ -117,7 +117,7 @@ def main(_):
                 return_state=True,
                 hard_reset=flags.hard_reset,
                 add_metric=False,
-                max_delay=5,
+                max_delay=flags.max_delay,  # 0 = auto-compute from SONATA data
                 current_input=flags.current_input,
                 use_dummy_state_input=False,
                 seed=flags.seed
@@ -413,6 +413,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('evoked_duration', 2000, '')
     absl.app.flags.DEFINE_integer('seed', 3000, '')
     absl.app.flags.DEFINE_integer('neurons_per_output', 16, '')
+    absl.app.flags.DEFINE_integer('max_delay', 0, 'Maximum synaptic delay in ms (0 = auto from data)')
 
     absl.app.flags.DEFINE_integer('n_cues', 3, '')
     absl.app.flags.DEFINE_integer('recall_duration', 40, '')

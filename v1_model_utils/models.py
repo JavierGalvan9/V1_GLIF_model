@@ -462,7 +462,7 @@ class V1Column(tf.keras.layers.Layer):
         recurrent_weight_scale=1.0,
         lr_scale=1.0,
         spike_gradient=False,
-        max_delay=5,
+        max_delay=0,
         batch_size=1,
         bkg_firing_rate=250,
         pseudo_gauss=False,
@@ -525,8 +525,20 @@ class V1Column(tf.keras.layers.Layer):
         psc_initial_np = np.tile(psc_initial_np, self._n_neurons)
         self.psc_initial = tf.constant(psc_initial_np[None, :], dtype=self.compute_dtype) # expand the dimension for processing different receptor types
 
-        # Find the maximum delay in the network
-        self.max_delay = int(np.round(np.min([np.max(network["synapses"]["delays"]), max_delay])))
+        # Determine the maximum delay from the network data
+        rec_delays = np.array(network["synapses"]["delays"])
+        all_delays = [rec_delays]
+        if "delays" in lgn_input:
+            all_delays.append(np.array(lgn_input["delays"]))
+        if "delays" in bkg_input:
+            all_delays.append(np.array(bkg_input["delays"]))
+        data_max_delay = int(np.ceil(np.max(np.concatenate(all_delays)) / dt))
+        if max_delay > 0:
+            self.max_delay = min(data_max_delay, max_delay)
+        else:
+            self.max_delay = data_max_delay
+        print(f"    > max_delay={self.max_delay} ms "
+              f"(data max={data_max_delay} ms{f', capped by flag={max_delay}' if max_delay > 0 and max_delay < data_max_delay else ''})")
         # self.batch_size = batch_size # Batch size is now determined by the input tensors in the call() method, not fixed at initialization, to allow for flexible batching during training and inference.
 
         def _gather(prop):
@@ -1223,7 +1235,7 @@ def create_model(
     down_sample=50,
     cue_duration=20,
     add_metric=True,
-    max_delay=5,
+    max_delay=0,
     batch_size=None,
     pseudo_gauss=False,
     hard_reset=False,
@@ -1443,7 +1455,7 @@ if __name__ == "__main__":
         return_sequences=False,
         down_sample=50,
         add_metric=True,
-        max_delay=5,
+        max_delay=0,
         batch_size=1,
         pseudo_gauss=False,
         hard_reset=True,

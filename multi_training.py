@@ -117,7 +117,7 @@ def main(_):
             return_state=True,
             hard_reset=flags.hard_reset,
             add_metric=False,
-            max_delay=5,
+            max_delay=flags.max_delay,  # 0 = auto-compute from SONATA data
             current_input=flags.current_input,
             seed=flags.seed,
             use_dummy_state_input=False
@@ -1107,7 +1107,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('steps_per_epoch', 25, '')
     # EA and garret dose not need this many but pure classification needs 156 = int(10000/64)
     absl.app.flags.DEFINE_integer('val_steps', 1, '')
-    # absl.app.flags.DEFINE_integer('max_delay', 5, '')
+    absl.app.flags.DEFINE_integer('max_delay', 0, 'Maximum synaptic delay in ms (0 = auto from data)')
     # absl.app.flags.DEFINE_integer('n_plots', 1, '')
     absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
     absl.app.flags.DEFINE_integer("cue_duration", 40, "")
@@ -1154,7 +1154,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
     absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")
     absl.app.flags.DEFINE_boolean(
-        "sequential_stimuli", False, "Run evoked and spontaneous stimuli sequentially but convergence would be slower and worse (memory friendly; intended for batch_size=1).")
+        "sequential_stimuli", True, "Run evoked and spontaneous stimuli sequentially but convergence would be slower and worse (memory friendly; intended for batch_size=1).")
     # New: enable/disable very expensive gradient logging
     absl.app.flags.DEFINE_boolean("debug_gradients", False, "")
 
