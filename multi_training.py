@@ -1089,9 +1089,9 @@ if __name__ == '__main__':
     # 0 is not using core plot
     absl.app.flags.DEFINE_float('plot_core_radius', 200.0, '')
 
-    absl.app.flags.DEFINE_integer('n_runs', 3, '')
+    absl.app.flags.DEFINE_integer('n_runs', 1, '')
     absl.app.flags.DEFINE_integer('run_session', 0, '')
-    absl.app.flags.DEFINE_integer('n_epochs', 25, '')
+    absl.app.flags.DEFINE_integer('n_epochs', 75, '')
     # number of epochs for osi/dsi evaluation if n_runs = 1
     absl.app.flags.DEFINE_integer('osi_dsi_eval_period', 1, '')
     absl.app.flags.DEFINE_integer('batch_size', 5, '')

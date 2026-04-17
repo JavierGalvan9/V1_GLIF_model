@@ -35,6 +35,11 @@ This model simulates a cortical column in mouse V1, processing LGN input togethe
 
 ## Getting Started
 
+### System requirements
+
+- **Operating system:** Linux. macOS and Windows are not supported because this repository requires an NVIDIA GPU with CUDA.
+- **Hardware:** NVIDIA GPU with CUDA support is required. Training the core model at batch size 5 needs ~24 GB of VRAM; smaller batch sizes work on smaller GPUs.
+
 ### Prerequisites
 
 - Python 3.11+
