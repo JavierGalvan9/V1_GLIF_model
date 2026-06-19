@@ -101,8 +101,9 @@ def spike_slayer(v_scaled, sigma, amplitude):
 
 # @tf.function(jit_compile=True) # (No registered 'RaggedGather' OpKernel for XLA_GPU_JIT devices)
 @tf.custom_gradient
-def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, weight_values_compute,
-                                dense_shape, synaptic_basis_weights, syn_ids, pre_ind_table):
+def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, weight_values,
+                                weight_values_compute, dense_shape, synaptic_basis_weights,
+                                syn_ids, pre_ind_table):
     """
     Optimized synaptic current calculation with memory-efficient gradients for RSNN timestep iteration.
 
@@ -131,16 +132,22 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, weigh
 
     # Retrieve connections and weights for active presynaptic neurons
     # This uses pre_ind_table (RaggedTensor), which benefits from int64 on CPU
-    new_indices, new_weights, new_syn_ids, post_in_degree, all_synaptic_inds = get_new_inds_table(
-        synapse_indices, weight_values_compute, syn_ids, pre_neuron_indices, pre_ind_table
+    post_neuron_indices, new_weights, new_syn_ids, post_in_degree, all_synaptic_inds = (
+        get_active_synapse_data_table(
+            post_ids_by_syn,
+            weight_values_compute,
+            syn_ids,
+            pre_neuron_indices,
+            pre_ind_table,
+        )
     )
     # new_syn_ids = tf.cast(new_syn_ids, dtype=tf.int32)  # int32 to reduce VRAM since its reused in backward pass
 
-    # Returns: new_indices (int64), new_syn_ids (int64), post_in_degree (int32), all_synaptic_inds (int32)
+    # Returns: post_neuron_indices (int64), new_syn_ids (int64), post_in_degree (int32),
+    # all_synaptic_inds (int32)
 
     # Build segment IDs for unsorted_segment_sum using int32 for the GPU kernel.
     batch_indices_per_connection = tf.repeat(batch_indices, post_in_degree)  # int64
-    post_neuron_indices = new_indices[:, 0]  # keep as int64 for compatibility, will be cast in segment_ids calculation
     num_segments = batch_size * n_post_neurons  # int64
     segment_ids = batch_indices_per_connection * n_post_neurons + post_neuron_indices  # int64
     segment_ids = tf.cast(segment_ids, dtype=tf.int32)
@@ -152,11 +159,11 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, weigh
     #     tf.gather(synaptic_basis_weights, new_syn_ids, axis=0), compute_dtype
     # )  # [n_active, n_basis], compute_dtype
     basis_factors = tf.gather(synaptic_basis_weights, new_syn_ids, axis=0)  # [n_active, n_basis]
-    new_syn_ids = tf.cast(new_syn_ids, dtype=tf.int32)  # int32 to reduce VRAM since its reused in backward pass
+    # new_syn_ids = tf.cast(new_syn_ids, dtype=tf.int32)  # int32 to reduce VRAM since its reused in backward pass
     # Mixed precision: cast gathered subsets to compute_dtype (float16) AFTER gather.
     # This avoids creating a temporary float16 copy of the full weight table (~23M elements)
     # and only casts the ~1-2M active connections — 10-20x less cast work and no extra VRAM.
-    new_weights = tf.cast(new_weights, compute_dtype)
+    # new_weights = tf.cast(new_weights, compute_dtype)
     weighted_basis = new_weights[:, tf.newaxis] * basis_factors  # [n_active, n_basis], compute_dtype
     # weighted_basis = new_weights[:, tf.newaxis] * basis_factors  # [n_active, n_basis], compute_dtype --- IGNORE ---
 
@@ -222,20 +229,34 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, weigh
         # =================================================================
         # For active synapses: dL/dW[syn] = sum_b,r( dy[b,post[syn],r] * basis[type[syn],r] )
 
-        # Gather gradients for active connections (reuses segment_ids from forward pass)
-        dnew_weights = tf.gather(dy, segment_ids)  # [n_active, n_basis]
-        # Recompute basis_factors (cheap gather, saves VRAM by not storing across all timesteps)
-        basis_factors_grad = tf.gather(synaptic_basis_weights, new_syn_ids, axis=0)
+        # Rebuild active synapse metadata here instead of keeping large per-connection
+        # indexing tensors alive across the forward pass.
+        post_neuron_indices_g, new_syn_ids_g, post_in_degree_g, all_synaptic_inds_g = (
+            get_active_synapse_metadata_table(
+                post_ids_by_syn,
+                syn_ids,
+                pre_neuron_indices,
+                pre_ind_table,
+            )
+        )
+        batch_indices_per_connection_g = tf.repeat(batch_indices, post_in_degree_g)
+        segment_ids_g = batch_indices_per_connection_g * n_post_neurons_g + post_neuron_indices_g
+        segment_ids_g = tf.cast(segment_ids_g, dtype=tf.int32)
+
+        # Gather gradients for active connections using reconstructed segment ids.
+        dnew_weights = tf.gather(dy, segment_ids_g)  # [n_active, n_basis]
+        basis_factors_grad = tf.gather(synaptic_basis_weights, new_syn_ids_g, axis=0)
         # Compute weight gradients in master-weight dtype (typically float32) to avoid
         # quantizing dW in mixed precision before optimizer update.
         # basis_factors_grad = tf.cast(basis_factors_grad, weight_values.dtype)
         de_dweight_values_connection = tf.einsum('cr,cr->c', dnew_weights, basis_factors_grad)
         # de_dweight_values_connection = tf.reduce_sum(dnew_weights * basis_factors_grad, axis=1)  # [n_active], compute_dtype
+
         # Accumulate to original synapse positions
         # Instead of tensor_scatter_nd_add, use unsorted_segment_sum:
         de_dweight_values = tf.math.unsorted_segment_sum(
             data=de_dweight_values_connection,
-            segment_ids=all_synaptic_inds,
+            segment_ids=all_synaptic_inds_g,
             num_segments=tf.shape(weight_values)[0]
         )
         de_dweight_values = tf.cast(de_dweight_values, dtype=weight_values.dtype)
@@ -251,6 +272,7 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values, weigh
         return [
             de_dv,              # Gradient w.r.t rec_z_buf (compute_dtype)
             None,               # synapse_indices (constant)
+            None,               # post_ids_by_syn (constant)
             de_dweight_values,  # Gradient w.r.t weight_values (float32, matches master weights)
             None,               # weight_values_compute (non-trainable shadow copy)
             None,               # dense_shape[0] (constant)
@@ -340,7 +362,7 @@ def _build_csr_order_numba(pre_ids, n_source_neurons):
 
     return order, row_splits
 
-def make_pre_ind_table(indices, n_source_neurons=197613):
+def make_pre_ind_table(indices, n_source_neurons=197613, order_keys=None):
     """
     Build CSR-style row_splits and sorted post indices by presynaptic index.
     Using Numba aliviates GPU memory pressure with minimal warmup time.
@@ -354,6 +376,26 @@ def make_pre_ind_table(indices, n_source_neurons=197613):
     if pre_ids.size == 0:
         order_np = np.empty((0,), dtype=np.int32)
         row_splits_np = np.zeros((n_source_neurons + 1,), dtype=np.int64)
+    elif order_keys is not None:
+        # Keep each presynaptic row contiguous while improving within-row locality
+        # for gather/segment operations.
+        if not isinstance(order_keys, (tuple, list)):
+            order_keys = (order_keys,)
+        normalized_keys = []
+        for key in order_keys:
+            key_np = np.asarray(key)
+            if key_np.shape[0] != pre_ids.shape[0]:
+                raise ValueError(
+                    f"`order_keys` entries must have length {pre_ids.shape[0]}, "
+                    f"got {key_np.shape[0]}."
+                )
+            normalized_keys.append(key_np.astype(np.int64, copy=False))
+        stable_index = np.arange(pre_ids.shape[0], dtype=np.int64)
+        order_np = np.lexsort((stable_index, *reversed(normalized_keys), pre_ids))
+        counts_np = np.bincount(pre_ids[order_np], minlength=n_source_neurons)
+        row_splits_np = np.empty((n_source_neurons + 1,), dtype=np.int64)
+        row_splits_np[0] = 0
+        np.cumsum(counts_np, dtype=np.int64, out=row_splits_np[1:])
     elif HAS_NUMBA:
         order_np, row_splits_np = _build_csr_order_numba(pre_ids, n_source_neurons)
     else:
@@ -397,24 +439,27 @@ def make_pre_ind_table(indices, n_source_neurons=197613):
 #     # For efficiency, rt should be in int32 dtype
 #     return tf.RaggedTensor.from_row_splits(sort_idx, row_splits, validate=False)
 
-def get_new_inds_table(indices, weights, syn_ids, non_zero_cols, pre_ind_table):
-    """Optimized function that prepares new sparse indices tensor."""
-    # Gather the rows corresponding to the non_zero_cols
+def get_active_synapse_data_table(post_ids_by_syn, weights, syn_ids, non_zero_cols, pre_ind_table):
+    """Gather active post ids, weights, and synapse ids without materializing full index rows."""
     selected_rows = tf.gather(pre_ind_table, non_zero_cols)
-    # Flatten the selected rows to get all_inds
     all_synapse_inds = selected_rows.flat_values
-    # Get the number of postsynaptic connections per active presynaptic neuron.
-    # Keep as int64 — tf.repeat and downstream arithmetic use int64 segment_ids
-    # for optimal GPU kernel performance (unsorted_segment_sum, gather).
     post_in_degree = selected_rows.row_lengths()  # int64
-    # Gather active rows from indices/weights/syn_ids.
-    # Note: gathering full active rows avoids materializing indices[:, 0]
-    # for the entire synapse table, which can trigger OOM on large networks.
-    new_indices = tf.gather(indices, all_synapse_inds)
-    new_weights = tf.gather(weights, all_synapse_inds)
-    new_syn_ids = tf.gather(syn_ids, all_synapse_inds)
+    active_post_ids = tf.gather(post_ids_by_syn, all_synapse_inds)
+    active_weights = tf.gather(weights, all_synapse_inds)
+    active_syn_ids = tf.gather(syn_ids, all_synapse_inds)
 
-    return new_indices, new_weights, new_syn_ids, post_in_degree, all_synapse_inds
+    return active_post_ids, active_weights, active_syn_ids, post_in_degree, all_synapse_inds
+
+
+def get_active_synapse_metadata_table(post_ids_by_syn, syn_ids, non_zero_cols, pre_ind_table):
+    """Gather only the metadata needed to rebuild active recurrent indexing in backward."""
+    selected_rows = tf.gather(pre_ind_table, non_zero_cols)
+    all_synapse_inds = selected_rows.flat_values
+    post_in_degree = selected_rows.row_lengths()  # int64
+    active_post_ids = tf.gather(post_ids_by_syn, all_synapse_inds)
+    active_syn_ids = tf.gather(syn_ids, all_synapse_inds)
+
+    return active_post_ids, active_syn_ids, post_in_degree, all_synapse_inds
 
 class SignedConstraint(tf.keras.constraints.Constraint):
     def __init__(self, positive):
@@ -637,7 +682,12 @@ class V1Column(tf.keras.layers.Layer):
         #the first column (presynaptic neuron) has size n_neurons and the second column (postsynaptic neuron) has size max_delay*n_neurons
         # Define the Tensorflow variables
         self.recurrent_indices = tf.Variable(indices, dtype=tf.int64, trainable=False) #dtype necessary for sparse dense matmul
-        self.pre_ind_table = make_pre_ind_table(indices, n_source_neurons=self.recurrent_dense_shape[1]) # dtype int32
+        self.recurrent_post_ids = tf.constant(indices[:, 0], dtype=tf.int64)
+        self.pre_ind_table = make_pre_ind_table(
+            indices,
+            n_source_neurons=self.recurrent_dense_shape[1],
+            order_keys=(indices[:, 0], syn_ids),
+        ) # dtype int32
         # add dimension for the weights factors - TensorShape([23525415, 1])
         # weights = tf.expand_dims(weights, axis=1)
         # Set the sign of the connections (exc or inh)
@@ -717,6 +767,7 @@ class V1Column(tf.keras.layers.Layer):
         # input_delays = np.round(np.clip(input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
         self.input_indices = tf.Variable(input_indices, trainable=False, dtype=tf.int64)
+        self.input_post_ids = tf.constant(input_indices[:, 0], dtype=tf.int64)
 
         # Define the Tensorflow variables
         # input_weight_positive = tf.Variable(
@@ -750,6 +801,7 @@ class V1Column(tf.keras.layers.Layer):
         # bkg_input_delays = np.round(np.clip(bkg_input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # bkg_input_indices[:, 1] = bkg_input_indices[:, 1] + self._n_neurons * (bkg_input_delays - 1)
         self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int64)
+        self.bkg_input_post_ids = tf.constant(bkg_input_indices[:, 0], dtype=tf.int64)
         # self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int32)
         self.pre_bkg_ind_table = make_pre_ind_table(bkg_input_indices, n_source_neurons=self.bkg_input_dense_shape[1])
 
@@ -830,8 +882,8 @@ class V1Column(tf.keras.layers.Layer):
 
         # Get the indices into self.recurrent_indices for each pre_neuron_index
         # self.pre_ind_table is a RaggedTensor or a list of lists mapping pre_neuron_index to indices in recurrent_indices
-        new_indices, new_weights, new_syn_ids, post_in_degree, _ = get_new_inds_table(
-            self.input_indices,
+        post_neuron_indices, new_weights, new_syn_ids, post_in_degree, _ = get_active_synapse_data_table(
+            self.input_post_ids,
             self.input_weight_values,
             self.input_syn_ids,
             pre_neuron_indices,
@@ -840,8 +892,6 @@ class V1Column(tf.keras.layers.Layer):
 
         # Expand batch_indices to match the length of inds_flat
         batch_indices_per_connection = tf.repeat(batch_indices, post_in_degree) #int64
-        # Get post-synaptic neuron indices
-        post_neuron_indices = new_indices[:, 0] #int64
         # Compute segment IDs
         segment_ids = batch_indices_per_connection * n_post_neurons + post_neuron_indices
         segment_ids = tf.cast(segment_ids, dtype=tf.int32)
@@ -893,8 +943,8 @@ class V1Column(tf.keras.layers.Layer):
         pre_neuron_indices = non_zero_indices[:, 1] #int64
         # Get the indices into self.recurrent_indices for each pre_neuron_index
         # self.pre_ind_table is a RaggedTensor or a list of lists mapping pre_neuron_index to indices in recurrent_indices
-        new_indices, new_weights, new_syn_ids, post_in_degree, _ = get_new_inds_table(
-            self.bkg_input_indices,
+        post_neuron_indices, new_weights, new_syn_ids, post_in_degree, _ = get_active_synapse_data_table(
+            self.bkg_input_post_ids,
             self.bkg_input_weights,
             self.bkg_input_syn_ids,
             pre_neuron_indices,
@@ -902,8 +952,6 @@ class V1Column(tf.keras.layers.Layer):
         )
         # Expand batch_indices to match the length of inds_flat
         batch_indices_per_connection = tf.repeat(batch_indices, post_in_degree)
-        # Get post-synaptic neuron indices
-        post_neuron_indices = new_indices[:, 0]
         # Compute segment IDs
         segment_ids = batch_indices_per_connection * n_post_neurons + post_neuron_indices
         segment_ids = tf.cast(segment_ids, dtype=tf.int32)
@@ -915,7 +963,7 @@ class V1Column(tf.keras.layers.Layer):
         # n_pre_spikes = tf.cast(tf.repeat(active_spike_counts, post_in_degree), dtype=self.variable_dtype)
 
         presynaptic_indices = tf.stack(
-            [batch_indices_per_connection, new_indices[:, 1]],
+            [batch_indices_per_connection, tf.repeat(pre_neuron_indices, post_in_degree)],
             axis=1
         ) # gather works better with int64
         n_pre_spikes = tf.cast(tf.gather_nd(rest_of_brain, presynaptic_indices), dtype=self.compute_dtype)
@@ -949,6 +997,7 @@ class V1Column(tf.keras.layers.Layer):
         i_rec_flat = calculate_synaptic_currents(
             rec_z_buf,
             self.recurrent_indices,
+            self.recurrent_post_ids,
             self.recurrent_weight_values,
             self.recurrent_weight_values_compute,
             self.recurrent_dense_shape,

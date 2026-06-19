@@ -539,7 +539,7 @@ def restore_model_with_runtime_dtype_cast(
     def _canonical_name(var_name):
         return var_name.split(':', 1)[0]
 
-    source_dtype = configure_policy_and_dtype(checkpoint_dtype_name)
+    _, source_dtype = configure_policy_and_dtype(checkpoint_dtype_name)
     source_model = build_model_fn(source_dtype)
     source_checkpoint = tf.train.Checkpoint(model=source_model)
     source_checkpoint.restore(checkpoint_directory).expect_partial()
