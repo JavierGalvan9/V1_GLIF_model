@@ -103,13 +103,14 @@ def spike_slayer(v_scaled, sigma, amplitude):
 @tf.custom_gradient
 def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, weight_values,
                                 weight_values_compute, dense_shape, synaptic_basis_weights,
-                                syn_ids, pre_ind_table):
+                                syn_ids, pre_ind_table, dampening_factor):
     """
     Optimized synaptic current calculation with memory-efficient gradients for RSNN timestep iteration.
 
     Mathematical formulation:
     - Forward: I[b,post,r] = sum_pre(spike[b,pre] * W[post,pre] * basis[type[post,pre], r])
-    - Grad w.r.t spike: dL/dspike[b,pre] = sum_post sum_r(dL/dI[b,post,r] * W[post,pre] * basis[type,r])
+    - Grad w.r.t spike: dL/dspike[b,pre] = dampening_factor
+      * sum_post sum_r(dL/dI[b,post,r] * W[post,pre] * basis[type,r])
     - Grad w.r.t W: dL/dW[post,pre] = sum_b sum_r(dL/dI[b,post,r] * spike[b,pre] * basis[type,r])
 
     Key optimizations:
@@ -207,6 +208,8 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, wei
             [tf.constant(0, dtype=tf.int32), init_acc],
             parallel_iterations=1,
         )
+        # de_dv = tf.cast(de_dv, rec_z_buf.dtype)
+        de_dv *= tf.cast(dampening_factor, de_dv.dtype)
 
         # # Extract the gradient for this receptor type (shape: [batch_size, n_post_neurons])
         # r_id = 0
@@ -218,11 +221,6 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, wei
         # sparse_w_rec = tf.sparse.SparseTensor(synapse_indices, weights_syn_receptors, dense_shape)
         # de_dv_rid = tf.sparse.sparse_dense_matmul(dy_r, sparse_w_rec, adjoint_a=False)
         # de_dv = tf.cast(de_dv_rid, dtype=rec_z_buf.dtype)
-
-        # IMPORTANT: The gradient should reflect the same dampening that was applied
-        # to rec_z_buf in the forward pass. However, we don't have access to the
-        # dampening factor here, so the dampening must be applied BEFORE calling
-        # this function, not within it.
 
         # =================================================================
         # GRADIENT W.R.T. WEIGHTS
@@ -279,7 +277,8 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, wei
             None,               # dense_shape[1] (constant)
             None,               # synaptic_basis_weights (constant)
             None,               # syn_ids (constant)
-            None                # pre_ind_table (constant)
+            None,               # pre_ind_table (constant)
+            None                # dampening_factor (constant)
         ]
 
     return i_rec_flat, grad
@@ -701,13 +700,10 @@ class V1Column(tf.keras.layers.Layer):
         if train_recurrent:
             if train_recurrent_per_type:
                 individual_training = False
-                per_type_training = True
             else:
                 individual_training = True
-                per_type_training = False
         else:
             individual_training = False
-            per_type_training = False
 
         # Scale the weights
         self.recurrent_weight_values = tf.Variable(
@@ -1003,7 +999,8 @@ class V1Column(tf.keras.layers.Layer):
             self.recurrent_dense_shape,
             self.synaptic_basis_weights,
             self.syn_ids,
-            self.pre_ind_table
+            self.pre_ind_table,
+            self._recurrent_dampening,
         )
 
         # Cast back to compute_dtype to keep downstream state buffers compact.
@@ -1119,18 +1116,8 @@ class V1Column(tf.keras.layers.Layer):
         # Get previous spikes
         prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
 
-        # Apply recurrent dampening: This creates the correct forward/backward behavior
-        # Forward pass: uses full spike buffer (z_buf_compute)
-        # Backward pass: gradients are scaled by recurrent_dampening factor
-        # The key insight is that we need to pass the dampened version to the
-        # synaptic current calculation so that gradients flow back correctly
-        # Use straight-through estimator: forward pass gets full value, backward gets dampened gradients
-        # dampened_z_buf = z_buf * self._recurrent_dampening
-        # rec_z_buf = (tf.stop_gradient(z_buf - dampened_z_buf) + dampened_z_buf)
-        rec_z_buf = straight_through_dampen(z_buf, 1 - self._recurrent_dampening)
-
         # Calculate the recurrent postsynaptic currents
-        i_rec = self.calculate_i_rec_with_custom_grad(rec_z_buf)
+        i_rec = self.calculate_i_rec_with_custom_grad(z_buf)
         # Calculate the postsynaptic current from the external input
         if self._current_input:
             external_current = self.calculate_input_current_from_firing_probabilities(lgn_input)
