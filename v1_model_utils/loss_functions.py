@@ -9,7 +9,6 @@ try:
 except Exception:
     HAS_NUMBA = False
 
-from math import pi
 import os
 import sys
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
@@ -623,6 +622,18 @@ def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     # target_firing_rates = np.interp(x_rand, percentiles, sorted_firing_rates)
     return target_firing_rates
 
+
+def resample_sorted_distribution(values, n_samples):
+    sorted_values = np.sort(np.asarray(values, dtype=np.float32))
+    if n_samples <= 0 or sorted_values.size == 0:
+        return np.empty((0,), dtype=np.float32)
+    if sorted_values.size == 1:
+        return np.full((n_samples,), sorted_values[0], dtype=np.float32)
+
+    source_quantiles = np.linspace(0.0, 1.0, sorted_values.size, dtype=np.float32)
+    target_quantiles = np.linspace(0.0, 1.0, n_samples, dtype=np.float32)
+    return np.interp(target_quantiles, source_quantiles, sorted_values).astype(np.float32)
+
 def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
     tau = tf.cast(tau, dtype)
     abs_u = tf.abs(u)
@@ -682,7 +693,7 @@ def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
 
 def process_neuropixels_data(path=''):
     # Load data
-    neuropixels_data_path = f'Neuropixels_data/cortical_metrics_1.4.csv'
+    neuropixels_data_path = 'Neuropixels_data/cortical_metrics_1.4.csv'
     df_all = pd.read_csv(neuropixels_data_path, sep=",")
     # Exc and PV have sufficient number of cells, so we'll filter out non-V1 Exc and PV.
     # SST and VIP are small populations, so let's keep also non-V1 neurons
@@ -696,7 +707,7 @@ def process_neuropixels_data(path=''):
     df.loc[(df["height_rf"] > 100), "height_rf"] = np.nan
 
     # Save the processed table
-    df.to_csv(f'Neuropixels_data/v1_OSI_DSI_DF.csv', sep=" ", index=False)
+    df.to_csv('Neuropixels_data/v1_OSI_DSI_DF.csv', sep=" ", index=False)
     # return df
 
 def neuropixels_cell_type_to_cell_type(pop_name):
@@ -777,6 +788,74 @@ def get_population_neuron_ids(
     for cell_type in CELL_TYPE_ORDER:
         grouped_ids[cell_type] = selected_ids[selected_cell_types == cell_type]
     return grouped_ids
+
+
+def compare_rate_mask_population_ids(network, data_dir="GLIF_network", core_mask=None):
+    """Compare canonical population-id grouping against the legacy mask path.
+
+    This is intentionally kept as a diagnostic helper: training should use
+    ``get_population_neuron_ids`` directly, while tests and migration checks can
+    use this function to verify that the rate-loss masks have not drifted.
+    """
+    canonical_ids = get_population_neuron_ids(
+        network,
+        data_dir=data_dir,
+        core_mask=core_mask,
+        reindex_selected=False,
+    )
+
+    pop_names = other_v1_utils.pop_names(network, data_dir=data_dir)
+    np_core_mask = _core_mask_to_numpy(core_mask, len(pop_names))
+    selected_ids = np.flatnonzero(np_core_mask)
+    selected_pop_names = pop_names[np_core_mask]
+    selected_cell_types = np.array(
+        [
+            other_v1_utils.pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=True)
+            for pop_name in selected_pop_names
+        ]
+    )
+
+    comparison = {}
+    for cell_type in CELL_TYPE_ORDER:
+        legacy_ids = selected_ids[selected_cell_types == cell_type]
+        canonical = np.asarray(canonical_ids[cell_type])
+        legacy = np.asarray(legacy_ids)
+        comparison[cell_type] = {
+            "match": bool(np.array_equal(canonical, legacy)),
+            "canonical_count": int(canonical.size),
+            "legacy_count": int(legacy.size),
+            "canonical_ids": canonical,
+            "legacy_ids": legacy,
+        }
+    return comparison
+
+
+def compute_rolling_decay_from_sample_ess(batch_size, target_sample_ess, max_decay=0.9999):
+    """Compute EMA decay from target effective sample size (ESS) in samples.
+
+    For EMA with decay ``d``, the effective sample size in update steps is
+    ``ESS_steps ~= (1 + d) / (1 - d)``. Converting to samples gives
+    ``ESS_samples ~= batch_size * ESS_steps``.
+    """
+    batch_size = float(batch_size)
+    target_sample_ess = float(target_sample_ess)
+    max_decay = float(max_decay)
+
+    if batch_size <= 0.0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}.")
+    if target_sample_ess <= 0.0:
+        raise ValueError(
+            f"target_sample_ess must be > 0, got {target_sample_ess}."
+        )
+    if not 0.0 <= max_decay < 1.0:
+        raise ValueError(f"max_decay must be in [0, 1), got {max_decay}.")
+
+    ess_steps = target_sample_ess / batch_size
+    if ess_steps <= 1.0:
+        return 0.0
+
+    decay = (ess_steps - 1.0) / (ess_steps + 1.0)
+    return float(np.clip(decay, 0.0, max_decay))
 
 
 class SpikeRateDistributionTarget:
@@ -871,21 +950,19 @@ class SpikeRateDistributionTarget:
         return target_firing_rates
 
     def __call__(self, spikes, trim=True):
-        # if trim:
-        #     if self._pre_delay is not None:
-        #         spikes = spikes[:, self._pre_delay:, :]
-        #     if self._post_delay is not None and self._post_delay != 0:
-        #         spikes = spikes[:, :-self._post_delay, :]
-
-        spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
-
+        spikes = spike_trimming(
+            spikes,
+            pre_delay=self._pre_delay,
+            post_delay=self._post_delay,
+            trim=trim,
+        )
         if spikes.dtype != self._dtype:
             spikes = tf.cast(spikes, self._dtype)
 
-        rates = tf.reduce_mean(spikes, (0, 1)) # calculate the mean firing rate over time and batch
-
-        reg_loss = compute_spike_rate_target_loss(rates, self._target_rates, dtype=self._dtype)
-
+        rates = tf.reduce_mean(spikes, (0, 1))
+        reg_loss = compute_spike_rate_target_loss(
+            rates, self._target_rates, dtype=self._dtype
+        )
         return reg_loss * self._rate_cost
 
 # class SpikeRateDistributionRegularization:
@@ -928,7 +1005,6 @@ class SynchronizationLoss(Layer):
         self._t_end = t_end
         self._t_start_seconds = int(t_start * 1000)
         self._t_end_seconds = int(t_end * 1000)
-        self._core_mask = core_mask
         self._data_dir = data_dir
         self._neuropixels_data_dir = neuropixels_data_dir
         self._dtype = dtype
@@ -936,13 +1012,26 @@ class SynchronizationLoss(Layer):
         self._base_seed = seed
 
         pop_names = other_v1_utils.pop_names(network, data_dir=self._data_dir)
-        if self._core_mask is not None:
-            pop_names = pop_names[core_mask]
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
-        node_id = np.arange(len(node_ei))
-        # Get the IDs for excitatory neurons
-        node_id_e = node_id[node_ei == 'e']
-        self.node_id_e = tf.constant(node_id_e, dtype=tf.int32) # 14423
+        excitatory_mask = node_ei == 'e'
+        if core_mask is not None:
+            core_mask = tf.get_static_value(core_mask)
+            if core_mask is None:
+                raise ValueError(
+                    "SynchronizationLoss core_mask must be statically known."
+                )
+            core_mask = np.asarray(core_mask, dtype=bool)
+            if core_mask.shape != excitatory_mask.shape:
+                raise ValueError(
+                    "SynchronizationLoss core_mask has shape "
+                    f"{core_mask.shape}, expected {excitatory_mask.shape}."
+                )
+            excitatory_mask &= core_mask
+
+        self._core_excitatory_mask = tf.constant(excitatory_mask, dtype=tf.bool)
+        self.node_id_e = tf.range(
+            np.count_nonzero(excitatory_mask), dtype=tf.int32
+        )
         # Pre-define bin sizes (same as experimental data)
         bin_sizes = np.logspace(-3, 0, 20)
         # using the simulation length, limit bin_sizes to define at least 2 bins
@@ -954,7 +1043,11 @@ class SynchronizationLoss(Layer):
 
         # Load the experimental data
         duration = str(int((t_end - t_start) * 1000))
-        experimental_data_path = os.path.join(self._neuropixels_data_dir, f'Fano_factor_v1', f'v1_fano_running_{duration}ms_{session}.npy')
+        experimental_data_path = os.path.join(
+            self._neuropixels_data_dir,
+            'Fano_factor_v1',
+            f'v1_fano_running_{duration}ms_{session}.npy',
+        )
         # experimental_data_path = os.path.join(data_dir, f'all_fano_300ms_{session}.npy')
         assert os.path.exists(experimental_data_path), f'File not found: {experimental_data_path}'
         experimental_fanos = np.load(experimental_data_path, allow_pickle=True)
@@ -983,8 +1076,7 @@ class SynchronizationLoss(Layer):
 
     def __call__(self, spikes, trim=True):
 
-        if self._core_mask is not None:
-            spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
+        spikes = tf.boolean_mask(spikes, self._core_excitatory_mask, axis=2)
 
         if trim:
             spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
@@ -1129,7 +1221,13 @@ class CustomMeanLayer(Layer):
 class OrientationSelectivityLoss:
     def __init__(self, network=None, osi_cost=1e-5, pre_delay=None, post_delay=None, dtype=tf.float32,
                  core_mask=None, method="crowd_osi", subtraction_ratio=1.0,
-                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv", data_dir=''):
+                 neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv", data_dir='',
+                 rolling_decay=0.5, rolling_epsilon=1e-6,
+                 rolling_target_sample_ess=80.0, rolling_batch_size=None,
+                 rolling_max_decay=0.9999,
+                 rolling_gradient_correction=True,
+                 rolling_max_gradient_scale=20.0,
+                 rolling_warmup=True):
 
         self._network = network
         self._osi_cost = osi_cost
@@ -1142,7 +1240,36 @@ class OrientationSelectivityLoss:
         self._tf_pi = tf.constant(np.pi, dtype=dtype)
         self._neuropixels_df = neuropixels_df
         self.data_dir = data_dir
-        if (self._core_mask is not None) and (self._method == "crowd_spikes" or self._method == "crowd_osi"):
+        self._rolling_gradient_correction = bool(rolling_gradient_correction)
+        self._rolling_warmup = bool(rolling_warmup)
+        self._rolling_target_sample_ess = tf.constant(
+            float(rolling_target_sample_ess), dtype=self._dtype
+        )
+        self._rolling_config_batch_size = tf.constant(
+            float(rolling_batch_size) if rolling_batch_size is not None else 1.0,
+            dtype=self._dtype,
+        )
+        rolling_max_gradient_scale = float(rolling_max_gradient_scale)
+        if rolling_max_gradient_scale <= 0.0:
+            raise ValueError(
+                "rolling_max_gradient_scale must be > 0, "
+                f"got {rolling_max_gradient_scale}."
+            )
+        self._rolling_max_gradient_scale = tf.constant(
+            rolling_max_gradient_scale, dtype=self._dtype
+        )
+        self._adaptative_scale_min = tf.constant(0.4, dtype=self._dtype)
+        self._adaptative_scale_max = tf.constant(1.0, dtype=self._dtype)
+        self._adaptative_shrink_k = tf.constant(20.0, dtype=self._dtype)
+        if (
+            self._core_mask is not None
+            and self._method in (
+                "crowd_spikes",
+                "crowd_osi",
+                "rolling_osi_emd",
+                "adaptative_crowd_osi",
+            )
+        ):
             self.np_core_mask = self._core_mask.numpy()
             core_tuning_angles = network['tuning_angle'][self.np_core_mask]
             self._tuning_angles = tf.constant(core_tuning_angles, dtype=dtype)
@@ -1156,30 +1283,70 @@ class OrientationSelectivityLoss:
             # the keys should be something like "EXC_L23" or "PV_L5"
 
         elif self._method == "crowd_osi":
-            # Get the target OSI
-            self._target_osi_dsi = self.get_neuropixels_osi_dsi()
-            self._min_rates_threshold = tf.constant(0.0005, dtype=self._dtype)
-            # sum the core_mask
-            n_nodes = len(self._tuning_angles)
-            # self.node_type_ids = tf.zeros(n_nodes, dtype=tf.int32)
-            node_type_ids = np.zeros(n_nodes, dtype=np.int32)
-            osi_target_values = []
-            dsi_target_values = []
-            cell_type_count = []
-            for node_type_id, (key, value) in enumerate(self._target_osi_dsi.items()):
-                node_ids = value['ids']
-                osi_target_values.append(value['OSI'])
-                dsi_target_values.append(value['DSI'])
-                cell_type_count.append(len(node_ids))
-                # update the ndoe_type_ids tensor in positions node_ids with the node_type_id
-                # self.node_type_ids = tf.tensor_scatter_nd_update(self.node_type_ids, indices=tf.expand_dims(node_ids, axis=1), updates=tf.fill(tf.shape(node_ids), node_type_id))
-                node_type_ids[node_ids] = node_type_id
+            self._initialize_crowd_targets()
+            self._rolling_epsilon = tf.constant(rolling_epsilon, dtype=self._dtype)
 
-            self.osi_target_values = tf.constant(osi_target_values, dtype=self._dtype)
-            self.dsi_target_values = tf.constant(dsi_target_values, dtype=self._dtype)
-            self.cell_type_count = tf.constant(cell_type_count, dtype=self._dtype)
-            self.node_type_ids = tf.constant(node_type_ids, dtype=tf.int32)
-            self._n_node_types = len(self._target_osi_dsi)
+        elif self._method == "adaptative_crowd_osi":
+            self._initialize_crowd_targets(include_experimental_counts=True)
+            resolved_decay = self._resolve_rolling_decay(
+                rolling_decay=rolling_decay,
+                rolling_batch_size=rolling_batch_size,
+                rolling_target_sample_ess=rolling_target_sample_ess,
+                rolling_max_decay=rolling_max_decay,
+            )
+            self._rolling_decay = tf.constant(resolved_decay, dtype=self._dtype)
+            self._rolling_one_minus_decay = tf.constant(1.0 - resolved_decay, dtype=self._dtype)
+            self._rolling_epsilon = tf.constant(rolling_epsilon, dtype=self._dtype)
+            self._initialize_rolling_state_variables(len(self._tuning_angles))
+
+        elif self._method == "rolling_osi_emd":
+            resolved_decay = self._resolve_rolling_decay(
+                rolling_decay=rolling_decay,
+                rolling_batch_size=rolling_batch_size,
+                rolling_target_sample_ess=rolling_target_sample_ess,
+                rolling_max_decay=rolling_max_decay,
+            )
+            self._rolling_decay = tf.constant(resolved_decay, dtype=self._dtype)
+            self._rolling_one_minus_decay = tf.constant(1.0 - resolved_decay, dtype=self._dtype)
+            self._rolling_epsilon = tf.constant(rolling_epsilon, dtype=self._dtype)
+            self._initialize_rolling_osi_emd_targets()
+
+    def _uses_rolling_state(self):
+        return self._method in ("rolling_osi_emd", "adaptative_crowd_osi")
+
+    def _resolve_rolling_decay(
+        self,
+        rolling_decay,
+        rolling_batch_size,
+        rolling_target_sample_ess,
+        rolling_max_decay,
+    ):
+        rolling_decay = float(rolling_decay)
+        if rolling_decay < 0.0:
+            if rolling_batch_size is None:
+                raise ValueError(
+                    "rolling_batch_size must be provided when rolling_decay < 0 "
+                    "(auto-decay mode)."
+                )
+            resolved_decay = compute_rolling_decay_from_sample_ess(
+                batch_size=rolling_batch_size,
+                target_sample_ess=rolling_target_sample_ess,
+                max_decay=rolling_max_decay,
+            )
+            print(
+                f"[{self._method}] Auto-decay enabled: "
+                f"target_sample_ess={float(rolling_target_sample_ess):.3f}, "
+                f"batch_size={int(rolling_batch_size)}, "
+                f"resolved_decay={resolved_decay:.6f}"
+            )
+            return resolved_decay
+
+        if not 0.0 <= rolling_decay < 1.0:
+            raise ValueError(
+                "rolling_decay must be in [0, 1), or < 0 to enable auto-decay. "
+                f"Got {rolling_decay}."
+            )
+        return rolling_decay
 
     def calculate_delta_angle(self, stim_angle, tuning_angle):
         # angle unit is degrees.
@@ -1220,13 +1387,21 @@ class OrientationSelectivityLoss:
         osi_dsi_df = pd.read_csv(neuropixels_data_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
 
         nonresponding = osi_dsi_df["max_mean_rate(Hz)"] < 0.5
-        osi_dsi_df.loc[nonresponding, "OSI"] = np.nan
-        osi_dsi_df.loc[nonresponding, "DSI"] = np.nan
+        osi_dsi_df.loc[nonresponding, ["OSI", "DSI"]] = np.nan
         osi_dsi_df = osi_dsi_df[osi_dsi_df["Ave_Rate(Hz)"] != 0]
         osi_dsi_df.dropna(inplace=True)
         osi_dsi_df["cell_type"] = osi_dsi_df["cell_type"].apply(neuropixels_cell_type_to_cell_type)
-        osi_target = osi_dsi_df.groupby("cell_type")['OSI'].mean()
-        dsi_target = osi_dsi_df.groupby("cell_type")['DSI'].mean()
+        grouped_np = osi_dsi_df.groupby("cell_type")
+        osi_target = grouped_np['OSI'].mean()
+        dsi_target = grouped_np['DSI'].mean()
+        osi_values = {
+            cell_type: np.sort(subdf['OSI'].dropna().to_numpy(dtype=np.float32))
+            for cell_type, subdf in grouped_np
+        }
+        dsi_values = {
+            cell_type: np.sort(subdf['DSI'].dropna().to_numpy(dtype=np.float32))
+            for cell_type, subdf in grouped_np
+        }
 
         cell_ids = get_population_neuron_ids(
             self._network,
@@ -1240,11 +1415,193 @@ class OrientationSelectivityLoss:
         # osi_df.groupby("cell_type")['OSI'].median()
         # convert to dict
         osi_dsi_exp_dict = {
-            key: {"OSI": val, "DSI": dsi_target[key], "ids": cell_ids.get(key, np.empty(0, dtype=np.int32))}
+            key: {
+                "OSI": val,
+                "DSI": dsi_target[key],
+                "OSI_values": osi_values.get(key, np.empty((0,), dtype=np.float32)),
+                "DSI_values": dsi_values.get(key, np.empty((0,), dtype=np.float32)),
+                "ids": cell_ids.get(key, np.empty(0, dtype=np.int32)),
+            }
             for key, val in osi_target.to_dict().items()
         }
 
         return osi_dsi_exp_dict
+
+    def _initialize_crowd_targets(self, include_experimental_counts=False):
+        self._target_osi_dsi = self.get_neuropixels_osi_dsi()
+        self._min_rates_threshold = tf.constant(0.0005, dtype=self._dtype)
+
+        n_nodes = len(self._tuning_angles)
+        node_type_ids = np.zeros(n_nodes, dtype=np.int32)
+        osi_target_values = []
+        dsi_target_values = []
+        cell_type_count = []
+        experimental_cell_type_count = []
+
+        for node_type_id, (_key, value) in enumerate(self._target_osi_dsi.items()):
+            node_ids = value["ids"]
+            osi_target_values.append(value["OSI"])
+            dsi_target_values.append(value["DSI"])
+            cell_type_count.append(len(node_ids))
+            if include_experimental_counts:
+                experimental_cell_type_count.append(len(value["OSI_values"]))
+            # update the ndoe_type_ids tensor in positions node_ids with the node_type_id
+            # self.node_type_ids = tf.tensor_scatter_nd_update(self.node_type_ids, indices=tf.expand_dims(node_ids, axis=1), updates=tf.fill(tf.shape(node_ids), node_type_id))
+            node_type_ids[node_ids] = node_type_id
+
+        self.osi_target_values = tf.constant(osi_target_values, dtype=self._dtype)
+        self.dsi_target_values = tf.constant(dsi_target_values, dtype=self._dtype)
+        self.cell_type_count = tf.constant(cell_type_count, dtype=self._dtype)
+        self.node_type_ids = tf.constant(node_type_ids, dtype=tf.int32)
+        self._n_node_types = len(self._target_osi_dsi)
+        if include_experimental_counts:
+            self.experimental_cell_type_count = tf.constant(
+                experimental_cell_type_count, dtype=self._dtype
+            )
+
+    def _initialize_rolling_state_variables(self, n_nodes):
+        zeros = tf.zeros((n_nodes,), dtype=self._dtype)
+        self._rolling_ori_real = tf.Variable(zeros, trainable=False, name="rolling_osi_ori_real")
+        self._rolling_ori_imag = tf.Variable(zeros, trainable=False, name="rolling_osi_ori_imag")
+        self._rolling_dir_real = tf.Variable(zeros, trainable=False, name="rolling_osi_dir_real")
+        self._rolling_dir_imag = tf.Variable(zeros, trainable=False, name="rolling_osi_dir_imag")
+        self._rolling_denominator = tf.Variable(zeros, trainable=False, name="rolling_osi_denominator")
+        self._rolling_weight_sum = tf.Variable(
+            tf.constant(0.0, dtype=self._dtype),
+            trainable=False,
+            name="rolling_osi_weight_sum",
+        )
+        self._rolling_weight_sq_sum = tf.Variable(
+            tf.constant(0.0, dtype=self._dtype),
+            trainable=False,
+            name="rolling_osi_weight_sq_sum",
+        )
+
+    def _initialize_rolling_osi_emd_targets(self):
+        self._target_osi_dsi = self.get_neuropixels_osi_dsi()
+        self._min_rates_threshold = tf.constant(0.0005, dtype=self._dtype)
+
+        n_nodes = len(self._tuning_angles)
+        group_indices = []
+        osi_target_values = []
+        dsi_target_values = []
+        cell_type_count = []
+
+        for cell_type in CELL_TYPE_ORDER:
+            value = self._target_osi_dsi.get(cell_type)
+            if value is None:
+                continue
+
+            node_ids = np.asarray(value["ids"], dtype=np.int32)
+            exp_osi = np.asarray(value["OSI_values"], dtype=np.float32)
+            exp_dsi = np.asarray(value["DSI_values"], dtype=np.float32)
+            if node_ids.size == 0 or exp_osi.size == 0 or exp_dsi.size == 0:
+                continue
+
+            group_indices.append(node_ids)
+            osi_target_values.append(resample_sorted_distribution(exp_osi, node_ids.size))
+            dsi_target_values.append(resample_sorted_distribution(exp_dsi, node_ids.size))
+            cell_type_count.append(float(node_ids.size))
+
+        if not group_indices:
+            raise ValueError(
+                "rolling_osi_emd requires at least one cell type with both model neurons "
+                "and Neuropixels OSI/DSI samples."
+            )
+
+        row_splits = np.zeros(len(group_indices) + 1, dtype=np.int32)
+        row_splits[1:] = np.cumsum([group.size for group in group_indices], dtype=np.int32)
+        flat_indices = np.concatenate(group_indices, axis=0).astype(np.int32, copy=False)
+        flat_osi_targets = np.concatenate(osi_target_values, axis=0).astype(np.float32, copy=False)
+        flat_dsi_targets = np.concatenate(dsi_target_values, axis=0).astype(np.float32, copy=False)
+
+        row_splits_tf = tf.convert_to_tensor(row_splits, dtype=tf.int32)
+        self._emd_group_indices = tf.RaggedTensor.from_row_splits(
+            tf.convert_to_tensor(flat_indices, dtype=tf.int32),
+            row_splits_tf,
+            validate=False,
+        )
+        self._osi_target_distributions = tf.RaggedTensor.from_row_splits(
+            tf.convert_to_tensor(flat_osi_targets, dtype=self._dtype),
+            row_splits_tf,
+            validate=False,
+        )
+        self._dsi_target_distributions = tf.RaggedTensor.from_row_splits(
+            tf.convert_to_tensor(flat_dsi_targets, dtype=self._dtype),
+            row_splits_tf,
+            validate=False,
+        )
+        self.cell_type_count = tf.constant(cell_type_count, dtype=self._dtype)
+        self._n_node_types = tf.constant(len(group_indices), dtype=tf.int32)
+
+        self._initialize_rolling_state_variables(n_nodes)
+
+    def get_rolling_state(self):
+        if not self._uses_rolling_state():
+            return {}
+        return {
+            "ori_real": self._rolling_ori_real.numpy(),
+            "ori_imag": self._rolling_ori_imag.numpy(),
+            "dir_real": self._rolling_dir_real.numpy(),
+            "dir_imag": self._rolling_dir_imag.numpy(),
+            "denominator": self._rolling_denominator.numpy(),
+            "weight_sum": self._rolling_weight_sum.numpy(),
+            "weight_sq_sum": self._rolling_weight_sq_sum.numpy(),
+        }
+
+    def set_rolling_state(self, state):
+        if not self._uses_rolling_state():
+            if state:
+                raise ValueError("Cannot restore rolling state for a non-rolling OSI loss.")
+            return False
+
+        if not state:
+            return False
+
+        state_specs = (
+            ("ori_real", self._rolling_ori_real),
+            ("ori_imag", self._rolling_ori_imag),
+            ("dir_real", self._rolling_dir_real),
+            ("dir_imag", self._rolling_dir_imag),
+            ("denominator", self._rolling_denominator),
+        )
+        for key, variable in state_specs:
+            if key not in state:
+                raise ValueError(f"Rolling state is missing key '{key}'.")
+            value = np.asarray(state[key], dtype=self._dtype.as_numpy_dtype)
+            if tuple(value.shape) != tuple(variable.shape):
+                raise ValueError(
+                    f"Rolling state '{key}' has shape {value.shape}, "
+                    f"expected {tuple(variable.shape)}."
+                )
+            variable.assign(value)
+        optional_state_specs = (
+            ("weight_sum", self._rolling_weight_sum),
+            ("weight_sq_sum", self._rolling_weight_sq_sum),
+        )
+        for key, variable in optional_state_specs:
+            if key not in state:
+                continue
+            value = np.asarray(state[key], dtype=self._dtype.as_numpy_dtype)
+            if tuple(value.shape) != tuple(variable.shape):
+                raise ValueError(
+                    f"Rolling state '{key}' has shape {value.shape}, "
+                    f"expected {tuple(variable.shape)}."
+                )
+            variable.assign(value)
+
+        if "weight_sum" not in state or "weight_sq_sum" not in state:
+            steady_ess_steps = (
+                (1.0 + self._rolling_decay)
+                / tf.maximum(1.0 - self._rolling_decay, self._rolling_epsilon)
+            )
+            steady_weight_sq_sum = 1.0 / tf.maximum(
+                steady_ess_steps * self._rolling_config_batch_size,
+                self._rolling_epsilon,
+            )
+            self._rolling_weight_sum.assign(tf.constant(1.0, dtype=self._dtype))
+            self._rolling_weight_sq_sum.assign(steady_weight_sq_sum)
+        return True
 
     def vonmises_model_fr(self, structure, population):
         from scipy.stats import vonmises
@@ -1337,65 +1694,305 @@ class OrientationSelectivityLoss:
         return angle_loss * self._osi_cost
 
     @tf.function(jit_compile=True)
-    def _compute_osi_dsi_core(self, rates, radians_delta_angle, batch_size, node_type_ids, n_node_types):
-        """JIT-compiled core computation for OSI/DSI loss.
-
-        Fuses segment operations and cosine computations for faster execution.
-        """
-        # Compute weighted responses using fused cos operations
+    def _compute_crowd_moment_core(self, rates, radians_delta_angle, batch_size, node_type_ids, n_node_types):
+        """Return phase-anchored crowd Fourier moments per cell type."""
         cos_2x = tf.math.cos(2.0 * radians_delta_angle)
+        sin_2x = tf.math.sin(2.0 * radians_delta_angle)
         cos_x = tf.math.cos(radians_delta_angle)
-        weighted_osi_cos_responses = rates * cos_2x
-        weighted_dsi_cos_responses = rates * cos_x
+        sin_x = tf.math.sin(radians_delta_angle)
 
-        # Segment IDs computation
         batch_offsets = tf.range(batch_size, dtype=node_type_ids.dtype) * n_node_types
         segment_ids = node_type_ids[tf.newaxis, :] + batch_offsets[:, tf.newaxis]
-
-        # Flatten data
-        data_flat_rates = tf.reshape(rates, [-1])
-        data_flat_weighted_osi = tf.reshape(weighted_osi_cos_responses, [-1])
-        data_flat_weighted_dsi = tf.reshape(weighted_dsi_cos_responses, [-1])
         segment_ids_flat = tf.reshape(segment_ids, [-1])
-
         num_segments = batch_size * n_node_types
 
-        # Compute denominators and numerators using segment operations
-        approximated_denominator = tf.math.unsorted_segment_mean(
-            data_flat_rates, segment_ids_flat, num_segments=num_segments
+        denominator = tf.math.unsorted_segment_mean(
+            tf.reshape(rates, [-1]), segment_ids_flat, num_segments=num_segments
         )
-        approximated_denominator = tf.reshape(approximated_denominator, [batch_size, n_node_types])
-        approximated_denominator = tf.maximum(approximated_denominator, 0.0005)  # min_rates_threshold
+        denominator = tf.reshape(denominator, [batch_size, n_node_types])
+        denominator = tf.maximum(denominator, self._min_rates_threshold)
 
-        osi_numerator = tf.math.unsorted_segment_mean(
-            data_flat_weighted_osi, segment_ids_flat, num_segments=num_segments
+        def _normalized_segment_mean(weighted_values):
+            numerator = tf.math.unsorted_segment_mean(
+                tf.reshape(weighted_values, [-1]),
+                segment_ids_flat,
+                num_segments=num_segments,
+            )
+            numerator = tf.reshape(numerator, [batch_size, n_node_types])
+            return numerator / denominator
+
+        osi_real = _normalized_segment_mean(rates * cos_2x)
+        osi_imag = _normalized_segment_mean(rates * sin_2x)
+        dsi_real = _normalized_segment_mean(rates * cos_x)
+        dsi_imag = _normalized_segment_mean(rates * sin_x)
+
+        return (
+            tf.reduce_mean(osi_real, axis=0),
+            tf.reduce_mean(osi_imag, axis=0),
+            tf.reduce_mean(dsi_real, axis=0),
+            tf.reduce_mean(dsi_imag, axis=0),
         )
-        osi_numerator = tf.reshape(osi_numerator, [batch_size, n_node_types])
 
-        dsi_numerator = tf.math.unsorted_segment_mean(
-            data_flat_weighted_dsi, segment_ids_flat, num_segments=num_segments
+    def _smoothed_vector_magnitude(self, real, imag):
+        eps_sq = tf.square(self._rolling_epsilon)
+        magnitude = tf.sqrt(tf.square(real) + tf.square(imag) + eps_sq) - self._rolling_epsilon
+        return tf.maximum(magnitude, tf.zeros((), dtype=self._dtype))
+
+    def _compute_rolling_moment_values(self, rates, radians_delta_angle):
+        ori_angle = 2.0 * radians_delta_angle
+        dir_angle = radians_delta_angle
+
+        batch_size = tf.cast(tf.shape(rates)[0], dtype=self._dtype)
+        ori_batch_real = tf.reduce_mean(rates * tf.math.cos(ori_angle), axis=0)
+        ori_batch_imag = tf.reduce_mean(rates * tf.math.sin(ori_angle), axis=0)
+        dir_batch_real = tf.reduce_mean(rates * tf.math.cos(dir_angle), axis=0)
+        dir_batch_imag = tf.reduce_mean(rates * tf.math.sin(dir_angle), axis=0)
+        den_batch = tf.reduce_mean(rates, axis=0)
+
+        new_ori_real = self._rolling_decay * self._rolling_ori_real + self._rolling_one_minus_decay * ori_batch_real
+        new_ori_imag = self._rolling_decay * self._rolling_ori_imag + self._rolling_one_minus_decay * ori_batch_imag
+        new_dir_real = self._rolling_decay * self._rolling_dir_real + self._rolling_one_minus_decay * dir_batch_real
+        new_dir_imag = self._rolling_decay * self._rolling_dir_imag + self._rolling_one_minus_decay * dir_batch_imag
+        new_denominator = (
+            self._rolling_decay * self._rolling_denominator
+            + self._rolling_one_minus_decay * den_batch
         )
-        dsi_numerator = tf.reshape(dsi_numerator, [batch_size, n_node_types])
+        new_weight_sum = (
+            self._rolling_decay * self._rolling_weight_sum
+            + self._rolling_one_minus_decay
+        )
+        new_weight_sq_sum = (
+            tf.square(self._rolling_decay) * self._rolling_weight_sq_sum
+            + tf.square(self._rolling_one_minus_decay)
+            / tf.maximum(batch_size, self._rolling_epsilon)
+        )
 
-        # Compute approximations
-        osi_approx_type = osi_numerator / approximated_denominator
-        dsi_approx_type = dsi_numerator / approximated_denominator
+        return (
+            new_ori_real,
+            new_ori_imag,
+            new_dir_real,
+            new_dir_imag,
+            new_denominator,
+            new_weight_sum,
+            new_weight_sq_sum,
+        )
 
-        # Average over batch
-        osi_approx_type = tf.reduce_mean(osi_approx_type, axis=0)
-        dsi_approx_type = tf.reduce_mean(dsi_approx_type, axis=0)
+    @tf.function(jit_compile=False)
+    def _distribution_emd_loss(self, values, target_distributions):
+        emd_losses = tf.TensorArray(self._dtype, size=self._n_node_types)
+        for i in tf.range(self._n_node_types):
+            current_values = tf.gather(values, self._emd_group_indices[i])
+            target_values = target_distributions[i]
+            emd = tf.reduce_mean(tf.abs(tf.sort(current_values) - target_values))
+            emd_losses = emd_losses.write(i, emd)
+        return emd_losses.stack()
 
-        return osi_approx_type, dsi_approx_type
+    @tf.function(jit_compile=False)
+    def _distribution_zero_l1_loss(self, values):
+        losses = tf.TensorArray(self._dtype, size=self._n_node_types)
+        for i in tf.range(self._n_node_types):
+            current_values = tf.gather(values, self._emd_group_indices[i])
+            losses = losses.write(i, tf.reduce_mean(tf.square(current_values)))
+        return losses.stack()
+
+    def _apply_rolling_gradient_correction(self, value):
+        if not self._rolling_gradient_correction:
+            return value
+
+        scale = tf.minimum(
+            1.0 / tf.maximum(self._rolling_one_minus_decay, self._rolling_epsilon),
+            self._rolling_max_gradient_scale,
+        )
+        stopped_value = tf.stop_gradient(value)
+        return stopped_value + scale * (value - stopped_value)
+
+    def _rolling_effective_sample_count(self, weight_sum, weight_sq_sum):
+        return tf.square(weight_sum) / tf.maximum(weight_sq_sum, self._rolling_epsilon)
+
+    def _rolling_loss_warmup_scale(self, weight_sum, weight_sq_sum):
+        if not self._rolling_warmup:
+            return tf.constant(1.0, dtype=self._dtype)
+
+        effective_samples = self._rolling_effective_sample_count(
+            weight_sum, weight_sq_sum
+        )
+        scale = effective_samples / tf.maximum(
+            self._rolling_target_sample_ess, self._rolling_epsilon
+        )
+        return tf.stop_gradient(
+            tf.clip_by_value(scale, 0.0, 1.0)
+        )
+
+    def _update_rolling_selectivity_estimates(self, rates, radians_delta_angle, update_state=True):
+        (
+            new_ori_real,
+            new_ori_imag,
+            new_dir_real,
+            new_dir_imag,
+            new_denominator,
+            new_weight_sum,
+            new_weight_sq_sum,
+        ) = self._compute_rolling_moment_values(
+            rates, radians_delta_angle
+        )
+
+        if update_state:
+            self._rolling_ori_real.assign(tf.stop_gradient(new_ori_real))
+            self._rolling_ori_imag.assign(tf.stop_gradient(new_ori_imag))
+            self._rolling_dir_real.assign(tf.stop_gradient(new_dir_real))
+            self._rolling_dir_imag.assign(tf.stop_gradient(new_dir_imag))
+            self._rolling_denominator.assign(tf.stop_gradient(new_denominator))
+            self._rolling_weight_sum.assign(tf.stop_gradient(new_weight_sum))
+            self._rolling_weight_sq_sum.assign(tf.stop_gradient(new_weight_sq_sum))
+
+        gradient_ori_real = self._apply_rolling_gradient_correction(new_ori_real)
+        gradient_ori_imag = self._apply_rolling_gradient_correction(new_ori_imag)
+        gradient_dir_real = self._apply_rolling_gradient_correction(new_dir_real)
+        gradient_dir_imag = self._apply_rolling_gradient_correction(new_dir_imag)
+        gradient_denominator = self._apply_rolling_gradient_correction(new_denominator)
+
+        # Use a smoothed vector norm to avoid NaN gradients at exactly zero activity.
+        # In TF 2.15, grad(sqrt(a^2+b^2)) at a=b=0 can be non-finite.
+        osi_magnitude = self._smoothed_vector_magnitude(
+            gradient_ori_real, gradient_ori_imag
+        )
+        dsi_magnitude = self._smoothed_vector_magnitude(
+            gradient_dir_real, gradient_dir_imag
+        )
+
+        safe_denominator = tf.maximum(gradient_denominator, self._min_rates_threshold)
+        osi_real_estimates = gradient_ori_real / safe_denominator
+        osi_imag_estimates = gradient_ori_imag / safe_denominator
+        dsi_real_estimates = gradient_dir_real / safe_denominator
+        dsi_imag_estimates = gradient_dir_imag / safe_denominator
+        osi_estimates = osi_magnitude / safe_denominator
+        dsi_estimates = dsi_magnitude / safe_denominator
+        warmup_scale = self._rolling_loss_warmup_scale(
+            new_weight_sum, new_weight_sq_sum
+        )
+
+        return (
+            osi_estimates,
+            dsi_estimates,
+            osi_real_estimates,
+            osi_imag_estimates,
+            dsi_real_estimates,
+            dsi_imag_estimates,
+            warmup_scale,
+        )
+
+    def _adaptative_rolling_moments(self, rates, radians_delta_angle, update_state=True):
+        if not update_state:
+            return (
+                self._rolling_ori_real,
+                self._rolling_ori_imag,
+                self._rolling_dir_real,
+                self._rolling_dir_imag,
+                self._rolling_denominator,
+            )
+
+        (
+            new_ori_real,
+            new_ori_imag,
+            new_dir_real,
+            new_dir_imag,
+            new_denominator,
+            new_weight_sum,
+            new_weight_sq_sum,
+        ) = self._compute_rolling_moment_values(
+            rates, radians_delta_angle
+        )
+        self._rolling_ori_real.assign(tf.stop_gradient(new_ori_real))
+        self._rolling_ori_imag.assign(tf.stop_gradient(new_ori_imag))
+        self._rolling_dir_real.assign(tf.stop_gradient(new_dir_real))
+        self._rolling_dir_imag.assign(tf.stop_gradient(new_dir_imag))
+        self._rolling_denominator.assign(tf.stop_gradient(new_denominator))
+        self._rolling_weight_sum.assign(tf.stop_gradient(new_weight_sum))
+        self._rolling_weight_sq_sum.assign(tf.stop_gradient(new_weight_sq_sum))
+        return new_ori_real, new_ori_imag, new_dir_real, new_dir_imag, new_denominator
+
+    def _segment_mean_by_cell_type(self, values):
+        return tf.math.unsorted_segment_mean(
+            values,
+            self.node_type_ids,
+            num_segments=self._n_node_types,
+        )
+
+    def _adaptative_scale_from_moments(self, real, imag, denominator):
+        safe_denominator = tf.maximum(denominator, self._min_rates_threshold)
+        single_neuron_selectivity = (
+            self._smoothed_vector_magnitude(real, imag) / safe_denominator
+        )
+        mean_single_selectivity = self._segment_mean_by_cell_type(
+            single_neuron_selectivity
+        )
+
+        crowd_real = self._segment_mean_by_cell_type(real)
+        crowd_imag = self._segment_mean_by_cell_type(imag)
+        crowd_denominator = tf.maximum(
+            self._segment_mean_by_cell_type(denominator),
+            self._min_rates_threshold,
+        )
+        crowd_selectivity = (
+            self._smoothed_vector_magnitude(crowd_real, crowd_imag)
+            / crowd_denominator
+        )
+
+        one = tf.ones_like(mean_single_selectivity)
+        raw_scale = tf.where(
+            mean_single_selectivity > self._rolling_epsilon,
+            crowd_selectivity / tf.maximum(mean_single_selectivity, self._rolling_epsilon),
+            one,
+        )
+        clipped_scale = tf.clip_by_value(
+            raw_scale, self._adaptative_scale_min, self._adaptative_scale_max
+        )
+
+        model_weights = tf.maximum(self.cell_type_count, self._rolling_epsilon)
+        global_scale = (
+            tf.reduce_sum(clipped_scale * model_weights)
+            / tf.reduce_sum(model_weights)
+        )
+        shrink_weight = (
+            self.experimental_cell_type_count
+            / (self.experimental_cell_type_count + self._adaptative_shrink_k)
+        )
+        shrunk_scale = (
+            shrink_weight * clipped_scale
+            + (1.0 - shrink_weight) * global_scale
+        )
+        return tf.stop_gradient(
+            tf.clip_by_value(
+                shrunk_scale,
+                self._adaptative_scale_min,
+                self._adaptative_scale_max,
+            )
+        )
+
+    def _adaptative_target_scales(self, rates, radians_delta_angle, update_state=True):
+        (
+            ori_real,
+            ori_imag,
+            dir_real,
+            dir_imag,
+            denominator,
+        ) = self._adaptative_rolling_moments(
+            rates, radians_delta_angle, update_state=update_state
+        )
+        osi_scale = self._adaptative_scale_from_moments(
+            ori_real, ori_imag, denominator
+        )
+        dsi_scale = self._adaptative_scale_from_moments(
+            dir_real, dir_imag, denominator
+        )
+        return osi_scale, dsi_scale
 
     def crowd_osi_loss(self, spikes, angle, normalizer=None):
-        # Ensure angle is [batch_size] and cast to correct dtype
-        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)  # [batch_size]
-        # Compute delta_angle with broadcasting
-        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]  # [batch_size, n_neurons_core]
+        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)
+        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
         radians_delta_angle = delta_angle * (self._tf_pi / 180)
 
-        # Compute rates over time dimension
-        rates = tf.reduce_mean(spikes, axis=1)  # [batch_size, n_neurons]
+        rates = tf.reduce_mean(spikes, axis=1)
         if self._core_mask is not None:
             rates = tf.boolean_mask(rates, self._core_mask, axis=1)
 
@@ -1407,15 +2004,19 @@ class OrientationSelectivityLoss:
 
         batch_size = tf.shape(rates)[0]
 
-        # Use JIT-compiled core computation
-        osi_approx_type, dsi_approx_type = self._compute_osi_dsi_core(
+        osi_real_type, osi_imag_type, dsi_real_type, dsi_imag_type = self._compute_crowd_moment_core(
             rates, radians_delta_angle, batch_size,
             self.node_type_ids, self._n_node_types
         )
 
-        # Compute losses
-        osi_loss_type = tf.math.square(osi_approx_type - self.osi_target_values)
-        dsi_loss_type = tf.math.square(dsi_approx_type - self.dsi_target_values)
+        osi_loss_type = (
+            tf.math.square(osi_real_type - self.osi_target_values)
+            + tf.math.square(osi_imag_type)
+        )
+        dsi_loss_type = (
+            tf.math.square(dsi_real_type - self.dsi_target_values)
+            + tf.math.square(dsi_imag_type)
+        )
 
         numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)
         denominator = tf.reduce_sum(self.cell_type_count)
@@ -1424,7 +2025,88 @@ class OrientationSelectivityLoss:
 
         return total_loss
 
-    def __call__(self, spikes, angle, trim, normalizer=None):
+    def adaptative_crowd_osi_loss(self, spikes, angle, normalizer=None, update_state=True):
+        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)
+        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
+        radians_delta_angle = delta_angle * (self._tf_pi / 180.0)
+
+        rates = tf.reduce_mean(spikes, axis=1)
+        if self._core_mask is not None:
+            rates = tf.boolean_mask(rates, self._core_mask, axis=1)
+
+        if normalizer is not None:
+            if self._core_mask is not None:
+                normalizer = tf.boolean_mask(normalizer, self._core_mask, axis=0)
+            normalizer = tf.maximum(normalizer, self._min_rates_threshold)
+            rates = rates / normalizer
+
+        batch_size = tf.shape(rates)[0]
+        osi_real_type, osi_imag_type, dsi_real_type, dsi_imag_type = self._compute_crowd_moment_core(
+            rates,
+            radians_delta_angle,
+            batch_size,
+            self.node_type_ids,
+            self._n_node_types,
+        )
+        osi_scale, dsi_scale = self._adaptative_target_scales(
+            rates, radians_delta_angle, update_state=update_state
+        )
+
+        osi_loss_type = tf.math.square(
+            osi_real_type - osi_scale * self.osi_target_values
+        ) + tf.math.square(osi_imag_type)
+        dsi_loss_type = tf.math.square(
+            dsi_real_type - dsi_scale * self.dsi_target_values
+        ) + tf.math.square(dsi_imag_type)
+
+        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)
+        denominator = tf.reduce_sum(self.cell_type_count)
+
+        return (numerator / denominator) * self._osi_cost
+
+    def rolling_osi_emd_loss(self, spikes, angle, trim=None, normalizer=None, update_state=True):
+        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)
+        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
+        radians_delta_angle = delta_angle * (self._tf_pi / 180.0)
+
+        rates = tf.reduce_mean(spikes, axis=1)
+        if self._core_mask is not None:
+            rates = tf.boolean_mask(rates, self._core_mask, axis=1)
+
+        if normalizer is not None:
+            if self._core_mask is not None:
+                normalizer = tf.boolean_mask(normalizer, self._core_mask, axis=0)
+            normalizer = tf.maximum(normalizer, self._min_rates_threshold)
+            rates = rates / normalizer
+
+        (
+            _osi_magnitude_estimates,
+            _dsi_magnitude_estimates,
+            osi_real_estimates,
+            osi_imag_estimates,
+            dsi_real_estimates,
+            dsi_imag_estimates,
+            warmup_scale,
+        ) = self._update_rolling_selectivity_estimates(
+            rates, radians_delta_angle, update_state=update_state
+        )
+        osi_loss_type = self._distribution_emd_loss(
+            osi_real_estimates, self._osi_target_distributions
+        ) + self._distribution_zero_l1_loss(
+            osi_imag_estimates
+        )
+        dsi_loss_type = self._distribution_emd_loss(
+            dsi_real_estimates, self._dsi_target_distributions
+        ) + self._distribution_zero_l1_loss(
+            dsi_imag_estimates
+        )
+
+        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)
+        denominator = tf.reduce_sum(self.cell_type_count)
+
+        return warmup_scale * (numerator / denominator) * self._osi_cost
+
+    def __call__(self, spikes, angle, trim, normalizer=None, update_state=True):
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
 
@@ -1433,7 +2115,16 @@ class OrientationSelectivityLoss:
 
         if self._method == "crowd_osi":
             return self.crowd_osi_loss(spikes, angle, normalizer=normalizer)
+        elif self._method == "adaptative_crowd_osi":
+            return self.adaptative_crowd_osi_loss(
+                spikes, angle, normalizer=normalizer, update_state=update_state
+            )
+        elif self._method == "rolling_osi_emd":
+            return self.rolling_osi_emd_loss(
+                spikes, angle, normalizer=normalizer, update_state=update_state
+            )
         elif self._method == "crowd_spikes":
             return self.crowd_spikes_loss(spikes, angle)
         elif self._method == "neuropixels_fr":
             return self.neuropixels_fr_loss(spikes, angle)
+        raise ValueError(f"Unknown OSI/DSI loss method: {self._method}")
