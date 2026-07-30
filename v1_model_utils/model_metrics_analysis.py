@@ -45,7 +45,7 @@ plt.rcParams.update({
     'ytick.labelsize': 12,
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
-    'savefig.transparent': True
+    'savefig.transparent': False
 })
 
 sns.set(style="ticks")
@@ -63,15 +63,15 @@ def calculate_Firing_Rate(z, stimulus_init=500, stimulus_end=2500, temporal_axis
 
 def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angles=range(0,360, 45),
                       n_selected_neurons=None, core_radius=None, remove_zero_rate_neurons=False,
-                      directory='', save_df=False):
+                      directory='', save_df=False, data_dir='GLIF_network'):
 
     # Get the pop names of the neurons
     if n_selected_neurons is not None:
-        pop_names = other_v1_utils.pop_names(network, n_selected_neurons=n_selected_neurons)
+        pop_names = other_v1_utils.pop_names(network, n_selected_neurons=n_selected_neurons, data_dir=data_dir)
     elif core_radius is not None and core_radius > 0:
-        pop_names = other_v1_utils.pop_names(network, core_radius=core_radius)
+        pop_names = other_v1_utils.pop_names(network, core_radius=core_radius, data_dir=data_dir)
     else:
-        pop_names = other_v1_utils.pop_names(network)
+        pop_names = other_v1_utils.pop_names(network, data_dir=data_dir)
 
     # Get the number of neurons and DG angles
     n_neurons = len(pop_names)
@@ -83,8 +83,8 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
     average_all_direction_rates = np.mean(all_direction_rates, axis=0)
 
     # Save the results in a dataframe
-    if os.path.exists(os.path.join(directory, f"v1_features_df.csv")):
-        osi_dsi_df = pd.read_csv(os.path.join(directory, f"v1_features_df.csv"), sep=" ")
+    if os.path.exists(os.path.join(directory, "v1_features_df.csv")):
+        osi_dsi_df = pd.read_csv(os.path.join(directory, "v1_features_df.csv"), sep=" ")
     else:
         osi_dsi_df = pd.DataFrame()
         osi_dsi_df["node_id"] = node_ids
@@ -139,7 +139,7 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
 
     if save_df:
         os.makedirs(directory, exist_ok=True)
-        osi_dsi_df.to_csv(os.path.join(directory, f"v1_features_df.csv"), sep=" ", index=False)
+        osi_dsi_df.to_csv(os.path.join(directory, "v1_features_df.csv"), sep=" ", index=False)
 
     return osi_dsi_df
 
@@ -556,11 +556,7 @@ class ModelMetricsAnalysis:
         self.spontaneous_init = spontaneous_init
         self.spontaneous_end = spontaneous_end
 
-        # Handle both full paths and just filenames for neuropixels_df
-        if os.path.isabs(neuropixels_df) or os.path.exists(neuropixels_df):
-            self.neuropixels_df = os.path.basename(neuropixels_df)  # Extract just the filename
-        else:
-            self.neuropixels_df = neuropixels_df
+        self.neuropixels_df = neuropixels_df
 
         # Calculate the firing rates
         if len(spikes.shape) == 3:
@@ -575,23 +571,21 @@ class ModelMetricsAnalysis:
             self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
             if spikes.shape[3] != np.sum(self.core_mask) and spikes.shape[3] == len(self.core_mask):
                 spikes = spikes[:, :, :, self.core_mask]
-            n_neurons_plot = np.sum(self.core_mask)
         else:
             self.core_mask = np.full(self.n_neurons, True)
-            # core_radius = None
-            n_neurons_plot = self.n_neurons
+        analysis_core_radius = self.core_radius if self.core_radius > 0 else None
 
         if self.drifting_gratings_init is not None:
             firingRates = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init,
                                                 stimulus_end=self.drifting_gratings_end, temporal_axis=2)
-            self.metrics_df = calculate_OSI_DSI(firingRates, self.network, session='drifting_gratings', DG_angles=DG_angles, n_selected_neurons=n_neurons_plot,
-                                                core_radius=self.core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df)
+            self.metrics_df = calculate_OSI_DSI(firingRates, self.network, session='drifting_gratings', DG_angles=DG_angles, n_selected_neurons=None,
+                                                core_radius=analysis_core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df, data_dir=self.data_dir)
         # Calculate the spontaneous metrics
         if self.spontaneous_init is not None:
             spontaneous_firingRates = calculate_Firing_Rate(spikes, stimulus_init=self.spontaneous_init,
                                                             stimulus_end=self.spontaneous_end, temporal_axis=2)
             self.metrics_df = calculate_OSI_DSI(spontaneous_firingRates, self.network, session='spontaneous', DG_angles=DG_angles,
-                                                n_selected_neurons=n_neurons_plot, core_radius=self.core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df)
+                                                n_selected_neurons=None, core_radius=analysis_core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df, data_dir=self.data_dir)
 
     def __call__(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], axis=None,
                  directory='', filename=''):
@@ -650,9 +644,13 @@ class MetricsBoxplot:
     def get_osi_dsi_df(self, metric_file, data_source_name="", feature='', data_dir=""):
         # Load the data csv file and remove rows with empty cell type
         # Rename the cell types
-        if data_dir == "Neuropixels_data":
+        if data_dir == "Neuropixels_data" or data_source_name == "Neuropixels":
+            if os.path.isabs(metric_file) or os.path.exists(metric_file):
+                metric_path = metric_file
+            else:
+                metric_path = os.path.join(data_dir, metric_file)
             # First, read the file to check which spontaneous rate column exists
-            temp_df = pd.read_csv(f"{data_dir}/{metric_file}", index_col=0, sep=" ", nrows=0)
+            temp_df = pd.read_csv(metric_path, index_col=0, sep=" ", nrows=0)
             # Determine which spontaneous rate column name to use
             if 'firing_rate_sp' in temp_df.columns:
                 spont_rate_col = 'firing_rate_sp'
@@ -666,7 +664,7 @@ class MetricsBoxplot:
             if spont_rate_col:
                 features_to_load.append(spont_rate_col)
             # Read the data file with the required features
-            df = pd.read_csv(f"{data_dir}/{metric_file}", index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
+            df = pd.read_csv(metric_path, index_col=0, sep=" ", usecols=features_to_load).dropna(how='all')
             df = df[df['cell_type'].notna()]
             df["cell_type"] = df["cell_type"].apply(self.neuropixels_cell_type_to_cell_type)
         elif data_dir == 'Benchmarks_metrics/Billeh_column_metrics':
@@ -719,9 +717,9 @@ class MetricsBoxplot:
     def plot(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], metrics_df=None, neuropixels_df="v1_OSI_DSI_DF.csv", axis=None):
         # Get the dataframes for the model and Neuropixels OSI and DSI
         if metrics_df is None:
-            metrics_df = f"v1_OSI_DSI_DF.csv"
+            metrics_df = "v1_OSI_DSI_DF.csv"
 
-        self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Untrained model", data_dir='Benchmarks_metrics/NEST_metrics'))
+        self.osi_dsi_dfs.append(self.get_osi_dsi_df("V1_OSI_DSI_DF.csv", data_source_name="Untrained model", data_dir='Benchmarks_metrics/NEST_metrics'))
         self.osi_dsi_dfs.append(self.get_osi_dsi_df(metrics_df, data_source_name="V1 GLIF model", data_dir=self.save_dir))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"OSI_DSI_neuropixels_v4.csv", data_source_name="Neuropixels", data_dir='Neuropixels_data'))
         # self.osi_dsi_dfs.append(self.get_osi_dsi_df(f"V1_OSI_DSI_DF.csv", data_source_name="Billeh et al (2020)", data_dir='Benchmarks_metrics/Billeh_column_metrics'))
@@ -965,7 +963,7 @@ class OneShotTuningAnalysis:
 
         plt.tight_layout()
         # plt.suptitle(f'{self.area} Tuning Curves', fontsize=20, y=1.02)  # Add main title and adjust its position
-        path = os.path.join(self.directory, f'Tuning_curves')
+        path = os.path.join(self.directory, 'Tuning_curves')
         os.makedirs(path, exist_ok=True)
         plt.savefig(os.path.join(path, f'epoch_{epoch}.png'), dpi=300, transparent=False)
         plt.close()

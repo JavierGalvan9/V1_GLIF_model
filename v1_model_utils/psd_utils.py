@@ -29,7 +29,7 @@ plt.rcParams.update({
     'ytick.labelsize': 12,
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
-    'savefig.transparent': True
+    'savefig.transparent': False
 })
 
 sns.set(style="ticks")

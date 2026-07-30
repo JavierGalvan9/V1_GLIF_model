@@ -363,13 +363,22 @@ def main(_):
                     "annulus",
                 )
 
-        extractor_model = tf.keras.Model(inputs=model.inputs, outputs=rsnn_layer.output)
+        extractor_model = models.build_sequence_only_model(model, rsnn_layer)
+        state_fallback_model = None
         # State-only model to avoid storing full sequences when only the final state is needed.
         try:
             state_model = models.build_state_only_model(model, rsnn_layer)
         except Exception as e:
             state_model = None
-            print(f"Warning: failed to build state-only model ({e}); using full model for gray state.")
+            state_fallback_model = tf.keras.Model(
+                inputs=model.inputs,
+                outputs=rsnn_layer.output[1:],
+                name="rsnn_state_fallback",
+            )
+            print(
+                f"Warning: failed to build state-only model ({e}); "
+                "using the original final-state graph for gray state."
+            )
 
         # Loss from Guozhang classification task (unused in our case)
         # loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
@@ -534,18 +543,32 @@ def main(_):
             if update_state:
                 # Update only during training; validation reads the existing normalizer.
                 v1_evoked_rates = tf.reduce_mean(
-                    tf.cast(_z[:, delays[0]: flags.seq_len - delays[1], :], tf.float32), (0, 1)
+                    tf.cast(
+                        _z[:, delays[0]: flags.seq_len - delays[1], :],
+                        tf.float32,
+                    ),
+                    (0, 1),
                 )
-                v1_ema.assign(ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates)
+                v1_ema.assign(
+                    ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates
+                )
             osi_dsi_loss = OSI_DSI_Loss(
-                _z, y, trim, normalizer=v1_ema, update_state=update_state
+                _z,
+                y,
+                trim,
+                normalizer=v1_ema,
+                update_state=update_state,
             )
             sync_loss = evoked_sync_loss(_z, trim)
 
             if annulus_mask is not None:
                 rate_loss += annulus_evoked_rate_regularizer(_z, trim)
                 osi_dsi_loss += annulus_OSI_DSI_Loss(
-                    _z, y, trim, normalizer=v1_ema, update_state=update_state
+                    _z,
+                    y,
+                    trim,
+                    normalizer=v1_ema,
+                    update_state=update_state,
                 )
 
             return rate_loss, osi_dsi_loss, sync_loss
@@ -582,7 +605,7 @@ def main(_):
 
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), initial_state)
         _out = run_extractor(x, initial_state)
-        _z, _v = _out[0]
+        _z, _v = _out
 
         # # update state_variables with the new model state
         # new_state = tuple(_out[1:])
@@ -606,7 +629,7 @@ def main(_):
         x_concat = tf.concat([x, x_spontaneous], axis=0)
 
         _out = run_extractor(x_concat, initial_state)
-        _z_full, _v_full = _out[0]
+        _z_full, _v_full = _out
 
         _z_evoked = _z_full[:per_replica_batch_size]
         _v_evoked = _v_full[:per_replica_batch_size]
@@ -666,7 +689,7 @@ def main(_):
         # Backpropagation of the model (metrics)
         mean_loss = (evoked_loss + spont_loss) / 2.0
         train_loss.update_state(mean_loss * strategy.num_replicas_in_sync)
-        rate = tf.reduce_mean(tf.cast(_out[0][0], tf.float32))
+        rate = tf.reduce_mean(tf.cast(_out[0], tf.float32))
         train_firing_rate.update_state(rate)
         train_rate_loss.update_state(mean_aux["rate_loss"])
         train_voltage_loss.update_state(mean_aux["voltage_loss"])
@@ -703,7 +726,7 @@ def main(_):
         train_loss.update_state(
             _loss * strategy.num_replicas_in_sync, sample_weight=metric_weight
         )
-        rate = tf.reduce_mean(tf.cast(_out[0][0], tf.float32))
+        rate = tf.reduce_mean(tf.cast(_out[0], tf.float32))
         train_firing_rate.update_state(rate)
         train_rate_loss.update_state(_aux["rate_loss"], sample_weight=metric_weight)
         train_voltage_loss.update_state(_aux["voltage_loss"], sample_weight=metric_weight)
@@ -799,13 +822,13 @@ def main(_):
                     return_sequences=True,
                     spontaneous=True
                 )
-                v1_spikes_evoked = strategy.experimental_local_results(out_evoked)[0][0][0]
-                v1_spikes_spont = strategy.experimental_local_results(out_spont)[0][0][0]
+                v1_spikes_evoked = strategy.experimental_local_results(out_evoked)[0][0]
+                v1_spikes_spont = strategy.experimental_local_results(out_spont)[0][0]
             else:
                 _loss, _aux, _out = distributed_train_step(
                     x, y, x_spontaneous, state_variables, trim, return_sequences=True
                 )
-                v1_spikes_full = strategy.experimental_local_results(_out)[0][0][0]
+                v1_spikes_full = strategy.experimental_local_results(_out)[0][0]
                 v1_spikes_evoked = v1_spikes_full[:per_replica_batch_size]
                 v1_spikes_spont = v1_spikes_full[per_replica_batch_size:]
             model_spikes = (v1_spikes_evoked, v1_spikes_spont)
@@ -933,9 +956,10 @@ def main(_):
             inputs.extend(list(init_state))
             state_out = state_model(tuple(inputs))
             return state_out  # tuple(tf.nest.flatten(state_out))
-        else:
-            _out = run_extractor(x, init_state)
-            return _out[1:]
+        seed_helper.advance_noise_seed()
+        inputs = [x]
+        inputs.extend(list(init_state))
+        return state_fallback_model(tuple(inputs))
 
     @tf.function
     def distributed_generate_gray_state(batch_size):
@@ -944,7 +968,7 @@ def main(_):
 
     def validation_step(x, state_variables):
         _out = run_extractor(x, state_variables)
-        return _out[0][0], _out[0][1]
+        return _out[0], _out[1]
 
     @tf.function
     def distributed_validation_step(x, state_variables):

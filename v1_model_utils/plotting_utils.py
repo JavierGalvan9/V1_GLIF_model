@@ -27,7 +27,7 @@ plt.rcParams.update({
     'ytick.labelsize': 12,
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
-    'savefig.transparent': True
+    'savefig.transparent': False
 })
 
 sns.set(style="ticks")
@@ -196,9 +196,9 @@ class InputActivityFigureWithoutStimulus:
 
 def pop_ordering(pop_name):
     layer_order = 2 if '23' in pop_name[1:3] else int(pop_name[1:2])
-    
+
     if pop_name[0] == "e":
-        inter_order = 4 
+        inter_order = 4
     elif pop_name.count("Vip") or pop_name.count("Htr3a") > 0:
         inter_order = 1
     elif pop_name.count("Sst") > 0:
@@ -321,7 +321,7 @@ class LaminarPlot:
         if plot_core_only:
             # if self.n_neurons > self.core_neurons:
                 # self.n_neurons = self.core_neurons
-            # core_neurons = 16679 #65871 
+            # core_neurons = 16679 #65871
             # core_radius = 400 #200
             self.core_mask = other_v1_utils.isolate_core_neurons(
                 self.network, radius=core_radius, data_dir=self.data_dir
@@ -333,7 +333,7 @@ class LaminarPlot:
         # if plot_core_only:
         #     # if self.n_neurons > self.core_neurons:
         #         # self.n_neurons = self.core_neurons
-        #     # core_neurons = 16679 #65871 
+        #     # core_neurons = 16679 #65871
         #     # core_radius = 400 #200
         #     if core_mask is None:
         #         self.core_mask = other_v1_utils.isolate_core_neurons(
@@ -361,14 +361,14 @@ class LaminarPlot:
             node_types.set_index('node_type_id', inplace=True)
             node_type_id_to_pop_name = node_types['pop_name'].to_dict()
 
-            # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
+            # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network
             node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][network['tf_id_to_bmtk_id']]
             true_pop_names = np.array([node_type_id_to_pop_name[nid] for nid in node_type_ids])
 
             # Select population names of neurons in the present network (core)
             true_pop_names = true_pop_names[self.core_mask]
             true_node_type_ids = node_type_ids[self.core_mask]
-    
+
         # Now order the pop_names
         #  according to their layer and type
         pop_orders = dict(sorted(node_type_id_to_pop_name.items(), key=lambda item: pop_ordering(item[1])))
@@ -462,7 +462,7 @@ class LaminarPlot:
         ###########################
 
         # plot the L1 top and L6 bottom
-        self.neuron_id_to_y = self.n_neurons - neuron_id_to_y  
+        self.neuron_id_to_y = self.n_neurons - neuron_id_to_y
 
     def __call__(self, ax, spikes):
         scale = self.scale
@@ -490,7 +490,7 @@ class LaminarPlot:
         spikes = np.array(spikes)[self.batch_ind, :, :]
 
         # Check if the spikes is already filtered for core neurons
-        if spikes.shape[1] != self.n_neurons and spikes.shape[1] == len(self.core_mask):    
+        if spikes.shape[1] != self.n_neurons and spikes.shape[1] == len(self.core_mask):
             # spikes = np.transpose(spikes[:, self.core_mask])
             spikes = spikes[:, self.core_mask]
 
@@ -541,7 +541,7 @@ class LaminarPlot:
         ###########################
         ax.plot([-1, -1], [-1, -1], ".", color="pink",
                 ms=6, alpha=0.9, label="Htr3a")
-        ax.plot([-1, -1], [-1, -1], ".", color="darkviolet", 
+        ax.plot([-1, -1], [-1, -1], ".", color="darkviolet",
                 ms=6, alpha=0.9, label="Vip")
         ax.plot([-1, -1], [-1, -1], ".", color="g",
                 ms=6, alpha=0.9, label="Sst")
@@ -736,7 +736,7 @@ class PopulationActivity:
             node_types.set_index('node_type_id', inplace=True)
             node_type_id_to_pop_name = node_types['pop_name'].to_dict()
 
-            # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network 
+            # Map node_type_id to pop_name for all neurons and select population names of neurons in the present network
             node_type_ids = node_h5['nodes']['v1']['node_type_id'][()][self.network['tf_id_to_bmtk_id']]
             true_node_type_ids = node_type_ids[self.core_mask]
 

@@ -1427,6 +1427,15 @@ def create_model(
 
     return many_input_model
 
+def build_sequence_only_model(model, rsnn_layer, name="rsnn_sequences"):
+    """Create a training model that returns only the RNN sequence outputs."""
+    return tf.keras.Model(
+        inputs=model.inputs,
+        outputs=rsnn_layer.output[0],
+        name=name,
+    )
+
+
 def build_state_only_model(model, rsnn_layer, name="rsnn_state"):
     """Create a model that returns only the final RNN state (no sequences)."""
     rnn_inputs = rsnn_layer.input

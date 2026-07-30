@@ -9,7 +9,6 @@ import pickle as pkl
 from numba import njit
 from matplotlib import pyplot as plt
 import matplotlib.ticker as ticker
-from matplotlib.gridspec import GridSpec
 import seaborn as sns
 from scipy.stats import ks_2samp
 from v1_model_utils import other_v1_utils, training_utils, tf_utils
@@ -38,7 +37,7 @@ plt.rcParams.update({
     'ytick.labelsize': 12,
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
-    'savefig.transparent': True
+    'savefig.transparent': False
 })
 
 sns.set(style="ticks")
@@ -100,7 +99,7 @@ def get_gpu_memory(gpu_id=0):
             return used_memory
         else:
             return 0.0
-    except:
+    except Exception:
         return 0.0
 
 
@@ -213,12 +212,12 @@ class OsiDsiCallbacks:
         self.inference_times = []
         self.inference_memory = []
         self.inference_rates = []
-        # Analyze changes in trainable variables.
-        if self.model_variables_dict is not None:
-            for var in self.model_variables_dict['Best'].keys():
-                t0 = time()
-                self.trainable_variable_change_heatmaps_and_distributions(var)
-                print(f'Time spent in {var}: {time()-t0}')
+        # # Analyze changes in trainable variables.
+        # if self.model_variables_dict is not None:
+        #     for var in self.model_variables_dict['Best'].keys():
+        #         t0 = time()
+        #         self.trainable_variable_change_heatmaps_and_distributions(var)
+        #         print(f'Time spent in {var}: {time()-t0}')
 
     # Add method to save inference metrics to CSV
     def save_inference_metrics(self):
@@ -715,7 +714,7 @@ class OsiDsiCallbacks:
             pivot_df = grouped_df.pivot(
                 index='Pre_names', columns='Post_names', values='Initial weight')
             # Plot heatmap
-            fig = plt.figure(figsize=(12, 6))
+            plt.figure(figsize=(12, 6))
             heatmap = sns.heatmap(
                 pivot_df, cmap='RdBu_r', annot=False, cbar=False, center=0, vmin=-20, vmax=20)
             plt.xticks(rotation=90, fontsize=tick_fontsize)
@@ -734,7 +733,7 @@ class OsiDsiCallbacks:
 
             # plt.tight_layout(rect=[0, 0, 0.9, 1])  # Adjust layout to make room for colorbar
             plt.tight_layout()
-            plt.savefig(os.path.join(boxplots_dir, f'Initial_weight.png'),
+            plt.savefig(os.path.join(boxplots_dir, 'Initial_weight.png'),
                         dpi=300, transparent=False, bbox_inches='tight')
             plt.close()
 
@@ -763,7 +762,7 @@ class OsiDsiCallbacks:
         cbar.ax.set_title('Weight (pA)', fontsize=label_fontsize, pad=10)
         # plt.tight_layout(rect=[0, 0, 0.9, 1])  # Adjust layout to make room for colorbar
         plt.tight_layout()
-        plt.savefig(os.path.join(boxplots_dir, f'Final_weight.png'),
+        plt.savefig(os.path.join(boxplots_dir, 'Final_weight.png'),
                     dpi=300, transparent=False, bbox_inches='tight')
         plt.close()
 
@@ -793,10 +792,10 @@ class OsiDsiCallbacks:
             cbar.ax.set_title('Weight (pA)', fontsize=label_fontsize, pad=10)
             # plt.tight_layout(rect=[0, 0, 0.9, 1])  # Adjust layout to make room for colorbar
             plt.tight_layout()
-            plt.savefig(os.path.join(boxplots_dir, f'Weight_change.png'),
+            plt.savefig(os.path.join(boxplots_dir, 'Weight_change.png'),
                         dpi=300, transparent=False, bbox_inches='tight')
             plt.close()
-        except:
+        except Exception:
             print('Skipping the plot for the weight change heatmap...')
             # raise the actual error
             print(grouped_df)
@@ -895,11 +894,11 @@ class OsiDsiCallbacks:
         spontaneous_fanos_sem = spontaneous_fanos_std / np.sqrt(n_samples)
 
         # Find the frequency of maximum Fano factor
-        evoked_max_fano = np.nanmax(evoked_fanos_mean)
-        evoked_max_fano_freq = 1 / \
+        np.nanmax(evoked_fanos_mean)
+        1 / \
             (2*evoked_bin_sizes[np.nanargmax(evoked_fanos_mean)])
-        spontaneous_max_fano = np.nanmax(spontaneous_fanos_mean)
-        spontaneous_max_fano_freq = 1 / \
+        np.nanmax(spontaneous_fanos_mean)
+        1 / \
             (2*spont_bin_sizes[np.nanargmax(spontaneous_fanos_mean)])
 
         # Load experimental data
@@ -932,7 +931,6 @@ class OsiDsiCallbacks:
         poisson_color = '#7f7f7f'       # Gray
 
         # Font size settings - INCREASED
-        TITLE_SIZE = 10      # Was 16
         AXIS_LABEL_SIZE = 18  # Was 14
         TICK_SIZE = 14       # Was 12
         LEGEND_SIZE = 16     # Was 12
@@ -1146,7 +1144,7 @@ class OsiDsiCallbacks:
         boxplots_dir = os.path.join(self.images_dir, 'Boxplots_OSI_DSI')
         os.makedirs(boxplots_dir, exist_ok=True)
         fr_boxplots_dir = os.path.join(
-            self.images_dir, f'Boxplots_OSI_DSI/Evoked_Rate(Hz)')
+            self.images_dir, 'Boxplots_OSI_DSI/Evoked_Rate(Hz)')
         os.makedirs(fr_boxplots_dir, exist_ok=True)
         spontaneous_boxplots_dir = os.path.join(
             self.images_dir, 'Boxplots_OSI_DSI/Spontaneous rate (Hz)')
@@ -1291,7 +1289,7 @@ class Callbacks:
             'no_improve_epochs': self.no_improve_epochs
         }
         if normalizers is not None:
-            data_to_save['v1_ema'] = normalizers['v1_ema']
+            data_to_save.update(normalizers)
 
         with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'wb') as f:
             pkl.dump(data_to_save, f)
@@ -1346,7 +1344,8 @@ class Callbacks:
         tf.print(f'\nEpoch {self.epoch:2d}/{self.total_epochs} @ {date_str}')
 
     def on_epoch_end(self, x, v1_spikes, y, metric_values, bkg_noise=None, verbose=True,
-                     x_spont=None, v1_spikes_spont=None):
+                     x_spont=None, v1_spikes_spont=None, protocol_spikes=None,
+                     protocol_angles=None):
 
         if self.flags.dtype != 'float32':
             v1_spikes = v1_spikes.numpy().astype(np.float32)
@@ -1368,7 +1367,7 @@ class Callbacks:
             self.initial_metric_values = metric_values
 
         if verbose:
-            print_str = f'  Validation:\n'
+            print_str = '  Validation:\n'
             val_values = metric_values[len(metric_values)//2:]
             print_str += '    ' + compose_str(val_values)
             print(print_str)
@@ -1390,6 +1389,8 @@ class Callbacks:
             val_loss_value = metric_values[val_loss_index]
 
         self.plot_losses_curves()
+        if protocol_spikes is not None and protocol_angles is not None:
+            self.plot_protocol_validation_metrics(protocol_spikes, protocol_angles)
 
         # # save latest model every 10 epochs
         # if self.epoch % 10 == 0:
@@ -1439,6 +1440,29 @@ class Callbacks:
 
         return stop
 
+    def plot_protocol_validation_metrics(self, protocol_spikes, protocol_angles):
+        metrics = ["Rate at preferred direction (Hz)", "OSI", "DSI"]
+        images_dir = os.path.join(self.logdir, "Boxplots_OSI_DSI")
+        os.makedirs(images_dir, exist_ok=True)
+
+        metrics_analysis = ModelMetricsAnalysis(
+            protocol_spikes,
+            protocol_angles,
+            self.network,
+            data_dir=self.flags.data_dir,
+            drifting_gratings_init=self.pre_delay,
+            drifting_gratings_end=protocol_spikes.shape[2] - self.post_delay,
+            core_radius=self.flags.loss_core_radius,
+            save_df=False,
+            df_directory=images_dir,
+            neuropixels_df=self.flags.neuropixels_df,
+        )
+        metrics_analysis(
+            metrics=metrics,
+            directory=images_dir,
+            filename=f"Epoch_{self.epoch}_preferred_rate_osi_dsi",
+        )
+
     def on_step_start(self):
         self.step += 1
         self.step_init_time = time()
@@ -1474,7 +1498,7 @@ class Callbacks:
         try:
             p = self.latest_manager.save(checkpoint_number=self.epoch)
             print(f'Latest model saved in {p}\n')
-        except:
+        except Exception:
             print("Saving failed. Maybe next time?")
 
     def save_best_model(self):
@@ -1483,7 +1507,7 @@ class Callbacks:
         try:
             p = self.best_manager.save(checkpoint_number=self.epoch)
             print(f'Model saved in {p}\n')
-        except:
+        except Exception:
             print("Saving failed. Maybe next time?")
 
     def plot_losses_curves(self):
@@ -1496,7 +1520,7 @@ class Callbacks:
             "val_osi_dsi_loss",
             "val_sync_loss",
         ]
-        component_labels = [l for l in labels if l != "val_loss"]
+        component_labels = [label for label in labels if label != "val_loss"]
 
         # Create descriptive names for the labels
         label_display_names = {
@@ -1524,8 +1548,27 @@ class Callbacks:
         if not normalized_data:  # If no valid data yet
             return
 
+        # Use the shortest available series so the plot stays aligned even if
+        # some metrics were logged with a different number of epochs.
+        plot_length = min(len(values) for values in normalized_data.values())
+        if plot_length == 0:
+            return
+
+        normalized_data = {
+            label: values[:plot_length] for label, values in normalized_data.items()
+        }
+        absolute_data = {
+            label: np.array(self.epoch_metric_values[label])[:plot_length]
+            for label in normalized_data
+        }
+
         # Create epoch indices
-        epochs = np.arange(1, len(next(iter(normalized_data.values()))) + 1)
+        epochs = np.arange(1, plot_length + 1)
+
+        def configure_epoch_axis(ax):
+            ax.set_xlim(1, max(plot_length, 1))
+            ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=6, integer=True))
+            ax.xaxis.set_major_formatter(ticker.StrMethodFormatter("{x:.0f}"))
 
         # Create figure with vertical layout (shared x-axis)
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
@@ -1542,30 +1585,29 @@ class Callbacks:
 
         # --- TOP SUBPLOT: STACKED AREA CHART ---
         valid_component_labels = [
-            l for l in component_labels if l in self.epoch_metric_values
+            label for label in component_labels if label in absolute_data
         ]
-        data = np.array(
-            [self.epoch_metric_values[label]
-                for label in valid_component_labels]
-        )
-        stack_colors = [colors[l] for l in valid_component_labels]
+        data = np.array([absolute_data[label] for label in valid_component_labels])
+        stack_colors = [colors[label] for label in valid_component_labels]
 
-        ax1.stackplot(
-            epochs,
-            data,
-            labels=[label_display_names[lbl]
-                    for lbl in valid_component_labels],
-            colors=stack_colors,
-            alpha=1,
-            edgecolor="white",
-            linewidth=0.5,
-        )
+        if valid_component_labels:
+            ax1.stackplot(
+                epochs,
+                data,
+                labels=[
+                    label_display_names[lbl] for lbl in valid_component_labels
+                ],
+                colors=stack_colors,
+                alpha=1,
+                edgecolor="white",
+                linewidth=0.5,
+            )
 
         # Total loss line (thicker, more prominent)
-        if "val_loss" in self.epoch_metric_values:
+        if "val_loss" in absolute_data:
             ax1.plot(
                 epochs,
-                self.epoch_metric_values["val_loss"],
+                absolute_data["val_loss"],
                 color="#000000",
                 linewidth=3,
                 linestyle="-",
@@ -1578,11 +1620,10 @@ class Callbacks:
         ax1.grid(True, linestyle="-", alpha=0.2, color="gray")
         ax1.set_axisbelow(True)
         ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f"))
+        configure_epoch_axis(ax1)
 
         max_y = np.sum(data, axis=0).max() * 1.05 if data.size > 0 else 1
         ax1.set_ylim(0, min(max_y, 5))
-        ax1.set_xlim(0, 75)
-        ax1.set_xticks([0, 25, 50, 75])
 
         ax1.tick_params(axis="both", which="major", labelsize=18)
         ax1.spines["top"].set_visible(False)
@@ -1600,7 +1641,7 @@ class Callbacks:
 
         # --- BOTTOM SUBPLOT: NORMALIZED LOSS COMPONENTS ---
         # Plot normalized loss components (thinner, more transparent)
-        for label in [l for l in component_labels if l in normalized_data]:
+        for label in [label for label in component_labels if label in normalized_data]:
             display_name = label_display_names.get(label, label)
             ax2.plot(
                 epochs,
@@ -1628,11 +1669,10 @@ class Callbacks:
         ax2.set_xlabel("Training Epoch", fontsize=26)
         ax2.set_ylabel("Relative Loss", fontsize=26)
         ax2.set_yscale("log")
-        ax2.set_xlim(0, 75)
-        ax2.set_xticks([0, 25, 50, 75])
         ax2.grid(True, linestyle="-", alpha=0.2, which="major", color="gray")
         ax2.grid(which="minor", linestyle=":", alpha=0.1, color="gray")
         ax2.set_axisbelow(True)
+        configure_epoch_axis(ax2)
 
         ax2.tick_params(axis="both", which="major", labelsize=18)
         ax2.spines["top"].set_visible(False)
@@ -1738,7 +1778,7 @@ class Callbacks:
     def plot_spontaneous_boxplot(self, v1_spikes, y):
         DG_angles = y
         seq_len = v1_spikes.shape[1]
-        boxplots_dir = os.path.join(self.logdir, f'Boxplots/Spontaneous')
+        boxplots_dir = os.path.join(self.logdir, 'Boxplots/Spontaneous')
         os.makedirs(boxplots_dir, exist_ok=True)
         metrics_analysis = ModelMetricsAnalysis(v1_spikes, DG_angles, self.network, data_dir=self.flags.data_dir,
                                                 spontaneous_init=self.pre_delay, spontaneous_end=seq_len-self.post_delay,

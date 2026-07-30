@@ -949,7 +949,8 @@ class SpikeRateDistributionTarget:
 
         return target_firing_rates
 
-    def __call__(self, spikes, trim=True):
+    def rates_per_sample_from_spikes(self, spikes, trim=True):
+        """Return full-population rates with shape ``[batch, neurons]``."""
         spikes = spike_trimming(
             spikes,
             pre_delay=self._pre_delay,
@@ -958,12 +959,24 @@ class SpikeRateDistributionTarget:
         )
         if spikes.dtype != self._dtype:
             spikes = tf.cast(spikes, self._dtype)
+        return tf.reduce_mean(spikes, axis=1)
 
-        rates = tf.reduce_mean(spikes, (0, 1))
+    def rates_from_spikes(self, spikes, trim=True):
+        """Return full-population rates averaged over samples and time."""
+        rates_per_sample = self.rates_per_sample_from_spikes(spikes, trim=trim)
+        return tf.reduce_mean(rates_per_sample, axis=0)
+
+    def loss_from_rates(self, rates):
+        """Evaluate the target from a full-population rate vector."""
+        if rates.dtype != self._dtype:
+            rates = tf.cast(rates, self._dtype)
         reg_loss = compute_spike_rate_target_loss(
             rates, self._target_rates, dtype=self._dtype
         )
         return reg_loss * self._rate_cost
+
+    def __call__(self, spikes, trim=True):
+        return self.loss_from_rates(self.rates_from_spikes(spikes, trim=trim))
 
 # class SpikeRateDistributionRegularization:
 #     def __init__(self, target_rates, rate_cost=0.5, dtype=tf.float32):
@@ -1987,23 +2000,44 @@ class OrientationSelectivityLoss:
         )
         return osi_scale, dsi_scale
 
-    def crowd_osi_loss(self, spikes, angle, normalizer=None):
-        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)
-        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
-        radians_delta_angle = delta_angle * (self._tf_pi / 180)
+    def rates_per_sample_from_spikes(self, spikes, trim=True):
+        """Return full-population rates with shape ``[batch, neurons]``."""
+        spikes = spike_trimming(
+            spikes,
+            pre_delay=self._pre_delay,
+            post_delay=self._post_delay,
+            trim=trim,
+        )
+        if spikes.dtype != self._dtype:
+            spikes = tf.cast(spikes, self._dtype)
+        return tf.reduce_mean(spikes, axis=1)
 
-        rates = tf.reduce_mean(spikes, axis=1)
+    def _prepare_rates(self, rates, normalizer):
+        if rates.dtype != self._dtype:
+            rates = tf.cast(rates, self._dtype)
+
         if self._core_mask is not None:
             rates = tf.boolean_mask(rates, self._core_mask, axis=1)
 
         if normalizer is not None:
+            if normalizer.dtype != self._dtype:
+                normalizer = tf.cast(normalizer, self._dtype)
             if self._core_mask is not None:
                 normalizer = tf.boolean_mask(normalizer, self._core_mask, axis=0)
             normalizer = tf.maximum(normalizer, self._min_rates_threshold)
             rates = rates / normalizer
 
-        batch_size = tf.shape(rates)[0]
+        return rates
 
+    def _radians_delta_angle(self, angle):
+        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)
+        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
+        return delta_angle * (self._tf_pi / 180.0)
+
+    def crowd_osi_loss_from_rates(self, rates, angle, normalizer=None):
+        rates = self._prepare_rates(rates, normalizer)
+        radians_delta_angle = self._radians_delta_angle(angle)
+        batch_size = tf.shape(rates)[0]
         osi_real_type, osi_imag_type, dsi_real_type, dsi_imag_type = self._compute_crowd_moment_core(
             rates, radians_delta_angle, batch_size,
             self.node_type_ids, self._n_node_types
@@ -2025,21 +2059,11 @@ class OrientationSelectivityLoss:
 
         return total_loss
 
-    def adaptative_crowd_osi_loss(self, spikes, angle, normalizer=None, update_state=True):
-        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)
-        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
-        radians_delta_angle = delta_angle * (self._tf_pi / 180.0)
-
-        rates = tf.reduce_mean(spikes, axis=1)
-        if self._core_mask is not None:
-            rates = tf.boolean_mask(rates, self._core_mask, axis=1)
-
-        if normalizer is not None:
-            if self._core_mask is not None:
-                normalizer = tf.boolean_mask(normalizer, self._core_mask, axis=0)
-            normalizer = tf.maximum(normalizer, self._min_rates_threshold)
-            rates = rates / normalizer
-
+    def adaptative_crowd_osi_loss_from_rates(
+        self, rates, angle, normalizer=None, update_state=True
+    ):
+        rates = self._prepare_rates(rates, normalizer)
+        radians_delta_angle = self._radians_delta_angle(angle)
         batch_size = tf.shape(rates)[0]
         osi_real_type, osi_imag_type, dsi_real_type, dsi_imag_type = self._compute_crowd_moment_core(
             rates,
@@ -2064,21 +2088,11 @@ class OrientationSelectivityLoss:
 
         return (numerator / denominator) * self._osi_cost
 
-    def rolling_osi_emd_loss(self, spikes, angle, trim=None, normalizer=None, update_state=True):
-        angle = tf.cast(tf.reshape(angle, [-1]), self._dtype)
-        delta_angle = angle[:, tf.newaxis] - self._tuning_angles[tf.newaxis, :]
-        radians_delta_angle = delta_angle * (self._tf_pi / 180.0)
-
-        rates = tf.reduce_mean(spikes, axis=1)
-        if self._core_mask is not None:
-            rates = tf.boolean_mask(rates, self._core_mask, axis=1)
-
-        if normalizer is not None:
-            if self._core_mask is not None:
-                normalizer = tf.boolean_mask(normalizer, self._core_mask, axis=0)
-            normalizer = tf.maximum(normalizer, self._min_rates_threshold)
-            rates = rates / normalizer
-
+    def rolling_osi_emd_loss_from_rates(
+        self, rates, angle, normalizer=None, update_state=True
+    ):
+        rates = self._prepare_rates(rates, normalizer)
+        radians_delta_angle = self._radians_delta_angle(angle)
         (
             _osi_magnitude_estimates,
             _dsi_magnitude_estimates,
@@ -2106,25 +2120,84 @@ class OrientationSelectivityLoss:
 
         return warmup_scale * (numerator / denominator) * self._osi_cost
 
-    def __call__(self, spikes, angle, trim, normalizer=None, update_state=True):
+    def loss_from_rates(
+        self, rates, angle, normalizer=None, update_state=True
+    ):
+        """Evaluate a rate-based OSI/DSI target from reusable sample rates."""
+        if self._method == "crowd_osi":
+            return self.crowd_osi_loss_from_rates(
+                rates, angle, normalizer=normalizer
+            )
+        if self._method == "adaptative_crowd_osi":
+            return self.adaptative_crowd_osi_loss_from_rates(
+                rates,
+                angle,
+                normalizer=normalizer,
+                update_state=update_state,
+            )
+        if self._method == "rolling_osi_emd":
+            return self.rolling_osi_emd_loss_from_rates(
+                rates,
+                angle,
+                normalizer=normalizer,
+                update_state=update_state,
+            )
+        raise ValueError(
+            f"OSI/DSI method {self._method!r} requires spike sequences."
+        )
+
+    def crowd_osi_loss(self, spikes, angle, normalizer=None):
+        rates = self.rates_per_sample_from_spikes(spikes, trim=False)
+        return self.crowd_osi_loss_from_rates(
+            rates, angle, normalizer=normalizer
+        )
+
+    def adaptative_crowd_osi_loss(
+        self, spikes, angle, normalizer=None, update_state=True
+    ):
+        rates = self.rates_per_sample_from_spikes(spikes, trim=False)
+        return self.adaptative_crowd_osi_loss_from_rates(
+            rates,
+            angle,
+            normalizer=normalizer,
+            update_state=update_state,
+        )
+
+    def rolling_osi_emd_loss(
+        self, spikes, angle, trim=None, normalizer=None, update_state=True
+    ):
+        del trim  # Kept for compatibility with the legacy positional argument.
+        rates = self.rates_per_sample_from_spikes(spikes, trim=False)
+        return self.rolling_osi_emd_loss_from_rates(
+            rates,
+            angle,
+            normalizer=normalizer,
+            update_state=update_state,
+        )
+
+    def __call__(
+        self, spikes, angle, trim, normalizer=None, update_state=True
+    ):
+        if self._method in (
+            "crowd_osi",
+            "adaptative_crowd_osi",
+            "rolling_osi_emd",
+        ):
+            rates = self.rates_per_sample_from_spikes(spikes, trim=trim)
+            return self.loss_from_rates(
+                rates,
+                angle,
+                normalizer=normalizer,
+                update_state=update_state,
+            )
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
 
         if spikes.dtype != self._dtype:
             spikes = tf.cast(spikes, self._dtype)
 
-        if self._method == "crowd_osi":
-            return self.crowd_osi_loss(spikes, angle, normalizer=normalizer)
-        elif self._method == "adaptative_crowd_osi":
-            return self.adaptative_crowd_osi_loss(
-                spikes, angle, normalizer=normalizer, update_state=update_state
-            )
-        elif self._method == "rolling_osi_emd":
-            return self.rolling_osi_emd_loss(
-                spikes, angle, normalizer=normalizer, update_state=update_state
-            )
-        elif self._method == "crowd_spikes":
+        if self._method == "crowd_spikes":
             return self.crowd_spikes_loss(spikes, angle)
-        elif self._method == "neuropixels_fr":
+        if self._method == "neuropixels_fr":
             return self.neuropixels_fr_loss(spikes, angle)
         raise ValueError(f"Unknown OSI/DSI loss method: {self._method}")

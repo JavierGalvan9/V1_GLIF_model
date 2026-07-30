@@ -369,6 +369,8 @@ def load_or_compute_osi_dsi_lgn_probabilities(
     seq_len=600,
     spont_duration=2000,
     evoked_duration=2000,
+    pre_delay=None,
+    post_delay=None,
     n_input=17400,
     data_dir='GLIF_network_nll',
     rotation='cw',
@@ -376,19 +378,32 @@ def load_or_compute_osi_dsi_lgn_probabilities(
     output_dtype=tf.float32,
     angles=None,
     strategy=None,
+    bmtk_compat=True,
+    current_input=False,
+    cache_prefix="osi_dsi_lgn_probabilities",
 ):
     """Load cached OSI/DSI LGN spike probabilities or compute and cache them."""
     if angles is None:
         angles = np.arange(0, 360, 45)
 
     cache_dir = os.path.join(data_dir, "tf_data")
-    stim_duration = int(spont_duration) + int(evoked_duration)
     seq_len = int(seq_len)
-    osi_seq_len = int(np.ceil(stim_duration / seq_len)) * seq_len
-    post_delay = osi_seq_len - stim_duration
+    if pre_delay is None:
+        stim_duration = int(spont_duration) + int(evoked_duration)
+        osi_seq_len = int(np.ceil(stim_duration / seq_len)) * seq_len
+        pre_delay = int(spont_duration)
+        post_delay = osi_seq_len - stim_duration
+    else:
+        osi_seq_len = seq_len
+        pre_delay = int(pre_delay)
+        post_delay = int(post_delay or 0)
+    angle_key = "-".join(str(int(angle)) for angle in angles)
+    current_key = "current" if current_input else "spikes"
     cache_file = os.path.join(
         cache_dir,
-        f"osi_dsi_lgn_probabilities_n_input_{n_input}_seqlen_{osi_seq_len}.pkl",
+        f"{cache_prefix}_n_input_{n_input}_seqlen_{osi_seq_len}_"
+        f"pre_{pre_delay}_post_{post_delay}_rotation_{rotation}_"
+        f"seed_{seed}_{current_key}_angles_{angle_key}.pkl",
     )
 
     if os.path.exists(cache_file):
@@ -399,11 +414,12 @@ def load_or_compute_osi_dsi_lgn_probabilities(
         print("Creating OSI/DSI dataset...")
         lgn_firing_rates = generate_drifting_grating_tuning(
             seq_len=osi_seq_len,
-            pre_delay=spont_duration,
+            pre_delay=pre_delay,
             post_delay=post_delay,
             n_input=n_input,
             data_dir=data_dir,
             regular=True,
+            bmtk_compat=bmtk_compat,
             return_firing_rates=True,
             rotation=rotation,
             dtype=tf.float32,
@@ -1286,15 +1302,7 @@ def generate_natural_scenes_stimulus(
 #     return data_set
 
 def main():
-    # import matplotlib
-    # matplotlib.use('agg')
-    import matplotlib.pyplot as plt
-    import pdb
-    data_set = generate_noisy_mnist_for_variance(data_usage=0,intensity=2,im_slice=100, pre_delay=50, post_delay=0,
-                                                     pre_chunks=2, resp_chunks=1, post_chunks=0, current_input=True,
-                                                     std=1, only_lgn=False, from_lgn=False, ind=0)
-    it = iter(data_set.batch(10))
-    x,y,l,w  = next(it)
+    pass
 
 if __name__ == '__main__':
     main()

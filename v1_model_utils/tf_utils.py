@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import pickle as pkl
@@ -126,9 +125,10 @@ def create_distribution_strategy(
     """
     if physical_devices is None:
         physical_devices = tf.config.list_physical_devices("GPU")
+    visible_devices = tf.config.get_visible_devices("GPU") or physical_devices
 
     # Use NCCL for multi-GPU communication to avoid CPU fallback
-    if len(physical_devices) > 1:
+    if len(visible_devices) > 1:
         if use_hierarchical_all_reduce:
             # Use HierarhicalCopyAllReduce to avoid NCCL issues with Blackwell GPUs
             return tf.distribute.MirroredStrategy(
@@ -138,7 +138,7 @@ def create_distribution_strategy(
         else:
             return tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
 
-    if len(physical_devices) == 1:
+    if len(visible_devices) == 1:
         if single_gpu_strategy == "one_device":
             # dont use this strategy since single device gpu increases largely the memory required to allocate the pre_ind_table tensor on GPU memory, which is already large and can cause OOM errors. MirroredStrategy with one GPU does not have this issue (it places it in the CPU) and is more memory efficient.
             return tf.distribute.OneDeviceStrategy(device="/gpu:0")
@@ -203,6 +203,65 @@ def configure_run_paths(
         current_epoch = flags.run_session * flags.n_epochs
 
     return flag_str, logdir, current_epoch
+
+
+def extract_sim_name(logdir):
+    """Return the simulation directory name from a logdir path."""
+    return os.path.basename(os.path.normpath(logdir))
+
+
+def current_run_start_epoch(flags, checkpoint_epochs=0):
+    """Epoch offset to use when resuming from an existing checkpoint/history."""
+    return int(checkpoint_epochs)
+
+
+def compute_total_epochs(flags, checkpoint_epochs=0):
+    """Compute the reportable total epoch count for new or resumed training.
+
+    If the checkpoint is still within the originally planned run budget, keep the
+    original total. If it already passed that budget, treat the current launch as
+    one additional session so progress displays do not move backwards.
+    """
+    planned_total = int(getattr(flags, "n_runs", 1)) * int(getattr(flags, "n_epochs", 0))
+    checkpoint_epochs = int(checkpoint_epochs)
+    if checkpoint_epochs >= planned_total:
+        return checkpoint_epochs + int(getattr(flags, "n_epochs", 0))
+    return planned_total
+
+
+def infer_completed_epochs(logdir, restore_from=""):
+    """Infer completed epochs from persisted train-end bookkeeping if present."""
+    train_end_data, _ = load_training_state(logdir, restore_from=restore_from)
+    if not train_end_data:
+        return 0
+
+    epoch_metric_values = train_end_data.get("epoch_metric_values", {})
+    if isinstance(epoch_metric_values, dict):
+        metric_lengths = []
+        for values in epoch_metric_values.values():
+            try:
+                metric_lengths.append(len(values))
+            except TypeError:
+                continue
+        if metric_lengths:
+            return int(max(metric_lengths))
+
+    for key in ("completed_epochs", "current_epoch", "epoch"):
+        if key in train_end_data:
+            try:
+                return int(train_end_data[key])
+            except (TypeError, ValueError):
+                pass
+
+    return 0
+
+
+def infer_report_epoch(logdir, restore_from="", run_session=0, n_epochs=0):
+    """Return the epoch offset to report for callbacks and diagnostics."""
+    completed_epochs = infer_completed_epochs(logdir, restore_from=restore_from)
+    if completed_epochs > 0:
+        return completed_epochs
+    return int(run_session) * int(n_epochs)
 
 
 class DistributedSeedHelper(tf.Module):
