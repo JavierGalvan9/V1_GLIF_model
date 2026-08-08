@@ -5,7 +5,9 @@ import os
 # Define the environment variables for optimal GPU performance
 os.environ['TF_GPU_THREAD_MODE'] = 'global'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
-os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+# Prefer the default BFC allocator: cuda_malloc_async retained GPU pool memory
+# and reached OOM earlier in this repository's workloads despite lower live usage.
+# os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import absl
