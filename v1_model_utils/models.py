@@ -7,6 +7,10 @@ from .cuda_synaptic_currents import (
     build_csr_connectivity,
     calculate_synaptic_currents as calculate_synaptic_currents_cuda,
 )
+from .cuda_external_currents import (
+    build_csr_connectivity as build_external_csr_connectivity,
+    calculate_external_currents,
+)
 try:
     from numba import njit
     HAS_NUMBA = True
@@ -769,7 +773,17 @@ class V1Column(tf.keras.layers.Layer):
         # input_delays = np.array(lgn_input["delays"])
         # input_delays = np.round(np.clip(input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
-        self.input_indices = tf.Variable(input_indices, trainable=False, dtype=tf.int64)
+        if self.synaptic_current_backend == "cuda":
+            # Retain the legacy checkpoint object without occupying GPU memory;
+            # CUDA execution consumes the compact CSR tensors below instead.
+            with tf.device("/CPU:0"):
+                self.input_indices = tf.Variable(
+                    input_indices, trainable=False, dtype=tf.int64
+                )
+        else:
+            self.input_indices = tf.Variable(
+                input_indices, trainable=False, dtype=tf.int64
+            )
 
         # Define the Tensorflow variables
         # input_weight_positive = tf.Variable(
@@ -783,8 +797,16 @@ class V1Column(tf.keras.layers.Layer):
             trainable=train_input,
             dtype=self.variable_dtype
         )
-        self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64) # for efficiency this needs to be in int64
-        if not self._current_input:
+        if self.synaptic_current_backend == "cuda" and not self._current_input:
+            self.input_csr = build_external_csr_connectivity(
+                input_indices,
+                input_syn_ids,
+                n_pre=self.lgn_input_dense_shape[1],
+                n_post=self.lgn_input_dense_shape[0],
+            )
+        else:
+            self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64)
+        if self.synaptic_current_backend == "tensorflow" and not self._current_input:
             self.pre_input_ind_table = make_pre_ind_table(input_indices, n_source_neurons=self.lgn_input_dense_shape[1])
 
         print(f"    > # LGN input synapses {len(input_indices)}")
@@ -802,9 +824,28 @@ class V1Column(tf.keras.layers.Layer):
         # bkg_input_delays = np.array(bkg_input['delays'])
         # bkg_input_delays = np.round(np.clip(bkg_input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # bkg_input_indices[:, 1] = bkg_input_indices[:, 1] + self._n_neurons * (bkg_input_delays - 1)
-        self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int64)
+        if self.synaptic_current_backend == "cuda":
+            with tf.device("/CPU:0"):
+                self.bkg_input_indices = tf.Variable(
+                    bkg_input_indices, trainable=False, dtype=tf.int64
+                )
+        else:
+            self.bkg_input_indices = tf.Variable(
+                bkg_input_indices, trainable=False, dtype=tf.int64
+            )
         # self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int32)
-        self.pre_bkg_ind_table = make_pre_ind_table(bkg_input_indices, n_source_neurons=self.bkg_input_dense_shape[1])
+        if self.synaptic_current_backend == "cuda":
+            self.bkg_input_csr = build_external_csr_connectivity(
+                bkg_input_indices,
+                bkg_input_syn_ids,
+                n_pre=self.bkg_input_dense_shape[1],
+                n_post=self.bkg_input_dense_shape[0],
+            )
+        else:
+            self.pre_bkg_ind_table = make_pre_ind_table(
+                bkg_input_indices,
+                n_source_neurons=self.bkg_input_dense_shape[1],
+            )
 
         # Define Tensorflow variables
         # bkg_input_weight_positive = tf.Variable(
@@ -819,7 +860,8 @@ class V1Column(tf.keras.layers.Layer):
             dtype=self.variable_dtype
         )
 
-        self.bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int64)
+        if self.synaptic_current_backend == "tensorflow":
+            self.bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int64)
         # self.bkg_input_weights_factors = tf.gather(self.synaptic_basis_weights, bkg_input_syn_ids, axis=0)
 
         print(f"    > # BKG input synapses {len(bkg_input_indices)}")
@@ -869,6 +911,19 @@ class V1Column(tf.keras.layers.Layer):
         Calculate the input current from the LGN neurons, given the spikes at time t (x_t).
         Use int64 for indexing to optimize GPU gather and segment_sum performance, which are critical operations in this function.
         """
+        if self.synaptic_current_backend == "cuda":
+            active_inputs = x_t if x_t.dtype == tf.bool else x_t > 0
+            activity = tf.stop_gradient(
+                tf.cast(active_inputs, dtype=self.compute_dtype)
+            )
+            return calculate_external_currents(
+                activity,
+                self.input_weight_values,
+                self.synaptic_basis_weights,
+                self.input_csr,
+                compute_activity_gradient=False,
+            )
+
         # x_t: Shape [batch_size, input_dim]
         batch_size = tf.cast(tf.shape(x_t)[0], dtype=tf.int64) # int64
         n_post_neurons = self.lgn_input_dense_shape[0] #int64
@@ -933,6 +988,18 @@ class V1Column(tf.keras.layers.Layer):
             lam=self.bkg_spike_prob,
             dtype=tf.int32,
         )
+
+        if self.synaptic_current_backend == "cuda":
+            activity = tf.stop_gradient(
+                tf.cast(rest_of_brain, dtype=self.compute_dtype)
+            )
+            return calculate_external_currents(
+                activity,
+                self.bkg_input_weights,
+                self.synaptic_basis_weights,
+                self.bkg_input_csr,
+                compute_activity_gradient=False,
+            )
 
         # Keep noise indexing in int64
         non_zero_indices = tf.where(rest_of_brain > 0)
