@@ -25,6 +25,35 @@ tf.get_logger().setLevel(logging.INFO)
 # logging.getLogger().setLevel(logging.INFO)
 
 
+def annulus_mask_from_core(core_mask):
+    """Return the complement of one area's core, or None for no annulus."""
+    if core_mask is None:
+        return None
+    annulus_mask = tf.logical_not(tf.convert_to_tensor(core_mask, tf.bool))
+    if not bool(tf.reduce_any(annulus_mask).numpy()):
+        return None
+    return annulus_mask
+
+
+def update_rate_emas(v1_ema, v1_rates, decay, update_state=True):
+    """Update the training rate normalizer without mutating it in evaluation."""
+    if update_state:
+        v1_ema.assign(decay * v1_ema + (1 - decay) * v1_rates)
+
+
+def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
+    """Return warm-up final state, using the full sequence model as fallback."""
+    if state_model is not None:
+        return state_model(inputs)
+    full_outputs = sequence_and_state_model(inputs)
+    if not isinstance(full_outputs, (tuple, list)) or len(full_outputs) < 2:
+        raise ValueError(
+            "The sequence-and-state fallback must return sequences followed "
+            "by at least one final-state tensor."
+        )
+    return tuple(full_outputs[1:])
+
+
 def main(_):
     flags = absl.app.flags.FLAGS
     if flags.profile_gpu_index >= 0:
@@ -183,7 +212,7 @@ def main(_):
                 # report how many neurons are selected.
                 print(f"Core mask is set to {core_mask_np.sum()} neurons.")
                 core_mask = tf.constant(core_mask_np, dtype=tf.bool)
-                annulus_mask = tf.constant(~core_mask_np, dtype=tf.bool)
+                annulus_mask = annulus_mask_from_core(core_mask)
 
         # Extract outputs of intermediate keras layers to get access to spikes and membrane voltages of the model
         rsnn_layer = model.get_layer("rsnn")
@@ -366,13 +395,13 @@ def main(_):
                 )
 
         extractor_model = models.build_sequence_only_model(model, rsnn_layer)
+        sequence_and_state_model = models.build_sequence_and_state_model(
+            model, rsnn_layer, name="training_sequence_and_state_extractor"
+        )
         segmented_extractor = None
         if flags.gradient_checkpointing:
-            segmented_core_model = models.build_sequence_and_state_model(
-                model, rsnn_layer
-            )
             segmented_extractor = models.SegmentedRecomputeRunner(
-                segmented_core_model,
+                sequence_and_state_model,
                 sequence_length=flags.seq_len,
                 chunk_size=flags.gradient_checkpoint_chunk_size,
                 differentiate_inputs=False,
@@ -384,20 +413,14 @@ def main(_):
             )
         else:
             print("Gradient checkpointing disabled.")
-        state_fallback_model = None
         # State-only model to avoid storing full sequences when only the final state is needed.
         try:
             state_model = models.build_state_only_model(model, rsnn_layer)
         except Exception as e:
             state_model = None
-            state_fallback_model = tf.keras.Model(
-                inputs=model.inputs,
-                outputs=rsnn_layer.output[1:],
-                name="rsnn_state_fallback",
-            )
             print(
                 f"Warning: failed to build state-only model ({e}); "
-                "using the original final-state graph for gray state."
+                "using the full sequence model for gray state."
             )
 
         # Loss from Guozhang classification task (unused in our case)
@@ -558,19 +581,14 @@ def main(_):
         spontaneous = tf.cast(spontaneous, tf.bool)
 
         def _evoked_losses():
-            rate_loss = evoked_rate_regularizer(_z, trim)
+            v1_rates_per_sample = (
+                evoked_rate_regularizer.rates_per_sample_from_spikes(_z, trim)
+            )
+            v1_rates = tf.reduce_mean(v1_rates_per_sample, axis=0)
             if update_state:
                 # Update only during training; validation reads the existing normalizer.
-                v1_evoked_rates = tf.reduce_mean(
-                    tf.cast(
-                        _z[:, delays[0]: flags.seq_len - delays[1], :],
-                        tf.float32,
-                    ),
-                    (0, 1),
-                )
-                v1_ema.assign(
-                    ema_decay * v1_ema + (1 - ema_decay) * v1_evoked_rates
-                )
+                update_rate_emas(v1_ema, v1_rates, ema_decay)
+            rate_loss = evoked_rate_regularizer.loss_from_rates(v1_rates)
             osi_dsi_loss = OSI_DSI_Loss(
                 _z,
                 y,
@@ -581,7 +599,9 @@ def main(_):
             sync_loss = evoked_sync_loss(_z, trim)
 
             if annulus_mask is not None:
-                rate_loss += annulus_evoked_rate_regularizer(_z, trim)
+                rate_loss += annulus_evoked_rate_regularizer.loss_from_rates(
+                    v1_rates
+                )
                 osi_dsi_loss += annulus_OSI_DSI_Loss(
                     _z,
                     y,
@@ -593,12 +613,18 @@ def main(_):
             return rate_loss, osi_dsi_loss, sync_loss
 
         def _spontaneous_losses():
-            rate_loss = spont_rate_regularizer(_z, trim)
+            v1_rates_per_sample = (
+                spont_rate_regularizer.rates_per_sample_from_spikes(_z, trim)
+            )
+            v1_rates = tf.reduce_mean(v1_rates_per_sample, axis=0)
+            rate_loss = spont_rate_regularizer.loss_from_rates(v1_rates)
             osi_dsi_loss = tf.constant(0.0, dtype=tf.float32)
             sync_loss = spont_sync_loss(_z, trim)
 
             if annulus_mask is not None:
-                rate_loss += annulus_spont_rate_regularizer(_z, trim)
+                rate_loss += annulus_spont_rate_regularizer.loss_from_rates(
+                    v1_rates
+                )
 
             return rate_loss, osi_dsi_loss, sync_loss
 
@@ -951,7 +977,19 @@ def main(_):
         return tf.less(random_uniform, probability)
 
     def generate_spontaneous_spikes(batch_size):
-        return sample_probability_batch(spontaneous_prob_base, batch_size)
+        batch_size = tf.cast(batch_size, tf.int32)
+        probability = spontaneous_prob_base[tf.newaxis, ...]
+        target_shape = tf.concat(
+            [[batch_size], tf.stop_gradient(tf.shape(spontaneous_prob_base))],
+            axis=0,
+        )
+        probability = tf.broadcast_to(probability, target_shape)
+        random_uniform = tf.random.stateless_uniform(
+            target_shape,
+            seed=seed_helper.next_spontaneous_seed(),
+            dtype=dtype,
+        )
+        return tf.less(random_uniform, probability)
 
     @tf.function
     def distributed_sample_probability_batch(probability, batch_size, current_input=False):
@@ -967,16 +1005,12 @@ def main(_):
         if x.dtype == tf.bool:
             x = tf.cast(x, dtype)
         init_state = rsnn_layer.cell.zero_state(batch_size, dtype=dtype)
-        if state_model is not None:
-            seed_helper.advance_noise_seed()
-            inputs = [x]
-            inputs.extend(list(init_state))
-            state_out = state_model(tuple(inputs))
-            return state_out  # tuple(tf.nest.flatten(state_out))
         seed_helper.advance_noise_seed()
         inputs = [x]
         inputs.extend(list(init_state))
-        return state_fallback_model(tuple(inputs))
+        return run_gray_state_rollout(
+            state_model, sequence_and_state_model, tuple(inputs)
+        )
 
     @tf.function
     def distributed_generate_gray_state(batch_size):
