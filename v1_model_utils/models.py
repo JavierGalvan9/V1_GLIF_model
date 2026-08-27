@@ -873,10 +873,7 @@ class V1Column(tf.keras.layers.Layer):
         batch_size = tf.cast(tf.shape(x_t)[0], dtype=tf.int64) # int64
         n_post_neurons = self.lgn_input_dense_shape[0] #int64
         # Find the indices of non-zero inputs
-        if x_t.dtype == tf.bool:
-            non_zero_indices = tf.where(x_t)
-        else:
-            non_zero_indices = tf.where(x_t > 0)
+        non_zero_indices = tf.where(x_t > 0) if x_t.dtype != tf.bool else tf.where(x_t)  # shape (n_active_inputs, 2)
 
         batch_indices = non_zero_indices[:, 0]  # int64
         pre_neuron_indices = non_zero_indices[:, 1] #int64

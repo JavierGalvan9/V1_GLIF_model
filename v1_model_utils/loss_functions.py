@@ -610,6 +610,7 @@ def spike_trimming(spikes, pre_delay=50, post_delay=50, trim=True):
     return spikes
 
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
+    """Return a stochastic inverse-CDF target for legacy use only."""
     # Sort the original firing rates
     sorted_firing_rates = np.sort(firing_rates)
     # Calculate the empirical cumulative distribution function (CDF)
@@ -621,6 +622,28 @@ def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     target_firing_rates = np.sort(np.interp(x_rand, percentiles, sorted_firing_rates))
     # target_firing_rates = np.interp(x_rand, percentiles, sorted_firing_rates)
     return target_firing_rates
+
+
+def interpolate_empirical_quantile_midpoints(firing_rates, n_neurons):
+    """Return empirical firing rates evaluated at model quantile-bin midpoints."""
+    sorted_firing_rates = np.sort(np.asarray(firing_rates))
+    if sorted_firing_rates.size == 0:
+        raise ValueError("At least one empirical firing rate is required")
+    if n_neurons < 0:
+        raise ValueError("n_neurons must be nonnegative")
+    if n_neurons == 0:
+        return np.empty(0, dtype=sorted_firing_rates.dtype)
+
+    positions = (
+        (np.arange(n_neurons, dtype=np.float64) + 0.5)
+        * sorted_firing_rates.size
+        / n_neurons
+        - 0.5
+    )
+    positions = np.clip(positions, 0.0, sorted_firing_rates.size - 1)
+    return np.interp(
+        positions, np.arange(sorted_firing_rates.size), sorted_firing_rates
+    )
 
 
 def resample_sorted_distribution(values, n_samples):
@@ -644,52 +667,34 @@ def huber_quantile_loss(u, tau, kappa, dtype=tf.float32):
 
 ### To calculate the loss of firing rates between neuron types
 def compute_spike_rate_target_loss(rates, target_rates, dtype=tf.float32):
-    # TODO: define this function
-    # target_rates is a dictionary that contains all the cell types.
-    # I should iterate on them, and add the cost for each one at the end.
-    # spikes will have a shape of (batch_size, n_steps, n_neurons)
-    # rates = tf.reduce_mean(_spikes, (0, 1))
     total_loss = tf.constant(0.0, dtype=dtype)
-    num_neurons = tf.constant(0, dtype=tf.int32)
-    # if core_mask is not None:
-    #     core_neurons_ids = np.where(core_mask)[0]
+    total_model_neurons = 0
 
-    for key, value in target_rates.items():
-        neuron_ids = value["neuron_ids"]
-        if len(neuron_ids) != 0:
-            _rate_type = tf.gather(rates, neuron_ids)
-            target_rate = value["sorted_target_rates"]
-            # if core_mask is not None:
-            #     key_core_mask = np.isin(value["neuron_ids"], core_neurons_ids)
-            #     neuron_ids =  np.where(key_core_mask)[0]
-            #     _rate_type = tf.gather(rates, neuron_ids)
-            #     target_rate = value["sorted_target_rates"][key_core_mask]
-            # else:
-            #     _rate_type = tf.gather(rates, value["neuron_ids"])
-            #     target_rate = value["sorted_target_rates"]
+    for value in target_rates.values():
+        n_model_neurons = value["n_model_neurons"]
+        if n_model_neurons == 0:
+            continue
 
-            loss_type = compute_spike_rate_distribution_loss(_rate_type, target_rate, dtype=dtype)
-            total_loss += tf.reduce_sum(loss_type)
-            num_neurons += tf.size(neuron_ids)
+        model_rates = tf.gather(rates, value["neuron_ids"])
+        neuron_indices = tf.range(n_model_neurons)
+        model_rates = tf.gather(
+            model_rates, tf.random.shuffle(neuron_indices)
+        )
+        residual = tf.sort(model_rates) - value["sorted_target_rates"]
+        # tau = (tf.cast(neuron_indices, dtype) + 0.5) / tf.cast(
+        #     n_model_neurons, dtype
+        # )
+        tau = (tf.cast(neuron_indices, dtype) + 1.0) / tf.cast(
+                    n_model_neurons, dtype
+                )
+        total_loss += tf.reduce_sum(
+            huber_quantile_loss(residual, tau, 0.002, dtype=dtype)
+        )
+        total_model_neurons += n_model_neurons
 
-    total_loss /= tf.cast(num_neurons, dtype=dtype)
-
-    return total_loss
-
-def compute_spike_rate_distribution_loss(_rates, target_rate, dtype=tf.float32):
-    # Firstly we shuffle the current model rates to avoid bias towards a particular tuning angles (inherited from neurons ordering in the network)
-    ind = tf.range(target_rate.shape[0])
-    rand_ind = tf.random.shuffle(ind)
-    _rates = tf.gather(_rates, rand_ind)
-    sorted_rate = tf.sort(_rates)
-    # u = target_rate - sorted_rate
-    u = sorted_rate - target_rate
-    n = tf.shape(target_rate)[0]
-    tau = (tf.cast(tf.range(n), dtype) + 1) / tf.cast(n, dtype)
-    loss = huber_quantile_loss(u, tau, 0.002, dtype=dtype)
-    # loss = huber_quantile_loss(u, tau, 0.1, dtype=dtype)
-
-    return loss
+    if total_model_neurons == 0:
+        raise ValueError("No modeled neurons were selected for the rate target")
+    return total_loss / tf.cast(total_model_neurons, dtype=dtype)
 
 def process_neuropixels_data(path=''):
     # Load data
@@ -936,16 +941,29 @@ class SpikeRateDistributionTarget:
         for cell_type in CELL_TYPE_ORDER:
             rates = type_rates_dict.get(cell_type, np.array([0.0], dtype=np.float32))
             neuron_ids = population_ids[cell_type]
-            type_n_neurons = len(neuron_ids)
+            type_n_neurons = int(len(neuron_ids))
+            # target_firing_rates[cell_type] = {
+            #     "rates": rates,
+            #     "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
+            #     "n_model_neurons": type_n_neurons,
+            #     "sorted_target_rates": tf.convert_to_tensor(
+            #         self._rates_dampening
+            #         * interpolate_empirical_quantile_midpoints(
+            #             rates, type_n_neurons
+            #         ),
+            #         dtype=self._dtype,
+            #     ),
+            # }
             target_firing_rates[cell_type] = {
-                "rates": rates,
-                "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
-                "sorted_target_rates": tf.convert_to_tensor(
-                    self._rates_dampening
-                    * sample_firing_rates(rates, type_n_neurons, self._seed),
-                    dtype=self._dtype,
-                ),
-            }
+                            "rates": rates,
+                            "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
+                            "n_model_neurons": type_n_neurons,
+                            "sorted_target_rates": tf.convert_to_tensor(
+                                self._rates_dampening
+                                * sample_firing_rates(rates, type_n_neurons, self._seed),
+                                dtype=self._dtype,
+                            ),
+                        }
 
         return target_firing_rates
 
@@ -978,21 +996,6 @@ class SpikeRateDistributionTarget:
 
     def __call__(self, spikes, trim=True):
         return self.loss_from_rates(self.rates_from_spikes(spikes, trim=trim))
-
-# class SpikeRateDistributionRegularization:
-#     def __init__(self, target_rates, rate_cost=0.5, dtype=tf.float32):
-#         self._rate_cost = rate_cost
-#         self._target_rates = target_rates
-#         self._dtype = dtype
-
-#     def __call__(self, spikes):
-#         reg_loss = (
-#             compute_spike_rate_distribution_loss(spikes, self._target_rates, dtype=self._dtype)
-#             * self._rate_cost
-#         )
-#         reg_loss = tf.reduce_sum(reg_loss)
-
-#         return reg_loss
 
 class SynchronizationLoss(Layer):
     def __init__(self, network, stimulus_type='drifting_gratings', sync_cost=10., t_start=0., t_end=0.5, n_samples=50, neuropixels_data_dir='Synchronization_data',
