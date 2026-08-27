@@ -949,6 +949,7 @@ class SpikeRateDistributionTarget:
 
         return target_firing_rates
 
+    @tf.function(jit_compile=True)
     def rates_per_sample_from_spikes(self, spikes, trim=True):
         """Return full-population rates with shape ``[batch, neurons]``."""
         spikes = spike_trimming(
@@ -1022,7 +1023,18 @@ class SynchronizationLoss(Layer):
         self._neuropixels_data_dir = neuropixels_data_dir
         self._dtype = dtype
         self._n_samples = n_samples
-        self._base_seed = seed
+        max_int32 = 2**31 - 1
+        self._base_seed_pair = tf.constant(
+            [int(seed) % max_int32, int(seed + 15485863) % max_int32],
+            dtype=tf.int32,
+        )
+        self._seed_stream = self.add_weight(
+            name="seed_stream",
+            shape=(),
+            dtype=tf.int64,
+            trainable=False,
+            initializer="zeros",
+        )
 
         pop_names = other_v1_utils.pop_names(network, data_dir=self._data_dir)
         node_ei = np.array([pop_name[0] for pop_name in pop_names])
@@ -1044,6 +1056,26 @@ class SynchronizationLoss(Layer):
         self._core_excitatory_mask = tf.constant(excitatory_mask, dtype=tf.bool)
         self.node_id_e = tf.range(
             np.count_nonzero(excitatory_mask), dtype=tf.int32
+        )
+        # Keep population sizes fixed for the loss lifetime. Trial and neuron
+        # selections remain random on each invocation.
+        sample_counts_seed = tf.random.experimental.stateless_fold_in(
+            self._base_seed_pair, tf.constant(2, dtype=tf.int32)
+        )
+        sample_counts = tf.cast(
+            tf.random.stateless_normal(
+                [self._n_samples],
+                seed=sample_counts_seed,
+                mean=70,
+                stddev=30,
+                dtype=self._dtype,
+            ),
+            tf.int32,
+        )
+        self._sample_counts = tf.clip_by_value(
+            sample_counts,
+            clip_value_min=15,
+            clip_value_max=tf.shape(self.node_id_e)[0],
         )
         # Pre-define bin sizes (same as experimental data)
         bin_sizes = np.logspace(-3, 0, 20)
@@ -1067,14 +1099,36 @@ class SynchronizationLoss(Layer):
         experimental_fanos_mean = np.nanmean(experimental_fanos[:, bin_sizes_mask], axis=0)
         self.experimental_fanos_mean = tf.constant(experimental_fanos_mean, dtype=self._dtype)
 
+    def _next_seed_pair(self):
+        stream_id = self._seed_stream.assign_add(tf.constant(1, dtype=tf.int64))
+        seed = tf.random.experimental.stateless_fold_in(
+            self._base_seed_pair, tf.cast(stream_id, tf.int32)
+        )
+        replica_context = tf.distribute.get_replica_context()
+        replica_id = (
+            tf.constant(0, dtype=tf.int32)
+            if replica_context is None
+            else tf.cast(replica_context.replica_id_in_sync_group, tf.int32)
+        )
+        return tf.random.experimental.stateless_fold_in(seed, replica_id)
+
+    @staticmethod
+    def _stateless_shuffle(values, seed):
+        random_keys = tf.random.stateless_uniform(
+            [tf.shape(values)[0]], seed=seed, dtype=tf.float32
+        )
+        return tf.gather(values, tf.argsort(random_keys, stable=True))
+
+    @tf.function(jit_compile=True)
     def pop_fano_tf(self, spikes):
-        spikes = tf.expand_dims(spikes, axis=-1)
         fanos = tf.TensorArray(dtype=self._dtype, size=len(self._bin_sizes_ms))
         for i, bin_size in enumerate(self._bin_sizes_ms):
-            # Use convolution for efficient binning
-            kernel = tf.ones((bin_size, 1, 1), dtype=self._dtype)
-            convolved = tf.nn.conv1d(spikes, kernel, stride=bin_size, padding="VALID")
-            sp_counts = tf.squeeze(convolved, axis=-1)  # Shape: (60, new_width)
+            n_bins = tf.shape(spikes)[1] // bin_size
+            trimmed = spikes[:, :n_bins * bin_size]
+            sp_counts = tf.reduce_sum(
+                tf.reshape(trimmed, [tf.shape(spikes)[0], n_bins, bin_size]),
+                axis=2,
+            )
             # Compute mean and variance of spike counts
             mean_count = tf.reduce_mean(sp_counts, axis=1)
             var_count = tf.math.reduce_variance(sp_counts, axis=1)
@@ -1088,6 +1142,8 @@ class SynchronizationLoss(Layer):
 
 
     def __call__(self, spikes, trim=True):
+        if self._sync_cost <= 0:
+            return tf.constant(0.0, dtype=self._dtype)
 
         spikes = tf.boolean_mask(spikes, self._core_excitatory_mask, axis=2)
 
@@ -1098,31 +1154,36 @@ class SynchronizationLoss(Layer):
         bin_sizes_mask = self._bin_sizes_ms_tf < bin_limit_ms
         experimental_fanos_mean = tf.boolean_mask(self.experimental_fanos_mean, bin_sizes_mask)
 
-        # if spikes.dtype != self._dtype:
-        #     spikes = tf.cast(spikes, self._dtype)
         # choose random trials to sample from (usually we only have 1 trial to sample from)
         n_trials = tf.shape(spikes)[0]
-        # increase the base seed to avoid the same random neurons to be selected in every instantiation of the class
-        self._base_seed += 1
-        sample_trials = tf.random.uniform([self._n_samples], minval=0, maxval=n_trials, dtype=tf.int32, seed=self._base_seed)
-        # Generate sample counts with a normal distribution
-        sample_size = 70
-        sample_std = 30
-        sample_counts = tf.cast(tf.random.normal([self._n_samples], mean=sample_size, stddev=sample_std, seed=self._base_seed), tf.int32)
-        sample_counts = tf.clip_by_value(sample_counts, clip_value_min=15, clip_value_max=tf.shape(self.node_id_e)[0]) # clip the values to be between 15 and 14423
-        # Randomize the neuron ids
-        shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
+        call_seed = self._next_seed_pair()
+        sample_trials_seed = tf.random.experimental.stateless_fold_in(
+            call_seed, tf.constant(1, dtype=tf.int32)
+        )
+        shuffled_ids_seed = tf.random.experimental.stateless_fold_in(
+            call_seed, tf.constant(3, dtype=tf.int32)
+        )
+        sample_trials = tf.random.stateless_uniform(
+            [self._n_samples],
+            seed=sample_trials_seed,
+            minval=0,
+            maxval=n_trials,
+            dtype=tf.int32,
+        )
+        shuffled_e_ids = self._stateless_shuffle(self.node_id_e, shuffled_ids_seed)
         selected_spikes_sample = tf.TensorArray(spikes.dtype, size=self._n_samples)
         previous_id = tf.constant(0, dtype=tf.int32)
         for i in tf.range(self._n_samples):
-            sample_num = sample_counts[i] # 40 #68
+            sample_num = self._sample_counts[i] # 40 #68
             sample_trial = sample_trials[i] # 0
             ## randomly choose sample_num ids from self.node_id_e with replacement
             ## sample_ids = tf.random.shuffle(self.node_id_e)[:sample_num]
             ## randomly choose sample_num ids from shuffled_ids without replacement
             if previous_id + sample_num > tf.size(shuffled_e_ids):
-                # shuffled_e_ids = tf.random.shuffle(self.node_id_e, seed=self._base_seed)
-                shuffled_e_ids = tf.random.shuffle(shuffled_e_ids, seed=self._base_seed)
+                reshuffle_seed = tf.random.experimental.stateless_fold_in(
+                    call_seed, tf.cast(i + 1000, tf.int32)
+                )
+                shuffled_e_ids = self._stateless_shuffle(shuffled_e_ids, reshuffle_seed)
                 previous_id = tf.constant(0, dtype=tf.int32)
             sample_ids = shuffled_e_ids[previous_id:previous_id+sample_num]
             previous_id += sample_num
@@ -2000,6 +2061,7 @@ class OrientationSelectivityLoss:
         )
         return osi_scale, dsi_scale
 
+    @tf.function(jit_compile=True)
     def rates_per_sample_from_spikes(self, spikes, trim=True):
         """Return full-population rates with shape ``[batch, neurons]``."""
         spikes = spike_trimming(
