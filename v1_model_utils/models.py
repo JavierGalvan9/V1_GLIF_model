@@ -2,6 +2,10 @@ import numpy as np
 import tensorflow as tf
 import os
 import pickle as pkl
+from .cuda_synaptic_currents import (
+    build_csr_connectivity,
+    calculate_synaptic_currents as calculate_synaptic_currents_cuda,
+)
 try:
     from numba import njit
     HAS_NUMBA = True
@@ -516,7 +520,9 @@ class V1Column(tf.keras.layers.Layer):
         train_noise=True,
         noise_seed=0,
         hard_reset=False,
-        current_input=False
+        current_input=False,
+        synaptic_current_backend="cuda",
+        cuda_weight_mode="fp16_shadow",
     ):
         super().__init__()
         # Disable Keras layer autocast so tensors keep explicit dtypes:
@@ -551,6 +557,18 @@ class V1Column(tf.keras.layers.Layer):
         self.noise_stream = tf.Variable(0, trainable=False, dtype=tf.int64, name="noise_stream")
         self._hard_reset = hard_reset
         self._current_input = current_input
+        if synaptic_current_backend not in ("cuda", "tensorflow"):
+            raise ValueError(
+                "synaptic_current_backend must be 'cuda' or 'tensorflow', got "
+                f"{synaptic_current_backend!r}"
+            )
+        self.synaptic_current_backend = synaptic_current_backend
+        if cuda_weight_mode not in ("fp16_shadow", "fp32_master"):
+            raise ValueError(
+                "cuda_weight_mode must be 'fp16_shadow' or 'fp32_master', got "
+                f"{cuda_weight_mode!r}"
+            )
+        self.cuda_weight_mode = cuda_weight_mode
         self._n_neurons = int(network["n_nodes"])
         self._gauss_std = tf.constant(gauss_std, self.compute_dtype)
         # Determine the membrane time decay constant
@@ -679,14 +697,23 @@ class V1Column(tf.keras.layers.Layer):
         indices[:, 1] = indices[:, 1] + self._n_neurons * (delays - 1)
         self.recurrent_dense_shape = dense_shape[0], self.max_delay * dense_shape[1]
         #the first column (presynaptic neuron) has size n_neurons and the second column (postsynaptic neuron) has size max_delay*n_neurons
-        # Define the Tensorflow variables
-        self.recurrent_indices = tf.Variable(indices, dtype=tf.int64, trainable=False) #dtype necessary for sparse dense matmul
-        self.recurrent_post_ids = tf.constant(indices[:, 0], dtype=tf.int64)
-        self.pre_ind_table = make_pre_ind_table(
-            indices,
-            n_source_neurons=self.recurrent_dense_shape[1],
-            order_keys=(indices[:, 0], syn_ids),
-        ) # dtype int32
+        if self.synaptic_current_backend == "cuda":
+            self.recurrent_csr = build_csr_connectivity(
+                indices,
+                syn_ids,
+                n_pre=self.recurrent_dense_shape[1],
+                n_post=self.recurrent_dense_shape[0],
+            )
+        else:
+            self.recurrent_indices = tf.Variable(
+                indices, dtype=tf.int64, trainable=False
+            )
+            self.recurrent_post_ids = tf.constant(indices[:, 0], dtype=tf.int64)
+            self.pre_ind_table = make_pre_ind_table(
+                indices,
+                n_source_neurons=self.recurrent_dense_shape[1],
+                order_keys=(indices[:, 0], syn_ids),
+            )
         # add dimension for the weights factors - TensorShape([23525415, 1])
         # weights = tf.expand_dims(weights, axis=1)
         # Set the sign of the connections (exc or inh)
@@ -715,7 +742,14 @@ class V1Column(tf.keras.layers.Layer):
         ) # shape = (n_synapses,)
         # Keep a non-trainable compute-lane shadow to avoid full-table casts
         # in the recurrent custom gradient path at every timestep.
-        if self.variable_dtype != self.compute_dtype:
+        use_compute_shadow = (
+            self.variable_dtype != self.compute_dtype
+            and not (
+                self.synaptic_current_backend == "cuda"
+                and self.cuda_weight_mode == "fp32_master"
+            )
+        )
+        if use_compute_shadow:
             recurrent_weight_values_compute = tf.Variable(
                 tf.cast(self.recurrent_weight_values, self.compute_dtype),
                 name="sparse_recurrent_weights_compute",
@@ -744,7 +778,8 @@ class V1Column(tf.keras.layers.Layer):
         # else:
         #     self.per_type_training = False
 
-        self.syn_ids = tf.constant(syn_ids, dtype=tf.int64) # this needs to be int64 for efficiency
+        if self.synaptic_current_backend == "tensorflow":
+            self.syn_ids = tf.constant(syn_ids, dtype=tf.int64)
         # self.recurrent_weights_factors = tf.gather(self.synaptic_basis_weights, self.syn_ids, axis=0) # TensorShape([23525415, 5])
         print(f"    > # Recurrent synapses: {len(indices)}")
 
@@ -985,23 +1020,30 @@ class V1Column(tf.keras.layers.Layer):
 
     def calculate_i_rec_with_custom_grad(self, rec_z_buf):
 
-        # This function performs the tensor multiplication to calculate the recurrent currents at each timestep.
-        # Backward mode is selectable:
-        # - receptor_loop: legacy per-receptor sparse matmul path
-        # - receptor_loop_sparse_left: receptor loop using sparse-first matmul kernel path
-        # - chunked_fused: fused receptor projection + segment accumulation
-        i_rec_flat = calculate_synaptic_currents(
-            rec_z_buf,
-            self.recurrent_indices,
-            self.recurrent_post_ids,
-            self.recurrent_weight_values,
-            self.recurrent_weight_values_compute,
-            self.recurrent_dense_shape,
-            self.synaptic_basis_weights,
-            self.syn_ids,
-            self.pre_ind_table,
-            self._recurrent_dampening,
-        )
+        # Calculate recurrent currents with the selected fused CUDA or reference
+        # TensorFlow implementation.
+        if self.synaptic_current_backend == "cuda":
+            i_rec_flat = calculate_synaptic_currents_cuda(
+                rec_z_buf,
+                self.recurrent_weight_values,
+                self.recurrent_weight_values_compute,
+                self.synaptic_basis_weights,
+                self._recurrent_dampening,
+                self.recurrent_csr,
+            )
+        else:
+            i_rec_flat = calculate_synaptic_currents(
+                rec_z_buf,
+                self.recurrent_indices,
+                self.recurrent_post_ids,
+                self.recurrent_weight_values,
+                self.recurrent_weight_values_compute,
+                self.recurrent_dense_shape,
+                self.synaptic_basis_weights,
+                self.syn_ids,
+                self.pre_ind_table,
+                self._recurrent_dampening,
+            )
 
         # Cast back to compute_dtype to keep downstream state buffers compact.
         # if i_rec_flat.dtype != self.compute_dtype:
@@ -1278,6 +1320,8 @@ def create_model(
     current_input=False,
     use_dummy_state_input=False,
     seed=42,
+    synaptic_current_backend="cuda",
+    cuda_weight_mode="fp16_shadow",
 ):
 
     # Create the input layer of the model
@@ -1322,7 +1366,9 @@ def create_model(
         train_noise=train_noise,
         noise_seed=seed,
         hard_reset=hard_reset,
-        current_input=current_input
+        current_input=current_input,
+        synaptic_current_backend=synaptic_current_backend,
+        cuda_weight_mode=cuda_weight_mode,
     )
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.

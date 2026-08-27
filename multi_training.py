@@ -135,7 +135,9 @@ def main(_):
             max_delay=flags.max_delay,  # 0 = auto-compute from SONATA data
             current_input=flags.current_input,
             seed=flags.seed,
-            use_dummy_state_input=False
+            use_dummy_state_input=False,
+            synaptic_current_backend=flags.synaptic_current_backend,
+            cuda_weight_mode=flags.cuda_weight_mode,
         )
 
         # Initialize the weights of the model based on the specified input shape. It operates in eager mode.
@@ -1557,6 +1559,18 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_string('neuron_model', 'GLIF3', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')
     absl.app.flags.DEFINE_string('dtype', 'float16', '')
+    absl.app.flags.DEFINE_enum(
+        'synaptic_current_backend',
+        'cuda',
+        ['cuda', 'tensorflow'],
+        'Recurrent synaptic-current implementation.',
+    )
+    absl.app.flags.DEFINE_enum(
+        'cuda_weight_mode',
+        'fp16_shadow',
+        ['fp16_shadow', 'fp32_master'],
+        'CUDA recurrent-weight storage and compute mode.',
+    )
     absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')

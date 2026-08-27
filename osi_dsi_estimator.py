@@ -11,7 +11,6 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import absl
-import re
 import copy
 import numpy as np
 import tensorflow as tf
@@ -122,7 +121,9 @@ def main(_):
                 max_delay=flags.max_delay,  # 0 = auto-compute from SONATA data
                 current_input=flags.current_input,
                 use_dummy_state_input=False,
-                seed=flags.seed
+                seed=flags.seed,
+                synaptic_current_backend=flags.synaptic_current_backend,
+                cuda_weight_mode=flags.cuda_weight_mode,
             )
             temp_model.build((per_replica_batch_size, flags.seq_len, flags.n_input))
             return temp_model
@@ -147,7 +148,7 @@ def main(_):
 
         # model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
         model_variables_dict['Best'] =  {var.name: var.numpy() for var in model.trainable_variables} # float32 dtype
-        print(f"Model variables stored in dictionary\n")
+        print("Model variables stored in dictionary\n")
 
         # Build the model layers
         rsnn_layer = model.get_layer('rsnn')
@@ -363,6 +364,18 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('scale', '2,2', '')
     absl.app.flags.DEFINE_string('optimizer', 'exp_adam', '')
     absl.app.flags.DEFINE_string('dtype', 'float32', '')
+    absl.app.flags.DEFINE_enum(
+        'synaptic_current_backend',
+        'cuda',
+        ['cuda', 'tensorflow'],
+        'Recurrent synaptic-current implementation.',
+    )
+    absl.app.flags.DEFINE_enum(
+        'cuda_weight_mode',
+        'fp16_shadow',
+        ['fp16_shadow', 'fp32_master'],
+        'CUDA recurrent-weight storage and compute mode.',
+    )
     absl.app.flags.DEFINE_float('learning_rate', .005, '')
     absl.app.flags.DEFINE_string('lr_schedule', 'none',
         "Learning-rate schedule. Options: 'none' or 'warmup_cosine'.",
