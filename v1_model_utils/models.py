@@ -106,7 +106,7 @@ def spike_slayer(v_scaled, sigma, amplitude):
 
 # @tf.function(jit_compile=True) # (No registered 'RaggedGather' OpKernel for XLA_GPU_JIT devices)
 @tf.custom_gradient
-def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, weight_values,
+def calculate_synaptic_currents(rec_z_buf, synapse_indices, weight_values,
                                 weight_values_compute, dense_shape, synaptic_basis_weights,
                                 syn_ids, pre_ind_table, dampening_factor):
     """
@@ -138,9 +138,9 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, wei
 
     # Retrieve connections and weights for active presynaptic neurons
     # This uses pre_ind_table (RaggedTensor), which benefits from int64 on CPU
-    post_neuron_indices, new_weights, new_syn_ids, post_in_degree, all_synaptic_inds = (
+    post_neuron_indices, new_weights, new_syn_ids, post_in_degree = (
         get_active_synapse_data_table(
-            post_ids_by_syn,
+            synapse_indices,
             weight_values_compute,
             syn_ids,
             pre_neuron_indices,
@@ -236,7 +236,7 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, wei
         # indexing tensors alive across the forward pass.
         post_neuron_indices_g, new_syn_ids_g, post_in_degree_g, all_synaptic_inds_g = (
             get_active_synapse_metadata_table(
-                post_ids_by_syn,
+                synapse_indices,
                 syn_ids,
                 pre_neuron_indices,
                 pre_ind_table,
@@ -275,7 +275,6 @@ def calculate_synaptic_currents(rec_z_buf, synapse_indices, post_ids_by_syn, wei
         return [
             de_dv,              # Gradient w.r.t rec_z_buf (compute_dtype)
             None,               # synapse_indices (constant)
-            None,               # post_ids_by_syn (constant)
             de_dweight_values,  # Gradient w.r.t weight_values (float32, matches master weights)
             None,               # weight_values_compute (non-trainable shadow copy)
             None,               # dense_shape[0] (constant)
@@ -443,24 +442,24 @@ def make_pre_ind_table(indices, n_source_neurons=197613, order_keys=None):
 #     # For efficiency, rt should be in int32 dtype
 #     return tf.RaggedTensor.from_row_splits(sort_idx, row_splits, validate=False)
 
-def get_active_synapse_data_table(post_ids_by_syn, weights, syn_ids, non_zero_cols, pre_ind_table):
+def get_active_synapse_data_table(indices, weights, syn_ids, non_zero_cols, pre_ind_table):
     """Gather active post ids, weights, and synapse ids without materializing full index rows."""
     selected_rows = tf.gather(pre_ind_table, non_zero_cols)
     all_synapse_inds = selected_rows.flat_values
     post_in_degree = selected_rows.row_lengths()  # int64
-    active_post_ids = tf.gather(post_ids_by_syn, all_synapse_inds)
+    active_post_ids = tf.gather(indices, all_synapse_inds)[:, 0]
     active_weights = tf.gather(weights, all_synapse_inds)
     active_syn_ids = tf.gather(syn_ids, all_synapse_inds)
 
-    return active_post_ids, active_weights, active_syn_ids, post_in_degree, all_synapse_inds
+    return active_post_ids, active_weights, active_syn_ids, post_in_degree
 
 
-def get_active_synapse_metadata_table(post_ids_by_syn, syn_ids, non_zero_cols, pre_ind_table):
+def get_active_synapse_metadata_table(indices, syn_ids, non_zero_cols, pre_ind_table):
     """Gather only the metadata needed to rebuild active recurrent indexing in backward."""
     selected_rows = tf.gather(pre_ind_table, non_zero_cols)
     all_synapse_inds = selected_rows.flat_values
     post_in_degree = selected_rows.row_lengths()  # int64
-    active_post_ids = tf.gather(post_ids_by_syn, all_synapse_inds)
+    active_post_ids = tf.gather(indices, all_synapse_inds)[:, 0]
     active_syn_ids = tf.gather(syn_ids, all_synapse_inds)
 
     return active_post_ids, active_syn_ids, post_in_degree, all_synapse_inds
@@ -702,7 +701,6 @@ class V1Column(tf.keras.layers.Layer):
             self.recurrent_indices = tf.Variable(
                 indices, dtype=tf.int64, trainable=False
             )
-            self.recurrent_post_ids = tf.constant(indices[:, 0], dtype=tf.int64)
             self.pre_ind_table = make_pre_ind_table(
                 indices,
                 n_source_neurons=self.recurrent_dense_shape[1],
@@ -772,7 +770,6 @@ class V1Column(tf.keras.layers.Layer):
         # input_delays = np.round(np.clip(input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
         self.input_indices = tf.Variable(input_indices, trainable=False, dtype=tf.int64)
-        self.input_post_ids = tf.constant(input_indices[:, 0], dtype=tf.int64)
 
         # Define the Tensorflow variables
         # input_weight_positive = tf.Variable(
@@ -806,7 +803,6 @@ class V1Column(tf.keras.layers.Layer):
         # bkg_input_delays = np.round(np.clip(bkg_input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # bkg_input_indices[:, 1] = bkg_input_indices[:, 1] + self._n_neurons * (bkg_input_delays - 1)
         self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int64)
-        self.bkg_input_post_ids = tf.constant(bkg_input_indices[:, 0], dtype=tf.int64)
         # self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int32)
         self.pre_bkg_ind_table = make_pre_ind_table(bkg_input_indices, n_source_neurons=self.bkg_input_dense_shape[1])
 
@@ -887,8 +883,8 @@ class V1Column(tf.keras.layers.Layer):
 
         # Get the indices into self.recurrent_indices for each pre_neuron_index
         # self.pre_ind_table is a RaggedTensor or a list of lists mapping pre_neuron_index to indices in recurrent_indices
-        post_neuron_indices, new_weights, new_syn_ids, post_in_degree, _ = get_active_synapse_data_table(
-            self.input_post_ids,
+        post_neuron_indices, new_weights, new_syn_ids, post_in_degree = get_active_synapse_data_table(
+            self.input_indices,
             self.input_weight_values,
             self.input_syn_ids,
             pre_neuron_indices,
@@ -948,8 +944,8 @@ class V1Column(tf.keras.layers.Layer):
         pre_neuron_indices = non_zero_indices[:, 1] #int64
         # Get the indices into self.recurrent_indices for each pre_neuron_index
         # self.pre_ind_table is a RaggedTensor or a list of lists mapping pre_neuron_index to indices in recurrent_indices
-        post_neuron_indices, new_weights, new_syn_ids, post_in_degree, _ = get_active_synapse_data_table(
-            self.bkg_input_post_ids,
+        post_neuron_indices, new_weights, new_syn_ids, post_in_degree = get_active_synapse_data_table(
+            self.bkg_input_indices,
             self.bkg_input_weights,
             self.bkg_input_syn_ids,
             pre_neuron_indices,
@@ -1008,7 +1004,6 @@ class V1Column(tf.keras.layers.Layer):
             i_rec_flat = calculate_synaptic_currents(
                 rec_z_buf,
                 self.recurrent_indices,
-                self.recurrent_post_ids,
                 self.recurrent_weight_values,
                 tf.cast(self.recurrent_weight_values, self.compute_dtype),
                 self.recurrent_dense_shape,
