@@ -366,6 +366,24 @@ def main(_):
                 )
 
         extractor_model = models.build_sequence_only_model(model, rsnn_layer)
+        segmented_extractor = None
+        if flags.gradient_checkpointing:
+            segmented_core_model = models.build_sequence_and_state_model(
+                model, rsnn_layer
+            )
+            segmented_extractor = models.SegmentedRecomputeRunner(
+                segmented_core_model,
+                sequence_length=flags.seq_len,
+                chunk_size=flags.gradient_checkpoint_chunk_size,
+                differentiate_inputs=False,
+            )
+            print(
+                "Gradient checkpointing: segmented exact BPTT "
+                f"({segmented_extractor.n_chunks} chunks, "
+                f"chunk_size={segmented_extractor.chunk_size})."
+            )
+        else:
+            print("Gradient checkpointing disabled.")
         state_fallback_model = None
         # State-only model to avoid storing full sequences when only the final state is needed.
         try:
@@ -455,11 +473,10 @@ def main(_):
             rsnn_layer.cell.noise_seed,
         )
 
-    if flags.gradient_checkpointing:
-        @tf.recompute_grad
+    if segmented_extractor is not None:
         def extractor_forward(x, state_vars):
-            # Call extractor model without storing intermediate state variables.
-            return extractor_model((x, state_vars))
+            outputs = segmented_extractor(x, state_vars)
+            return outputs[:segmented_extractor.n_sequence_outputs]
     else:
         def extractor_forward(x, state_vars):
             return extractor_model((x, state_vars))
@@ -1702,6 +1719,11 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
+    absl.app.flags.DEFINE_integer(
+        "gradient_checkpoint_chunk_size",
+        25,
+        "Temporal chunk size for segmented exact-BPTT recomputation.",
+    )
     absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")
     absl.app.flags.DEFINE_boolean(
         "sequential_stimuli", True, "Run evoked and spontaneous stimuli sequentially but convergence would be slower and worse (memory friendly; intended for batch_size=1).")
