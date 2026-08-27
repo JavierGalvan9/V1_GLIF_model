@@ -26,7 +26,5 @@ the model's sparse firing regime.
 Training defaults to `--synaptic_current_backend=cuda`. Use
 `--synaptic_current_backend=tensorflow` only as a reference/debug fallback.
 
-Mixed-precision CUDA training defaults to
-`--cuda_weight_mode=fp16_shadow`. Set `--cuda_weight_mode=fp32_master` to load
-the optimizer's FP32 master weights directly and avoid allocating or refreshing
-the persistent FP16 weight shadow.
+The CUDA kernels consume the FP32 recurrent master weights directly. Activations
+and synaptic basis values still use the model compute dtype.

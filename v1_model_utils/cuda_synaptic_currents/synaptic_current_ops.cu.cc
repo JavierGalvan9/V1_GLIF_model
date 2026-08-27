@@ -448,23 +448,16 @@ class V1CsrBackwardOp : public OpKernel {
   int n_edges_;
 };
 
-#define REGISTER_PAIR(T, W)                                                \
+#define REGISTER_TYPE(T)                                                   \
   REGISTER_KERNEL_BUILDER(                                                 \
-      Name("V1CsrForward").Device(DEVICE_GPU).TypeConstraint<T>("T")      \
-          .TypeConstraint<W>("W"),                                        \
-      V1CsrForwardOp<T, W>);                                               \
+      Name("V1CsrForward").Device(DEVICE_GPU).TypeConstraint<T>("T"),     \
+      V1CsrForwardOp<T, float>);                                           \
   REGISTER_KERNEL_BUILDER(                                                 \
-      Name("V1CsrBackward").Device(DEVICE_GPU).TypeConstraint<T>("T")     \
-          .TypeConstraint<W>("W"),                                        \
-      V1CsrBackwardOp<T, W>);
+      Name("V1CsrBackward").Device(DEVICE_GPU).TypeConstraint<T>("T"),    \
+      V1CsrBackwardOp<T, float>);
 
-#define REGISTER_WEIGHTS(T)                                                \
-  REGISTER_PAIR(T, Eigen::half);                                          \
-  REGISTER_PAIR(T, float)
-
-TF_CALL_half(REGISTER_WEIGHTS);
-TF_CALL_float(REGISTER_WEIGHTS);
-#undef REGISTER_WEIGHTS
-#undef REGISTER_PAIR
+TF_CALL_half(REGISTER_TYPE);
+TF_CALL_float(REGISTER_TYPE);
+#undef REGISTER_TYPE
 
 #endif

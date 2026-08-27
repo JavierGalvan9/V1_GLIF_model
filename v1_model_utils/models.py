@@ -522,7 +522,6 @@ class V1Column(tf.keras.layers.Layer):
         hard_reset=False,
         current_input=False,
         synaptic_current_backend="cuda",
-        cuda_weight_mode="fp16_shadow",
     ):
         super().__init__()
         # Disable Keras layer autocast so tensors keep explicit dtypes:
@@ -563,12 +562,6 @@ class V1Column(tf.keras.layers.Layer):
                 f"{synaptic_current_backend!r}"
             )
         self.synaptic_current_backend = synaptic_current_backend
-        if cuda_weight_mode not in ("fp16_shadow", "fp32_master"):
-            raise ValueError(
-                "cuda_weight_mode must be 'fp16_shadow' or 'fp32_master', got "
-                f"{cuda_weight_mode!r}"
-            )
-        self.cuda_weight_mode = cuda_weight_mode
         self._n_neurons = int(network["n_nodes"])
         self._gauss_std = tf.constant(gauss_std, self.compute_dtype)
         # Determine the membrane time decay constant
@@ -740,26 +733,6 @@ class V1Column(tf.keras.layers.Layer):
             trainable=individual_training,
             dtype=self.variable_dtype
         ) # shape = (n_synapses,)
-        # Keep a non-trainable compute-lane shadow to avoid full-table casts
-        # in the recurrent custom gradient path at every timestep.
-        use_compute_shadow = (
-            self.variable_dtype != self.compute_dtype
-            and not (
-                self.synaptic_current_backend == "cuda"
-                and self.cuda_weight_mode == "fp32_master"
-            )
-        )
-        if use_compute_shadow:
-            recurrent_weight_values_compute = tf.Variable(
-                tf.cast(self.recurrent_weight_values, self.compute_dtype),
-                name="sparse_recurrent_weights_compute",
-                trainable=False,
-                dtype=self.compute_dtype,
-            )
-            # Keep untracked so older checkpoints remain loadable with assert_consumed().
-            self.recurrent_weight_values_compute = self._no_dependency(recurrent_weight_values_compute)
-        else:
-            self.recurrent_weight_values_compute = self.recurrent_weight_values
 
         # # prepare per_type variable, if required
         # if per_type_training:
@@ -1026,7 +999,6 @@ class V1Column(tf.keras.layers.Layer):
             i_rec_flat = calculate_synaptic_currents_cuda(
                 rec_z_buf,
                 self.recurrent_weight_values,
-                self.recurrent_weight_values_compute,
                 self.synaptic_basis_weights,
                 self._recurrent_dampening,
                 self.recurrent_csr,
@@ -1037,7 +1009,7 @@ class V1Column(tf.keras.layers.Layer):
                 self.recurrent_indices,
                 self.recurrent_post_ids,
                 self.recurrent_weight_values,
-                self.recurrent_weight_values_compute,
+                tf.cast(self.recurrent_weight_values, self.compute_dtype),
                 self.recurrent_dense_shape,
                 self.synaptic_basis_weights,
                 self.syn_ids,
@@ -1050,18 +1022,6 @@ class V1Column(tf.keras.layers.Layer):
         #     i_rec_flat = tf.cast(i_rec_flat, dtype=self.compute_dtype)
 
         return i_rec_flat
-
-    def refresh_recurrent_weight_shadow(self):
-        # If both names point to the same variable object, there’s no separate shadow copy to update, so exit.
-        if self.recurrent_weight_values_compute is self.recurrent_weight_values:
-            return
-        # If weights are frozen, no training updates are expected, so skip syncing.
-        if not self.recurrent_weight_values.trainable:
-            return
-        # Copy current trainable recurrent weights into the compute copy, casting to the model’s compute dtype
-        self.recurrent_weight_values_compute.assign(
-            tf.cast(self.recurrent_weight_values, self.compute_dtype)
-        )
 
     # @tf.function(jit_compile=True) does not work here because it breaks the graph structure
     def update_psc(self, psc, psc_rise, rec_inputs):
@@ -1321,7 +1281,6 @@ def create_model(
     use_dummy_state_input=False,
     seed=42,
     synaptic_current_backend="cuda",
-    cuda_weight_mode="fp16_shadow",
 ):
 
     # Create the input layer of the model
@@ -1368,7 +1327,6 @@ def create_model(
         hard_reset=hard_reset,
         current_input=current_input,
         synaptic_current_backend=synaptic_current_backend,
-        cuda_weight_mode=cuda_weight_mode,
     )
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.

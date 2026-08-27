@@ -123,7 +123,6 @@ def main(_):
                 use_dummy_state_input=False,
                 seed=flags.seed,
                 synaptic_current_backend=flags.synaptic_current_backend,
-                cuda_weight_mode=flags.cuda_weight_mode,
             )
             temp_model.build((per_replica_batch_size, flags.seq_len, flags.n_input))
             return temp_model
@@ -152,7 +151,6 @@ def main(_):
 
         # Build the model layers
         rsnn_layer = model.get_layer('rsnn')
-        rsnn_layer.cell.refresh_recurrent_weight_shadow()
         # prediction_layer = model.get_layer('prediction')
         # abstract_layer = model.get_layer('abstract_output')
         extractor_model = tf.keras.Model(inputs=model.inputs, outputs=rsnn_layer.output)
@@ -369,12 +367,6 @@ if __name__ == '__main__':
         'cuda',
         ['cuda', 'tensorflow'],
         'Recurrent synaptic-current implementation.',
-    )
-    absl.app.flags.DEFINE_enum(
-        'cuda_weight_mode',
-        'fp16_shadow',
-        ['fp16_shadow', 'fp32_master'],
-        'CUDA recurrent-weight storage and compute mode.',
     )
     absl.app.flags.DEFINE_float('learning_rate', .005, '')
     absl.app.flags.DEFINE_string('lr_schedule', 'none',

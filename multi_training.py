@@ -137,7 +137,6 @@ def main(_):
             seed=flags.seed,
             use_dummy_state_input=False,
             synaptic_current_backend=flags.synaptic_current_backend,
-            cuda_weight_mode=flags.cuda_weight_mode,
         )
 
         # Initialize the weights of the model based on the specified input shape. It operates in eager mode.
@@ -188,7 +187,6 @@ def main(_):
 
         # Extract outputs of intermediate keras layers to get access to spikes and membrane voltages of the model
         rsnn_layer = model.get_layer("rsnn")
-        rsnn_layer.cell.refresh_recurrent_weight_shadow()
         # prediction_layer = model.get_layer('prediction')
 
         ### RECURRENT REGULARIZERS ###
@@ -680,7 +678,6 @@ def main(_):
             grad = _print_and_check_gradients(grad, "[Combined]")
 
         optimizer.apply_gradients(zip(grad, model.trainable_variables))
-        rsnn_layer.cell.refresh_recurrent_weight_shadow()
 
         mean_aux = {
             "rate_loss": (evoked_aux["rate_loss"] + spont_aux["rate_loss"]) / 2.0,
@@ -725,7 +722,6 @@ def main(_):
             )
 
         optimizer.apply_gradients(zip(grad, model.trainable_variables))
-        rsnn_layer.cell.refresh_recurrent_weight_shadow()
 
         train_loss.update_state(
             _loss * strategy.num_replicas_in_sync, sample_weight=metric_weight
@@ -1564,12 +1560,6 @@ if __name__ == '__main__':
         'cuda',
         ['cuda', 'tensorflow'],
         'Recurrent synaptic-current implementation.',
-    )
-    absl.app.flags.DEFINE_enum(
-        'cuda_weight_mode',
-        'fp16_shadow',
-        ['fp16_shadow', 'fp32_master'],
-        'CUDA recurrent-weight storage and compute mode.',
     )
     absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')

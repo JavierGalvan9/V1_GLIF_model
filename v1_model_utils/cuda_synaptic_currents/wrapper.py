@@ -86,17 +86,14 @@ def build_csr_connectivity(indices, synapse_types, n_pre, n_post):
     )
 
 
-def calculate_synaptic_currents(
-    spikes, master_weights, compute_weights, basis, dampening, connectivity
-):
+def calculate_synaptic_currents(spikes, weights, basis, dampening, connectivity):
     """Calculate currents with gradients for spikes and original-order weights."""
     ops = _load_ops()
 
     @tf.custom_gradient
     def fused(
         spike_values,
-        master_weight_values,
-        compute_weight_values,
+        weight_values,
         basis_values,
         post_ids,
         synapse_types,
@@ -109,7 +106,7 @@ def calculate_synaptic_currents(
         currents = ops.v1_csr_forward(
             spike_values,
             active,
-            compute_weight_values,
+            weight_values,
             post_ids,
             synapse_types,
             row_splits,
@@ -122,7 +119,7 @@ def calculate_synaptic_currents(
             spike_grad, weight_grad = ops.v1_csr_backward(
                 spike_values,
                 current_grad,
-                compute_weight_values,
+                weight_values,
                 post_ids,
                 synapse_types,
                 row_splits,
@@ -135,8 +132,7 @@ def calculate_synaptic_currents(
             )
             return (
                 spike_grad,
-                tf.cast(weight_grad, master_weight_values.dtype),
-                None,
+                tf.cast(weight_grad, weight_values.dtype),
                 None,
                 None,
                 None,
@@ -150,8 +146,7 @@ def calculate_synaptic_currents(
 
     return fused(
         spikes,
-        master_weights,
-        compute_weights,
+        weights,
         basis,
         connectivity.post_ids,
         connectivity.synapse_types,
