@@ -14,8 +14,11 @@ import absl
 import socket
 # import re
 import copy
+import json
 import numpy as np
 import pandas as pd
+import statistics
+import subprocess
 import tensorflow as tf
 import pickle as pkl
 from time import strftime, time
@@ -166,6 +169,9 @@ def main(_):
             seed=flags.seed,
             use_dummy_state_input=False,
             synaptic_current_backend=flags.synaptic_current_backend,
+            track_voltage_penalty=flags.use_online_voltage_loss,
+            voltage_penalty_mode=flags.voltage_penalty_mode,
+            return_voltage_sequences=not flags.use_online_voltage_loss,
         )
 
         # Initialize the weights of the model based on the specified input shape. It operates in eager mode.
@@ -499,16 +505,33 @@ def main(_):
     if segmented_extractor is not None:
         def extractor_forward(x, state_vars):
             outputs = segmented_extractor(x, state_vars)
+            if flags.use_online_voltage_loss:
+                return outputs[:segmented_extractor.n_sequence_outputs] + (outputs[-1],)
             return outputs[:segmented_extractor.n_sequence_outputs]
     else:
         def extractor_forward(x, state_vars):
+            if flags.use_online_voltage_loss:
+                outputs = sequence_and_state_model((x, state_vars))
+                return tuple(tf.nest.flatten(outputs[0])) + (outputs[-1],)
             return extractor_model((x, state_vars))
 
     def run_extractor(_x, _state_variables):
         if _x.dtype == tf.bool:
             _x = tf.cast(_x, dtype)
         seed_helper.advance_noise_seed()
+        _state_variables = models.reset_voltage_penalty_state(
+            rsnn_layer.cell, _state_variables
+        )
         return extractor_forward(_x, _state_variables)
+
+    def voltage_loss_from_source(voltage_source):
+        if flags.use_online_voltage_loss:
+            return (
+                tf.reduce_mean(tf.cast(voltage_source, tf.float32))
+                / tf.cast(flags.seq_len, tf.float32)
+                * tf.cast(flags.voltage_cost, tf.float32)
+            )
+        return tf.cast(voltage_regularizer(voltage_source), tf.float32)
 
     def _gradient_value_tensor(gradient):
         if isinstance(gradient, tf.IndexedSlices):
@@ -573,11 +596,11 @@ def main(_):
             return [_identity_gradient_with_control(g) for g in gradients]
 
     def _compute_losses_from_activity(
-        _z, _v, y, spontaneous, trim, regularizers_loss, update_state=True
+        _z, voltage_source, y, spontaneous, trim, regularizers_loss, update_state=True
     ):
 
         # keep final scalar aggregation in float32
-        voltage_loss = tf.cast(voltage_regularizer(_v), tf.float32)
+        voltage_loss = voltage_loss_from_source(voltage_source)
         spontaneous = tf.cast(spontaneous, tf.bool)
 
         def _evoked_losses():
@@ -650,7 +673,7 @@ def main(_):
 
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), initial_state)
         _out = run_extractor(x, initial_state)
-        _z, _v = _out
+        _z, voltage_source = _out
 
         # # update state_variables with the new model state
         # new_state = tuple(_out[1:])
@@ -663,7 +686,7 @@ def main(_):
             )
 
         _loss, _aux = _compute_losses_from_activity(
-            _z, _v, y, spontaneous, trim, regularizers_loss,
+            _z, voltage_source, y, spontaneous, trim, regularizers_loss,
             update_state=update_loss_state,
         )
 
@@ -674,12 +697,12 @@ def main(_):
         x_concat = tf.concat([x, x_spontaneous], axis=0)
 
         _out = run_extractor(x_concat, initial_state)
-        _z_full, _v_full = _out
+        _z_full, voltage_source_full = _out
 
         _z_evoked = _z_full[:per_replica_batch_size]
-        _v_evoked = _v_full[:per_replica_batch_size]
+        voltage_source_evoked = voltage_source_full[:per_replica_batch_size]
         _z_spont = _z_full[per_replica_batch_size:]
-        _v_spont = _v_full[per_replica_batch_size:]
+        voltage_source_spont = voltage_source_full[per_replica_batch_size:]
 
         regularizers_loss = tf.constant(0.0, dtype=tf.float32)
         if flags.train_recurrent and flags.recurrent_weight_regularization > 0:
@@ -689,11 +712,11 @@ def main(_):
             )
 
         evoked_loss, evoked_aux = _compute_losses_from_activity(
-            _z_evoked, _v_evoked, y, False, trim, regularizers_loss,
+            _z_evoked, voltage_source_evoked, y, False, trim, regularizers_loss,
             update_state=update_loss_state,
         )
         spont_loss, spont_aux = _compute_losses_from_activity(
-            _z_spont, _v_spont, y, True, trim, regularizers_loss,
+            _z_spont, voltage_source_spont, y, True, trim, regularizers_loss,
             update_state=update_loss_state,
         )
 
@@ -1153,9 +1176,7 @@ def main(_):
             z_np = z_local.numpy()
             spont_rates.append(trimmed_rates_hz(z_np))
             spont_rate_losses.append(rate_loss)
-            spont_voltage_losses.append(
-                float(tf.cast(voltage_regularizer(v_local), tf.float32).numpy())
-            )
+            spont_voltage_losses.append(float(voltage_loss_from_source(v_local).numpy()))
             spont_sync_losses.append(
                 float(tf.cast(spont_sync_loss(z_local, trim=True), tf.float32).numpy())
             )
@@ -1194,9 +1215,7 @@ def main(_):
             z_evoked_np = z_evoked.numpy()
             evoked_rates.append(trimmed_rates_hz(z_evoked_np))
             evoked_rate_losses.append(rate_loss)
-            evoked_voltage_losses.append(
-                float(tf.cast(voltage_regularizer(v_evoked), tf.float32).numpy())
-            )
+            evoked_voltage_losses.append(float(voltage_loss_from_source(v_evoked).numpy()))
             evoked_sync_losses.append(
                 float(tf.cast(evoked_sync_loss(z_evoked, trim=True), tf.float32).numpy())
             )
@@ -1426,6 +1445,17 @@ def main(_):
     n_prev_epochs = flags.run_session * flags.n_epochs  # used for resuming training and logging correct epoch numbers in that case
     profiler_logdir = None
     profiler_finished = False
+    benchmark_step_times = []
+    benchmark_total_steps = flags.benchmark_warmup_steps + flags.benchmark_measure_steps
+    if flags.benchmark_output:
+        if flags.benchmark_warmup_steps < 0 or flags.benchmark_measure_steps < 1:
+            raise ValueError("Benchmark warm-up must be non-negative and measured steps positive.")
+        if flags.steps_per_epoch < benchmark_total_steps:
+            raise ValueError("steps_per_epoch must cover benchmark warm-up plus measured steps.")
+        print(
+            f"Benchmark mode: {flags.benchmark_warmup_steps} warm-up + "
+            f"{flags.benchmark_measure_steps} measured updates."
+        )
     if flags.profile_train_step:
         profiler_logdir = flags.profile_logdir or os.path.join(
             logdir, "logs", "profile", strftime("%Y%m%d-%H%M%S")
@@ -1447,13 +1477,15 @@ def main(_):
     it = iter(train_data_set)
 
     for epoch in range(n_prev_epochs, n_prev_epochs + flags.n_epochs):
-        callbacks.on_epoch_start()
+        if not flags.benchmark_output:
+            callbacks.on_epoch_start()
         # Reset the model state to the gray state
         gray_state = distributed_generate_gray_state(real_batch_size)
 
         # tf.profiler.experimental.start(logdir=logdir)
         for step in range(flags.steps_per_epoch):
-            callbacks.on_step_start()
+            if not flags.benchmark_output:
+                callbacks.on_step_start()
             # Start profiler at specified step
             # if step == profile_start_step:
             #     tf.profiler.experimental.start(logdir=logdir)
@@ -1492,6 +1524,9 @@ def main(_):
                 #     model_spikes, step_values = distributed_split_train_step(x_chunk, y, gray_state, x_spont_chunk, trim=chunknum==1)
                 # # distributed_train_step(x, y, w, trim=chunknum==1)
                 # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=chunknum==1)
+                if flags.benchmark_output and step == flags.benchmark_warmup_steps:
+                    tf.config.experimental.reset_memory_stats("GPU:0")
+                start_time = time() if flags.benchmark_output and step >= flags.benchmark_warmup_steps else None
                 if profile_this_step:
                     options = tf.profiler.experimental.ProfilerOptions(
                         host_tracer_level=2,
@@ -1512,6 +1547,8 @@ def main(_):
                     _, step_values = split_train_step(
                         x, y, gray_state, x_spontaneous, trim=True, capture_spikes=False
                     )
+                if start_time is not None:
+                    benchmark_step_times.append(time() - start_time)
                 # break
             except tf.errors.ResourceExhaustedError as e:
                 raise RuntimeError(
@@ -1522,7 +1559,36 @@ def main(_):
                 ) from e
 
 
-            callbacks.on_step_end(step_values, y, verbose=True)
+            if flags.benchmark_output:
+                if len(benchmark_step_times) == flags.benchmark_measure_steps:
+                    memory = tf.config.experimental.get_memory_info("GPU:0")
+                    try:
+                        smi_output = subprocess.check_output(
+                            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                            text=True,
+                        ).splitlines()
+                        process_memory_mib = float(smi_output[flags.profile_gpu_index])
+                    except (OSError, subprocess.CalledProcessError, IndexError, ValueError):
+                        process_memory_mib = None
+                    result = {
+                        "online_voltage_loss": bool(flags.use_online_voltage_loss),
+                        "warmup_steps": flags.benchmark_warmup_steps,
+                        "measured_steps": flags.benchmark_measure_steps,
+                        "mean_step_seconds": statistics.mean(benchmark_step_times),
+                        "median_step_seconds": statistics.median(benchmark_step_times),
+                        "updates_per_second": 1.0 / statistics.mean(benchmark_step_times),
+                        "tf_peak_memory_mib": memory["peak"] / 2**20,
+                        "tf_current_memory_mib": memory["current"] / 2**20,
+                        "nvidia_smi_memory_mib": process_memory_mib,
+                        "last_loss": float(step_values[0]),
+                    }
+                    os.makedirs(os.path.dirname(flags.benchmark_output) or ".", exist_ok=True)
+                    with open(flags.benchmark_output, "w", encoding="utf-8") as output_file:
+                        json.dump(result, output_file, indent=2, sort_keys=True)
+                    print("BENCHMARK_RESULT=" + json.dumps(result, sort_keys=True))
+                    return
+            else:
+                callbacks.on_step_end(step_values, y, verbose=True)
             if profiler_finished and flags.profile_stop_after_capture:
                 print("Stopping after captured profiler step (--profile_stop_after_capture).")
                 return
@@ -1753,6 +1819,20 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
+    absl.app.flags.DEFINE_boolean(
+        "use_online_voltage_loss",
+        True,
+        "Accumulate voltage penalty in the recurrent state instead of retaining voltage sequences.",
+    )
+    absl.app.flags.DEFINE_string(
+        "benchmark_output", "", "Write a fixed-window training benchmark JSON and exit.",
+    )
+    absl.app.flags.DEFINE_integer(
+        "benchmark_warmup_steps", 3, "Unmeasured updates before benchmark timing.",
+    )
+    absl.app.flags.DEFINE_integer(
+        "benchmark_measure_steps", 20, "Measured updates before benchmark exit.",
+    )
     absl.app.flags.DEFINE_integer(
         "gradient_checkpoint_chunk_size",
         25,

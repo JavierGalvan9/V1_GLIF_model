@@ -42,6 +42,69 @@ def slayer_pseudo(v_scaled, sigma, amplitude):
     amplitude = tf.cast(amplitude, dtype)
     return tf.math.exp(-sigma * tf.abs(v_scaled)) * amplitude
 
+
+@tf.custom_gradient
+def _range_voltage_penalty_mean(voltage, inverse_n_neurons):
+    """Compute the neuron mean and return it in the voltage compute dtype."""
+    centered = voltage - tf.cast(0.5, voltage.dtype)
+    outside = tf.nn.relu(tf.abs(centered) - tf.cast(0.5, voltage.dtype))
+    mean_penalty = (
+        tf.reduce_sum(tf.cast(tf.square(outside), tf.float32), axis=1)
+        * inverse_n_neurons
+    )
+    mean_penalty = tf.cast(mean_penalty, voltage.dtype)
+
+    def grad(dy):
+        direction = tf.sign(centered)
+        reduction_gradient = (
+            tf.cast(dy[:, None], voltage.dtype)
+            * tf.cast(inverse_n_neurons, voltage.dtype)
+        )
+        gradient = reduction_gradient * tf.cast(2.0, voltage.dtype)
+        gradient = gradient * outside
+        return gradient * direction, None
+
+    return mean_penalty, grad
+
+
+@tf.custom_gradient
+def _threshold_voltage_penalty_mean(voltage, inverse_n_neurons):
+    """Compute the threshold mean and return it in the voltage compute dtype."""
+    offset = voltage - tf.cast(1.0, voltage.dtype)
+    mean_penalty = (
+        tf.reduce_sum(tf.cast(tf.square(offset), tf.float32), axis=1)
+        * inverse_n_neurons
+    )
+    mean_penalty = tf.cast(mean_penalty, voltage.dtype)
+
+    def grad(dy):
+        reduction_gradient = (
+            tf.cast(dy[:, None], voltage.dtype)
+            * tf.cast(inverse_n_neurons, voltage.dtype)
+        )
+        gradient = reduction_gradient * tf.cast(2.0, voltage.dtype)
+        return gradient * offset, None
+
+    return mean_penalty, grad
+
+
+def voltage_penalty_mean_step(voltage, n_neurons, penalty_mode="range"):
+    """Return the compute-dtype neuron-mean penalty for one timestep."""
+    inverse_n_neurons = tf.math.reciprocal(tf.cast(n_neurons, tf.float32))
+    if penalty_mode == "range":
+        return _range_voltage_penalty_mean(voltage, inverse_n_neurons)
+    if penalty_mode == "threshold":
+        return _threshold_voltage_penalty_mean(voltage, inverse_n_neurons)
+    raise ValueError("penalty_mode must be 'range' or 'threshold'.")
+
+
+def reset_voltage_penalty_state(cell, state):
+    """Reset only an online voltage accumulator, preserving all neural state."""
+    state = tuple(state)
+    if not getattr(cell, "_track_voltage_penalty", False):
+        return state
+    return state[:-1] + (tf.zeros_like(state[-1]),)
+
 @tf.custom_gradient
 def spike_gauss(v_scaled, sigma, amplitude):
     dtype = v_scaled.dtype
@@ -526,6 +589,9 @@ class V1Column(tf.keras.layers.Layer):
         hard_reset=False,
         current_input=False,
         synaptic_current_backend="cuda",
+        track_voltage_penalty=False,
+        voltage_penalty_mode="range",
+        return_voltage_sequences=True,
     ):
         super().__init__()
         # Disable Keras layer autocast so tensors keep explicit dtypes:
@@ -560,6 +626,11 @@ class V1Column(tf.keras.layers.Layer):
         self.noise_stream = tf.Variable(0, trainable=False, dtype=tf.int64, name="noise_stream")
         self._hard_reset = hard_reset
         self._current_input = current_input
+        if voltage_penalty_mode not in ("range", "threshold"):
+            raise ValueError("voltage_penalty_mode must be 'range' or 'threshold'.")
+        self._track_voltage_penalty = bool(track_voltage_penalty)
+        self._voltage_penalty_mode = voltage_penalty_mode
+        self._return_voltage_sequences = bool(return_voltage_sequences)
         if synaptic_current_backend not in ("cuda", "tensorflow"):
             raise ValueError(
                 "synaptic_current_backend must be 'cuda' or 'tensorflow', got "
@@ -1147,6 +1218,8 @@ class V1Column(tf.keras.layers.Layer):
             self._n_neurons * self._n_syn_basis,  # psc
             tf.TensorShape([]),  # noise timestep counter
         )
+        if self._track_voltage_penalty:
+            state_size += (tf.TensorShape([]),)
         return state_size
 
     def zero_state(self, batch_size, dtype=tf.float32):
@@ -1161,7 +1234,15 @@ class V1Column(tf.keras.layers.Layer):
         psc0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), self.compute_dtype)
         noise_step0 = tf.zeros((batch_size,), tf.int32)
 
-        return z0_buf, v0, r0, asc, psc_rise0, psc0, noise_step0
+        state = (z0_buf, v0, r0, asc, psc_rise0, psc0, noise_step0)
+        if self._track_voltage_penalty:
+            state += (tf.zeros((batch_size,), self.compute_dtype),)
+        return state
+
+    def _voltage_penalty_mean_step(self, voltage):
+        return voltage_penalty_mean_step(
+            voltage, self._n_neurons, self._voltage_penalty_mode
+        )
 
     # @tf.function # dont use it in here because it breaks the graph structure and the custom gradients
     def call(self, inputs, state, constants=None):
@@ -1174,7 +1255,8 @@ class V1Column(tf.keras.layers.Layer):
         batch_size = tf.cast(tf.shape(inputs)[0], dtype=tf.int64)
 
         # Extract the network variables from the state
-        z_buf, v, r, asc, psc_rise, psc, noise_step = state
+        z_buf, v, r, asc, psc_rise, psc, noise_step = state[:7]
+        voltage_penalty = state[7] if self._track_voltage_penalty else None
         # Get previous spikes
         prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
 
@@ -1221,14 +1303,11 @@ class V1Column(tf.keras.layers.Layer):
 
         # Define the model outputs and the new state of the network
         # The outputs cannot be int or bool since they would break the gradient flow, so we keep them in compute_dtype (float32 under mixed policy) even if they are binary spikes.
-        outputs = (
-            new_z,
-            new_v,
-            # new_v * self.voltage_scale + self.voltage_offset,
-            # (input_current + tf.reduce_sum(asc, axis=-1)) * self.voltage_scale,
-        )
+        outputs = (new_z, new_v) if self._return_voltage_sequences else (new_z,)
         new_noise_step = noise_step + 1
         new_state = (new_z_buf, new_v, new_r, new_asc, new_psc_rise, new_psc, new_noise_step)
+        if self._track_voltage_penalty:
+            new_state += (voltage_penalty + self._voltage_penalty_mean_step(new_v),)
 
         return outputs, new_state
 
@@ -1341,6 +1420,9 @@ def create_model(
     use_dummy_state_input=False,
     seed=42,
     synaptic_current_backend="cuda",
+    track_voltage_penalty=False,
+    voltage_penalty_mode="range",
+    return_voltage_sequences=True,
 ):
 
     # Create the input layer of the model
@@ -1387,6 +1469,9 @@ def create_model(
         hard_reset=hard_reset,
         current_input=current_input,
         synaptic_current_backend=synaptic_current_backend,
+        track_voltage_penalty=track_voltage_penalty,
+        voltage_penalty_mode=voltage_penalty_mode,
+        return_voltage_sequences=return_voltage_sequences,
     )
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.
