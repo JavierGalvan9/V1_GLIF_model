@@ -64,36 +64,33 @@ def transfer_function(arg__a, dtype=tf.float32):
     _h = tf.cast(arg__a >= 0, dtype)
     return _h * arg__a
 
-def select_spatial(x, y, convolved_movie):
-    i1 = tf.cast(tf.stack([tf.floor(y), tf.floor(x)], axis=-1), dtype=tf.int32)
-    i2 = tf.cast(tf.stack([tf.math.ceil(y), tf.floor(x)], axis=-1), dtype=tf.int32)
-    i3 = tf.cast(tf.stack([tf.floor(y), tf.math.ceil(x)], axis=-1), dtype=tf.int32)
-    i4 = tf.cast(tf.stack([tf.math.ceil(y), tf.math.ceil(x)], axis=-1), dtype=tf.int32)
+def _bilinear_metadata(x, y, width):
+    """Precompute flattened indices and weights for bilinear sampling."""
+    x0 = np.floor(x).astype(np.int32)
+    x1 = np.ceil(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    y1 = np.ceil(y).astype(np.int32)
+    x_fraction = x - x0
+    y_fraction = y - y0
+    indices = np.stack(
+        (y0 * width + x0, y1 * width + x0, y0 * width + x1, y1 * width + x1),
+        axis=1,
+    )
+    weights = np.stack(
+        (
+            (1 - x_fraction) * (1 - y_fraction),
+            (1 - x_fraction) * y_fraction,
+            x_fraction * (1 - y_fraction),
+            x_fraction * y_fraction,
+        ),
+        axis=1,
+    ).astype(np.float32)
+    return indices, weights
 
-    transposed_convolved_movie = tf.transpose(convolved_movie, perm=[1, 2, 0])
 
-    sr1 = tf.gather_nd(transposed_convolved_movie, i1)
-    sr2 = tf.gather_nd(transposed_convolved_movie, i2)
-    sr3 = tf.gather_nd(transposed_convolved_movie, i3)
-    sr4 = tf.gather_nd(transposed_convolved_movie, i4)
-
-    ss = tf.stack([sr1, sr2, sr3, sr4], axis=0)
-
-    y_factor = y - tf.floor(y)
-    x_factor = x - tf.floor(x)
-
-    weights = tf.stack([
-                        (1 - x_factor) * (1 - y_factor),
-                        (1 - x_factor) * y_factor,
-                        x_factor * (1 - y_factor),
-                        x_factor * y_factor
-                        ], axis=0)
-
-    # spatial_responses = tf.reduce_sum(ss * tf.expand_dims(weights, axis=-1), axis=0)
-    # spatial_responses = tf.transpose(spatial_responses)
-    spatial_responses = tf.einsum('int,in->tn', ss, weights)
-
-    return spatial_responses
+def _sample_spatial(flattened_movie, indices, weights):
+    values = tf.gather(flattened_movie, indices, axis=1)
+    return tf.reduce_sum(values * weights[None, ...], axis=-1)
 
 
 def create_lgn_units_info(csv_path='/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/GLIF_network/network/lgn_node_types.csv', 
@@ -153,6 +150,8 @@ class LGN(object):
     """
 
     def __init__(self, row_size=80, col_size=120, data_dir='GLIF_network', n_input=None, dtype=tf.float32):
+        self.row_size = row_size
+        self.col_size = col_size
         filename = f'lgn_full_col_cells_{col_size}x{row_size}.csv'
         lgn_code_dir = os.path.split(__file__)[0]
         # go up one folder and add "GLIF_network" to the path
@@ -477,55 +476,132 @@ class LGN(object):
         self.spatial_range_indices = spatial_range_indices
         self.sorted_neuron_ids_indices = tf.convert_to_tensor(sorted_neuron_ids_indices, dtype=tf.int32)
 
-    @tf.function#(jit_compile=True) # for this model it seems to be better without the jit_compile (dont know why)
-    def spatial_response(self, movie, bmtk_compat=True):
+        self.vertical_filters = []
+        self.horizontal_filters = []
+        self.edge_reciprocals = []
+        for gaussian_filter in gaussian_filters:
+            matrix = gaussian_filter[:, :, 0, 0]
+            u, singular_values, vh = np.linalg.svd(matrix, full_matrices=False)
+            if singular_values[1:].sum() > singular_values[0] * 1e-5:
+                raise ValueError('Expected a rank-one Gaussian spatial kernel')
+            scale = np.sqrt(singular_values[0])
+            vertical_filter = (u[:, 0] * scale)[:, None, None, None]
+            horizontal_filter = (vh[0] * scale)[None, :, None, None]
+            self.vertical_filters.append(tf.constant(vertical_filter, dtype=dtype))
+            self.horizontal_filters.append(tf.constant(horizontal_filter, dtype=dtype))
+            edge_fraction = tf.nn.conv2d(
+                tf.ones((1, row_size, col_size, 1), dtype=dtype),
+                tf.constant(gaussian_filter, dtype=dtype),
+                strides=1,
+                padding='SAME',
+            )
+            self.edge_reciprocals.append(tf.math.reciprocal(edge_fraction))
 
-        if not isinstance(movie, tf.Tensor):
-            movie = tf.constant(movie, dtype=self.dtype)
-            print(f'Movie type: {type(movie)}')
-        else:
-            movie = tf.cast(movie, dtype=self.dtype)
-       
+        composite_mask = is_composite.astype(bool)
+        composite_ids = np.flatnonzero(composite_mask).astype(np.int32)
+        self.n_composite = composite_ids.size
+        self.composite_ids = tf.constant(composite_ids)
+        self.composite_non_dom_kernels = tf.gather(
+            self.non_dom_temporal_kernels, self.composite_ids, axis=1
+        )
+        self.composite_non_dom_amplitude = tf.gather(self.non_dom_amplitude, self.composite_ids)
+        self.composite_spontaneous_rates = tf.gather(
+            self.spontaneous_firing_rates, self.composite_ids
+        )
+
+        self.dominant_sample_indices = []
+        self.dominant_sample_weights = []
+        self.non_dominant_sample_indices = []
+        self.non_dominant_sample_weights = []
+        grouped_composite_ids = []
+        for indices in spatial_range_indices:
+            dominant_indices, dominant_weights = _bilinear_metadata(
+                x[indices], y[indices], col_size
+            )
+            selected_ids = indices[composite_mask[indices]]
+            non_dominant_indices, non_dominant_weights = _bilinear_metadata(
+                non_dominant_x[selected_ids], non_dominant_y[selected_ids], col_size
+            )
+            self.dominant_sample_indices.append(tf.constant(dominant_indices))
+            self.dominant_sample_weights.append(tf.constant(dominant_weights, dtype=dtype))
+            self.non_dominant_sample_indices.append(tf.constant(non_dominant_indices))
+            self.non_dominant_sample_weights.append(
+                tf.constant(non_dominant_weights, dtype=dtype)
+            )
+            grouped_composite_ids.append(selected_ids)
+        grouped_composite_ids = np.concatenate(grouped_composite_ids)
+        self.composite_sort_indices = tf.constant(
+            np.argsort(grouped_composite_ids).astype(np.int32)
+        )
+
+    @tf.function
+    def spatial_response(self, movie, bmtk_compat=True):
+        """Return dominant responses and compact non-dominant composite responses."""
+        movie = tf.cast(movie, dtype=self.dtype)
         all_spatial_responses = []
         all_non_dom_spatial_responses = []
-        for i, indices in enumerate(self.spatial_range_indices):
-            # Construct spatial filter
-            gaussian_filter = self.gaussian_filters[i]  # Assuming self.gaussian_filters is a list of precomputed filters
-            # The gaussian filter has shape (7, 7, 1, 1), and the movie (700, 120, 240, 1), where the 1 and 2 dimensions are the spatial dimensions          
-            # Apply it
-            convolved_movie = tf.nn.conv2d(movie, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')
-            # Making BMTK compatible by normalizing the edge values
+        for i, _ in enumerate(self.spatial_range_indices):
+            convolved_movie = tf.nn.conv2d(
+                movie, self.vertical_filters[i], strides=1, padding='SAME'
+            )
+            convolved_movie = tf.nn.conv2d(
+                convolved_movie, self.horizontal_filters[i], strides=1, padding='SAME'
+            )
             if bmtk_compat:
-                ones = tf.ones_like(movie)
-                gaussian_fraction = tf.nn.conv2d(ones, gaussian_filter, strides=[1, 1, 1, 1], padding='SAME')
-                convolved_movie = convolved_movie / gaussian_fraction
-            # Assuming you only need one channel
-            convolved_movie = convolved_movie[..., 0]  # Assuming you only need one channel
-            # Assign the spatial responses
-            spatial_responses = select_spatial(tf.gather(self.x, indices), tf.gather(self.y, indices), convolved_movie)
-            non_dom_spatial_responses = select_spatial(tf.gather(self.non_dominant_x, indices), tf.gather(self.non_dominant_y, indices), convolved_movie)
-
-            all_spatial_responses.append(spatial_responses)
-            all_non_dom_spatial_responses.append(non_dom_spatial_responses)
+                convolved_movie *= self.edge_reciprocals[i]
+            flattened_movie = tf.reshape(
+                convolved_movie[..., 0], (tf.shape(movie)[0], -1)
+            )
+            all_spatial_responses.append(
+                _sample_spatial(
+                    flattened_movie,
+                    self.dominant_sample_indices[i],
+                    self.dominant_sample_weights[i],
+                )
+            )
+            all_non_dom_spatial_responses.append(
+                _sample_spatial(
+                    flattened_movie,
+                    self.non_dominant_sample_indices[i],
+                    self.non_dominant_sample_weights[i],
+                )
+            )
 
         all_spatial_responses = tf.concat(all_spatial_responses, axis=1)
         all_non_dom_spatial_responses = tf.concat(all_non_dom_spatial_responses, axis=1)
-        # Sort the spatial responses
         all_spatial_responses = tf.gather(all_spatial_responses, self.sorted_neuron_ids_indices, axis=1)
-        all_non_dom_spatial_responses = tf.gather(all_non_dom_spatial_responses, self.sorted_neuron_ids_indices, axis=1)
+        all_non_dom_spatial_responses = tf.gather(
+            all_non_dom_spatial_responses, self.composite_sort_indices, axis=1
+        )
 
         return all_spatial_responses, all_non_dom_spatial_responses
 
-    @tf.function#(jit_compile=True) # for this model it seems to be better without the jit_compile (dont know why)
+    @tf.function(jit_compile=True)
     def firing_rates_from_spatial(self, all_spatial_responses, all_non_dom_spatial_responses):
         dom_filtered_output = temporal_filter(all_spatial_responses, self.dom_temporal_kernels)
-        non_dom_filtered_output = temporal_filter(all_non_dom_spatial_responses, self.non_dom_temporal_kernels)
+        dom_firing_rates = transfer_function(
+            dom_filtered_output * self.amplitude + self.spontaneous_firing_rates,
+            dtype=self.dtype,
+        )
+        if self.n_composite == 0:
+            return dom_firing_rates
 
-        dom_firing_rates = transfer_function(dom_filtered_output * self.amplitude + self.spontaneous_firing_rates, dtype=self.dtype)
-        non_dom_firing_rates = transfer_function(non_dom_filtered_output * self.non_dom_amplitude + self.spontaneous_firing_rates, dtype=self.dtype)
-        firing_rates = dom_firing_rates + self.is_composite * non_dom_firing_rates
-
-        return firing_rates
+        non_dom_filtered_output = temporal_filter(
+            all_non_dom_spatial_responses, self.composite_non_dom_kernels
+        )
+        composite_firing_rates = transfer_function(
+            non_dom_filtered_output * self.composite_non_dom_amplitude
+            + self.composite_spontaneous_rates,
+            dtype=self.dtype,
+        )
+        non_dom_firing_rates = tf.transpose(
+            tf.scatter_nd(
+                self.composite_ids[:, None],
+                tf.transpose(composite_firing_rates),
+                (tf.shape(all_spatial_responses)[1], tf.shape(all_spatial_responses)[0]),
+            )
+        )
+        return dom_firing_rates + non_dom_firing_rates
 
 
 def main():
