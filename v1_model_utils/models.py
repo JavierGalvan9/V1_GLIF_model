@@ -11,11 +11,7 @@ from .cuda_external_currents import (
     build_csr_connectivity as build_external_csr_connectivity,
     calculate_external_currents,
 )
-try:
-    from numba import njit
-    HAS_NUMBA = True
-except Exception:
-    HAS_NUMBA = False
+from numba import njit
 
 # import subprocess
 # from . import other_v1_utils
@@ -55,11 +51,10 @@ def _range_voltage_penalty_mean(voltage, inverse_n_neurons):
     mean_penalty = tf.cast(mean_penalty, voltage.dtype)
 
     def grad(dy):
+        centered = voltage - tf.cast(0.5, voltage.dtype)
+        outside = tf.nn.relu(tf.abs(centered) - tf.cast(0.5, voltage.dtype))
         direction = tf.sign(centered)
-        reduction_gradient = (
-            tf.cast(dy[:, None], voltage.dtype)
-            * tf.cast(inverse_n_neurons, voltage.dtype)
-        )
+        reduction_gradient = dy[:, None] * tf.cast(inverse_n_neurons, voltage.dtype)
         gradient = reduction_gradient * tf.cast(2.0, voltage.dtype)
         gradient = gradient * outside
         return gradient * direction, None
@@ -78,10 +73,8 @@ def _threshold_voltage_penalty_mean(voltage, inverse_n_neurons):
     mean_penalty = tf.cast(mean_penalty, voltage.dtype)
 
     def grad(dy):
-        reduction_gradient = (
-            tf.cast(dy[:, None], voltage.dtype)
-            * tf.cast(inverse_n_neurons, voltage.dtype)
-        )
+        offset = voltage - tf.cast(1.0, voltage.dtype)
+        reduction_gradient = dy[:, None] * tf.cast(inverse_n_neurons, voltage.dtype)
         gradient = reduction_gradient * tf.cast(2.0, voltage.dtype)
         return gradient * offset, None
 
@@ -432,10 +425,17 @@ def _build_csr_order_numba(pre_ids, n_source_neurons):
 
     return order, row_splits
 
+
+def _csr_index_dtype(n_synapses):
+    """Return an index dtype that represents every CSR offset."""
+    return tf.int32 if n_synapses <= np.iinfo(np.int32).max else tf.int64
+
+
 def make_pre_ind_table(indices, n_source_neurons=197613, order_keys=None):
     """
     Build CSR-style row_splits and sorted post indices by presynaptic index.
-    Using Numba aliviates GPU memory pressure with minimal warmup time.
+    Numba provides a linear-time stable bucket build when no within-row ordering
+    is requested.
     This function creates a table that maps presynaptic indices to
     the indices of the recurrent_indices tensor using a RaggedTensor.
     This approach ensures that every presynaptic neuron, even those with no
@@ -466,21 +466,12 @@ def make_pre_ind_table(indices, n_source_neurons=197613, order_keys=None):
         row_splits_np = np.empty((n_source_neurons + 1,), dtype=np.int64)
         row_splits_np[0] = 0
         np.cumsum(counts_np, dtype=np.int64, out=row_splits_np[1:])
-    elif HAS_NUMBA:
+    else:
         order_np, row_splits_np = _build_csr_order_numba(pre_ids, n_source_neurons)
-    else:
-        # Safe deterministic fallback if numba is unavailable.
-        order_np = np.argsort(pre_ids, kind='stable')
-        counts_np = np.bincount(pre_ids[order_np], minlength=n_source_neurons)
-        row_splits_np = np.empty((n_source_neurons + 1,), dtype=np.int64)
-        row_splits_np[0] = 0
-        np.cumsum(counts_np, dtype=np.int64, out=row_splits_np[1:])
 
-    if order_np.size <= np.iinfo(np.int32).max:
-        order_tf = tf.convert_to_tensor(order_np, dtype=tf.int32)
-    else:
-        order_tf = tf.convert_to_tensor(order_np, dtype=tf.int64)
-    row_splits_tf = tf.convert_to_tensor(row_splits_np, dtype=tf.int32)
+    index_dtype = _csr_index_dtype(order_np.size)
+    order_tf = tf.convert_to_tensor(order_np, dtype=index_dtype)
+    row_splits_tf = tf.convert_to_tensor(row_splits_np, dtype=index_dtype)
 
     return tf.RaggedTensor.from_row_splits(order_tf, row_splits_tf, validate=False)
 
