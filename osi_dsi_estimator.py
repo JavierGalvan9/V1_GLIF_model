@@ -123,6 +123,7 @@ def main(_):
                 use_dummy_state_input=False,
                 seed=flags.seed,
                 synaptic_current_backend=flags.synaptic_current_backend,
+                inference_mode=flags.inference_mode,
             )
             temp_model.build((per_replica_batch_size, flags.seq_len, flags.n_input))
             return temp_model
@@ -463,6 +464,11 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
     absl.app.flags.DEFINE_boolean("track_core_only", False, "Track spikes only from core neurons to reduce memory usage")
     absl.app.flags.DEFINE_boolean("track_voltage", False, "Track and save membrane voltage traces during simulation")
+    absl.app.flags.DEFINE_boolean(
+        "inference_mode",
+        True,
+        "Return V1 spike sequences as uint8 while retaining floating recurrent state.",
+    )
     absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")
 
     absl.app.flags.DEFINE_string("rotation", "ccw", "")

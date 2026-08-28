@@ -51,13 +51,11 @@ def _range_voltage_penalty_mean(voltage, inverse_n_neurons):
     mean_penalty = tf.cast(mean_penalty, voltage.dtype)
 
     def grad(dy):
-        centered = voltage - tf.cast(0.5, voltage.dtype)
-        outside = tf.nn.relu(tf.abs(centered) - tf.cast(0.5, voltage.dtype))
-        direction = tf.sign(centered)
+        gradient_factor = (
+            tf.cast(2.0, voltage.dtype) * outside * tf.sign(centered)
+        )
         reduction_gradient = dy[:, None] * tf.cast(inverse_n_neurons, voltage.dtype)
-        gradient = reduction_gradient * tf.cast(2.0, voltage.dtype)
-        gradient = gradient * outside
-        return gradient * direction, None
+        return reduction_gradient * gradient_factor, None
 
     return mean_penalty, grad
 
@@ -73,10 +71,10 @@ def _threshold_voltage_penalty_mean(voltage, inverse_n_neurons):
     mean_penalty = tf.cast(mean_penalty, voltage.dtype)
 
     def grad(dy):
-        offset = voltage - tf.cast(1.0, voltage.dtype)
+        # Compute the gradient of the mean penalty with respect to the voltage.
+        gradient_factor = tf.cast(2.0, voltage.dtype) * offset
         reduction_gradient = dy[:, None] * tf.cast(inverse_n_neurons, voltage.dtype)
-        gradient = reduction_gradient * tf.cast(2.0, voltage.dtype)
-        return gradient * offset, None
+        return reduction_gradient * gradient_factor, None
 
     return mean_penalty, grad
 
@@ -583,6 +581,7 @@ class V1Column(tf.keras.layers.Layer):
         track_voltage_penalty=False,
         voltage_penalty_mode="range",
         return_voltage_sequences=True,
+        inference_mode=False,
     ):
         super().__init__()
         # Disable Keras layer autocast so tensors keep explicit dtypes:
@@ -622,6 +621,7 @@ class V1Column(tf.keras.layers.Layer):
         self._track_voltage_penalty = bool(track_voltage_penalty)
         self._voltage_penalty_mode = voltage_penalty_mode
         self._return_voltage_sequences = bool(return_voltage_sequences)
+        self._inference_mode = bool(inference_mode)
         if synaptic_current_backend not in ("cuda", "tensorflow"):
             raise ValueError(
                 "synaptic_current_backend must be 'cuda' or 'tensorflow', got "
@@ -1293,8 +1293,14 @@ class V1Column(tf.keras.layers.Layer):
         #     output_v = tf.cast(output_v, self.compute_dtype)
 
         # Define the model outputs and the new state of the network
-        # The outputs cannot be int or bool since they would break the gradient flow, so we keep them in compute_dtype (float32 under mixed policy) even if they are binary spikes.
-        outputs = (new_z, new_v) if self._return_voltage_sequences else (new_z,)
+        # Training keeps floating spikes for surrogate gradients. Inference can expose
+        # the same binary values as uint8 without changing the floating delay state.
+        visible_z = tf.cast(new_z, tf.uint8) if self._inference_mode else new_z
+        outputs = (
+            (visible_z, new_v)
+            if self._return_voltage_sequences
+            else (visible_z,)
+        )
         new_noise_step = noise_step + 1
         new_state = (new_z_buf, new_v, new_r, new_asc, new_psc_rise, new_psc, new_noise_step)
         if self._track_voltage_penalty:
@@ -1414,6 +1420,7 @@ def create_model(
     track_voltage_penalty=False,
     voltage_penalty_mode="range",
     return_voltage_sequences=True,
+    inference_mode=False,
 ):
 
     # Create the input layer of the model
@@ -1463,6 +1470,7 @@ def create_model(
         track_voltage_penalty=track_voltage_penalty,
         voltage_penalty_mode=voltage_penalty_mode,
         return_voltage_sequences=return_voltage_sequences,
+        inference_mode=inference_mode,
     )
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.
@@ -1506,7 +1514,9 @@ def create_model(
         hidden = rsnn_out
 
     spikes_dict = {}
-    spikes_dict['v1'] = hidden[0]
+    spikes_dict['v1'] = (
+        tf.cast(hidden[0], dtype) if inference_mode else hidden[0]
+    )
     # voltage = hidden[1]
 
     outputs_dict = {}
