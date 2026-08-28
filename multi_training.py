@@ -57,6 +57,23 @@ def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
     return tuple(full_outputs[1:])
 
 
+def resolve_stimulus_batch_sizes(batch_size, grating_batch_size, gray_batch_size):
+    """Validate and return the per-replica stimulus batch sizes."""
+    stimulus_batch_sizes = (grating_batch_size, gray_batch_size)
+    if any(size <= 0 for size in stimulus_batch_sizes):
+        raise ValueError("All per-replica stimulus batch sizes must be positive.")
+    if sum(stimulus_batch_sizes) != batch_size:
+        raise ValueError(
+            "batch_size must equal grating_batch_size + gray_batch_size."
+        )
+    return stimulus_batch_sizes
+
+
+def split_combined_outputs(outputs, grating_batch_size):
+    """Split concatenated grating and gray/spontaneous outputs by batch."""
+    return outputs[:grating_batch_size], outputs[grating_batch_size:]
+
+
 def main(_):
     flags = absl.app.flags.FLAGS
     if flags.profile_gpu_index >= 0:
@@ -107,18 +124,26 @@ def main(_):
     )
 
     per_replica_batch_size = flags.batch_size
-    batch_multiplier = 1 if flags.sequential_stimuli else 2
-    real_batch_size = per_replica_batch_size * batch_multiplier
+    grating_batch_size, gray_batch_size = resolve_stimulus_batch_sizes(
+        per_replica_batch_size,
+        flags.grating_batch_size,
+        flags.gray_batch_size,
+    )
+    real_batch_size = per_replica_batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
+    global_grating_batch_size = grating_batch_size * strategy.num_replicas_in_sync
+    global_gray_batch_size = gray_batch_size * strategy.num_replicas_in_sync
     print(f'Per replica batch size: {per_replica_batch_size}')
     if flags.sequential_stimuli:
         print('Sequential stimuli updates enabled (memory friendly).')
         print(f'Model batch size: {real_batch_size}')
-        if per_replica_batch_size != 1:
-            print(f'Warning: sequential_stimuli is intended for batch_size=1; got {per_replica_batch_size}.')
     else:
         print(f'Real batch size (evoked+spont): {real_batch_size}')
-    print(f'Global batch size: {global_batch_size}\n')
+    print(f'Global batch size: {global_batch_size}')
+    print(
+        f'Stimulus batch sizes (per replica): grating={grating_batch_size}, '
+        f'gray={gray_batch_size}\n'
+    )
     print(f'Training with current input: {flags.current_input}')
     print(f'Pseudo derivative gaussian: {flags.pseudo_gauss}')
 
@@ -334,7 +359,7 @@ def main(_):
                                                          data_dir=flags.data_dir,
                                                          rolling_decay=flags.rolling_decay,
                                                          rolling_target_sample_ess=flags.rolling_target_sample_ess,
-                                                         rolling_batch_size=per_replica_batch_size,
+                                                         rolling_batch_size=grating_batch_size,
                                                          rolling_gradient_correction=flags.rolling_gradient_correction,
                                                          rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                          rolling_warmup=flags.rolling_warmup)
@@ -360,7 +385,7 @@ def main(_):
                                                                      data_dir=flags.data_dir,
                                                                      rolling_decay=flags.rolling_decay,
                                                                      rolling_target_sample_ess=flags.rolling_target_sample_ess,
-                                                                     rolling_batch_size=per_replica_batch_size,
+                                                                     rolling_batch_size=grating_batch_size,
                                                                      rolling_gradient_correction=flags.rolling_gradient_correction,
                                                                      rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                                      rolling_warmup=flags.rolling_warmup)
@@ -699,10 +724,12 @@ def main(_):
         _out = run_extractor(x_concat, initial_state)
         _z_full, voltage_source_full = _out
 
-        _z_evoked = _z_full[:per_replica_batch_size]
-        voltage_source_evoked = voltage_source_full[:per_replica_batch_size]
-        _z_spont = _z_full[per_replica_batch_size:]
-        voltage_source_spont = voltage_source_full[per_replica_batch_size:]
+        _z_evoked, _z_spont = split_combined_outputs(
+            _z_full, grating_batch_size
+        )
+        voltage_source_evoked, voltage_source_spont = split_combined_outputs(
+            voltage_source_full, grating_batch_size
+        )
 
         regularizers_loss = tf.constant(0.0, dtype=tf.float32)
         if flags.train_recurrent and flags.recurrent_weight_regularization > 0:
@@ -771,10 +798,18 @@ def main(_):
         spontaneous = tf.cast(spontaneous, tf.bool)
         metric_weight = tf.cast(0.5, tf.float32)
         _x = tf.cond(spontaneous, lambda: x_spontaneous, lambda: x)
+        _state_variables = tf.nest.map_structure(
+            lambda state: tf.cond(
+                spontaneous,
+                lambda: state[grating_batch_size:],
+                lambda: state[:grating_batch_size],
+            ),
+            state_variables,
+        )
 
         with tf.GradientTape() as tape:
             _out, _loss, _aux = roll_out(
-                _x, y, state_variables, spontaneous=spontaneous, trim=trim
+                _x, y, _state_variables, spontaneous=spontaneous, trim=trim
             )
             _loss = tf.cast(_loss, tf.float32)
             loss_for_grad = optimizer_utils.scale_loss_for_optimizer(optimizer, _loss)
@@ -895,8 +930,9 @@ def main(_):
                     x, y, x_spontaneous, state_variables, trim, return_sequences=True
                 )
                 v1_spikes_full = strategy.experimental_local_results(_out)[0][0]
-                v1_spikes_evoked = v1_spikes_full[:per_replica_batch_size]
-                v1_spikes_spont = v1_spikes_full[per_replica_batch_size:]
+                v1_spikes_evoked, v1_spikes_spont = split_combined_outputs(
+                    v1_spikes_full, grating_batch_size
+                )
             model_spikes = (v1_spikes_evoked, v1_spikes_spont)
         else:
             if flags.sequential_stimuli:
@@ -939,7 +975,9 @@ def main(_):
     # Define the function that generates the dataset for our task
     def get_gratings_dataset_fn(regular=False):
         def _f(input_context):
-            batch_size = input_context.get_per_replica_batch_size(global_batch_size)
+            batch_size = input_context.get_per_replica_batch_size(
+                global_grating_batch_size
+            )
             pipeline_seed = flags.seed + 10000 + int(input_context.input_pipeline_id)
             _data_set = (stim_dataset.generate_drifting_grating_tuning(
                 seq_len=flags.seq_len,
@@ -962,7 +1000,9 @@ def main(_):
 
     def get_gray_dataset_fn():
         def _f(input_context):
-            batch_size = input_context.get_per_replica_batch_size(global_batch_size)
+            batch_size = input_context.get_per_replica_batch_size(
+                global_gray_batch_size
+            )
             pipeline_seed = flags.seed + 20000 + int(input_context.input_pipeline_id)
             _gray_data_set = (stim_dataset.generate_gray_screen_stimulus(
                 seq_len=flags.seq_len,
@@ -1498,7 +1538,7 @@ def main(_):
             x, y, _, _ = next(it)  # x dtype tf.bool
             x_spontaneous = distributed_sample_probability_batch(
                 spontaneous_prob_base,
-                per_replica_batch_size,
+                gray_batch_size,
             )
             profile_this_step = (
                 flags.profile_train_step
@@ -1761,7 +1801,16 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('n_epochs', 75, '')
     # number of epochs for osi/dsi evaluation if n_runs = 1
     absl.app.flags.DEFINE_integer('osi_dsi_eval_period', 1, '')
-    absl.app.flags.DEFINE_integer('batch_size', 5, '')
+    absl.app.flags.DEFINE_integer(
+        'batch_size', 2,
+        'Total per-replica batch size; must equal grating_batch_size + gray_batch_size.',
+    )
+    absl.app.flags.DEFINE_integer(
+        'grating_batch_size', 1, 'Grating samples per replica.'
+    )
+    absl.app.flags.DEFINE_integer(
+        'gray_batch_size', 1, 'Gray/spontaneous samples per replica.'
+    )
     absl.app.flags.DEFINE_integer('neurons', 0, '')  # 0 to take all neurons
     absl.app.flags.DEFINE_integer("n_input", 17400, "")
     absl.app.flags.DEFINE_integer('seq_len', 500, '')
