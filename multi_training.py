@@ -637,10 +637,9 @@ def main(_):
                 # Update only during training; validation reads the existing normalizer.
                 update_rate_emas(v1_ema, v1_rates, ema_decay)
             rate_loss = evoked_rate_regularizer.loss_from_rates(v1_rates)
-            osi_dsi_loss = OSI_DSI_Loss(
-                _z,
+            osi_dsi_loss = OSI_DSI_Loss.loss_from_rates(
+                v1_rates_per_sample,
                 y,
-                trim,
                 normalizer=v1_ema,
                 update_state=update_state,
             )
@@ -650,10 +649,9 @@ def main(_):
                 rate_loss += annulus_evoked_rate_regularizer.loss_from_rates(
                     v1_rates
                 )
-                osi_dsi_loss += annulus_OSI_DSI_Loss(
-                    _z,
+                osi_dsi_loss += annulus_OSI_DSI_Loss.loss_from_rates(
+                    v1_rates_per_sample,
                     y,
-                    trim,
                     normalizer=v1_ema,
                     update_state=update_state,
                 )
@@ -783,7 +781,7 @@ def main(_):
         # Backpropagation of the model (metrics)
         mean_loss = (evoked_loss + spont_loss) / 2.0
         train_loss.update_state(mean_loss * strategy.num_replicas_in_sync)
-        rate = tf.reduce_mean(tf.cast(_out[0], tf.float32))
+        rate = losses.temporal_mean(_out[0], dtype=tf.float32)
         train_firing_rate.update_state(rate)
         train_rate_loss.update_state(mean_aux["rate_loss"])
         train_voltage_loss.update_state(mean_aux["voltage_loss"])
@@ -827,7 +825,7 @@ def main(_):
         train_loss.update_state(
             _loss * strategy.num_replicas_in_sync, sample_weight=metric_weight
         )
-        rate = tf.reduce_mean(tf.cast(_out[0], tf.float32))
+        rate = losses.temporal_mean(_out[0], dtype=tf.float32)
         train_firing_rate.update_state(rate)
         train_rate_loss.update_state(_aux["rate_loss"], sample_weight=metric_weight)
         train_voltage_loss.update_state(_aux["voltage_loss"], sample_weight=metric_weight)

@@ -609,6 +609,59 @@ def spike_trimming(spikes, pre_delay=50, post_delay=50, trim=True):
         spikes = spikes[:, pre:, :]
     return spikes
 
+
+_INT32_MAX = 2**31 - 1
+
+
+def temporal_sum(
+    values,
+    dtype=tf.float32,
+    chunk_size=25,
+    full_tensor_element_limit=_INT32_MAX,
+):
+    """Sum over time, chunking only above the GPU indexing limit."""
+    sequence_length = values.shape[1]
+    if sequence_length is None:
+        raise ValueError("Temporal reduction requires a static sequence length.")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    element_count = values.shape.num_elements()
+    if element_count is not None and element_count <= full_tensor_element_limit:
+        return tf.cast(tf.reduce_sum(values, axis=1), dtype)
+
+    partial_counts = [
+        tf.reduce_sum(values[:, start:start + chunk_size], axis=1)
+        for start in range(0, sequence_length, chunk_size)
+    ]
+    partial_counts = tf.add_n(partial_counts)
+
+    if values.dtype != dtype:
+        partial_counts = tf.cast(partial_counts, dtype)
+
+    return partial_counts
+
+
+@tf.function(jit_compile=True)
+def temporal_mean(
+    values,
+    dtype=tf.float32,
+    chunk_size=25,
+    full_tensor_element_limit=_INT32_MAX,
+):
+    """Return the mean, chunking only above the GPU indexing limit."""
+    element_count = values.shape.num_elements()
+    if element_count is not None and element_count <= full_tensor_element_limit:
+        return tf.reduce_mean(tf.cast(values, dtype))
+
+    counts_per_sample = temporal_sum(
+        values,
+        dtype=dtype,
+        chunk_size=chunk_size,
+        full_tensor_element_limit=full_tensor_element_limit,
+    )
+    element_count = tf.size(values, out_type=tf.int64)
+    return tf.reduce_sum(counts_per_sample) / tf.cast(element_count, dtype)
+
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     """Return a stochastic inverse-CDF target for legacy use only."""
     # Sort the original firing rates
@@ -976,9 +1029,8 @@ class SpikeRateDistributionTarget:
             post_delay=self._post_delay,
             trim=trim,
         )
-        if spikes.dtype != self._dtype:
-            spikes = tf.cast(spikes, self._dtype)
-        return tf.reduce_mean(spikes, axis=1)
+        spike_counts = temporal_sum(spikes, dtype=self._dtype)
+        return spike_counts / tf.cast(tf.shape(spikes)[1], self._dtype)
 
     def rates_from_spikes(self, spikes, trim=True):
         """Return full-population rates averaged over samples and time."""
@@ -2073,9 +2125,8 @@ class OrientationSelectivityLoss:
             post_delay=self._post_delay,
             trim=trim,
         )
-        if spikes.dtype != self._dtype:
-            spikes = tf.cast(spikes, self._dtype)
-        return tf.reduce_mean(spikes, axis=1)
+        spike_counts = temporal_sum(spikes, dtype=self._dtype)
+        return spike_counts / tf.cast(tf.shape(spikes)[1], self._dtype)
 
     def _prepare_rates(self, rates, normalizer):
         if rates.dtype != self._dtype:
