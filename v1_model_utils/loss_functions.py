@@ -602,6 +602,8 @@ class EarthMoversDistanceRegularizer(Layer):
 
 def spike_trimming(spikes, pre_delay=50, post_delay=50, trim=True):
     pre = pre_delay or 0
+    if pre == 0 and (not trim or not post_delay):
+        return spikes
     if trim:
         post = -post_delay if post_delay else None
         spikes = spikes[:, pre:post, :]
@@ -626,19 +628,43 @@ def temporal_sum(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
     element_count = values.shape.num_elements()
-    if element_count is not None and element_count <= full_tensor_element_limit:
-        return tf.cast(tf.reduce_sum(values, axis=1), dtype)
+    needs_chunks = (
+        element_count is None or element_count > full_tensor_element_limit
+    )
 
-    partial_counts = [
-        tf.reduce_sum(values[:, start:start + chunk_size], axis=1)
-        for start in range(0, sequence_length, chunk_size)
-    ]
-    partial_counts = tf.add_n(partial_counts)
+    @tf.custom_gradient
+    def sum_with_compact_gradient(input_values):
+        if needs_chunks:
+            counts = tf.add_n(
+                [
+                    tf.reduce_sum(
+                        input_values[:, start:start + chunk_size], axis=1
+                    )
+                    for start in range(0, sequence_length, chunk_size)
+                ]
+            )
+        else:
+            counts = tf.reduce_sum(input_values, axis=1)
+        counts = tf.cast(counts, dtype)
 
-    if values.dtype != dtype:
-        partial_counts = tf.cast(partial_counts, dtype)
+        def gradient(upstream):
+            upstream = tf.cast(upstream, input_values.dtype)[:, tf.newaxis, :]
+            if not needs_chunks:
+                return tf.broadcast_to(upstream, tf.shape(input_values))
+            return tf.concat(
+                [
+                    tf.broadcast_to(
+                        upstream,
+                        tf.shape(input_values[:, start:start + chunk_size]),
+                    )
+                    for start in range(0, sequence_length, chunk_size)
+                ],
+                axis=1,
+            )
 
-    return partial_counts
+        return counts, gradient
+
+    return sum_with_compact_gradient(values)
 
 
 @tf.function(jit_compile=True)
@@ -661,6 +687,33 @@ def temporal_mean(
     )
     element_count = tf.size(values, out_type=tf.int64)
     return tf.reduce_sum(counts_per_sample) / tf.cast(element_count, dtype)
+
+
+def boolean_mask_neurons(
+    values, mask, full_tensor_element_limit=_INT32_MAX
+):
+    """Mask neurons, splitting time only when a GPU op would exceed int32."""
+    element_count = values.shape.num_elements()
+    if element_count is None:
+        raise ValueError("Neuron masking requires statically known dimensions.")
+    if element_count <= full_tensor_element_limit:
+        return tf.boolean_mask(values, mask, axis=2)
+
+    batch_size, sequence_length, n_neurons = values.shape
+    max_chunk_length = full_tensor_element_limit // (batch_size * n_neurons)
+    if max_chunk_length < 1:
+        raise ValueError(
+            "One batch-time slice exceeds the configured element limit."
+        )
+    return tf.concat(
+        [
+            tf.boolean_mask(
+                values[:, start:start + max_chunk_length], mask, axis=2
+            )
+            for start in range(0, sequence_length, max_chunk_length)
+        ],
+        axis=1,
+    )
 
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     """Return a stochastic inverse-CDF target for legacy use only."""
@@ -1020,7 +1073,7 @@ class SpikeRateDistributionTarget:
 
         return target_firing_rates
 
-    @tf.function(jit_compile=True)
+    @tf.function # jit compile is not used here because it converts the spikes to float32 before summing, which can cause memory issues for large spike tensors.
     def rates_per_sample_from_spikes(self, spikes, trim=True):
         """Return full-population rates with shape ``[batch, neurons]``."""
         spikes = spike_trimming(
@@ -1200,10 +1253,9 @@ class SynchronizationLoss(Layer):
         if self._sync_cost <= 0:
             return tf.constant(0.0, dtype=self._dtype)
 
-        spikes = tf.boolean_mask(spikes, self._core_excitatory_mask, axis=2)
-
         if trim:
             spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
+        spikes = boolean_mask_neurons(spikes, self._core_excitatory_mask)
         duration_ms = tf.cast(tf.shape(spikes)[1], tf.int32)
         bin_limit_ms = duration_ms // 2
         bin_sizes_mask = self._bin_sizes_ms_tf < bin_limit_ms
@@ -1243,7 +1295,10 @@ class SynchronizationLoss(Layer):
             sample_ids = shuffled_e_ids[previous_id:previous_id+sample_num]
             previous_id += sample_num
 
-            selected_spikes = tf.reduce_sum(tf.gather(spikes[sample_trial], sample_ids, axis=1), axis=-1)
+            selected_spikes = tf.reduce_sum(
+                tf.gather(spikes[sample_trial], sample_ids, axis=1),
+                axis=-1,
+            )
             selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
 
         selected_spikes_sample = selected_spikes_sample.stack()
@@ -2116,7 +2171,7 @@ class OrientationSelectivityLoss:
         )
         return osi_scale, dsi_scale
 
-    @tf.function(jit_compile=True)
+    @tf.function # jit compile is not used here because it converts the spikes to float32 before summing, which can cause memory issues for large spike tensors.
     def rates_per_sample_from_spikes(self, spikes, trim=True):
         """Return full-population rates with shape ``[batch, neurons]``."""
         spikes = spike_trimming(

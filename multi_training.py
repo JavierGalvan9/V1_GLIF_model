@@ -71,7 +71,75 @@ def resolve_stimulus_batch_sizes(batch_size, grating_batch_size, gray_batch_size
 
 def split_combined_outputs(outputs, grating_batch_size):
     """Split concatenated grating and gray/spontaneous outputs by batch."""
-    return outputs[:grating_batch_size], outputs[grating_batch_size:]
+    @tf.custom_gradient
+    def split_with_compact_gradient(values):
+        grating = values[:grating_batch_size]
+        gray = values[grating_batch_size:]
+
+        def gradient(grating_gradient, gray_gradient):
+            if grating_gradient is None:
+                grating_gradient = tf.zeros_like(grating)
+            if gray_gradient is None:
+                gray_gradient = tf.zeros_like(gray)
+            return tf.concat([grating_gradient, gray_gradient], axis=0)
+
+        return (grating, gray), gradient
+
+    return split_with_compact_gradient(outputs)
+
+
+def concatenate_stimulus_batches(grating, spontaneous, dtype):
+    """Cast sub-batches before concatenating an int32-unsafe full batch."""
+    if grating.dtype != dtype:
+        grating = tf.cast(grating, dtype)
+    if spontaneous.dtype != dtype:
+        spontaneous = tf.cast(spontaneous, dtype)
+    return tf.concat([grating, spontaneous], axis=0)
+
+
+def sample_stateless_bernoulli_batch(
+    probability,
+    batch_size,
+    seed,
+    dtype,
+    batch_chunk_size=64,
+    full_tensor_element_limit=np.iinfo(np.int32).max,
+):
+    """Sample a batch without launching a random kernel above int32 size."""
+    probability = tf.cast(probability, dtype)
+    sample_shape = probability.shape
+    if sample_shape.rank is None or not sample_shape.is_fully_defined():
+        raise ValueError("Bernoulli sampling requires a static per-sample shape.")
+
+    batch_size = int(batch_size)
+    elements_per_sample = sample_shape.num_elements()
+    if batch_size * elements_per_sample <= full_tensor_element_limit:
+        random_uniform = tf.random.stateless_uniform(
+            (batch_size, *sample_shape), seed=seed, dtype=dtype
+        )
+        return random_uniform < probability
+
+    if elements_per_sample % 4:
+        raise ValueError(
+            "Chunked Philox sampling requires a per-sample size divisible by four."
+        )
+    key, counter = tf.raw_ops.StatelessRandomGetKeyCounter(seed=seed)
+    algorithm = tf.raw_ops.StatelessRandomGetAlg()
+    sampled_chunks = []
+    for start in range(0, batch_size, batch_chunk_size):
+        chunk_batch_size = min(batch_chunk_size, batch_size - start)
+        chunk_counter = counter + tf.constant(
+            [start * elements_per_sample // 4, 0], dtype=tf.uint64
+        )
+        random_uniform = tf.raw_ops.StatelessRandomUniformV2(
+            shape=tf.constant([chunk_batch_size, *sample_shape]),
+            key=key,
+            counter=chunk_counter,
+            alg=algorithm,
+            dtype=dtype,
+        )
+        sampled_chunks.append(tf.cast(random_uniform < probability, dtype))
+    return tf.concat(sampled_chunks, axis=0)
 
 
 def main(_):
@@ -656,7 +724,12 @@ def main(_):
                     update_state=update_state,
                 )
 
-            return rate_loss, osi_dsi_loss, sync_loss
+            return (
+                rate_loss,
+                osi_dsi_loss,
+                sync_loss,
+                tf.reduce_mean(v1_rates_per_sample),
+            )
 
         def _spontaneous_losses():
             v1_rates_per_sample = (
@@ -672,9 +745,14 @@ def main(_):
                     v1_rates
                 )
 
-            return rate_loss, osi_dsi_loss, sync_loss
+            return (
+                rate_loss,
+                osi_dsi_loss,
+                sync_loss,
+                tf.reduce_mean(v1_rates_per_sample),
+            )
 
-        rate_loss, osi_dsi_loss, sync_loss = tf.cond(
+        rate_loss, osi_dsi_loss, sync_loss, firing_rate = tf.cond(
             spontaneous, _spontaneous_losses, _evoked_losses
         )
 
@@ -684,6 +762,7 @@ def main(_):
             osi_dsi_loss=osi_dsi_loss,
             regularizer_loss=regularizers_loss,
             sync_loss=sync_loss,
+            firing_rate=firing_rate,
         )
         # Rescale the losses based on the number of replicas
         _loss = tf.nn.scale_regularization_loss(
@@ -717,7 +796,7 @@ def main(_):
 
     def roll_out_combined(x, y, x_spontaneous, initial_state, trim=True, update_loss_state=True):
 
-        x_concat = tf.concat([x, x_spontaneous], axis=0)
+        x_concat = concatenate_stimulus_batches(x, x_spontaneous, dtype)
 
         _out = run_extractor(x_concat, initial_state)
         _z_full, voltage_source_full = _out
@@ -781,7 +860,12 @@ def main(_):
         # Backpropagation of the model (metrics)
         mean_loss = (evoked_loss + spont_loss) / 2.0
         train_loss.update_state(mean_loss * strategy.num_replicas_in_sync)
-        rate = losses.temporal_mean(_out[0], dtype=tf.float32)
+        rate = (
+            evoked_aux["firing_rate"]
+            * tf.cast(grating_batch_size, tf.float32)
+            + spont_aux["firing_rate"]
+            * tf.cast(gray_batch_size, tf.float32)
+        ) / tf.cast(real_batch_size, tf.float32)
         train_firing_rate.update_state(rate)
         train_rate_loss.update_state(mean_aux["rate_loss"])
         train_voltage_loss.update_state(mean_aux["voltage_loss"])
@@ -825,7 +909,7 @@ def main(_):
         train_loss.update_state(
             _loss * strategy.num_replicas_in_sync, sample_weight=metric_weight
         )
-        rate = losses.temporal_mean(_out[0], dtype=tf.float32)
+        rate = _aux["firing_rate"]
         train_firing_rate.update_state(rate)
         train_rate_loss.update_state(_aux["rate_loss"], sample_weight=metric_weight)
         train_voltage_loss.update_state(_aux["voltage_loss"], sample_weight=metric_weight)
@@ -1024,48 +1108,58 @@ def main(_):
         train_data_set = strategy.distribute_datasets_from_function(get_gratings_dataset_fn())
 
     def sample_probability_batch(probability, batch_size, current_input=False):
-        batch_size = tf.cast(batch_size, tf.int32)
         probability = tf.cast(probability, dtype)
-        target_shape = tf.concat([[batch_size], tf.shape(probability)], axis=0)
-        probability = tf.broadcast_to(probability, target_shape)
         if current_input:
-            return tf.cast(probability * tf.cast(1.3, dtype), dtype)
-        random_uniform = tf.random.stateless_uniform(
-            tf.shape(probability),
+            return tf.broadcast_to(
+                probability * tf.cast(1.3, dtype),
+                (int(batch_size), *probability.shape),
+            )
+        return sample_stateless_bernoulli_batch(
+            probability,
+            int(batch_size),
             seed=seed_helper.next_spontaneous_seed(),
             dtype=dtype,
         )
-        return tf.less(random_uniform, probability)
 
     def generate_spontaneous_spikes(batch_size):
-        batch_size = tf.cast(batch_size, tf.int32)
-        probability = spontaneous_prob_base[tf.newaxis, ...]
-        target_shape = tf.concat(
-            [[batch_size], tf.stop_gradient(tf.shape(spontaneous_prob_base))],
-            axis=0,
-        )
-        probability = tf.broadcast_to(probability, target_shape)
-        random_uniform = tf.random.stateless_uniform(
-            target_shape,
+        return sample_stateless_bernoulli_batch(
+            spontaneous_prob_base,
+            int(batch_size),
             seed=seed_helper.next_spontaneous_seed(),
             dtype=dtype,
         )
-        return tf.less(random_uniform, probability)
 
-    @tf.function
-    def distributed_sample_probability_batch(probability, batch_size, current_input=False):
-        return strategy.run(
-            sample_probability_batch,
-            args=(probability, batch_size),
-            kwargs={"current_input": current_input},
-        )
+    def make_distributed_probability_sampler(batch_size):
+        @tf.function
+        def distributed_sampler(probability, current_input=False):
+            def replica_sample(replica_probability):
+                return sample_probability_batch(
+                    replica_probability,
+                    batch_size,
+                    current_input=current_input,
+                )
 
-    def generate_gray_state(batch_size):
-        batch_size = tf.cast(batch_size, tf.int32)
-        x = generate_spontaneous_spikes(batch_size)
+            return strategy.run(replica_sample, args=(probability,))
+
+        return distributed_sampler
+
+    probability_samplers = {
+        per_replica_batch_size: make_distributed_probability_sampler(
+            per_replica_batch_size
+        ),
+        gray_batch_size: make_distributed_probability_sampler(gray_batch_size),
+    }
+
+    def distributed_sample_probability_batch(
+        probability, batch_size, current_input=False
+    ):
+        return probability_samplers[batch_size](probability, current_input)
+
+    def generate_gray_state():
+        x = generate_spontaneous_spikes(real_batch_size)
         if x.dtype == tf.bool:
             x = tf.cast(x, dtype)
-        init_state = rsnn_layer.cell.zero_state(batch_size, dtype=dtype)
+        init_state = rsnn_layer.cell.zero_state(real_batch_size, dtype=dtype)
         seed_helper.advance_noise_seed()
         inputs = [x]
         inputs.extend(list(init_state))
@@ -1074,9 +1168,9 @@ def main(_):
         )
 
     @tf.function
-    def distributed_generate_gray_state(batch_size):
+    def distributed_generate_gray_state():
         # Run generate_gray_state on each replica
-        return strategy.run(generate_gray_state, args=(batch_size,))
+        return strategy.run(generate_gray_state)
 
     def validation_step(x, state_variables):
         _out = run_extractor(x, state_variables)
@@ -1207,7 +1301,7 @@ def main(_):
                 spontaneous_prob_base,
                 per_replica_batch_size,
             )
-            state = distributed_generate_gray_state(per_replica_batch_size)
+            state = distributed_generate_gray_state()
             z, v = distributed_validation_step(x, state)
             rate_loss = distributed_validation_rate_loss(z, spontaneous=True)
             x_local, z_local, v_local = collect_local_validation_outputs(x, z, v, keep)
@@ -1246,7 +1340,7 @@ def main(_):
         while completed < repeats:
             keep = min(global_batch_size, repeats - completed)
             x = distributed_sample_probability_batch(probability, per_replica_batch_size)
-            state = distributed_generate_gray_state(per_replica_batch_size)
+            state = distributed_generate_gray_state()
             z_evoked, v_evoked = distributed_validation_step(x, state)
             rate_loss = distributed_validation_rate_loss(z_evoked, spontaneous=False)
             x_local, z_evoked, v_evoked = collect_local_validation_outputs(x, z_evoked, v_evoked, keep)
@@ -1518,7 +1612,7 @@ def main(_):
         if not flags.benchmark_output:
             callbacks.on_epoch_start()
         # Reset the model state to the gray state
-        gray_state = distributed_generate_gray_state(real_batch_size)
+        gray_state = distributed_generate_gray_state()
 
         # tf.profiler.experimental.start(logdir=logdir)
         for step in range(flags.steps_per_epoch):
@@ -1530,7 +1624,7 @@ def main(_):
 
             # try resetting every iteration
             if flags.reset_every_step:
-                gray_state = distributed_generate_gray_state(real_batch_size)
+                gray_state = distributed_generate_gray_state()
 
             # Generate LGN spikes
             x, y, _, _ = next(it)  # x dtype tf.bool
