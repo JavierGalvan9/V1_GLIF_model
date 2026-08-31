@@ -536,7 +536,8 @@ class EarthMoversDistanceRegularizer(Layer):
     """
     EMD Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
     synaptic weight distributions, per edge type, averaged over all edge types.
-    Uses TF operations for execution and CPU numba for initialization.
+    Uses one flat gather followed by contiguous group slices during execution.
+    Group metadata is prepared on CPU and stored as non-trainable local state.
     """
 
     def __init__(self, strength, network, dtype=tf.float32):
@@ -569,19 +570,27 @@ class EarthMoversDistanceRegularizer(Layer):
                 order_np, row_splits_np = _build_group_order_numpy(group_ids_np, n_groups)
                 sorted_initial_flat_np = _sort_initial_values_by_group_numpy(initial_value_np, order_np, row_splits_np)
 
-        if order_np.size <= np.iinfo(np.int32).max:
-            order_tf = tf.convert_to_tensor(order_np, dtype=tf.int32)
-        else:
-            order_tf = tf.convert_to_tensor(order_np, dtype=tf.int64)
-        row_splits_tf = tf.convert_to_tensor(row_splits_np, dtype=tf.int32)
-        sorted_initial_tf = tf.convert_to_tensor(sorted_initial_flat_np, dtype=self._dtype)
-
-        # 3. Build row_splits directly from per-type counts.
-        # This avoids RaggedTensor.from_value_rowids -> DenseBincount, which raises
-        # under GPU deterministic mode in TF 2.15.
+        index_dtype = tf.int32 if order_np.size <= np.iinfo(np.int32).max else tf.int64
+        self._n_groups = n_groups
         self.num_unique = tf.constant(n_groups, dtype=tf.int32)
-        self._group_indices = tf.RaggedTensor.from_row_splits(order_tf, row_splits_tf, validate=False)
-        self._sorted_initial_values = tf.RaggedTensor.from_row_splits(sorted_initial_tf, row_splits_tf, validate=False)
+        self._group_order = tf.Variable(
+            order_np,
+            dtype=index_dtype,
+            trainable=False,
+            name="emd_group_order",
+        )
+        self._row_splits = tf.Variable(
+            row_splits_np,
+            dtype=tf.int64,
+            trainable=False,
+            name="emd_row_splits",
+        )
+        self._sorted_initial_values = tf.Variable(
+            sorted_initial_flat_np,
+            dtype=self._dtype,
+            trainable=False,
+            name="emd_sorted_initial_values",
+        )
 
     @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
     def __call__(self, x):
@@ -590,10 +599,16 @@ class EarthMoversDistanceRegularizer(Layer):
         if len(x.shape) > 1 and x.shape[1] == 1:
             x = tf.squeeze(x, axis=1)
 
-        emd_losses = tf.TensorArray(self._dtype, size=self.num_unique)
-        for i in tf.range(self.num_unique):
-            x_i = tf.gather(x, self._group_indices[i])
-            y_i = self._sorted_initial_values[i] # Already presorted during initialization
+        if self._n_groups == 0:
+            return tf.reduce_sum(x) * tf.cast(0.0, self._dtype)
+
+        grouped_x = tf.gather(x, self._group_order)
+        emd_losses = tf.TensorArray(self._dtype, size=self._n_groups)
+        for i in tf.range(self._n_groups):
+            start = self._row_splits[i]
+            end = self._row_splits[i + 1]
+            x_i = grouped_x[start:end]
+            y_i = self._sorted_initial_values[start:end]
             emd = tf.reduce_mean(tf.abs(tf.sort(x_i) - y_i))
             emd_losses = emd_losses.write(i, emd)
         reg_loss = tf.reduce_mean(emd_losses.stack())
