@@ -497,6 +497,34 @@ class LGN(object):
             )
             self.edge_reciprocals.append(tf.math.reciprocal(edge_fraction))
 
+        max_vertical = max(value.shape[0] for value in self.vertical_filters)
+        max_horizontal = max(value.shape[1] for value in self.horizontal_filters)
+
+        def center_pad(value, target, axis):
+            padding = target - value.shape[axis]
+            before = padding // 2
+            after = padding - before
+            widths = [(0, 0)] * value.ndim
+            widths[axis] = (before, after)
+            return np.pad(value, widths)
+
+        packed_vertical = np.concatenate(
+            [
+                center_pad(np.asarray(value), max_vertical, axis=0)
+                for value in self.vertical_filters
+            ],
+            axis=3,
+        )
+        packed_horizontal = np.concatenate(
+            [
+                center_pad(np.asarray(value), max_horizontal, axis=1)
+                for value in self.horizontal_filters
+            ],
+            axis=2,
+        )
+        self.packed_vertical_filters = tf.constant(packed_vertical, dtype=dtype)
+        self.packed_horizontal_filters = tf.constant(packed_horizontal, dtype=dtype)
+
         composite_mask = is_composite.astype(bool)
         composite_ids = np.flatnonzero(composite_mask).astype(np.int32)
         self.n_composite = composite_ids.size
@@ -538,15 +566,19 @@ class LGN(object):
     def spatial_response(self, movie, bmtk_compat=True):
         """Return dominant responses and compact non-dominant composite responses."""
         movie = tf.cast(movie, dtype=self.dtype)
+        convolved_movies = tf.nn.conv2d(
+            movie, self.packed_vertical_filters, strides=1, padding='SAME'
+        )
+        convolved_movies = tf.nn.depthwise_conv2d(
+            convolved_movies,
+            self.packed_horizontal_filters,
+            strides=(1, 1, 1, 1),
+            padding='SAME',
+        )
         all_spatial_responses = []
         all_non_dom_spatial_responses = []
         for i, _ in enumerate(self.spatial_range_indices):
-            convolved_movie = tf.nn.conv2d(
-                movie, self.vertical_filters[i], strides=1, padding='SAME'
-            )
-            convolved_movie = tf.nn.conv2d(
-                convolved_movie, self.horizontal_filters[i], strides=1, padding='SAME'
-            )
+            convolved_movie = convolved_movies[..., i:i + 1]
             if bmtk_compat:
                 convolved_movie *= self.edge_reciprocals[i]
             flattened_movie = tf.reshape(
