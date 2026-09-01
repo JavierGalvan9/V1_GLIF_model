@@ -2,7 +2,7 @@
 
 This package exposes the production external-current interface used by both
 LGN and background connections. It shares the mature CSR forward and full
-activity/weight backward kernels from `cuda_synaptic_currents`, and adds a
+activity/weight backward kernels from `cuda_csr_recurrent`, and adds a
 dedicated weight-only backward operator. The latter does not allocate or
 calculate activity gradients and is the intended model configuration.
 
@@ -16,6 +16,12 @@ order; CSR identifiers are `uint32` and synapse types are `uint8`.
 Build both required libraries in the configured environment:
 
 ```bash
-python -m v1_model_utils.cuda_synaptic_currents.build
-python -m v1_model_utils.cuda_external_currents.build
+python -m v1_model_utils.cuda_csr_recurrent.build
+python -m v1_model_utils.cuda_csr_external.build
 ```
+
+Both commands detect the visible GPU architecture by default. Pass
+`--architecture 86`, `--architecture 80`, `--architecture 89`, or
+`--architecture 120` to prebuild caches for RTX 3090, A100, L40S, or RTX Pro
+6000 GPUs respectively. Architecture-specific shared libraries coexist and are
+selected automatically at runtime.

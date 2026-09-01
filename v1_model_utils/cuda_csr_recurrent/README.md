@@ -9,11 +9,14 @@ Build it in the project environment:
 
 ```bash
 conda activate neuro_tf2151
-python -m v1_model_utils.cuda_synaptic_currents.build --architecture 120
+python -m v1_model_utils.cuda_csr_recurrent.build
 ```
 
-Set `V1_CUDA_ARCH` or pass `--architecture` for a different GPU compute
-capability. The build includes native cubin and PTX for that architecture.
+The default architecture is detected from the visible GPU. Set `V1_CUDA_ARCH`
+or pass `--architecture` to prebuild for another compute capability. Builds are
+cached under their CUDA ABI and architecture directory (for example,
+`sm86/cuda_csr_recurrent/_csr_recurrent_ops.so`), and runtime loading selects the exact match
+for the visible GPUs.
 
 The operator dispatches four basis columns to an unrolled specialization and
 uses a runtime loop for every other positive basis dimension. Batch sizes
@@ -23,8 +26,9 @@ The generic backward path processes runtime batches in four-sample tiles and
 skips zero weight-gradient writes, which keeps arbitrary batches efficient for
 the model's sparse firing regime.
 
-Training defaults to `--synaptic_current_backend=cuda`. Use
-`--synaptic_current_backend=tensorflow` only as a reference/debug fallback.
+Training defaults to `--acceleration=auto`. Use `--acceleration=cuda` to
+require the optimized kernels or `--acceleration=tensorflow` for the reference
+implementation.
 
 The CUDA kernels consume the FP32 recurrent master weights directly. Activations
 and synaptic basis values still use the model compute dtype.

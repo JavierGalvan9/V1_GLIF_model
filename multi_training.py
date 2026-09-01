@@ -10,6 +10,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 # os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
+from v1_model_utils import training_orchestration
+from v1_model_utils.training_bootstrap import TRAINING_LAUNCH_PLAN
+
 import absl
 import socket
 # import re
@@ -18,12 +21,13 @@ import json
 import numpy as np
 import pandas as pd
 import statistics
-import subprocess
 import tensorflow as tf
 import pickle as pkl
 from time import strftime, time
 import logging
 from v1_model_utils import tf_utils
+
+_TRAINING_LAUNCH_PLAN = TRAINING_LAUNCH_PLAN
 tf.get_logger().setLevel(logging.INFO)
 # logging.getLogger().setLevel(logging.INFO)
 
@@ -184,11 +188,10 @@ def main(_):
     # Configure the dtype policy
     mixed_precision, dtype = tf_utils.configure_policy_and_dtype(flags.dtype)
 
-    # Use HierarchicalCopyAllReduce to avoid NCCL issues with Blackwell GPUs
     strategy = tf_utils.create_distribution_strategy(
         physical_devices=physical_devices,
-        use_hierarchical_all_reduce=True,
         single_gpu_strategy=flags.single_gpu_strategy,
+        multi_worker=_TRAINING_LAUNCH_PLAN.worker_index is not None,
     )
 
     per_replica_batch_size = flags.batch_size
@@ -245,6 +248,8 @@ def main(_):
             dampening_factor=flags.dampening_factor,
             recurrent_dampening_factor=flags.recurrent_dampening_factor,
             voltage_gradient_dampening=flags.voltage_gradient_dampening,
+            detach_reset=flags.detach_reset,
+            detach_asc_reset=flags.detach_asc_reset,
             gauss_std=flags.gauss_std,
             lr_scale=flags.lr_scale,
             train_input=flags.train_input,
@@ -261,7 +266,7 @@ def main(_):
             current_input=flags.current_input,
             seed=flags.seed,
             use_dummy_state_input=False,
-            synaptic_current_backend=flags.synaptic_current_backend,
+            acceleration=flags.acceleration,
             track_voltage_penalty=flags.use_online_voltage_loss,
             voltage_penalty_mode=flags.voltage_penalty_mode,
             return_voltage_sequences=not flags.use_online_voltage_loss,
@@ -838,6 +843,9 @@ def main(_):
         # Backpropagation of the model (gradients computation and application)
         grad = tape.gradient(loss_for_grad, model.trainable_variables)
         grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
+        grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
+            grad, flags.global_clipnorm
+        )
 
         # # The optimizer will aggregate the gradients across replicas automatically before applying them by default,
         # # so the losses have to be properly scaled to account for the number of replicas
@@ -845,6 +853,7 @@ def main(_):
         # # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/optimizer_v2/optimizer_v2.py#L741
         # optimizer.apply_gradients(zip(combined_grads, model.trainable_variables))
         if flags.debug_gradients:
+            tf.print("[Combined] pre-clip global norm:", gradient_global_norm)
             grad = _print_and_check_gradients(grad, "[Combined]")
 
         optimizer.apply_gradients(zip(grad, model.trainable_variables))
@@ -898,8 +907,12 @@ def main(_):
 
         grad = tape.gradient(loss_for_grad, model.trainable_variables)
         grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
+        grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
+            grad, flags.global_clipnorm
+        )
 
         if flags.debug_gradients:
+            tf.print("[Sequential] pre-clip global norm:", gradient_global_norm)
             grad = _print_and_check_gradients(
                 grad, "[Sequential]", spontaneous=spontaneous
             )
@@ -1549,7 +1562,8 @@ def main(_):
 
     callbacks = Callbacks(network, lgn_input, bkg_input, model, optimizer, flags, logdir, strategy,
                           metric_keys, pre_delay=delays[0], post_delay=delays[1], model_variables_init=model_variables_dict,
-                          checkpoint=checkpoint, spontaneous_training=flags.spontaneous_training)
+                          checkpoint=checkpoint, spontaneous_training=flags.spontaneous_training,
+                          write_outputs=_TRAINING_LAUNCH_PLAN.is_chief)
 
     protocol_angles = np.asarray(tuple(range(0, 360, 45)), dtype=np.int32)
     protocol_n_trials = 10
@@ -1578,6 +1592,7 @@ def main(_):
     profiler_logdir = None
     profiler_finished = False
     benchmark_step_times = []
+    benchmark_losses = []
     benchmark_total_steps = flags.benchmark_warmup_steps + flags.benchmark_measure_steps
     if flags.benchmark_output:
         if flags.benchmark_warmup_steps < 0 or flags.benchmark_measure_steps < 1:
@@ -1681,6 +1696,7 @@ def main(_):
                     )
                 if start_time is not None:
                     benchmark_step_times.append(time() - start_time)
+                    benchmark_losses.append(float(step_values[0]))
                 # break
             except tf.errors.ResourceExhaustedError as e:
                 raise RuntimeError(
@@ -1694,14 +1710,9 @@ def main(_):
             if flags.benchmark_output:
                 if len(benchmark_step_times) == flags.benchmark_measure_steps:
                     memory = tf.config.experimental.get_memory_info("GPU:0")
-                    try:
-                        smi_output = subprocess.check_output(
-                            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                            text=True,
-                        ).splitlines()
-                        process_memory_mib = float(smi_output[flags.profile_gpu_index])
-                    except (OSError, subprocess.CalledProcessError, IndexError, ValueError):
-                        process_memory_mib = None
+                    process_memory_mib = (
+                        training_orchestration.current_process_gpu_memory_mib()
+                    )
                     result = {
                         "online_voltage_loss": bool(flags.use_online_voltage_loss),
                         "warmup_steps": flags.benchmark_warmup_steps,
@@ -1713,6 +1724,7 @@ def main(_):
                         "tf_current_memory_mib": memory["current"] / 2**20,
                         "nvidia_smi_memory_mib": process_memory_mib,
                         "last_loss": float(step_values[0]),
+                        "loss_history": benchmark_losses,
                     }
                     os.makedirs(os.path.dirname(flags.benchmark_output) or ".", exist_ok=True)
                     with open(flags.benchmark_output, "w", encoding="utf-8") as output_file:
@@ -1755,6 +1767,16 @@ def main(_):
             protocol_spikes=protocol_spikes,
             protocol_angles=protocol_angles_epoch,
         )
+
+        if _TRAINING_LAUNCH_PLAN.worker_index is not None:
+            distributed_stop = strategy.run(
+                lambda: tf.constant(1 if stop else 0, dtype=tf.int32)
+            )
+            stop = bool(
+                strategy.reduce(
+                    tf.distribute.ReduceOp.MAX, distributed_stop, axis=None
+                ).numpy()
+            )
 
         if stop:
             break
@@ -1805,10 +1827,10 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('scale', '2,2', '')
     absl.app.flags.DEFINE_string('dtype', 'float16', '')
     absl.app.flags.DEFINE_enum(
-        'synaptic_current_backend',
-        'cuda',
-        ['cuda', 'tensorflow'],
-        'Recurrent synaptic-current implementation.',
+        'acceleration',
+        'auto',
+        ['auto', 'cuda', 'tensorflow'],
+        'Model acceleration mode.',
     )
     absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
@@ -1869,6 +1891,11 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_float('dampening_factor', 0.1, '')
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.1, "")
+    absl.app.flags.DEFINE_float(
+        "global_clipnorm",
+        0.0,
+        "Clip the unscaled global gradient norm; values <= 0 disable clipping.",
+    )
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 10., '')
@@ -1902,6 +1929,17 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_integer(
         'gray_batch_size', 1, 'Gray/spontaneous samples per replica.'
+    )
+    absl.app.flags.DEFINE_integer(
+        'n_gpus', 1, 'Number of visible GPUs to use.'
+    )
+    absl.app.flags.DEFINE_integer(
+        'global_batch_size', 0,
+        'Optional global batch split evenly across n_gpus; 0 keeps per-replica flags.',
+    )
+    absl.app.flags.DEFINE_integer(
+        'distributed_worker_index', -1,
+        'Internal worker marker used by the multi-GPU launcher.',
     )
     absl.app.flags.DEFINE_integer('neurons', 0, '')  # 0 to take all neurons
     absl.app.flags.DEFINE_integer("n_input", 17400, "")
@@ -1979,7 +2017,19 @@ if __name__ == '__main__':
         25,
         "Temporal chunk size for segmented exact-BPTT recomputation.",
     )
-    absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")
+    absl.app.flags.DEFINE_float(
+        "voltage_gradient_dampening",
+        0.0,
+        "Deprecated compatibility option; the voltage self-loop is not dampened.",
+    )
+    absl.app.flags.DEFINE_boolean(
+        "detach_reset", True, "Detach the spike from the membrane-reset gradient path."
+    )
+    absl.app.flags.DEFINE_boolean(
+        "detach_asc_reset",
+        False,
+        "Detach the spike from the after-spike-current increment gradient path.",
+    )
     absl.app.flags.DEFINE_boolean(
         "sequential_stimuli", True, "Run evoked and spontaneous stimuli sequentially but convergence would be slower and worse (memory friendly; intended for batch_size=1).")
     absl.app.flags.DEFINE_boolean(

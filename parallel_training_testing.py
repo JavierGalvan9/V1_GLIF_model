@@ -89,9 +89,16 @@ parser.add_argument(
 )
 parser.set_defaults(rolling_warmup=True)
 
-parser.add_argument('--dampening_factor', default=1, type=float) #0.1
-parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float) #0.1
-parser.add_argument('--voltage_gradient_dampening', default=0.5, type=float)
+parser.add_argument('--dampening_factor', default=0.1, type=float)
+parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
+parser.add_argument('--global_clipnorm', default=0.0, type=float)
+parser.add_argument('--voltage_gradient_dampening', default=0.0, type=float)
+parser.add_argument('--detach_reset', dest='detach_reset', action='store_true')
+parser.add_argument('--nodetach_reset', dest='detach_reset', action='store_false')
+parser.set_defaults(detach_reset=True)
+parser.add_argument('--detach_asc_reset', dest='detach_asc_reset', action='store_true')
+parser.add_argument('--nodetach_asc_reset', dest='detach_asc_reset', action='store_false')
+parser.set_defaults(detach_asc_reset=False)
 parser.add_argument('--input_weight_scale', default=1.0, type=float)
 parser.add_argument('--gauss_std', default=0.3, type=float)
 parser.add_argument('--recurrent_weight_regularization', default=0.0, type=float)
@@ -107,7 +114,9 @@ parser.add_argument('--plot_core_radius', default=400.0, type=float)
 parser.add_argument('--n_gpus', default=1, type=int)
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=75, type=int)
-parser.add_argument('--batch_size', default=1, type=int)
+parser.add_argument('--batch_size', default=2, type=int)
+parser.add_argument('--grating_batch_size', default=1, type=int)
+parser.add_argument('--gray_batch_size', default=1, type=int)
 parser.add_argument('--neurons', default=0, type=int)
 parser.add_argument('--steps_per_epoch', default=25, type=int)
 parser.add_argument('--val_steps', default=1, type=int)
@@ -224,7 +233,7 @@ def main():
 
     # Define the job submission commands for the training and evaluation scripts
     if flags.low_memory_gpu:
-        training_commands = ["run", "-g", "1", "-m", "64", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
+        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtx3090", "-m", "64", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
     else:
         # training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{16 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the L40S GPU with 48GB of memory
         training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtxpro6000", "-c", f"{16 * flags.n_gpus}", "-m", "64", "-t", "48:00"] # choose the rtx6000 GPU with 64GB of memory
@@ -239,7 +248,7 @@ def main():
 
     # Append each flag to the string
     for name, value in vars(flags).items():
-        if name not in ['seed', 'n_gpus', 'low_memory_gpu', 'print_only']:
+        if name not in ['seed', 'low_memory_gpu', 'print_only']:
             if isinstance(value, bool) and not value:
                 training_script += f"--no{name} "
             elif isinstance(value, bool) and value:
@@ -247,8 +256,13 @@ def main():
             else:
                 training_script += f"--{name} {value} "
 
-            # osi_dsi_estimator.py does not define rolling loss or training debug flags.
-            if name.startswith('rolling_') or name == 'debug_gradients':
+            # osi_dsi_estimator.py does not define training-only batch splits,
+            # rolling-loss flags, or training debug flags.
+            if name in {
+                'n_gpus', 'grating_batch_size', 'gray_batch_size',
+                'debug_gradients', 'global_clipnorm',
+                'detach_reset', 'detach_asc_reset',
+            } or name.startswith('rolling_'):
                 continue
 
             if isinstance(value, bool) and not value:
@@ -265,13 +279,13 @@ def main():
     _initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
 
     if initial_benchmark_model:
-        _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
+        _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
     else:
-        _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
+        _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
 
-    # initial_evaluation_command = initial_evaluation_command + [initial_evaluation_script]
-    # eval_job_id = submit_job(initial_evaluation_command)
-    # eval_job_ids.append(eval_job_id)
+    initial_evaluation_command = _initial_evaluation_command + [_initial_evaluation_script]
+    eval_job_id = submit_job(initial_evaluation_command)
+    eval_job_ids.append(eval_job_id)
 
     for i in range(flags.n_runs):
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...

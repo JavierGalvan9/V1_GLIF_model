@@ -3,15 +3,26 @@ import tensorflow as tf
 import os
 import pickle as pkl
 from tensorflow.python.eager import record
-from .cuda_synaptic_currents import (
+from .cuda_csr_recurrent import (
     build_csr_connectivity,
-    calculate_synaptic_currents as calculate_synaptic_currents_cuda,
+    calculate_recurrent_csr_currents,
 )
-from .cuda_external_currents import (
+from .cuda_csr_external import (
     build_csr_connectivity as build_external_csr_connectivity,
-    calculate_external_currents,
+    calculate_external_csr_currents,
 )
 from numba import njit
+
+
+def _has_homogeneous_cuda_devices():
+    """Return whether one CUDA artifact can serve every visible GPU."""
+    devices = tf.config.list_physical_devices("GPU")
+    capabilities = {
+        tuple(tf.config.experimental.get_device_details(device)["compute_capability"])
+        for device in devices
+    }
+    return bool(devices) and len(capabilities) == 1
+
 
 # import subprocess
 # from . import other_v1_utils
@@ -79,7 +90,7 @@ def _threshold_voltage_penalty_mean(voltage, inverse_n_neurons):
     return mean_penalty, grad
 
 
-def voltage_penalty_mean_step(voltage, n_neurons, penalty_mode="range"):
+def compute_voltage_penalty_mean_step(voltage, n_neurons, penalty_mode="range"):
     """Return the compute-dtype neuron-mean penalty for one timestep."""
     inverse_n_neurons = tf.math.reciprocal(tf.cast(n_neurons, tf.float32))
     if penalty_mode == "range":
@@ -562,6 +573,8 @@ class V1Column(tf.keras.layers.Layer):
         dampening_factor=0.3,
         recurrent_dampening_factor=0.5,
         voltage_gradient_dampening=0.5,
+        detach_reset=True,
+        detach_asc_reset=False,
         input_weight_scale=1.0,
         recurrent_weight_scale=1.0,
         lr_scale=1.0,
@@ -577,11 +590,12 @@ class V1Column(tf.keras.layers.Layer):
         noise_seed=0,
         hard_reset=False,
         current_input=False,
-        synaptic_current_backend="cuda",
+        acceleration="auto",
         track_voltage_penalty=False,
         voltage_penalty_mode="range",
         return_voltage_sequences=True,
-        inference_mode=False,
+        output_spike_dtype=None,
+        output_neuron_ids=None,
     ):
         super().__init__()
         # Disable Keras layer autocast so tensors keep explicit dtypes:
@@ -605,6 +619,8 @@ class V1Column(tf.keras.layers.Layer):
         self._voltage_gradient_dampening = tf.constant(
             voltage_gradient_dampening, self.compute_dtype
         )
+        self._detach_reset = bool(detach_reset)
+        self._detach_asc_reset = bool(detach_asc_reset)
         self._pseudo_gauss = pseudo_gauss
         self._lr_scale = tf.constant(lr_scale, dtype=self.compute_dtype)
         # self._spike_gradient = spike_gradient
@@ -621,13 +637,46 @@ class V1Column(tf.keras.layers.Layer):
         self._track_voltage_penalty = bool(track_voltage_penalty)
         self._voltage_penalty_mode = voltage_penalty_mode
         self._return_voltage_sequences = bool(return_voltage_sequences)
-        self._inference_mode = bool(inference_mode)
-        if synaptic_current_backend not in ("cuda", "tensorflow"):
+        self._output_spike_dtype = tf.as_dtype(
+            self.compute_dtype if output_spike_dtype is None else output_spike_dtype
+        )
+        if not (
+            self._output_spike_dtype.is_floating
+            or self._output_spike_dtype == tf.uint8
+        ):
             raise ValueError(
-                "synaptic_current_backend must be 'cuda' or 'tensorflow', got "
-                f"{synaptic_current_backend!r}"
+                "output_spike_dtype must be a floating dtype or tf.uint8"
             )
-        self.synaptic_current_backend = synaptic_current_backend
+        self._output_neuron_ids = (
+            None
+            if output_neuron_ids is None
+            else tf.convert_to_tensor(output_neuron_ids, dtype=tf.int32)
+        )
+        if acceleration not in ("auto", "cuda", "tensorflow"):
+            raise ValueError(
+                "acceleration must be 'auto', 'cuda', or 'tensorflow', got "
+                f"{acceleration!r}"
+            )
+        cuda_available = _has_homogeneous_cuda_devices()
+        if acceleration == "cuda" and self._pseudo_gauss:
+            raise ValueError("acceleration='cuda' does not support pseudo_gauss")
+        if acceleration == "cuda" and not cuda_available:
+            raise RuntimeError(
+                "acceleration='cuda' requires visible GPUs with one compute capability"
+            )
+        use_cuda = acceleration == "cuda" or (
+            acceleration == "auto" and cuda_available
+        )
+        self.acceleration = acceleration
+        self._synaptic_current_backend = "cuda" if use_cuda else "tensorflow"
+        self._state_backend = (
+            "cuda" if use_cuda and not self._pseudo_gauss else "tensorflow"
+        )
+        self.resolved_acceleration = (
+            "cuda"
+            if self._state_backend == "cuda"
+            else "hybrid" if use_cuda else "tensorflow"
+        )
         self._n_neurons = int(network["n_nodes"])
         self._gauss_std = tf.constant(gauss_std, self.compute_dtype)
         # Determine the membrane time decay constant
@@ -756,7 +805,7 @@ class V1Column(tf.keras.layers.Layer):
         indices[:, 1] = indices[:, 1] + self._n_neurons * (delays - 1)
         self.recurrent_dense_shape = dense_shape[0], self.max_delay * dense_shape[1]
         #the first column (presynaptic neuron) has size n_neurons and the second column (postsynaptic neuron) has size max_delay*n_neurons
-        if self.synaptic_current_backend == "cuda":
+        if self._synaptic_current_backend == "cuda":
             self.recurrent_csr = build_csr_connectivity(
                 indices,
                 syn_ids,
@@ -816,7 +865,7 @@ class V1Column(tf.keras.layers.Layer):
         # else:
         #     self.per_type_training = False
 
-        if self.synaptic_current_backend == "tensorflow":
+        if self._synaptic_current_backend == "tensorflow":
             self.syn_ids = tf.constant(syn_ids, dtype=tf.int64)
         # self.recurrent_weights_factors = tf.gather(self.synaptic_basis_weights, self.syn_ids, axis=0) # TensorShape([23525415, 5])
         print(f"    > # Recurrent synapses: {len(indices)}")
@@ -835,7 +884,7 @@ class V1Column(tf.keras.layers.Layer):
         # input_delays = np.array(lgn_input["delays"])
         # input_delays = np.round(np.clip(input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
-        if self.synaptic_current_backend == "cuda":
+        if self._synaptic_current_backend == "cuda":
             # Retain the legacy checkpoint object without occupying GPU memory;
             # CUDA execution consumes the compact CSR tensors below instead.
             with tf.device("/CPU:0"):
@@ -859,7 +908,7 @@ class V1Column(tf.keras.layers.Layer):
             trainable=train_input,
             dtype=self.variable_dtype
         )
-        if self.synaptic_current_backend == "cuda" and not self._current_input:
+        if self._synaptic_current_backend == "cuda" and not self._current_input:
             self.input_csr = build_external_csr_connectivity(
                 input_indices,
                 input_syn_ids,
@@ -868,7 +917,7 @@ class V1Column(tf.keras.layers.Layer):
             )
         else:
             self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64)
-        if self.synaptic_current_backend == "tensorflow" and not self._current_input:
+        if self._synaptic_current_backend == "tensorflow" and not self._current_input:
             self.pre_input_ind_table = make_pre_ind_table(input_indices, n_source_neurons=self.lgn_input_dense_shape[1])
 
         print(f"    > # LGN input synapses {len(input_indices)}")
@@ -886,7 +935,7 @@ class V1Column(tf.keras.layers.Layer):
         # bkg_input_delays = np.array(bkg_input['delays'])
         # bkg_input_delays = np.round(np.clip(bkg_input_delays, dt, self.max_delay)/dt).astype(np.int32)
         # bkg_input_indices[:, 1] = bkg_input_indices[:, 1] + self._n_neurons * (bkg_input_delays - 1)
-        if self.synaptic_current_backend == "cuda":
+        if self._synaptic_current_backend == "cuda":
             with tf.device("/CPU:0"):
                 self.bkg_input_indices = tf.Variable(
                     bkg_input_indices, trainable=False, dtype=tf.int64
@@ -896,7 +945,7 @@ class V1Column(tf.keras.layers.Layer):
                 bkg_input_indices, trainable=False, dtype=tf.int64
             )
         # self.bkg_input_indices = tf.Variable(bkg_input_indices, trainable=False, dtype=tf.int32)
-        if self.synaptic_current_backend == "cuda":
+        if self._synaptic_current_backend == "cuda":
             self.bkg_input_csr = build_external_csr_connectivity(
                 bkg_input_indices,
                 bkg_input_syn_ids,
@@ -922,7 +971,7 @@ class V1Column(tf.keras.layers.Layer):
             dtype=self.variable_dtype
         )
 
-        if self.synaptic_current_backend == "tensorflow":
+        if self._synaptic_current_backend == "tensorflow":
             self.bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int64)
         # self.bkg_input_weights_factors = tf.gather(self.synaptic_basis_weights, bkg_input_syn_ids, axis=0)
 
@@ -973,12 +1022,12 @@ class V1Column(tf.keras.layers.Layer):
         Calculate the input current from the LGN neurons, given the spikes at time t (x_t).
         Use int64 for indexing to optimize GPU gather and segment_sum performance, which are critical operations in this function.
         """
-        if self.synaptic_current_backend == "cuda":
+        if self._synaptic_current_backend == "cuda":
             active_inputs = x_t if x_t.dtype == tf.bool else x_t > 0
             activity = tf.stop_gradient(
                 tf.cast(active_inputs, dtype=self.compute_dtype)
             )
-            return calculate_external_currents(
+            return calculate_external_csr_currents(
                 activity,
                 self.input_weight_values,
                 self.synaptic_basis_weights,
@@ -1051,11 +1100,11 @@ class V1Column(tf.keras.layers.Layer):
             dtype=tf.int32,
         )
 
-        if self.synaptic_current_backend == "cuda":
+        if self._synaptic_current_backend == "cuda":
             activity = tf.stop_gradient(
                 tf.cast(rest_of_brain, dtype=self.compute_dtype)
             )
-            return calculate_external_currents(
+            return calculate_external_csr_currents(
                 activity,
                 self.bkg_input_weights,
                 self.synaptic_basis_weights,
@@ -1118,8 +1167,8 @@ class V1Column(tf.keras.layers.Layer):
 
         # Calculate recurrent currents with the selected fused CUDA or reference
         # TensorFlow implementation.
-        if self.synaptic_current_backend == "cuda":
-            i_rec_flat = calculate_synaptic_currents_cuda(
+        if self._synaptic_current_backend == "cuda":
+            i_rec_flat = calculate_recurrent_csr_currents(
                 rec_z_buf,
                 self.recurrent_weight_values,
                 self.synaptic_basis_weights,
@@ -1160,8 +1209,9 @@ class V1Column(tf.keras.layers.Layer):
         new_psc, new_psc_rise = self.update_psc(psc, psc_rise, rec_inputs)
         # Calculate the ASC variables
         asc = tf.reshape(asc, (batch_size, self._n_neurons, 2))
-        # new_asc = self.asc_decay * asc + tf.expand_dims(prev_z, axis=-1) * self.asc_amps
-        new_asc = self.asc_decay * asc + tf.expand_dims(tf.stop_gradient(prev_z), axis=-1) * self.asc_amps
+        asc_spike = tf.stop_gradient(prev_z) if self._detach_asc_reset else prev_z
+        new_asc = self.asc_decay * asc + tf.expand_dims(asc_spike, axis=-1) * self.asc_amps
+        # new_asc = self.asc_decay * asc + tf.expand_dims(tf.stop_gradient(prev_z), axis=-1) * self.asc_amps
         new_asc = tf.reshape(new_asc, (batch_size, self._n_neurons * 2))
         # Calculate the postsynaptic current
         input_current = tf.reshape(psc, (batch_size, self._n_neurons, self._n_syn_basis))
@@ -1170,21 +1220,15 @@ class V1Column(tf.keras.layers.Layer):
         c1 = input_current + tf.reduce_sum(asc, axis=-1) # + self.gathered_g
         # Compute membrane update in variable_dtype (fp32 under mixed policy) for
         # more stable threshold crossings, then store state in compute_dtype.
-        # decayed_v = self.decay * v
-        # reset_current = prev_z * self.v_gap
-        # new_v = decayed_v + self.current_factor * c1 + reset_current
-        # new_v = self.decay * v + self.current_factor * c1 - prev_z
-        # new_v = self.decay * v + self.current_factor * c1 - tf.stop_gradient(prev_z)
+        reset = tf.stop_gradient(prev_z) if self._detach_reset else prev_z
+        new_v = self.decay * v + self.current_factor * c1 - reset
         # Damp only the voltage self-loop. We intentionally leave
         # current_factor * c1 untouched so recurrent/input pathways keep full credit.
-        dampened_v = straight_through_dampen(v, self._voltage_gradient_dampening)
-        new_v = self.decay * dampened_v + self.current_factor * c1 - tf.stop_gradient(prev_z)
-        # new_v = self.decay * dampened_v + self.current_factor * c1 - prev_z
+        # dampened_v = straight_through_dampen(v, self._voltage_gradient_dampening)
+        # new_v = self.decay * dampened_v + self.current_factor * c1 - tf.stop_gradient(prev_z)
         # Update the voltage according to the LIF equation and the refractory period
         # New r is a variable that accounts for the refractory period in which a neuron cannot spike
-        # prev_spike = tf.cast(prev_z > 0, self._refractory_state_dtype)
         prev_spike = tf.cast(prev_z, dtype=self._refractory_state_dtype)
-        # new_r = tf.maximum(r + prev_spike * self.t_ref_steps - 1, 0)
         new_r = tf.stop_gradient(tf.maximum(r + prev_spike * self.t_ref_steps - 1, 0)) # prevent gradients from flowing through the refractory state
 
         if self._hard_reset:
@@ -1231,7 +1275,7 @@ class V1Column(tf.keras.layers.Layer):
         return state
 
     def _voltage_penalty_mean_step(self, voltage):
-        return voltage_penalty_mean_step(
+        return compute_voltage_penalty_mean_step(
             voltage, self._n_neurons, self._voltage_penalty_mode
         )
 
@@ -1267,25 +1311,43 @@ class V1Column(tf.keras.layers.Layer):
         # Scale with the learning rate
         rec_inputs = rec_inputs * self._lr_scale
 
-        new_v, new_r, new_asc, new_psc_rise, new_psc = self._dense_update_impl(
-            batch_size, prev_z, v, r, asc, psc_rise, psc, rec_inputs
-        )
+        if self._state_backend == "cuda":
+            from .cuda_glif_state import update_glif_state
+
+            new_z, transition_state = update_glif_state(
+                z_buf, v, r, asc, psc_rise, psc, rec_inputs, cell=self
+            )
+            (
+                new_z_buf,
+                new_v,
+                new_r,
+                new_asc,
+                new_psc_rise,
+                new_psc,
+            ) = transition_state
+        else:
+            new_v, new_r, new_asc, new_psc_rise, new_psc = self._dense_update_impl(
+                batch_size, prev_z, v, r, asc, psc_rise, psc, rec_inputs
+            )
 
         # Generate spikes from a high-fidelity membrane lane before state quantization.
         # v_sc = (new_v - self.v_th) / self.normalizer # normalized is 1 for scaled voltage
-        v_sc = new_v - self.v_th
-        if self._pseudo_gauss:
-            new_z = spike_gauss(v_sc, self._gauss_std, self._dampening_factor)
-        else:
-            new_z = spike_function(v_sc, self._dampening_factor)
+        if self._state_backend != "cuda":
+            v_sc = new_v - self.v_th
+            if self._pseudo_gauss:
+                new_z = spike_gauss(v_sc, self._gauss_std, self._dampening_factor)
+            else:
+                new_z = spike_function(v_sc, self._dampening_factor)
 
-        # Generate the new spikes if the refractory period is concluded
-        # new_z = tf.cast(new_z, self.compute_dtype)
-        refractory_active = tf.greater(new_r, 0)
-        new_z = tf.where(refractory_active, tf.zeros_like(new_z), new_z)
+            # Generate the new spikes if the refractory period is concluded
+            # new_z = tf.cast(new_z, self.compute_dtype)
+            refractory_active = tf.greater(new_r, 0)
+            new_z = tf.where(refractory_active, tf.zeros_like(new_z), new_z)
 
-        # Add current spikes to the buffer
-        new_z_buf = tf.concat([new_z, z_buf[:, :-self._n_neurons]], axis=1)  # Shift buffer
+            # Add current spikes to the buffer
+            new_z_buf = tf.concat(
+                [new_z, z_buf[:, :-self._n_neurons]], axis=1
+            )
 
         # Keep model outputs in compute_dtype for mixed-precision efficiency.
         # output_v = new_v
@@ -1293,11 +1355,21 @@ class V1Column(tf.keras.layers.Layer):
         #     output_v = tf.cast(output_v, self.compute_dtype)
 
         # Define the model outputs and the new state of the network
-        # Training keeps floating spikes for surrogate gradients. Inference can expose
-        # the same binary values as uint8 without changing the floating delay state.
-        visible_z = tf.cast(new_z, tf.uint8) if self._inference_mode else new_z
+        # The exposed spike representation is independent of the recurrent state
+        # dtype and backend; the floating delay state remains unchanged.
+        output_z = (
+            new_z
+            if self._output_neuron_ids is None
+            else tf.gather(new_z, self._output_neuron_ids, axis=1)
+        )
+        visible_z = tf.cast(output_z, self._output_spike_dtype)
+        output_v = (
+            new_v
+            if self._output_neuron_ids is None
+            else tf.gather(new_v, self._output_neuron_ids, axis=1)
+        )
         outputs = (
-            (visible_z, new_v)
+            (visible_z, output_v)
             if self._return_voltage_sequences
             else (visible_z,)
         )
@@ -1397,6 +1469,8 @@ def create_model(
     dampening_factor=0.2,
     recurrent_dampening_factor=0.5,
     voltage_gradient_dampening=0.5,
+    detach_reset=True,
+    detach_asc_reset=False,
     lr_scale=800.0,
     train_recurrent=True,
     train_recurrent_per_type=False,
@@ -1416,11 +1490,12 @@ def create_model(
     current_input=False,
     use_dummy_state_input=False,
     seed=42,
-    synaptic_current_backend="cuda",
+    acceleration="auto",
     track_voltage_penalty=False,
     voltage_penalty_mode="range",
     return_voltage_sequences=True,
-    inference_mode=False,
+    output_spike_dtype=None,
+    output_neuron_ids=None,
 ):
 
     # Create the input layer of the model
@@ -1456,6 +1531,8 @@ def create_model(
         spike_gradient=True,
         recurrent_dampening_factor=recurrent_dampening_factor,
         voltage_gradient_dampening=voltage_gradient_dampening,
+        detach_reset=detach_reset,
+        detach_asc_reset=detach_asc_reset,
         max_delay=max_delay,
         pseudo_gauss=pseudo_gauss,
         batch_size=batch_size,
@@ -1466,11 +1543,12 @@ def create_model(
         noise_seed=seed,
         hard_reset=hard_reset,
         current_input=current_input,
-        synaptic_current_backend=synaptic_current_backend,
+        acceleration=acceleration,
         track_voltage_penalty=track_voltage_penalty,
         voltage_penalty_mode=voltage_penalty_mode,
         return_voltage_sequences=return_voltage_sequences,
-        inference_mode=inference_mode,
+        output_spike_dtype=output_spike_dtype,
+        output_neuron_ids=output_neuron_ids,
     )
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.
@@ -1514,9 +1592,7 @@ def create_model(
         hidden = rsnn_out
 
     spikes_dict = {}
-    spikes_dict['v1'] = (
-        tf.cast(hidden[0], dtype) if inference_mode else hidden[0]
-    )
+    spikes_dict['v1'] = tf.cast(hidden[0], dtype)
     # voltage = hidden[1]
 
     outputs_dict = {}
@@ -1576,6 +1652,7 @@ def create_model(
         many_input_model.add_metric(rate, name="rate")
 
     return many_input_model
+
 
 def build_sequence_only_model(model, rsnn_layer, name="rsnn_sequences"):
     """Create a training model that returns only the RNN sequence outputs."""

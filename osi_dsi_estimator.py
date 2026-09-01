@@ -48,10 +48,8 @@ def main(_):
     # Configure the dtype policy
     mixed_precision, dtype = tf_utils.configure_policy_and_dtype(flags.dtype)
 
-    # Use HierarchicalCopyAllReduce to avoid NCCL issues with Blackwell GPUs
     strategy = tf_utils.create_distribution_strategy(
         physical_devices=physical_devices,
-        use_hierarchical_all_reduce=True,
         single_gpu_strategy="mirrored",
     )
 
@@ -87,6 +85,19 @@ def main(_):
     network, lgn_input, bkg_input = load_fn(modified_flags, flags.neurons, flag_str=flag_str)
     print(f"Model files loading: {time()-t0:.2f} seconds\n")
 
+    if flags.track_core_only:
+        from v1_model_utils import other_v1_utils
+
+        core_mask = other_v1_utils.isolate_core_neurons(
+            network,
+            radius=flags.plot_core_radius,
+            data_dir=flags.data_dir,
+        )
+        output_neuron_ids = np.flatnonzero(core_mask).astype(np.int32)
+    else:
+        core_mask = None
+        output_neuron_ids = None
+
     # Define the scope in which the model training will be executed
     with strategy.scope():
         t0 = time()
@@ -108,10 +119,10 @@ def main(_):
                 voltage_gradient_dampening=flags.voltage_gradient_dampening,
                 gauss_std=flags.gauss_std,
                 lr_scale=flags.lr_scale,
-                train_input=flags.train_input,
-                train_noise=flags.train_noise,
-                train_recurrent=flags.train_recurrent,
-                train_recurrent_per_type=flags.train_recurrent_per_type,
+                train_input=False,
+                train_noise=False,
+                train_recurrent=False,
+                train_recurrent_per_type=False,
                 neuron_output=flags.neuron_output,
                 pseudo_gauss=flags.pseudo_gauss,
                 use_state_input=True,
@@ -122,8 +133,15 @@ def main(_):
                 current_input=flags.current_input,
                 use_dummy_state_input=False,
                 seed=flags.seed,
-                synaptic_current_backend=flags.synaptic_current_backend,
-                inference_mode=flags.inference_mode,
+                acceleration=flags.acceleration,
+                # A full-neuron uint8 Keras RNN output triggers a host-backed
+                # TensorArray and repeated PCIe copies. Keep compact core-neuron
+                # sequences floating on GPU and quantize once per completed chunk.
+                output_spike_dtype=(
+                    tf.float32 if flags.track_core_only else tf.uint8
+                ),
+                output_neuron_ids=output_neuron_ids,
+                return_voltage_sequences=flags.track_voltage,
             )
             temp_model.build((per_replica_batch_size, flags.seq_len, flags.n_input))
             return temp_model
@@ -150,10 +168,8 @@ def main(_):
         model_variables_dict['Best'] =  {var.name: var.numpy() for var in model.trainable_variables} # float32 dtype
         print("Model variables stored in dictionary\n")
 
-        # Build the model layers
+        # Build the sequence-and-state model used by the optimized Keras RNN loop.
         rsnn_layer = model.get_layer('rsnn')
-        # prediction_layer = model.get_layer('prediction')
-        # abstract_layer = model.get_layer('abstract_output')
         extractor_model = tf.keras.Model(inputs=model.inputs, outputs=rsnn_layer.output)
 
         # zero_state = rsnn_layer.cell.zero_state(per_replica_batch_size, dtype=dtype)
@@ -195,23 +211,17 @@ def main(_):
         )
 
     def roll_out(_x, _state_variables):
-        # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
         if _x.dtype == tf.bool:
             _x = tf.cast(_x, dtype)
         seed_helper.advance_noise_seed()
         _out = extractor_model((_x, _state_variables))
-        z = _out[0][0]
-        v = _out[0][1]
-        # update state_variables with the new model state
-        new_state = tuple(_out[1:])
-        # tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
-
-        return z, v, new_state
+        sequences = _out[0]
+        voltage = sequences[1] if flags.track_voltage else ()
+        return sequences[0], voltage, tuple(_out[1:])
 
     @tf.function
     def distributed_roll_out(x, state_variables):
-        z, v, new_state = strategy.run(roll_out, args=(x, state_variables))
-        return z, v, new_state
+        return strategy.run(roll_out, args=(x, state_variables))
 
     # Generate spontaneous spikes efficiently
     @tf.function
@@ -225,24 +235,20 @@ def main(_):
         return tf.less(random_uniform, spontaneous_prob)
 
     def generate_gray_state(batch_size):
-        # Generate LGN spikes
         batch_size = tf.cast(batch_size, tf.int32)
         prob = tf.tile(tf.expand_dims(spontaneous_prob, axis=0), [batch_size, 1, 1])
-        x = generate_spontaneous_spikes(prob)
-        x = tf.cast(x, dtype)
-        # Simulate the network with a gray screen
+        gray_spikes = tf.cast(generate_spontaneous_spikes(prob), dtype)
         zero_state = rsnn_layer.cell.zero_state(batch_size, dtype=dtype)
-        _, _, new_state = roll_out(x, zero_state)
+        _, _, new_state = roll_out(gray_spikes, zero_state)
         return new_state
 
     @tf.function
     def distributed_generate_gray_state(batch_size):
-        # Run generate_gray_state on each replica
         return strategy.run(generate_gray_state, args=(batch_size,))
 
-    # Generate the gray state
+    # Match the original estimator semantics: initialize the gray-screen state
+    # once, outside per-angle timing, and reuse it as an immutable starting state.
     gray_state = distributed_generate_gray_state(per_replica_batch_size)
-    continuing_state = gray_state
 
     # Define the callbacks for the OSI/DSI analysis
     stim_duration = flags.spont_duration + flags.evoked_duration
@@ -253,12 +259,9 @@ def main(_):
 
     n_iterations = int(np.ceil(flags.n_trials_per_angle / per_replica_batch_size))
     chunk_size = flags.seq_len
-    num_chunks = int(np.ceil(sim_duration/chunk_size))
-
+    num_chunks = int(np.ceil(sim_duration / chunk_size))
     # Determine which neurons to track based on track_core_only flag
     if flags.track_core_only:
-        from v1_model_utils import other_v1_utils
-        core_mask = other_v1_utils.isolate_core_neurons(network, radius=flags.plot_core_radius, data_dir=flags.data_dir)
         n_tracked_neurons = np.sum(core_mask)
         print(f"Tracking only core neurons: {n_tracked_neurons} out of {network['n_nodes']} total neurons")
     else:
@@ -266,12 +269,19 @@ def main(_):
         n_tracked_neurons = network['n_nodes']
         print(f"Tracking all neurons: {n_tracked_neurons}")
 
-    spikes = np.zeros((flags.n_trials_per_angle, len(DG_angles), sim_duration, n_tracked_neurons), dtype=np.uint8)
+    print(f"Resolved model acceleration: {rsnn_layer.cell.resolved_acceleration}")
 
-    # Initialize voltage tracking arrays if requested
-    if flags.track_voltage:
-        voltages = np.zeros((sim_duration, n_tracked_neurons), dtype=np.float16)
-        print(f"Voltage tracking enabled. Allocating {voltages.nbytes / (1024**3):.2f} GB for voltage storage.")
+    spikes = np.zeros((flags.n_trials_per_angle, len(DG_angles), sim_duration, n_tracked_neurons), dtype=np.uint8)
+    voltages = (
+        np.zeros((sim_duration, n_tracked_neurons), dtype=np.float16)
+        if flags.track_voltage
+        else None
+    )
+    if voltages is not None:
+        print(
+            "Voltage tracking enabled. Allocating "
+            f"{voltages.nbytes / (1024**3):.2f} GiB for the first trial."
+        )
 
     for angle_id, angle in enumerate(DG_angles):
         print(f'Running angle {angle}...')
@@ -280,6 +290,7 @@ def main(_):
         lgn_prob = tf.tile(tf.expand_dims(lgn_prob, axis=0), [per_replica_batch_size, 1, 1])
 
         t0 = time()
+        angle_spike_count = 0
 
         for iter_id in range(n_iterations):
             start_idx = iter_id * per_replica_batch_size
@@ -287,30 +298,28 @@ def main(_):
             iteration_length = end_idx - start_idx
 
             lgn_spikes = generate_spontaneous_spikes(lgn_prob)
-            # Reset the memory stats
-            # tf.config.experimental.reset_memory_stats('GPU:0')
-            continuing_state = distributed_generate_gray_state(per_replica_batch_size)
+            continuing_state = gray_state
 
-            for i in range(num_chunks):
-                chunk = lgn_spikes[:, i * chunk_size : (i + 1) * chunk_size, :]
-                v1_z_chunk, v1_v_chunk, continuing_state = distributed_roll_out(chunk, continuing_state)
-                # Extract spikes based on tracking mode
-                if flags.track_core_only:
-                    tracked_spikes = v1_z_chunk.numpy()[:iteration_length, :, core_mask].astype(np.uint8)
-                    if flags.track_voltage and iter_id == 0 and angle_id == 0:
-                        tracked_voltage = v1_v_chunk.numpy()[:iteration_length, :, core_mask].astype(np.float16)
-                else:
-                    tracked_spikes = v1_z_chunk.numpy()[:iteration_length, :, :].astype(np.uint8)
-                    if flags.track_voltage and iter_id == 0 and angle_id == 0:
-                        tracked_voltage = v1_v_chunk.numpy()[:iteration_length, :, :].astype(np.float16)
-
-                spikes[start_idx:end_idx, angle_id, i * chunk_size : (i + 1) * chunk_size, :] += tracked_spikes
-                if flags.track_voltage and iter_id == 0 and angle_id == 0:
-                    voltages[i * chunk_size : (i + 1) * chunk_size, :] = tracked_voltage[0, :, :]
+            for chunk_id in range(num_chunks):
+                start = chunk_id * chunk_size
+                stop = (chunk_id + 1) * chunk_size
+                chunk = lgn_spikes[:, start:stop, :]
+                v1_z_chunk, v1_v_chunk, continuing_state = distributed_roll_out(
+                    chunk, continuing_state
+                )
+                tracked_spikes = tf.cast(v1_z_chunk, tf.uint8).numpy()[
+                    :iteration_length
+                ]
+                angle_spike_count += np.sum(tracked_spikes, dtype=np.uint64)
+                spikes[start_idx:end_idx, angle_id, start:stop, :] = tracked_spikes
+                if voltages is not None and angle_id == 0 and iter_id == 0:
+                    voltages[start:stop] = v1_v_chunk.numpy()[0].astype(
+                        np.float16
+                    )
 
         # Track GPU memory and inference time
         # average_rate = np.mean(spikes[start_idx:end_idx, angle_id, :, :].astype(np.float32))
-        average_rate = np.mean(spikes[:, angle_id, :, :].astype(np.float32))
+        average_rate = angle_spike_count / spikes[:, angle_id].size
         callbacks.track_performance(t0, average_rate=average_rate, gpu_id=0)
 
         print(f'    Angle processing time: {time() - t0:.2f}s')
@@ -320,23 +329,15 @@ def main(_):
         if angle_id == 0:
             # Raster plot for 0 degree orientation
             callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
-            # Save voltage traces if tracking was enabled
-            if flags.track_voltage:
-                voltage_path = os.path.join(logdir, 'voltage_trace.npy')
+            if voltages is not None:
+                voltage_path = os.path.join(logdir, "voltage_trace.npy")
                 np.save(voltage_path, voltages)
                 print(f"Voltage traces saved to {voltage_path}")
-
         if not flags.calculate_osi_dsi:
             break
 
     # Save the performance metrics
     callbacks.save_inference_metrics()
-
-    # Save voltage traces if tracking was enabled
-    if flags.track_voltage:
-        voltage_path = os.path.join(logdir, 'voltage_trace.npy')
-        np.save(voltage_path, voltages)
-        print(f"Voltage traces saved to {voltage_path}")
 
     # Do the OSI/DSI analysis
     if flags.calculate_osi_dsi:
@@ -364,10 +365,10 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('optimizer', 'exp_adam', '')
     absl.app.flags.DEFINE_string('dtype', 'float32', '')
     absl.app.flags.DEFINE_enum(
-        'synaptic_current_backend',
-        'cuda',
-        ['cuda', 'tensorflow'],
-        'Recurrent synaptic-current implementation.',
+        'acceleration',
+        'auto',
+        ['auto', 'cuda', 'tensorflow'],
+        'Model acceleration mode.',
     )
     absl.app.flags.DEFINE_float('learning_rate', .005, '')
     absl.app.flags.DEFINE_string('lr_schedule', 'none',
@@ -464,11 +465,6 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
     absl.app.flags.DEFINE_boolean("track_core_only", False, "Track spikes only from core neurons to reduce memory usage")
     absl.app.flags.DEFINE_boolean("track_voltage", False, "Track and save membrane voltage traces during simulation")
-    absl.app.flags.DEFINE_boolean(
-        "inference_mode",
-        True,
-        "Return V1 spike sequences as uint8 while retaining floating recurrent state.",
-    )
     absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")
 
     absl.app.flags.DEFINE_string("rotation", "ccw", "")

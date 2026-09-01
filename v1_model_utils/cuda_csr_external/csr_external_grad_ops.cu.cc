@@ -2,6 +2,7 @@
 #define EIGEN_USE_GPU
 
 #include <cuda_runtime.h>
+#include <type_traits>
 
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -10,7 +11,22 @@
 using namespace tensorflow;
 using GPUDevice = Eigen::GpuDevice;
 
-constexpr int kThreads = 128;
+#ifndef V1_EXTERNAL_THREADS
+#define V1_EXTERNAL_THREADS 128
+#endif
+#ifndef V1_EXTERNAL_BATCH32_TILE
+#define V1_EXTERNAL_BATCH32_TILE 4
+#endif
+#ifndef V1_EXTERNAL_HALF2
+#define V1_EXTERNAL_HALF2 0
+#endif
+
+constexpr int kThreads = V1_EXTERNAL_THREADS;
+
+template <typename T>
+constexpr int LaunchThreads() {
+  return std::is_same<T, Eigen::half>::value ? kThreads : 256;
+}
 
 template <typename T>
 __device__ __forceinline__ float AsFloat(T value) {
@@ -43,6 +59,28 @@ struct BasisProjection<T, 0> {
     return result;
   }
 };
+
+#if V1_EXTERNAL_HALF2
+template <>
+struct BasisProjection<Eigen::half, 4> {
+  __device__ __forceinline__ static float Apply(
+      const Eigen::half* upstream, const Eigen::half* basis, int type,
+      int n_basis) {
+    const float2 u01 = __half22float2(
+        *reinterpret_cast<const __half2*>(upstream));
+    const float2 u23 = __half22float2(
+        *reinterpret_cast<const __half2*>(upstream + 2));
+    const Eigen::half* type_basis = basis + type * 4;
+    const float2 b01 = __half22float2(
+        *reinterpret_cast<const __half2*>(type_basis));
+    const float2 b23 = __half22float2(
+        *reinterpret_cast<const __half2*>(type_basis + 2));
+    return fmaf(u01.x, b01.x,
+                fmaf(u01.y, b01.y,
+                     fmaf(u23.x, b23.x, u23.y * b23.y)));
+  }
+};
+#endif
 
 template <typename T, int kBasis, int kBatch, int kTile>
 __global__ void WeightBackwardStaticBatchKernel(
@@ -139,7 +177,7 @@ Status LaunchWeightBackward(
 #define LAUNCH_STATIC(BATCH, TILE)                                        \
   TF_RETURN_IF_ERROR(GpuLaunchKernel(                                    \
       WeightBackwardStaticBatchKernel<T, kBasis, BATCH, TILE>,           \
-      static_cast<int>(n_rows * (BATCH / TILE)), kThreads, 0,            \
+      static_cast<int>(n_rows * (BATCH / TILE)), LaunchThreads<T>(), 0, \
       device.stream(), activity.dim_size(1), n_post, n_basis,            \
       activity.flat<T>().data(), current_grad.flat<T>().data(),          \
       post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(), \
@@ -150,12 +188,12 @@ Status LaunchWeightBackward(
     EXTERNAL_BATCH_CASE(1, 1, LAUNCH_STATIC);
     EXTERNAL_BATCH_CASE(2, 2, LAUNCH_STATIC);
     EXTERNAL_BATCH_CASE(4, 4, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(8, 4, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(16, 4, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(32, 4, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(64, 4, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(128, 4, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(256, 4, LAUNCH_STATIC);
+    EXTERNAL_BATCH_CASE(8, 8, LAUNCH_STATIC);
+    EXTERNAL_BATCH_CASE(16, 16, LAUNCH_STATIC);
+    EXTERNAL_BATCH_CASE(32, V1_EXTERNAL_BATCH32_TILE, LAUNCH_STATIC);
+    EXTERNAL_BATCH_CASE(64, 32, LAUNCH_STATIC);
+    EXTERNAL_BATCH_CASE(128, 32, LAUNCH_STATIC);
+    EXTERNAL_BATCH_CASE(256, 32, LAUNCH_STATIC);
     default: {
       constexpr int kRuntimeTile = 4;
       const int64_t tiles = (batch + kRuntimeTile - 1) / kRuntimeTile;
@@ -235,6 +273,7 @@ class ExternalCsrWeightBackwardOp : public OpKernel {
   int n_edges_;
 };
 
+#ifndef V1_KERNEL_IMPLEMENTATION_ONLY
 #define REGISTER_TYPE(T)                                                \
   REGISTER_KERNEL_BUILDER(                                             \
       Name("ExternalCsrWeightBackward")                               \
@@ -245,5 +284,6 @@ class ExternalCsrWeightBackwardOp : public OpKernel {
 TF_CALL_half(REGISTER_TYPE);
 TF_CALL_float(REGISTER_TYPE);
 #undef REGISTER_TYPE
+#endif
 
 #endif

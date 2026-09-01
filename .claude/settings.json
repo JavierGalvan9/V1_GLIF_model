@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run -n neuro_tf2151 python3 *)",
+      "Bash(conda run --no-capture-output -n neuro_tf2151 python3 *)"
+    ]
+  }
+}

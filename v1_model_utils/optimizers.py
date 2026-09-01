@@ -81,6 +81,25 @@ def unscale_gradients_for_optimizer(optimizer, gradients):
     return gradients
 
 
+def clip_gradients_by_global_norm(gradients, clip_norm):
+    """Clip present gradients together and return their pre-clip global norm.
+
+    A nonpositive limit disables clipping while retaining norm measurement.
+    Missing gradients keep their positions so variables remain aligned.
+    """
+    present_indices = [index for index, gradient in enumerate(gradients) if gradient is not None]
+    present = [gradients[index] for index in present_indices]
+    global_norm = tf.linalg.global_norm(present)
+    if clip_norm <= 0:
+        return gradients, global_norm
+
+    clipped_present, _ = tf.clip_by_global_norm(present, clip_norm, use_norm=global_norm)
+    clipped = list(gradients)
+    for index, gradient in zip(present_indices, clipped_present):
+        clipped[index] = gradient
+    return clipped, global_norm
+
+
 @tf.keras.utils.register_keras_serializable(package="V1GLIF")
 class LinearWarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
     """Linear warmup followed by cosine decay."""

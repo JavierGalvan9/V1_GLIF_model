@@ -1182,7 +1182,7 @@ class OsiDsiCallbacks:
 class Callbacks:
     def __init__(self, network, lgn_input, bkg_input, model, optimizer, flags, logdir, strategy,
                  metrics_keys, pre_delay=50, post_delay=50, checkpoint=None, model_variables_init=None,
-                 save_optimizer=True, spontaneous_training=False):
+                 save_optimizer=True, spontaneous_training=False, write_outputs=True):
 
         self.n_neurons = int(network.get('n_nodes', flags.neurons))
         self.n_edges = network['n_edges'] + len(lgn_input['weights'])
@@ -1197,6 +1197,7 @@ class Callbacks:
         self.optimizer = optimizer
         self.flags = flags
         self.logdir = logdir
+        self.write_outputs = bool(write_outputs)
         self.strategy = strategy
         self.metrics_keys = metrics_keys
         self.pre_delay = pre_delay
@@ -1207,9 +1208,14 @@ class Callbacks:
         self.step_rate = []  # Track step rate
         self.model_variables_dict = model_variables_init
         self.initial_metric_values = None
-        self.summary_writer = tf.summary.create_file_writer(self.logdir)
-        with open(os.path.join(self.logdir, "config.json"), "w", encoding="utf-8") as handle:
-            json.dump(flags.flag_values_dict(), handle, indent=4)
+        self.summary_writer = (
+            tf.summary.create_file_writer(self.logdir)
+            if self.write_outputs
+            else tf.summary.create_noop_writer()
+        )
+        if self.write_outputs:
+            with open(os.path.join(self.logdir, "config.json"), "w", encoding="utf-8") as handle:
+                json.dump(flags.flag_values_dict(), handle, indent=4)
 
         if checkpoint is None:
             if save_optimizer:
@@ -1244,16 +1250,17 @@ class Callbacks:
 
         self.total_epochs = flags.n_runs * flags.n_epochs
         # Manager for the best model
-        self.best_manager = tf.train.CheckpointManager(
-            checkpoint, directory=self.logdir + '/Best_model', max_to_keep=1
-        )
-        self.latest_manager = tf.train.CheckpointManager(
-            checkpoint, directory=self.logdir + '/latest', max_to_keep=1
-        )
-        # Manager for osi/dsi checkpoints
-        self.epoch_manager = tf.train.CheckpointManager(
-            checkpoint, directory=self.logdir + '/Intermediate_checkpoints', max_to_keep=3
-        )
+        self.best_manager = self.latest_manager = self.epoch_manager = None
+        if self.write_outputs:
+            self.best_manager = tf.train.CheckpointManager(
+                checkpoint, directory=self.logdir + '/Best_model', max_to_keep=1
+            )
+            self.latest_manager = tf.train.CheckpointManager(
+                checkpoint, directory=self.logdir + '/latest', max_to_keep=1
+            )
+            self.epoch_manager = tf.train.CheckpointManager(
+                checkpoint, directory=self.logdir + '/Intermediate_checkpoints', max_to_keep=3
+            )
 
     def on_train_begin(self):
         print("---------- Training started at ",
@@ -1281,6 +1288,9 @@ class Callbacks:
         for initial, final, key in zip(self.initial_metric_values[n_metrics:], metric_values[n_metrics:], self.metrics_keys[n_metrics:]):
             print(
                 f"| {key:<{max_key_length}} | {initial:<{max_key_length}.3f} | {final:<{max_key_length}.3f} |")
+
+        if not self.write_outputs:
+            return
 
         # Save epoch_metric_values and min_val_loss to a file
         data_to_save = {
@@ -1388,9 +1398,10 @@ class Callbacks:
             val_loss_index = self.metrics_keys.index('train_loss')
             val_loss_value = metric_values[val_loss_index]
 
-        self.plot_losses_curves()
-        if protocol_spikes is not None and protocol_angles is not None:
-            self.plot_protocol_validation_metrics(protocol_spikes, protocol_angles)
+        if self.write_outputs:
+            self.plot_losses_curves()
+            if protocol_spikes is not None and protocol_angles is not None:
+                self.plot_protocol_validation_metrics(protocol_spikes, protocol_angles)
 
         # # save latest model every 10 epochs
         # if self.epoch % 10 == 0:
@@ -1400,13 +1411,14 @@ class Callbacks:
             self.min_val_loss = val_loss_value
             # if self.no_improve_epochs > 50: # plot the best model results if there has been at least 50 epochs from the last best model
             self.no_improve_epochs = 0
-            if getattr(self.flags, "save_best_checkpoint", True):
+            if self.write_outputs and getattr(self.flags, "save_best_checkpoint", True):
                 self.save_best_model()
 
-            self.plot_mean_firing_rate_boxplot(v1_spikes, y)
-            self.plot_raster(x, v1_spikes, y, stimulus_type='drifting_gratings')
+            if self.write_outputs:
+                self.plot_mean_firing_rate_boxplot(v1_spikes, y)
+                self.plot_raster(x, v1_spikes, y, stimulus_type='drifting_gratings')
 
-            if v1_spikes_spont is not None:
+            if self.write_outputs and v1_spikes_spont is not None:
                 self.plot_spontaneous_boxplot(v1_spikes_spont, y)
                 self.plot_raster(x, v1_spikes, y, stimulus_type='spontaneous')
                 # self.composed_raster(x, v1_spikes, x_spont, v1_spikes_spont, y)
@@ -1414,18 +1426,20 @@ class Callbacks:
                 # self.plot_lgn_activity(x, x_spont)
                 # self.plot_populations_activity(v1_spikes, v1_spikes_spont)
 
-            self.model_variables_dict['Best'] = {
-                var.name: var.numpy() if len(
-                    var.shape) == 1 else var[:, 0].numpy()
-                for var in self.model.trainable_variables
-            }
+            if self.write_outputs:
+                self.model_variables_dict['Best'] = {
+                    var.name: var.numpy() if len(
+                        var.shape) == 1 else var[:, 0].numpy()
+                    for var in self.model.trainable_variables
+                }
 
         else:
             self.no_improve_epochs += 1
 
-        with self.summary_writer.as_default():
-            for k, v in zip(self.metrics_keys, metric_values):
-                tf.summary.scalar(k, v, step=self.epoch)
+        if self.write_outputs:
+            with self.summary_writer.as_default():
+                for k, v in zip(self.metrics_keys, metric_values):
+                    tf.summary.scalar(k, v, step=self.epoch)
 
         # EARLY STOPPING CONDITIONS
         if (0 < self.flags.max_time < (time() - self.epoch_init_time) / 3600):

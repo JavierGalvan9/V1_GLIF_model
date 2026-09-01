@@ -6,14 +6,32 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
+from v1_model_utils.cuda_operator_cache import ensure_artifact
+from v1_model_utils.cuda_csr_external.build import BUILD_FLAGS
+from v1_model_utils.cuda_csr_recurrent.build import (
+    BUILD_FLAGS as RECURRENT_BUILD_FLAGS,
+)
+from v1_model_utils.cuda_csr_resources import (
+    initialize_resource,
+    load_ops as load_resource_ops,
+    resource_mode_enabled,
+)
+
 
 SPECIALIZED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-LIBRARY = Path(__file__).with_name("_external_current_ops.so")
-RECURRENT_LIBRARY = (
-    Path(__file__).parents[1] / "cuda_synaptic_currents" / "_synaptic_current_ops.so"
-)
 _OPS = None
 _RECURRENT_OPS = None
+
+
+def _active_rows_or_pairs(values, basis_values):
+    """Use grouped CSR rows only for the measured static fast paths."""
+    if values.shape[0] in (1, 2, 4, 8, 16, 32, 64, 128) and basis_values.shape[-1] == 4:
+        row_ids = tf.cast(
+            tf.where(tf.reduce_any(values != tf.cast(0, values.dtype), axis=0))[:, 0],
+            tf.int64,
+        )
+        return tf.stack((tf.zeros_like(row_ids), row_ids), axis=1)
+    return tf.where(values != tf.cast(0, values.dtype))
 
 
 @dataclass(frozen=True)
@@ -28,6 +46,7 @@ class CsrConnectivity:
     n_pre: int
     n_post: int
     n_edges: int
+    resource_name: str | None = None
 
 
 def kernel_variant(n_basis, batch_size):
@@ -66,7 +85,7 @@ def build_csr_connectivity(indices, synapse_types, n_pre, n_post):
     offsets = np.empty(int(n_pre) + 1, dtype=np.uint32)
     offsets[0] = 0
     offsets[1:] = np.cumsum(counts, dtype=np.uint64).astype(np.uint32)
-    return CsrConnectivity(
+    connectivity = CsrConnectivity(
         post_ids=tf.constant(indices[order, 0], tf.uint32),
         synapse_types=tf.constant(types[order], tf.uint8),
         row_splits=tf.constant(offsets, tf.uint32),
@@ -76,23 +95,50 @@ def build_csr_connectivity(indices, synapse_types, n_pre, n_post):
         n_post=int(n_post),
         n_edges=int(indices.shape[0]),
     )
+    if resource_mode_enabled():
+        resource = initialize_resource(connectivity)
+        connectivity = CsrConnectivity(
+            **{
+                **connectivity.__dict__,
+                "resource_name": resource.name,
+            }
+        )
+    return connectivity
 
 
 def _load_ops():
     global _OPS, _RECURRENT_OPS
     if _OPS is None:
-        if not LIBRARY.exists() or not RECURRENT_LIBRARY.exists():
-            raise FileNotFoundError(
-                "CUDA external-current operators are not built; run "
-                "`python -m v1_model_utils.cuda_synaptic_currents.build` and "
-                "`python -m v1_model_utils.cuda_external_currents.build`"
-            )
-        _RECURRENT_OPS = tf.load_op_library(str(RECURRENT_LIBRARY))
-        _OPS = tf.load_op_library(str(LIBRARY))
+        recurrent_directory = Path(__file__).parents[1] / "cuda_csr_recurrent"
+        recurrent_library = ensure_artifact(
+            recurrent_directory,
+            "csr_recurrent_ops",
+            sources=(
+                recurrent_directory / "build.py",
+                recurrent_directory / "csr_recurrent_ops.cc",
+                recurrent_directory / "csr_recurrent_ops.cu.cc",
+            ),
+            build_module="v1_model_utils.cuda_csr_recurrent.build",
+            build_flags=RECURRENT_BUILD_FLAGS,
+        )
+        directory = Path(__file__).parent
+        library = ensure_artifact(
+            directory,
+            "csr_external_grad_ops",
+            sources=(
+                directory / "build.py",
+                directory / "csr_external_grad_ops.cc",
+                directory / "csr_external_grad_ops.cu.cc",
+            ),
+            build_module="v1_model_utils.cuda_csr_external.build",
+            build_flags=BUILD_FLAGS,
+        )
+        _RECURRENT_OPS = tf.load_op_library(str(recurrent_library))
+        _OPS = tf.load_op_library(str(library))
     return _RECURRENT_OPS, _OPS
 
 
-def calculate_external_currents(
+def calculate_external_csr_currents(
     activity,
     weights,
     basis,
@@ -115,6 +161,14 @@ def calculate_external_currents(
         raise ValueError("activity width does not match connectivity.n_pre")
     if basis.shape.rank != 2:
         raise ValueError("basis must be rank two")
+    if connectivity.resource_name is not None:
+        return _calculate_resource_currents(
+            activity,
+            weights,
+            basis,
+            connectivity,
+            compute_activity_gradient=compute_activity_gradient,
+        )
     recurrent_ops, external_ops = _load_ops()
 
     @tf.custom_gradient
@@ -128,7 +182,7 @@ def calculate_external_currents(
         edge_ids,
         nonempty_rows,
     ):
-        active = tf.where(values != tf.cast(0, values.dtype))
+        active = _active_rows_or_pairs(values, basis_values)
         currents = recurrent_ops.v1_csr_forward(
             values,
             active,
@@ -184,4 +238,59 @@ def calculate_external_currents(
         connectivity.row_splits,
         connectivity.edge_ids,
         connectivity.nonempty_rows,
+    )
+
+
+def _calculate_resource_currents(
+    activity,
+    weights,
+    basis,
+    connectivity,
+    *,
+    compute_activity_gradient,
+):
+    ops = load_resource_ops()
+
+    @tf.custom_gradient
+    def fused(values, master_weights, basis_values):
+        active = _active_rows_or_pairs(values, basis_values)
+        currents = ops.v1_csr_forward_resource(
+            values,
+            active,
+            master_weights,
+            basis_values,
+            n_post=connectivity.n_post,
+            resource_name=connectivity.resource_name,
+        )
+
+        def grad(upstream):
+            if compute_activity_gradient:
+                activity_grad, weight_grad = ops.v1_csr_backward_resource(
+                    values,
+                    upstream,
+                    master_weights,
+                    basis_values,
+                    tf.cast(1, values.dtype),
+                    n_post=connectivity.n_post,
+                    n_edges=connectivity.n_edges,
+                    resource_name=connectivity.resource_name,
+                )
+            else:
+                activity_grad = None
+                weight_grad = ops.external_csr_weight_backward_resource(
+                    values,
+                    upstream,
+                    basis_values,
+                    n_post=connectivity.n_post,
+                    n_edges=connectivity.n_edges,
+                    resource_name=connectivity.resource_name,
+                )
+            return activity_grad, tf.cast(weight_grad, master_weights.dtype), None
+
+        return currents, grad
+
+    return fused(
+        tf.convert_to_tensor(activity),
+        tf.convert_to_tensor(weights, tf.float32),
+        tf.cast(basis, activity.dtype),
     )

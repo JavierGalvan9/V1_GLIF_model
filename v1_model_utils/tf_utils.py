@@ -113,30 +113,49 @@ def configure_policy_and_dtype(dtype_name):
 
 def create_distribution_strategy(
     physical_devices=None,
-    use_hierarchical_all_reduce=True,
     single_gpu_strategy="mirrored",
+    multi_worker=False,
 ):
     """
     Create a distribution strategy using the common project defaults.
 
-    - Multi-GPU: MirroredStrategy, optionally with HierarchicalCopyAllReduce.
+    - Multi-worker Ampere: one process per GPU using NCCL.
+    - Multi-GPU Blackwell: one process using hierarchical copy as the
+      TensorFlow 2.15 compatibility fallback.
     - Single-GPU: MirroredStrategy (default) or OneDeviceStrategy.
     - CPU-only: OneDeviceStrategy('/cpu:0').
     """
+    if multi_worker:
+        communication_options = tf.distribute.experimental.CommunicationOptions(
+            implementation=tf.distribute.experimental.CommunicationImplementation.NCCL
+        )
+        return tf.distribute.MultiWorkerMirroredStrategy(
+            communication_options=communication_options
+        )
+
     if physical_devices is None:
         physical_devices = tf.config.list_physical_devices("GPU")
     visible_devices = tf.config.get_visible_devices("GPU") or physical_devices
 
-    # Use NCCL for multi-GPU communication to avoid CPU fallback
     if len(visible_devices) > 1:
-        if use_hierarchical_all_reduce:
-            # Use HierarhicalCopyAllReduce to avoid NCCL issues with Blackwell GPUs
+        device_details = tf.config.experimental.get_device_details(
+            physical_devices[0]
+        )
+        compute_capability = device_details.get("compute_capability", ())
+        if not compute_capability:
+            raise RuntimeError(
+                "Could not determine GPU compute capability for multi-GPU "
+                "strategy selection."
+            )
+        if int(compute_capability[0]) >= 10:
+            # Temporary fallback for Blackwell with TensorFlow 2.15. Replace
+            # with NCCL after the TensorFlow 2.21 CUDA stack is validated.
             return tf.distribute.MirroredStrategy(
                 cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()
             )
-        # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.ReductionToOneDevice(reduce_to_device="cpu:0")) # slowest option
-        else:
-            return tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
+        raise RuntimeError(
+            "Pre-Blackwell multi-GPU training must use one worker per GPU."
+        )
 
     if len(visible_devices) == 1:
         if single_gpu_strategy == "one_device":
