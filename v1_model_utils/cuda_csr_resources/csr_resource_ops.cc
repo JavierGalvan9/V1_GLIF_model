@@ -10,6 +10,9 @@ REGISTER_OP("InitializeV1CsrResource")
     .Input("row_splits: int32")
     .Input("edge_ids: int32")
     .Input("nonempty_rows: int32")
+    .Input("pair_ids: int32")
+    .Input("pair_posts: int32")
+    .Input("pair_types: int32")
     .Output("initialized: bool")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* context) {
@@ -79,5 +82,26 @@ REGISTER_OP("ExternalCsrWeightBackwardResource")
       int n_edges;
       TF_RETURN_IF_ERROR(context->GetAttr("n_edges", &n_edges));
       context->set_output(0, context->Vector(n_edges));
+      return OkStatus();
+    });
+
+REGISTER_OP("ExternalCsrActivityBackwardResource")
+    .Attr("T: {half, float}")
+    .Attr("n_post: int >= 1")
+    .Attr("resource_name: string")
+    .Input("current_grad: T")
+    .Input("weights: float")
+    .Input("basis: T")
+    .Output("activity_grad: T")
+    .SetShapeFn([](shape_inference::InferenceContext* context) {
+      shape_inference::ShapeHandle current_grad;
+      TF_RETURN_IF_ERROR(
+          context->WithRank(context->input(0), 2, &current_grad));
+      int n_post;
+      TF_RETURN_IF_ERROR(context->GetAttr("n_post", &n_post));
+      shape_inference::DimensionHandle batch;
+      TF_RETURN_IF_ERROR(context->Divide(
+          context->Dim(current_grad, 0), n_post, true, &batch));
+      context->set_output(0, context->Matrix(batch, context->UnknownDim()));
       return OkStatus();
     });

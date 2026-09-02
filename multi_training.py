@@ -26,6 +26,8 @@ import pickle as pkl
 from time import strftime, time
 import logging
 from v1_model_utils import tf_utils
+from v1_model_utils import spatial_layout
+from v1_model_utils import cuda_csr_recurrent
 
 _TRAINING_LAUNCH_PLAN = TRAINING_LAUNCH_PLAN
 tf.get_logger().setLevel(logging.INFO)
@@ -227,6 +229,38 @@ def main(_):
     network, lgn_input, bkg_input = load_fn(flags, flags.neurons, flag_str=flag_str)
     print(f"Model files loading: {time()-t0:.2f} seconds\n")
 
+    # Renumber neurons for CSR cache locality. The cached network files and every
+    # checkpoint stay in the canonical order; only the in-memory model moves.
+    neuron_layout = spatial_layout.build_layout(network, flags.neuron_layout)
+    if not neuron_layout.is_identity:
+        network, lgn_input, bkg_input = spatial_layout.apply_layout(
+            neuron_layout, network, lgn_input, bkg_input
+        )
+        print(f"Neuron layout: {neuron_layout.mode}")
+
+    # Renumber LGN rows so consecutive forward blocks drive nearby V1
+    # territory. Orthogonal to the neuron layout, and applied before the CSR
+    # edge order so that permutation carries it; the kernels are unchanged.
+    lgn_row_order = spatial_layout.build_lgn_row_order(
+        lgn_input, flags.lgn_row_order
+    )
+    if not lgn_row_order.is_identity:
+        lgn_input = spatial_layout.apply_lgn_row_order(lgn_row_order, lgn_input)
+        print(f"LGN row order: {lgn_row_order.mode}")
+
+    # Reorder edges into each operator's CSR order so the kernels can index
+    # weights by CSR position. Everything built from the network afterwards -
+    # weight variables, sign masks, per-edge regularizer references - is derived
+    # from the reordered arrays and therefore stays consistent.
+    edge_orders = None
+    if cuda_csr_recurrent.DIRECT_CSR:
+        network, lgn_input, bkg_input, edge_orders = (
+            spatial_layout.apply_csr_edge_order(
+                network, lgn_input, bkg_input, max_delay=flags.max_delay
+            )
+        )
+        print("Edge layout: csr")
+
     pre_delay, post_delay = training_utils.parse_delays(flags.delays)
     delays = [pre_delay, post_delay]
 
@@ -254,6 +288,8 @@ def main(_):
             lr_scale=flags.lr_scale,
             train_input=flags.train_input,
             train_noise=flags.train_noise,
+            compute_lgn_activity_gradient=flags.compute_lgn_activity_gradient,
+            compute_bkg_activity_gradient=flags.compute_bkg_activity_gradient,
             train_recurrent=flags.train_recurrent,
             train_recurrent_per_type=flags.train_recurrent_per_type,
             neuron_output=flags.neuron_output,
@@ -270,6 +306,9 @@ def main(_):
             track_voltage_penalty=flags.use_online_voltage_loss,
             voltage_penalty_mode=flags.voltage_penalty_mode,
             return_voltage_sequences=not flags.use_online_voltage_loss,
+            neuron_layout=neuron_layout,
+            edge_orders=edge_orders,
+            lgn_row_order=lgn_row_order,
         )
 
         # Initialize the weights of the model based on the specified input shape. It operates in eager mode.
@@ -403,6 +442,10 @@ def main(_):
         if os.path.exists(os.path.join(logdir, 'train_end_data.pkl')):
             with open(os.path.join(logdir, 'train_end_data.pkl'), 'rb') as f:
                 train_end_data = pkl.load(f)
+            # Stored canonical, like checkpoints; move it into the runtime layout.
+            train_end_data = spatial_layout.translate_neuron_state(
+                neuron_layout, train_end_data, to_runtime=True
+            )
         # 3 Hz is near the average FR of cortex.
         default_v1_ema = tf.constant(
             0.003, shape=(network["n_nodes"],), dtype=tf.float32
@@ -1979,6 +2022,8 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean('train_input', True, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', True, '')
+    absl.app.flags.DEFINE_boolean('compute_lgn_activity_gradient', False, '')
+    absl.app.flags.DEFINE_boolean('compute_bkg_activity_gradient', False, '')
     absl.app.flags.DEFINE_boolean('train_recurrent', True, '')
     absl.app.flags.DEFINE_boolean('train_recurrent_per_type', False, '')
     absl.app.flags.DEFINE_boolean('connected_selection', True, '')
@@ -2031,7 +2076,7 @@ if __name__ == '__main__':
         "Detach the spike from the after-spike-current increment gradient path.",
     )
     absl.app.flags.DEFINE_boolean(
-        "sequential_stimuli", True, "Run evoked and spontaneous stimuli sequentially but convergence would be slower and worse (memory friendly; intended for batch_size=1).")
+        "sequential_stimuli", False, "Run evoked and spontaneous stimuli sequentially but convergence would be slower and worse (memory friendly; intended for batch_size=1).")
     absl.app.flags.DEFINE_boolean(
         "profile_train_step",
         False,
@@ -2067,6 +2112,32 @@ if __name__ == '__main__':
         "debug_gradients",
         False,
         "Print and assert finite gradients at every training update.",
+    )
+    absl.app.flags.DEFINE_enum(
+        "lgn_row_order",
+        "original",
+        list(spatial_layout.LGN_ROW_ORDERS),
+        "Runtime LGN row numbering. 'retinotopic' ranks LGN rows by the mean "
+        "V1 index they drive, so consecutive forward blocks scatter into "
+        "nearby postsynaptic memory. Measured worth about 2% of the LGN "
+        "forward kernel, and only once the postsynaptic currents array "
+        "outgrows L2 - roughly 0.09% of a batch-64 step, and nothing at batch "
+        "32 - so it stays off by default. It exists because a tensor-row WMMA "
+        "kernel would make the same ordering pay through fragment reuse "
+        "instead of cache capacity, which does not depend on the batch. "
+        "Checkpoints stay in the canonical row order either way.",
+    )
+    absl.app.flags.DEFINE_enum(
+        "neuron_layout",
+        "morton",
+        list(spatial_layout.LAYOUTS),
+        "Runtime neuron numbering. 'morton' renumbers neurons along a 2-D "
+        "space-filling curve with a coarse cortical-depth key, which cuts the "
+        "recurrent forward kernel by 11% and the LGN forward kernel by 21% at "
+        "the production operating point (about 1.5% of a training step). It "
+        "requires CSR-ordered weights: without them the edge_ids gather becomes "
+        "5x more scattered and the layout is a regression. Checkpoints stay in "
+        "the canonical order either way.",
     )
 
     absl.app.run(main)

@@ -25,3 +25,11 @@ Both commands detect the visible GPU architecture by default. Pass
 `--architecture 120` to prebuild caches for RTX 3090, A100, L40S, or RTX Pro
 6000 GPUs respectively. Architecture-specific shared libraries coexist and are
 selected automatically at runtime.
+
+## CSR-ordered weights
+
+This operator shares the recurrent forward kernel, so it follows the same
+`DIRECT_CSR` contract: LGN and background weights must be in each population's
+CSR edge order. Note that the external CSR sort key omits the synapse type,
+unlike the recurrent one, so the two populations get different permutations.
+`spatial_layout.apply_csr_edge_order` derives all three.

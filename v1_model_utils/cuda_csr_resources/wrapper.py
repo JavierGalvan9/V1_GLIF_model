@@ -70,6 +70,9 @@ def initialize_resource(metadata):
                 "row_splits",
                 "edge_ids",
                 "nonempty_rows",
+                "pair_ids",
+                "pair_posts",
+                "pair_types",
             )
         ]
         initialized = load_ops().initialize_v1_csr_resource(

@@ -88,8 +88,20 @@ def _dense_state(
             ga = _gradient_like(ga, outputs[2])
             grise = _gradient_like(grise, outputs[3])
             gpsc = _gradient_like(gpsc, outputs[4])
+            # The kernel reads the refractory state only to mask the voltage
+            # gradient under hard reset, so under soft reset the value is dead.
+            # Referencing the forward tensor anyway would make TensorFlow retain
+            # the whole per-timestep history, and its dtype has no GPU TensorList
+            # kernel, so that history is staged through host memory: 13,840
+            # transfers of 6.5 MB and 21% of a batch-32 training step. Passing
+            # zeros keeps it out of the backward graph; gradients are identical.
+            backward_refractory = (
+                refractory
+                if cell._hard_reset
+                else tf.zeros_like(z, dtype=refractory.dtype)
+            )
             zg, vg, ag, rg, pg, ig = glif_ops.fused_glif_single_backward(
-                z, refractory, adaptation, rise,
+                z, backward_refractory, adaptation, rise,
                 syn_decay, psc_initial, asc_decay, decay, current_factor,
                 t_ref_steps, asc_amps, dt, gv, ga, grise, gpsc,
                 hard_reset=cell._hard_reset,

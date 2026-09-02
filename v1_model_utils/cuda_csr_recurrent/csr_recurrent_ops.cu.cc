@@ -48,6 +48,19 @@ using GPUDevice = Eigen::GpuDevice;
 #ifndef V1_FORWARD_GROUPED
 #define V1_FORWARD_GROUPED 0
 #endif
+#ifndef V1_DIRECT_CSR
+#define V1_DIRECT_CSR 0
+#endif
+
+// With direct-CSR weights the caller keeps `weights` and `weight_grad` in CSR
+// edge order, so the CSR position is the weight index and the effectively
+// random `edge_ids[csr]` gather disappears from every inner loop. The choice is
+// global: forward and backward, and every batch specialization, must agree.
+#if V1_DIRECT_CSR
+#define V1_EDGE_INDEX(csr) (csr)
+#else
+#define V1_EDGE_INDEX(csr) (edge_ids[csr])
+#endif
 
 constexpr int kThreads = V1_THREADS;
 
@@ -143,7 +156,7 @@ __global__ void ForwardKernel(
   const uint32 start = row_splits[pre];
   const uint32 end = row_splits[pre + 1];
   for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
-    const uint32 edge = edge_ids[csr];
+    const uint32 edge = V1_EDGE_INDEX(csr);
     const uint32 post = post_ids[csr];
     const uint32 type = synapse_types[csr];
     const float weighted_spike = spike * AsFloat(weights[edge]);
@@ -227,7 +240,7 @@ __global__ void ForwardGroupedStaticBatchKernel(
   __syncthreads();
   for (uint32 csr = row_splits[pre] + threadIdx.x;
        csr < row_splits[pre + 1]; csr += blockDim.x) {
-    const uint32 edge = edge_ids[csr];
+    const uint32 edge = V1_EDGE_INDEX(csr);
     const uint32 post = post_ids[csr];
     const uint32 type = synapse_types[csr];
     const float weight = AsFloat(weights[edge]);
@@ -282,7 +295,7 @@ __global__ void BackwardRuntimeBatchKernel(
     const uint32 start = row_splits[pre];
     const uint32 end = row_splits[pre + 1];
     for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
-      const uint32 edge = edge_ids[csr];
+      const uint32 edge = V1_EDGE_INDEX(csr);
       const uint32 post = post_ids[csr];
       const uint32 type = synapse_types[csr];
     float tile_weight_grad = 0.0f;
@@ -358,7 +371,7 @@ __global__ void BackwardStaticBatchKernel(
   const uint32 start = row_splits[pre];
   const uint32 end = row_splits[pre + 1];
   for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
-    const uint32 edge = edge_ids[csr];
+    const uint32 edge = V1_EDGE_INDEX(csr);
     const uint32 post = post_ids[csr];
     const uint32 type = synapse_types[csr];
     float tile_weight_grad = 0.0f;
@@ -461,7 +474,7 @@ __global__ void BackwardWarpPerRowStaticBatchKernel(
   const uint32 start = row_splits[pre];
   const uint32 end = row_splits[pre + 1];
   for (uint32 csr = start + lane; csr < end; csr += 32) {
-    const uint32 edge = edge_ids[csr];
+    const uint32 edge = V1_EDGE_INDEX(csr);
     const uint32 post = post_ids[csr];
     const uint32 type = synapse_types[csr];
     float edge_weight_grad = 0.0f;
@@ -533,6 +546,65 @@ __global__ void PreprojectPairsBatch32Kernel(
         current_grad + (batch * static_cast<int64_t>(n_post) + post) * n_basis,
         basis, type, n_basis);
   }
+}
+
+// Same compact projection, emitted as [pair, batch] so that one warp reading a
+// pair's whole batch touches a single 128-byte line. Consumed by
+// BackwardBatchLaneKernel, which assigns one batch sample per lane.
+template <typename T, int kBasis, int kBatch>
+__global__ void PreprojectPairsPairMajorKernel(
+    int64_t elements, int n_post, int n_basis, const T* current_grad,
+    const T* basis, const uint32* pair_posts, const uint8* pair_types,
+    float* projected) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int batch = static_cast<int>(index % kBatch);
+    const int64_t pair = index / kBatch;
+    const uint32 post = pair_posts[pair];
+    const uint32 type = pair_types[pair];
+    projected[index] = BasisProjection<T, kBasis>::Apply(
+        current_grad + (static_cast<int64_t>(batch) * n_post + post) * n_basis,
+        basis, type, n_basis);
+  }
+}
+
+// Backward with lane == batch sample instead of lane == edge.
+//
+// Every lane walks the whole CSR row, so each lane keeps a single spike-gradient
+// accumulator rather than a per-tile array; that removes the register array and
+// its stack spill from the hot kernel. The weight gradient of one edge is the
+// sum across the batch, which is exactly a warp reduction.
+template <typename T, typename W, int kBatch, int kWarps>
+__global__ void BackwardBatchLaneKernel(
+    int64_t n_pre, const T* spikes, const float* projected, const W* weights,
+    const uint32* pair_ids, const uint32* edge_ids, const uint32* row_splits,
+    const uint32* nonempty_rows, int64_t n_rows, const T* dampening,
+    T* spike_grad, float* weight_grad) {
+  static_assert(kBatch == 32, "the batch-lane mapping needs one lane per sample");
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int64_t row_id = static_cast<int64_t>(blockIdx.x) * kWarps + warp;
+  if (row_id >= n_rows) return;
+  const uint32 pre = nonempty_rows[row_id];
+  const uint32 start = row_splits[pre];
+  const uint32 end = row_splits[pre + 1];
+  const float spike = AsFloat(spikes[static_cast<int64_t>(lane) * n_pre + pre]);
+  float local_spike_grad = 0.0f;
+  for (uint32 csr = start; csr < end; ++csr) {
+    const uint32 edge = V1_EDGE_INDEX(csr);
+    const float value =
+        projected[static_cast<int64_t>(pair_ids[csr]) * kBatch + lane];
+    local_spike_grad += value * AsFloat(weights[edge]);
+    float edge_weight_grad = value * spike;
+#pragma unroll
+    for (int delta = 16; delta > 0; delta >>= 1) {
+      edge_weight_grad += __shfl_down_sync(0xffffffff, edge_weight_grad, delta);
+    }
+    // The full batch is covered in one pass, so this is the only writer.
+    if (lane == 0) weight_grad[edge] = edge_weight_grad;
+  }
+  spike_grad[static_cast<int64_t>(lane) * n_pre + pre] =
+      FromFloat<T>(local_spike_grad * AsFloat(*dampening));
 }
 
 #define V1_BATCH_CASE(BATCH, TILE, LAUNCH) \
@@ -747,23 +819,23 @@ Status LaunchPairProjectedBackward(
   constexpr int kProjectionThreads = 256;
   const int projection_blocks = static_cast<int>(
       (projected_elements + kProjectionThreads - 1) / kProjectionThreads);
+  // Project each distinct (post, synapse type) pair once, pair-major so the
+  // batch-lane kernel reads one line per pair.
   TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      PreprojectPairsBatch32Kernel<T, kBasis>, projection_blocks,
+      PreprojectPairsPairMajorKernel<T, kBasis, 32>, projection_blocks,
       kProjectionThreads, 0, device.stream(), projected_elements, n_post,
-      n_basis, n_pairs, current_grad.flat<T>().data(), basis.flat<T>().data(),
+      n_basis, current_grad.flat<T>().data(), basis.flat<T>().data(),
       pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),
       projected));
-  constexpr int kWarps = kThreads / 32;
+  constexpr int kLaneThreads = 128;
+  constexpr int kLaneWarps = kLaneThreads / 32;
   TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      BackwardWarpPerRowStaticBatchKernel<T, W, kBasis, 32, 32, 128>,
-      static_cast<int>((n_rows + kWarps - 1) / kWarps), kThreads, 0,
-      device.stream(), spikes.dim_size(1), n_post, n_basis,
-      spikes.flat<T>().data(), current_grad.flat<T>().data(),
-      weights.flat<W>().data(), post_ids.flat<uint32>().data(),
-      synapse_types.flat<uint8>().data(), row_splits.flat<uint32>().data(),
-      edge_ids.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),
-      n_rows, basis.flat<T>().data(), projected, 0,
-      pair_ids.flat<uint32>().data(), n_pairs, dampening.flat<T>().data(),
+      BackwardBatchLaneKernel<T, W, 32, kLaneWarps>,
+      static_cast<int>((n_rows + kLaneWarps - 1) / kLaneWarps), kLaneThreads, 0,
+      device.stream(), spikes.dim_size(1), spikes.flat<T>().data(), projected,
+      weights.flat<W>().data(), pair_ids.flat<uint32>().data(),
+      edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),
+      nonempty_rows.flat<uint32>().data(), n_rows, dampening.flat<T>().data(),
       spike_grad->flat<T>().data(), weight_grad->flat<float>().data()));
   return OkStatus();
 }
@@ -786,6 +858,7 @@ class V1CsrForwardOp : public OpKernel {
     const Tensor& row_splits = context->input(5);
     const Tensor& edge_ids = context->input(6);
     const Tensor& basis = context->input(7);
+    const Tensor& initial = context->input(8);
     OP_REQUIRES(context, spikes.dims() == 2,
                 errors::InvalidArgument("spikes must be rank two"));
     OP_REQUIRES(context, active.dims() == 2 && active.dim_size(1) == 2,
@@ -797,12 +870,29 @@ class V1CsrForwardOp : public OpKernel {
     Tensor* output;
     const int64_t batch = spikes.dim_size(0);
     const int n_basis = basis.dim_size(1);
-    OP_REQUIRES_OK(context, context->allocate_output(
-                                0, TensorShape({batch * n_post_, n_basis}),
-                                &output));
+    const TensorShape shape({batch * n_post_, n_basis});
+    const bool accumulate = initial.NumElements() > 0;
+    OP_REQUIRES(
+        context, !accumulate || initial.shape() == shape,
+        errors::InvalidArgument("initial must be empty or match the output shape"));
     auto device = context->eigen_device<GPUDevice>();
-    cudaMemsetAsync(output->flat<T>().data(), 0,
-                    output->NumElements() * sizeof(T), device.stream());
+    if (accumulate) {
+      // Reuse the incoming buffer when TensorFlow can hand it over, so the
+      // scatter lands directly on the previous source's currents and costs no
+      // initialization traffic at all. Otherwise seed a fresh buffer with it.
+      OP_REQUIRES_OK(context,
+                     context->forward_input_or_allocate_output({8}, 0, shape,
+                                                               &output));
+      if (output->flat<T>().data() != initial.flat<T>().data()) {
+        cudaMemcpyAsync(output->flat<T>().data(), initial.flat<T>().data(),
+                        output->NumElements() * sizeof(T),
+                        cudaMemcpyDeviceToDevice, device.stream());
+      }
+    } else {
+      OP_REQUIRES_OK(context, context->allocate_output(0, shape, &output));
+      cudaMemsetAsync(output->flat<T>().data(), 0,
+                      output->NumElements() * sizeof(T), device.stream());
+    }
     if (n_basis == 4) {
       OP_REQUIRES_OK(context, LaunchForward<T, W, 4>(
                                   context, spikes, active, weights, post_ids,

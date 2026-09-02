@@ -424,6 +424,47 @@ def resolve_checkpoint_directory(flags):
     return None, None
 
 
+def v1_cell(model):
+    """Return the V1Column cell of a built model, or None."""
+    try:
+        return model.get_layer("rsnn").cell
+    except (ValueError, AttributeError):
+        return None
+
+
+def neuron_layout(model):
+    """Return the neuron layout a built model runs in."""
+    from v1_model_utils import spatial_layout
+
+    cell = v1_cell(model)
+    layout = getattr(cell, "_neuron_layout", None)
+    if layout is None:
+        return spatial_layout.NeuronLayout.identity(1)
+    return layout
+
+
+def rebase_checkpointed_layout(model, to_runtime, optimizer=None):
+    """Translate checkpointed variables between the on-disk and runtime layouts.
+
+    Checkpoints are always written in the neuron and edge order that
+    ``load_sparse`` produced, so a restore has to be followed by a translation
+    into the layout the model was built in, and a save has to be wrapped by the
+    inverse translation. Pass the optimizer so its per-edge slots move with the
+    weights they mirror.
+    """
+    cell = v1_cell(model)
+    if cell is not None and hasattr(cell, "translate_checkpointed_layout"):
+        cell.translate_checkpointed_layout(
+            to_runtime=to_runtime, optimizer=optimizer
+        )
+
+
+def restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer=None):
+    """Restore an original-order checkpoint into a possibly relabelled model."""
+    checkpoint.restore(checkpoint_directory).expect_partial()  # .assert_consumed()
+    rebase_checkpointed_layout(model, to_runtime=True, optimizer=optimizer)
+
+
 def restore_training_checkpoint(
     flags,
     model,
@@ -462,11 +503,11 @@ def restore_training_checkpoint(
                 mixed_precision_module=mixed_precision_module,
             )
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-            checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
+            restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
             print('Checkpoint restored with a new optimizer.')
         else:
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-            checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
+            restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
             print('Checkpoint restored!')
         return checkpoint, optimizer, checkpoint_directory
 
@@ -491,11 +532,11 @@ def restore_training_checkpoint(
                 mixed_precision_module=mixed_precision_module,
             )
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-            checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
+            restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
             print('Checkpoint restored with a new optimizer.')
         else:
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-            checkpoint.restore(checkpoint_directory).expect_partial()#.assert_consumed()
+            restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
             print('Checkpoint restored!')
         return checkpoint, optimizer, checkpoint_directory
 
@@ -548,7 +589,7 @@ def restore_evaluation_checkpoint(
             print('Checkpoint restored via in-memory dtype conversion (no checkpoint re-save).')
         else:
             checkpoint = tf.train.Checkpoint(model=model)
-            checkpoint.restore(checkpoint_directory).expect_partial()
+            restore_and_rebase(checkpoint, checkpoint_directory, model)
             print('Checkpoint restored!')
 
         if checkpoint_source == 'ckpt_dir' and flags.restore_from == "Best_model":
@@ -620,7 +661,7 @@ def restore_model_with_runtime_dtype_cast(
     _, source_dtype = configure_policy_and_dtype(checkpoint_dtype_name)
     source_model = build_model_fn(source_dtype)
     source_checkpoint = tf.train.Checkpoint(model=source_model)
-    source_checkpoint.restore(checkpoint_directory).expect_partial()
+    restore_and_rebase(source_checkpoint, checkpoint_directory, source_model)
 
     try:
         source_vars_by_name = {_canonical_name(var.name): var for var in source_model.variables}

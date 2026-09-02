@@ -11,6 +11,7 @@ from .cuda_csr_external import (
     build_csr_connectivity as build_external_csr_connectivity,
     calculate_external_csr_currents,
 )
+from . import spatial_layout
 from numba import njit
 
 
@@ -587,6 +588,8 @@ class V1Column(tf.keras.layers.Layer):
         train_recurrent_per_type=True,
         train_input=False,
         train_noise=True,
+        compute_lgn_activity_gradient=False,
+        compute_bkg_activity_gradient=False,
         noise_seed=0,
         hard_reset=False,
         current_input=False,
@@ -596,12 +599,33 @@ class V1Column(tf.keras.layers.Layer):
         return_voltage_sequences=True,
         output_spike_dtype=None,
         output_neuron_ids=None,
+        neuron_layout=None,
+        edge_orders=None,
+        lgn_row_order=None,
     ):
         super().__init__()
         # Disable Keras layer autocast so tensors keep explicit dtypes:
         # recurrent state buffers in compute_dtype, selected threshold-critical
         # parameters in variable_dtype.
         self._autocast = False
+        # Neuron numbering this cell was built in. Checkpoints stay canonical,
+        # so the layout is what translates them; see translate_checkpointed_layout.
+        self._neuron_layout = neuron_layout or spatial_layout.NeuronLayout.identity(
+            network["n_nodes"]
+        )
+        # Set when the network's edges were reordered into the operators' CSR
+        # order; the kernels then index weights by CSR position. Checkpoints stay
+        # in the network's original edge order, so these are what translate them.
+        self._edge_orders = dict(edge_orders or {})
+        self._weights_csr_ordered = bool(self._edge_orders)
+        # LGN row numbering this cell was built in. The spike stream arrives in
+        # canonical row order, so a non-identity order means `call` has to
+        # gather the LGN columns into runtime order before the kernels read
+        # them; see _permute_lgn_input.
+        self._lgn_row_order = lgn_row_order or spatial_layout.LgnRowOrder.identity(
+            lgn_input["n_inputs"]
+        )
+        self._lgn_row_gather = None
         _params = dict(network["node_params"])
         # Rescale the voltages to have them near 0, as we wanted the effective step size
         # for the weights to be normalized when learning (weights are scaled similarly)
@@ -623,6 +647,7 @@ class V1Column(tf.keras.layers.Layer):
         self._detach_asc_reset = bool(detach_asc_reset)
         self._pseudo_gauss = pseudo_gauss
         self._lr_scale = tf.constant(lr_scale, dtype=self.compute_dtype)
+        self._scales_recurrent_inputs = float(lr_scale) != 1.0
         # self._spike_gradient = spike_gradient
         # Updated by the training loop before each logical forward call.
         # Combined with per-timestep noise_step state to keep recompute_grad deterministic.
@@ -632,6 +657,8 @@ class V1Column(tf.keras.layers.Layer):
         self.noise_stream = tf.Variable(0, trainable=False, dtype=tf.int64, name="noise_stream")
         self._hard_reset = hard_reset
         self._current_input = current_input
+        self._compute_lgn_activity_gradient = bool(compute_lgn_activity_gradient)
+        self._compute_bkg_activity_gradient = bool(compute_bkg_activity_gradient)
         if voltage_penalty_mode not in ("range", "threshold"):
             raise ValueError("voltage_penalty_mode must be 'range' or 'threshold'.")
         self._track_voltage_penalty = bool(track_voltage_penalty)
@@ -677,6 +704,11 @@ class V1Column(tf.keras.layers.Layer):
             if self._state_backend == "cuda"
             else "hybrid" if use_cuda else "tensorflow"
         )
+        # The CSR operators can seed their output with another source's currents,
+        # which removes the separate adds that combine them. The
+        # firing-probability input path is a TensorFlow sparse product with no
+        # such seam, so it keeps the explicit combination.
+        self._chain_current_sources = use_cuda and not current_input
         self._n_neurons = int(network["n_nodes"])
         self._gauss_std = tf.constant(gauss_std, self.compute_dtype)
         # Determine the membrane time decay constant
@@ -745,6 +777,20 @@ class V1Column(tf.keras.layers.Layer):
         t_ref_steps = np.ceil(t_ref_per_neuron / dt).astype(np.int16)
         t_ref_steps = np.maximum(t_ref_steps, 1)
         max_ref_steps = int(np.max(t_ref_steps))
+        # Keep the counter narrow. Its per-timestep history is accumulated in a
+        # tf.TensorArray for the fused-state backward pass, and TensorFlow has no
+        # GPU kernel for TensorList operations on 8- or 16-bit integers, so that
+        # history is staged through host memory: 13,840 transfers of 6.5 MB,
+        # 1.75 s, about 21% of a batch-32 training step.
+        #
+        # Widening the counter does NOT fix that, and was measured: int32 moves
+        # the TensorList operations onto the GPU, but TensorFlow then places the
+        # loop-carried control flow on the host instead (Enter/Merge/Switch/Exit
+        # go from one to seven nodes each), and the same state round-trips at
+        # four times the size. Median step time regressed 8.22 s -> 9.10 s, so
+        # int8 is retained. The remaining host dependency to attack is
+        # StatelessRandomPoisson, which has no GPU kernel at all; see
+        # Benchmarks_metrics/host_device_transfer_investigation_20260901.
         if max_ref_steps > 127:
             self._refractory_state_dtype = tf.int16
             print(f"Warning: max refractory period is {max_ref_steps} steps, which exceeds int8 capacity. Using int16 for refractory state.")
@@ -811,6 +857,7 @@ class V1Column(tf.keras.layers.Layer):
                 syn_ids,
                 n_pre=self.recurrent_dense_shape[1],
                 n_post=self.recurrent_dense_shape[0],
+                weights_csr_ordered=self._weights_csr_ordered,
             )
         else:
             self.recurrent_indices = tf.Variable(
@@ -874,6 +921,11 @@ class V1Column(tf.keras.layers.Layer):
 
         ### LGN input connectivity ###
         self.input_dim = lgn_input["n_inputs"]
+        if not self._lgn_row_order.is_identity:
+            # Runtime row r holds the spikes of canonical row new_to_old[r].
+            self._lgn_row_gather = tf.constant(
+                self._lgn_row_order.new_to_old, dtype=tf.int32
+            )
         self.lgn_input_dense_shape = (self._n_neurons, self.input_dim,)
         input_indices = np.array(lgn_input["indices"])
         input_weights = np.array(lgn_input["weights"])
@@ -914,6 +966,7 @@ class V1Column(tf.keras.layers.Layer):
                 input_syn_ids,
                 n_pre=self.lgn_input_dense_shape[1],
                 n_post=self.lgn_input_dense_shape[0],
+                weights_csr_ordered=self._weights_csr_ordered,
             )
         else:
             self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64)
@@ -951,6 +1004,7 @@ class V1Column(tf.keras.layers.Layer):
                 bkg_input_syn_ids,
                 n_pre=self.bkg_input_dense_shape[1],
                 n_post=self.bkg_input_dense_shape[0],
+                weights_csr_ordered=self._weights_csr_ordered,
             )
         else:
             self.pre_bkg_ind_table = make_pre_ind_table(
@@ -977,6 +1031,148 @@ class V1Column(tf.keras.layers.Layer):
 
         print(f"    > # BKG input synapses {len(bkg_input_indices)}")
         del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, bkg_input_weight_positive #, bkg_input_delays
+
+    # Per population: the trainable weight vector, then any other edge-aligned
+    # variables. Each operator derives its own CSR order, so the permutation is
+    # keyed by population.
+    _EDGE_POPULATIONS = (
+        ("recurrent", "recurrent_weight_values", ("recurrent_indices",)),
+        ("lgn", "input_weight_values", ("input_indices",)),
+        ("bkg", "bkg_input_weights", ("bkg_input_indices",)),
+    )
+
+    def edge_aligned_variables(self):
+        """Yield ``(population, variable, order)`` for every edge-aligned variable."""
+        for population, weight_name, other_names in self._EDGE_POPULATIONS:
+            order = self._edge_orders.get(population)
+            if order is None:
+                continue
+            for name in (weight_name,) + other_names:
+                variable = getattr(self, name, None)
+                if variable is not None:
+                    yield population, variable, order
+
+    def edge_weight_variables(self):
+        """Yield ``(population, weight_variable, order)`` for each population.
+
+        Only the weight vectors have optimizer slots mirroring them.
+        """
+        for population, weight_name, _ in self._EDGE_POPULATIONS:
+            order = self._edge_orders.get(population)
+            variable = getattr(self, weight_name, None)
+            if order is not None and variable is not None:
+                yield population, variable, order
+
+    def translate_checkpointed_layout(self, to_runtime, optimizer=None):
+        """Move checkpointed variables between the on-disk and runtime layouts.
+
+        Checkpoints are written in the neuron and edge order produced by
+        ``load_sparse``, so every existing checkpoint stays loadable and every
+        per-neuron or per-edge artefact keeps its meaning. Call this with
+        ``to_runtime=True`` right after restoring and with ``to_runtime=False``
+        around a save.
+        """
+        self._translate_neuron_layout(to_runtime)
+        self._translate_lgn_row_layout(to_runtime)
+        self._translate_edge_layout(to_runtime, optimizer)
+
+    def _translate_lgn_row_layout(self, to_runtime):
+        """Relabel the checkpointed LGN presynaptic ids.
+
+        Only ``input_indices`` column one carries an LGN row id. The weights
+        themselves are edge-aligned, so the CSR permutation in
+        ``_edge_orders['lgn']`` already accounts for the row order and
+        ``_translate_edge_layout`` moves them.
+        """
+        order = self._lgn_row_order
+        if order.is_identity:
+            return
+        variable = getattr(self, "input_indices", None)
+        if variable is None:
+            return
+        indices = variable.numpy()
+        indices[:, 1] = (
+            order.relabel(indices[:, 1])
+            if to_runtime
+            else order.relabel_to_canonical(indices[:, 1])
+        )
+        variable.assign(indices)
+
+    def _translate_neuron_layout(self, to_runtime):
+        layout = self._neuron_layout
+        if layout.is_identity:
+            return
+        reorder = layout.to_runtime if to_runtime else layout.to_canonical
+        for variable in (self.asc_amps, self.decay, self.current_factor):
+            variable.assign(reorder(variable.numpy()))
+        # Index variables store neuron labels rather than neuron-aligned rows.
+        # Under the CUDA backend they exist purely to keep checkpoints readable.
+        for name in ("input_indices", "bkg_input_indices"):
+            variable = getattr(self, name, None)
+            if variable is not None:
+                indices = variable.numpy()
+                indices[:, 0] = (
+                    layout.relabel(indices[:, 0])
+                    if to_runtime
+                    else layout.relabel_to_canonical(indices[:, 0])
+                )
+                variable.assign(indices)
+        recurrent = getattr(self, "recurrent_indices", None)
+        if recurrent is not None:
+            indices = recurrent.numpy()
+            indices[:, 0] = (
+                layout.relabel(indices[:, 0])
+                if to_runtime
+                else layout.relabel_to_canonical(indices[:, 0])
+            )
+            # Column one carries the delay-expanded presynaptic index.
+            indices[:, 1] = layout.relabel_delayed(
+                indices[:, 1], to_canonical=not to_runtime
+            )
+            recurrent.assign(indices)
+
+    def _translate_edge_layout(self, to_runtime, optimizer):
+        """Reorder edge-aligned variables, and the optimizer slots that mirror them."""
+        if not self._edge_orders:
+            return
+        move = (
+            spatial_layout.to_csr_edges
+            if to_runtime
+            else spatial_layout.to_original_edges
+        )
+        for _, variable, order in self.edge_aligned_variables():
+            variable.assign(move(variable.numpy(), order))
+        # Slots are handled per population rather than per variable: several
+        # edge-aligned variables share a length, and a slot must move once.
+        slots = self._optimizer_slots_by_length(optimizer)
+        for _, variable, order in self.edge_weight_variables():
+            for slot in slots.get(int(variable.shape[0]), ()):
+                slot.assign(move(slot.numpy(), order))
+
+    def _optimizer_slots_by_length(self, optimizer):
+        """Group optimizer slots by length so each follows its own weights.
+
+        Slots are matched on length, the same way ``other_v1_utils.optimizers_match``
+        identifies a compatible optimizer. Edge counts differ per population, so
+        an ambiguous match means the assumption no longer holds.
+        """
+        if optimizer is None:
+            return {}
+        lengths = [
+            int(variable.shape[0])
+            for _, variable, _ in self.edge_weight_variables()
+        ]
+        if len(set(lengths)) != len(lengths):
+            raise ValueError(
+                "two edge populations have the same edge count, so optimizer "
+                "slots cannot be matched by length"
+            )
+        wanted = set(lengths)
+        slots = {}
+        for slot in getattr(optimizer, "variables", lambda: ())():
+            if len(slot.shape) == 1 and int(slot.shape[0]) in wanted:
+                slots.setdefault(int(slot.shape[0]), []).append(slot)
+        return slots
 
     def calculate_input_current_from_firing_probabilities(self, x_t):
         """
@@ -1017,22 +1213,34 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
-    def calculate_input_current_from_spikes(self, x_t):
+    def calculate_input_current_from_spikes(self, x_t, initial=None):
         """
         Calculate the input current from the LGN neurons, given the spikes at time t (x_t).
         Use int64 for indexing to optimize GPU gather and segment_sum performance, which are critical operations in this function.
+        ``initial`` accumulates onto another source's currents instead of
+        returning a separate tensor for a later add.
         """
         if self._synaptic_current_backend == "cuda":
             active_inputs = x_t if x_t.dtype == tf.bool else x_t > 0
-            activity = tf.stop_gradient(
-                tf.cast(active_inputs, dtype=self.compute_dtype)
+            activity = tf.cast(active_inputs, dtype=self.compute_dtype)
+            compute_activity_gradient = getattr(
+                self, "_compute_lgn_activity_gradient", False
             )
+            if compute_activity_gradient and x_t.dtype.is_floating:
+                differentiable_input = tf.cast(x_t, self.compute_dtype)
+                activity += differentiable_input - tf.stop_gradient(
+                    differentiable_input
+                )
+            else:
+                activity = tf.stop_gradient(activity)
             return calculate_external_csr_currents(
                 activity,
                 self.input_weight_values,
                 self.synaptic_basis_weights,
                 self.input_csr,
-                compute_activity_gradient=False,
+                compute_activity_gradient=compute_activity_gradient,
+                compute_weight_gradient=self.input_weight_values.trainable,
+                initial=initial,
             )
 
         # x_t: Shape [batch_size, input_dim]
@@ -1076,7 +1284,7 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
-    def calculate_noise_current(self, batch_size, noise_step):
+    def calculate_noise_current(self, batch_size, noise_step, initial=None):
         n_post_neurons = self.bkg_input_dense_shape[0]
         step_seed = tf.cast(noise_step[0], tf.int32)
         base_seed = tf.cast(self.noise_seed, tf.int32)
@@ -1101,15 +1309,20 @@ class V1Column(tf.keras.layers.Layer):
         )
 
         if self._synaptic_current_backend == "cuda":
-            activity = tf.stop_gradient(
-                tf.cast(rest_of_brain, dtype=self.compute_dtype)
+            activity = tf.cast(rest_of_brain, dtype=self.compute_dtype)
+            compute_activity_gradient = getattr(
+                self, "_compute_bkg_activity_gradient", False
             )
+            if not compute_activity_gradient:
+                activity = tf.stop_gradient(activity)
             return calculate_external_csr_currents(
                 activity,
                 self.bkg_input_weights,
                 self.synaptic_basis_weights,
                 self.bkg_input_csr,
-                compute_activity_gradient=False,
+                compute_activity_gradient=compute_activity_gradient,
+                compute_weight_gradient=self.bkg_input_weights.trainable,
+                initial=initial,
             )
 
         # Keep noise indexing in int64
@@ -1163,7 +1376,7 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
-    def calculate_i_rec_with_custom_grad(self, rec_z_buf):
+    def calculate_i_rec_with_custom_grad(self, rec_z_buf, initial=None):
 
         # Calculate recurrent currents with the selected fused CUDA or reference
         # TensorFlow implementation.
@@ -1174,6 +1387,7 @@ class V1Column(tf.keras.layers.Layer):
                 self.synaptic_basis_weights,
                 self._recurrent_dampening,
                 self.recurrent_csr,
+                initial=initial,
             )
         else:
             i_rec_flat = calculate_synaptic_currents(
@@ -1280,12 +1494,24 @@ class V1Column(tf.keras.layers.Layer):
         )
 
     # @tf.function # dont use it in here because it breaks the graph structure and the custom gradients
+    def _permute_lgn_input(self, lgn_input):
+        """Gather the canonical LGN spike stream into runtime row order.
+
+        One gather on a ``[batch, n_inputs]`` slice per timestep - 2.2 MB at
+        batch 64, well under the LGN forward kernel it buys - keeps the
+        permutation out of the data pipeline, so the stimulus datasets and the
+        cached spontaneous probabilities stay in canonical row order.
+        """
+        if self._lgn_row_gather is None:
+            return lgn_input
+        return tf.gather(lgn_input, self._lgn_row_gather, axis=1)
+
     def call(self, inputs, state, constants=None):
 
         # Get all the model inputs
         # external_current = inputs[:, :self._n_neurons*self._n_syn_basis] # external inputs shape (1, 399804)
         # bkg_noise = inputs[:, self._n_neurons*self._n_syn_basis:-self._n_neurons]
-        lgn_input = inputs[:, :self.input_dim]
+        lgn_input = self._permute_lgn_input(inputs[:, :self.input_dim])
 
         batch_size = tf.cast(tf.shape(inputs)[0], dtype=tf.int64)
 
@@ -1295,21 +1521,34 @@ class V1Column(tf.keras.layers.Layer):
         # Get previous spikes
         prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
 
-        # Calculate the recurrent postsynaptic currents
-        i_rec = self.calculate_i_rec_with_custom_grad(z_buf)
-        # Calculate the postsynaptic current from the external input
-        if self._current_input:
-            external_current = self.calculate_input_current_from_firing_probabilities(lgn_input)
+        # Accumulate every current source into one buffer. Each CSR operator
+        # already scatters with atomics, so seeding it with the previous source's
+        # output removes a full pass over a [batch * n_neurons, n_syn_basis]
+        # tensor per source - the largest elementwise traffic in the step.
+        if self._chain_current_sources:
+            rec_inputs = self.calculate_i_rec_with_custom_grad(z_buf)
+            rec_inputs = self.calculate_input_current_from_spikes(
+                lgn_input, initial=rec_inputs
+            )
+            rec_inputs = self.calculate_noise_current(
+                batch_size, noise_step, initial=rec_inputs
+            )
         else:
-            external_current = self.calculate_input_current_from_spikes(lgn_input)
-
-        i_noise = self.calculate_noise_current(batch_size, noise_step)
-        # Add all the current sources
-        rec_inputs = i_rec + external_current + i_noise
+            i_rec = self.calculate_i_rec_with_custom_grad(z_buf)
+            if self._current_input:
+                external_current = self.calculate_input_current_from_firing_probabilities(lgn_input)
+            else:
+                external_current = self.calculate_input_current_from_spikes(lgn_input)
+            i_noise = self.calculate_noise_current(batch_size, noise_step)
+            # One add_n reads the three sources once instead of chaining two adds.
+            rec_inputs = tf.add_n([i_rec, external_current, i_noise])
         # Reshape i_rec_flat back to [batch_size, num_neurons]
         rec_inputs = tf.reshape(rec_inputs, [batch_size, self._n_neurons * self._n_syn_basis])
-        # Scale with the learning rate
-        rec_inputs = rec_inputs * self._lr_scale
+        # The master weights are pre-divided by lr_scale, so this restores the
+        # requested scale. At lr_scale == 1 it is an identity over ~26 M
+        # elements, so do not emit it at all.
+        if self._scales_recurrent_inputs:
+            rec_inputs = rec_inputs * self._lr_scale
 
         if self._state_backend == "cuda":
             from .cuda_glif_state import update_glif_state
@@ -1476,6 +1715,8 @@ def create_model(
     train_recurrent_per_type=False,
     train_input=True,
     train_noise=True,
+    compute_lgn_activity_gradient=False,
+    compute_bkg_activity_gradient=False,
     neuron_output=False,
     use_state_input=False,
     return_state=False,
@@ -1496,6 +1737,9 @@ def create_model(
     return_voltage_sequences=True,
     output_spike_dtype=None,
     output_neuron_ids=None,
+    neuron_layout=None,
+    edge_orders=None,
+    lgn_row_order=None,
 ):
 
     # Create the input layer of the model
@@ -1540,6 +1784,8 @@ def create_model(
         train_recurrent_per_type=train_recurrent_per_type,
         train_input=train_input,
         train_noise=train_noise,
+        compute_lgn_activity_gradient=compute_lgn_activity_gradient,
+        compute_bkg_activity_gradient=compute_bkg_activity_gradient,
         noise_seed=seed,
         hard_reset=hard_reset,
         current_input=current_input,
@@ -1549,6 +1795,9 @@ def create_model(
         return_voltage_sequences=return_voltage_sequences,
         output_spike_dtype=output_spike_dtype,
         output_neuron_ids=output_neuron_ids,
+        neuron_layout=neuron_layout,
+        edge_orders=edge_orders,
+        lgn_row_order=lgn_row_order,
     )
 
     # initialize the RNN state to zero using the zero_state() method of the V1Column class.
