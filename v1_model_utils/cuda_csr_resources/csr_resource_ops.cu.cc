@@ -3,6 +3,7 @@
 #define EIGEN_USE_GPU
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <type_traits>
 
 #include "tensorflow/core/framework/op_kernel.h"
@@ -40,12 +41,16 @@ class V1CsrResource : public ResourceBase {
  public:
   V1CsrResource(const Tensor& post_ids, const Tensor& synapse_types,
                 const Tensor& row_splits, const Tensor& edge_ids,
-                const Tensor& nonempty_rows)
+                const Tensor& nonempty_rows, const Tensor& pair_ids,
+                const Tensor& pair_posts, const Tensor& pair_types)
       : post_ids(post_ids),
         synapse_types(synapse_types),
         row_splits(row_splits),
         edge_ids(edge_ids),
-        nonempty_rows(nonempty_rows) {}
+        nonempty_rows(nonempty_rows),
+        pair_ids(pair_ids),
+        pair_posts(pair_posts),
+        pair_types(pair_types) {}
 
   string DebugString() const override { return "V1CsrResource"; }
 
@@ -54,20 +59,28 @@ class V1CsrResource : public ResourceBase {
   Tensor row_splits;
   Tensor edge_ids;
   Tensor nonempty_rows;
+  Tensor pair_ids;
+  Tensor pair_posts;
+  Tensor pair_types;
 };
 
 Status ValidateMetadata(const Tensor& post_ids, const Tensor& synapse_types,
                         const Tensor& row_splits, const Tensor& edge_ids,
-                        const Tensor& nonempty_rows) {
+                        const Tensor& nonempty_rows, const Tensor& pair_ids,
+                        const Tensor& pair_posts, const Tensor& pair_types) {
   if (!TensorShapeUtils::IsVector(post_ids.shape()) ||
       !TensorShapeUtils::IsVector(synapse_types.shape()) ||
       !TensorShapeUtils::IsVector(row_splits.shape()) ||
       !TensorShapeUtils::IsVector(edge_ids.shape()) ||
-      !TensorShapeUtils::IsVector(nonempty_rows.shape())) {
+      !TensorShapeUtils::IsVector(nonempty_rows.shape()) ||
+      !TensorShapeUtils::IsVector(pair_ids.shape()) ||
+      !TensorShapeUtils::IsVector(pair_posts.shape()) ||
+      !TensorShapeUtils::IsVector(pair_types.shape())) {
     return errors::InvalidArgument("CSR metadata tensors must be rank one");
   }
   if (post_ids.NumElements() != synapse_types.NumElements() ||
-      post_ids.NumElements() != edge_ids.NumElements()) {
+      post_ids.NumElements() != edge_ids.NumElements() ||
+      post_ids.NumElements() != pair_ids.NumElements()) {
     return errors::InvalidArgument(
         "post_ids, synapse_types, and edge_ids must have equal lengths");
   }
@@ -77,6 +90,10 @@ Status ValidateMetadata(const Tensor& post_ids, const Tensor& synapse_types,
   if (nonempty_rows.NumElements() >= row_splits.NumElements()) {
     return errors::InvalidArgument(
         "nonempty_rows cannot exceed the number of CSR rows");
+  }
+  if (pair_posts.NumElements() != pair_types.NumElements()) {
+    return errors::InvalidArgument(
+        "pair_posts and pair_types must have equal lengths");
   }
   return OkStatus();
 }
@@ -124,10 +141,12 @@ class InitializeV1CsrResourceOp : public OpKernel {
     OP_REQUIRES_OK(context,
                    ValidateMetadata(context->input(0), context->input(1),
                                     context->input(2), context->input(3),
-                                    context->input(4)));
+                                    context->input(4), context->input(5),
+                                    context->input(6), context->input(7)));
     V1CsrResource* resource = new V1CsrResource(
         context->input(0), context->input(1), context->input(2),
-        context->input(3), context->input(4));
+        context->input(3), context->input(4), context->input(5),
+        context->input(6), context->input(7));
     Status status = context->resource_manager()->Create(
         "distributed_connectivity", resource_name_, resource);
     if (!status.ok()) {
@@ -317,20 +336,84 @@ class ExternalCsrWeightBackwardResourceOp : public OpKernel {
                          context, activity, current_grad, resource->post_ids,
                          resource->synapse_types, resource->row_splits,
                          resource->edge_ids, resource->nonempty_rows, basis,
-                         n_post_, weight_grad));
+                         resource->pair_ids, resource->pair_posts,
+                         resource->pair_types, n_post_, weight_grad));
     } else {
       OP_REQUIRES_OK(context,
                      external_resource_kernel::LaunchWeightBackward<T, 0>(
                          context, activity, current_grad, resource->post_ids,
                          resource->synapse_types, resource->row_splits,
                          resource->edge_ids, resource->nonempty_rows, basis,
-                         n_post_, weight_grad));
+                         resource->pair_ids, resource->pair_posts,
+                         resource->pair_types, n_post_, weight_grad));
     }
   }
 
  private:
   int n_post_;
   int n_edges_;
+  string resource_name_;
+};
+
+template <typename T>
+class ExternalCsrActivityBackwardResourceOp : public OpKernel {
+ public:
+  explicit ExternalCsrActivityBackwardResourceOp(
+      OpKernelConstruction* context) : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("resource_name", &resource_name_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    V1CsrResource* resource = nullptr;
+    OP_REQUIRES_OK(context, context->resource_manager()->Lookup(
+                                "distributed_connectivity",
+                                DeviceResourceName(context, resource_name_),
+                                &resource));
+    core::ScopedUnref resource_unref(resource);
+    const Tensor& current_grad = context->input(0);
+    const Tensor& weights = context->input(1);
+    const Tensor& basis = context->input(2);
+    OP_REQUIRES(context, current_grad.dims() == 2 && basis.dims() == 2,
+                errors::InvalidArgument(
+                    "current_grad and basis must be rank two"));
+    OP_REQUIRES(context, current_grad.dim_size(0) % n_post_ == 0 &&
+                                 current_grad.dim_size(1) == basis.dim_size(1),
+                errors::InvalidArgument(
+                    "current_grad has an incompatible shape"));
+    OP_REQUIRES(context,
+                weights.NumElements() == resource->post_ids.NumElements(),
+                errors::InvalidArgument(
+                    "weights and resource metadata size mismatch"));
+    const int64_t batch = current_grad.dim_size(0) / n_post_;
+    const int64_t n_pre = resource->row_splits.NumElements() - 1;
+    Tensor* activity_grad;
+    OP_REQUIRES_OK(context, context->allocate_output(
+                                0, TensorShape({batch, n_pre}), &activity_grad));
+    auto device = context->eigen_device<GPUDevice>();
+    cudaMemsetAsync(activity_grad->flat<T>().data(), 0,
+                    activity_grad->NumElements() * sizeof(T), device.stream());
+    if (basis.dim_size(1) == 4) {
+      OP_REQUIRES_OK(
+          context, external_resource_kernel::LaunchActivityBackward<T, 4>(
+                       context, current_grad, weights, resource->post_ids,
+                       resource->synapse_types, resource->row_splits,
+                       resource->edge_ids, resource->nonempty_rows, basis,
+                       resource->pair_ids, resource->pair_posts,
+                       resource->pair_types, n_post_, activity_grad));
+    } else {
+      OP_REQUIRES_OK(
+          context, external_resource_kernel::LaunchActivityBackward<T, 0>(
+                       context, current_grad, weights, resource->post_ids,
+                       resource->synapse_types, resource->row_splits,
+                       resource->edge_ids, resource->nonempty_rows, basis,
+                       resource->pair_ids, resource->pair_posts,
+                       resource->pair_types, n_post_, activity_grad));
+    }
+  }
+
+ private:
+  int n_post_;
   string resource_name_;
 };
 
@@ -353,12 +436,22 @@ class ExternalCsrWeightBackwardResourceOp : public OpKernel {
           .TypeConstraint<T>("T"),                                     \
       ExternalCsrWeightBackwardResourceOp<T>);
 
+#define REGISTER_EXTERNAL_ACTIVITY_RESOURCE_TYPE(T)                      \
+  REGISTER_KERNEL_BUILDER(                                               \
+      Name("ExternalCsrActivityBackwardResource")                      \
+          .Device(DEVICE_GPU)                                            \
+          .TypeConstraint<T>("T"),                                     \
+      ExternalCsrActivityBackwardResourceOp<T>);
+
 TF_CALL_half(REGISTER_RESOURCE_TYPE);
 TF_CALL_float(REGISTER_RESOURCE_TYPE);
 #undef REGISTER_RESOURCE_TYPE
 TF_CALL_half(REGISTER_EXTERNAL_RESOURCE_TYPE);
 TF_CALL_float(REGISTER_EXTERNAL_RESOURCE_TYPE);
 #undef REGISTER_EXTERNAL_RESOURCE_TYPE
+TF_CALL_half(REGISTER_EXTERNAL_ACTIVITY_RESOURCE_TYPE);
+TF_CALL_float(REGISTER_EXTERNAL_ACTIVITY_RESOURCE_TYPE);
+#undef REGISTER_EXTERNAL_ACTIVITY_RESOURCE_TYPE
 
 REGISTER_KERNEL_BUILDER(Name("InitializeV1CsrResource")
                             .Device(DEVICE_GPU)

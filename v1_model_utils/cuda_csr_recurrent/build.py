@@ -16,15 +16,29 @@ from v1_model_utils.cuda_operator_cache import (
     temporary_build_directory,
     write_build_metadata,
 )
+from v1_model_utils.cuda_csr_config import DIRECT_CSR
 
 
 HERE = Path(__file__).resolve().parent
+
+# Keep recurrent weights and weight gradients in CSR edge order so the kernels
+# index them by CSR position instead of gathering through `edge_ids`. The
+# Python wrappers read this same constant, so the host-side weight ordering can
+# never disagree with the compiled kernels.
+#
+# Callers must build their model from a network reordered by
+# `spatial_layout.apply_csr_edge_order`, which puts every edge-aligned array
+# (weights, sign masks, and the per-edge reference values inside the weight
+# regularizers) in the same order. `require_csr_ordered_weights` refuses to run
+# otherwise rather than silently pairing CSR positions with original-order
+# weights, and checkpoints are translated back on save.
 BUILD_FLAGS = (
     "-DV1_THREADS=128", "-DV1_BATCH32_TILE=32", "-DV1_WARP_REDUCTION=0",
     "-DV1_HALF2_PROJECTION=1", "-DV1_WARP_PER_ROW=1", "-DV1_PREPROJECT=0",
     "-DV1_PAIR_PREPROJECT=0", "-DV1_FORWARD_THREADS=128",
     "-DV1_FORWARD_HALF2_ATOMICS=1", "-DV1_FORWARD_FLOAT_ACCUM=0",
-    "-DV1_FORWARD_GROUPED=1", "--expt-relaxed-constexpr", "--use_fast_math",
+    "-DV1_FORWARD_GROUPED=1", f"-DV1_DIRECT_CSR={int(DIRECT_CSR)}",
+    "--expt-relaxed-constexpr", "--use_fast_math",
 )
 
 

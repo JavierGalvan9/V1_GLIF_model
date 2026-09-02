@@ -11,7 +11,7 @@ from matplotlib import pyplot as plt
 import matplotlib.ticker as ticker
 import seaborn as sns
 from scipy.stats import ks_2samp
-from v1_model_utils import other_v1_utils, training_utils, tf_utils
+from v1_model_utils import other_v1_utils, training_utils, tf_utils, spatial_layout
 from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivity
 from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
 from v1_model_utils.model_metrics_analysis import calculate_Firing_Rate, get_borders, draw_borders
@@ -1301,6 +1301,10 @@ class Callbacks:
         if normalizers is not None:
             data_to_save.update(normalizers)
 
+        # Persist per-neuron statistics in canonical order, as for checkpoints.
+        data_to_save = spatial_layout.translate_neuron_state(
+            tf_utils.neuron_layout(self.model), data_to_save, to_runtime=False
+        )
         with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'wb') as f:
             pkl.dump(data_to_save, f)
 
@@ -1503,14 +1507,31 @@ class Callbacks:
             for gpu_id in range(len(self.strategy.extended.worker_devices)):
                 printgpu(gpu_id=gpu_id)
 
+    def _save_canonical(self, manager):
+        """Write a checkpoint in canonical neuron order.
+
+        The model may be built in a relabelled runtime layout for CSR cache
+        locality, but checkpoints stay canonical so that they remain readable
+        by every other tool and by runs using a different layout.
+        """
+        tf_utils.rebase_checkpointed_layout(
+            self.model, to_runtime=False, optimizer=self.optimizer
+        )
+        try:
+            return manager.save(checkpoint_number=self.epoch)
+        finally:
+            tf_utils.rebase_checkpointed_layout(
+                self.model, to_runtime=True, optimizer=self.optimizer
+            )
+
     def save_intermediate_checkpoint(self):
         # Save the checkpoint to reload weights in the osi_dsi_estimator
-        p = self.epoch_manager.save(checkpoint_number=self.epoch)
+        p = self._save_canonical(self.epoch_manager)
         print(f'Checkpoint model saved in {p}\n')
 
     def save_latest_model(self):
         try:
-            p = self.latest_manager.save(checkpoint_number=self.epoch)
+            p = self._save_canonical(self.latest_manager)
             print(f'Latest model saved in {p}\n')
         except Exception:
             print("Saving failed. Maybe next time?")
@@ -1519,7 +1540,7 @@ class Callbacks:
         # self.step_counter.assign_add(1)
         print(f'[ Saving the model at epoch {self.epoch} ]')
         try:
-            p = self.best_manager.save(checkpoint_number=self.epoch)
+            p = self._save_canonical(self.best_manager)
             print(f'Model saved in {p}\n')
         except Exception:
             print("Saving failed. Maybe next time?")

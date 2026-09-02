@@ -17,6 +17,7 @@ import tensorflow as tf
 from time import time
 import logging
 from v1_model_utils import tf_utils
+from v1_model_utils import cuda_csr_recurrent, spatial_layout
 tf.get_logger().setLevel(logging.INFO)
 
 
@@ -85,6 +86,34 @@ def main(_):
     network, lgn_input, bkg_input = load_fn(modified_flags, flags.neurons, flag_str=flag_str)
     print(f"Model files loading: {time()-t0:.2f} seconds\n")
 
+    # Renumber neurons for CSR cache locality, then reorder the edges into the
+    # order the kernels index weights by. Checkpoints and every per-neuron
+    # artefact this script writes stay in the canonical order and are translated
+    # at those boundaries.
+    neuron_layout = spatial_layout.build_layout(network, flags.neuron_layout)
+    if not neuron_layout.is_identity:
+        network, lgn_input, bkg_input = spatial_layout.apply_layout(
+            neuron_layout, network, lgn_input, bkg_input
+        )
+        print(f"Neuron layout: {neuron_layout.mode}")
+    # Renumber LGN rows so consecutive forward blocks drive nearby V1
+    # territory. Orthogonal to the neuron layout, and applied before the CSR
+    # edge order so that permutation carries it; the kernels are unchanged.
+    lgn_row_order = spatial_layout.build_lgn_row_order(
+        lgn_input, flags.lgn_row_order
+    )
+    if not lgn_row_order.is_identity:
+        lgn_input = spatial_layout.apply_lgn_row_order(lgn_row_order, lgn_input)
+        print(f"LGN row order: {lgn_row_order.mode}")
+
+    edge_orders = None
+    if cuda_csr_recurrent.DIRECT_CSR:
+        network, lgn_input, bkg_input, edge_orders = (
+            spatial_layout.apply_csr_edge_order(
+                network, lgn_input, bkg_input, max_delay=flags.max_delay
+            )
+        )
+
     if flags.track_core_only:
         from v1_model_utils import other_v1_utils
 
@@ -121,6 +150,8 @@ def main(_):
                 lr_scale=flags.lr_scale,
                 train_input=False,
                 train_noise=False,
+                compute_lgn_activity_gradient=flags.compute_lgn_activity_gradient,
+                compute_bkg_activity_gradient=flags.compute_bkg_activity_gradient,
                 train_recurrent=False,
                 train_recurrent_per_type=False,
                 neuron_output=flags.neuron_output,
@@ -142,6 +173,9 @@ def main(_):
                 ),
                 output_neuron_ids=output_neuron_ids,
                 return_voltage_sequences=flags.track_voltage,
+                neuron_layout=neuron_layout,
+                edge_orders=edge_orders,
+                lgn_row_order=lgn_row_order,
             )
             temp_model.build((per_replica_batch_size, flags.seq_len, flags.n_input))
             return temp_model
@@ -331,7 +365,14 @@ def main(_):
             callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
             if voltages is not None:
                 voltage_path = os.path.join(logdir, "voltage_trace.npy")
-                np.save(voltage_path, voltages)
+                # Columns follow the runtime numbering; save them canonically so
+                # the trace matches a canonical run neuron for neuron.
+                np.save(
+                    voltage_path,
+                    spatial_layout.tracked_to_canonical(
+                        neuron_layout, voltages, output_neuron_ids, axis=1
+                    ),
+                )
                 print(f"Voltage traces saved to {voltage_path}")
         if not flags.calculate_osi_dsi:
             break
@@ -444,6 +485,8 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('hard_reset', False, '')
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', False, '')
+    absl.app.flags.DEFINE_boolean('compute_lgn_activity_gradient', False, '')
+    absl.app.flags.DEFINE_boolean('compute_bkg_activity_gradient', False, '')
     absl.app.flags.DEFINE_boolean('train_recurrent', True, '')
     absl.app.flags.DEFINE_boolean('train_recurrent_per_type', False, '')
     # absl.app.flags.DEFINE_boolean('train_recurrent_per_type', False, '')
@@ -470,5 +513,31 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string("rotation", "ccw", "")
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
     absl.app.flags.DEFINE_string('neuropixels_df', 'Neuropixels_data/v1_OSI_DSI_DF.csv', 'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
+    absl.app.flags.DEFINE_enum(
+        "lgn_row_order",
+        "original",
+        list(spatial_layout.LGN_ROW_ORDERS),
+        "Runtime LGN row numbering. 'retinotopic' ranks LGN rows by the mean "
+        "V1 index they drive, so consecutive forward blocks scatter into "
+        "nearby postsynaptic memory. Measured worth about 2% of the LGN "
+        "forward kernel, and only once the postsynaptic currents array "
+        "outgrows L2 - roughly 0.09% of a batch-64 step, and nothing at batch "
+        "32 - so it stays off by default. It exists because a tensor-row WMMA "
+        "kernel would make the same ordering pay through fragment reuse "
+        "instead of cache capacity, which does not depend on the batch. "
+        "Checkpoints stay in the canonical row order either way.",
+    )
+    absl.app.flags.DEFINE_enum(
+        "neuron_layout",
+        "morton",
+        list(spatial_layout.LAYOUTS),
+        "Runtime neuron numbering. 'morton' renumbers neurons along a 2-D "
+        "space-filling curve, which takes 11% off the recurrent forward kernel "
+        "and 21% off the LGN forward kernel; inference has no backward pass, so "
+        "those kernels are a larger share of the step here than in training. It "
+        "reorders FP16 atomic accumulation, so results shift by about the "
+        "run-to-run noise floor; use 'canonical' for bit-comparability with "
+        "historical runs. Saved per-neuron outputs stay canonical either way.",
+    )
 
     absl.app.run(main)

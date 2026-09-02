@@ -5,6 +5,7 @@ import re
 import argparse
 import shlex
 from v1_model_utils import toolkit
+from v1_model_utils import spatial_layout
 # # script_path = "bash d
 
 # Create argument parser
@@ -19,6 +20,16 @@ parser.add_argument('--comment', default='', type=str)
 parser.add_argument('--delays', default='0,0', type=str)
 parser.add_argument('--scale', default='2,2', type=str)
 parser.add_argument('--dtype', default='float32', type=str, choices=['float16', 'float32', 'bfloat16'])
+parser.add_argument(
+    '--neuron_layout', default='morton', type=str,
+    choices=list(spatial_layout.LAYOUTS),
+    help='Runtime neuron numbering passed to both scripts.',
+)
+parser.add_argument(
+    '--lgn_row_order', default='original', type=str,
+    choices=list(spatial_layout.LGN_ROW_ORDERS),
+    help='Runtime LGN row numbering passed to both scripts.',
+)
 
 parser.add_argument('--optimizer', default='exp_adam', type=str, choices=['adam', 'sgd', 'exp_adam'])
 parser.add_argument('--learning_rate', default=0.005, type=float)
@@ -147,6 +158,8 @@ parser.set_defaults(train_recurrent=True)
 parser.add_argument('--train_recurrent_per_type', default=False, action='store_true')
 parser.add_argument('--train_input', default=False, action='store_true')
 parser.add_argument('--train_noise', default=False, action='store_true')
+parser.add_argument('--compute_lgn_activity_gradient', default=False, action='store_true')
+parser.add_argument('--compute_bkg_activity_gradient', default=False, action='store_true')
 parser.add_argument('--sequential_stimuli', default=False, action='store_true')
 parser.add_argument('--debug_gradients', dest='debug_gradients', action='store_true')
 parser.add_argument('--nodebug_gradients', dest='debug_gradients', action='store_false')

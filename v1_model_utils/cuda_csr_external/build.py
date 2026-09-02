@@ -16,6 +16,9 @@ from v1_model_utils.cuda_operator_cache import (
     temporary_build_directory,
     write_build_metadata,
 )
+# The external operator shares the recurrent forward kernel, so the weight
+# ordering has to match it exactly.
+from v1_model_utils.cuda_csr_config import DIRECT_CSR
 
 
 HERE = Path(__file__).resolve().parent
@@ -23,6 +26,7 @@ BUILD_FLAGS = (
     "-DV1_EXTERNAL_THREADS=1024",
     "-DV1_EXTERNAL_BATCH32_TILE=32",
     "-DV1_EXTERNAL_HALF2=1",
+    f"-DV1_DIRECT_CSR={int(DIRECT_CSR)}",
     "--expt-relaxed-constexpr",
     "--use_fast_math",
 )

@@ -9,6 +9,8 @@ import sys
 
 import tensorflow as tf
 
+from v1_model_utils.cuda_csr_config import DIRECT_CSR
+
 from v1_model_utils.cuda_operator_cache import (
     active_gpu_architecture,
     artifact_path,
@@ -26,6 +28,8 @@ BUILD_FLAGS = (
     "-DV1_PAIR_PREPROJECT=0", "-DV1_FORWARD_THREADS=128",
     "-DV1_FORWARD_HALF2_ATOMICS=1", "-DV1_FORWARD_FLOAT_ACCUM=0",
     "-DV1_FORWARD_GROUPED=1", "--expt-relaxed-constexpr", "--use_fast_math",
+    f"-DV1_DIRECT_CSR={int(DIRECT_CSR)}", "-DV1_EXTERNAL_THREADS=1024",
+    "-DV1_EXTERNAL_BATCH32_TILE=32", "-DV1_EXTERNAL_HALF2=1",
 )
 
 
