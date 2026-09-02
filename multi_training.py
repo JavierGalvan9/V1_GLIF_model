@@ -2000,7 +2000,7 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_integer('n_plots', 1, '')
     absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
     absl.app.flags.DEFINE_integer("cue_duration", 40, "")
-    absl.app.flags.DEFINE_integer('fano_samples', 500, '')
+    absl.app.flags.DEFINE_integer('fano_samples', 512, '')
 
     # absl.app.flags.DEFINE_integer('pre_chunks', 3, '')
     # absl.app.flags.DEFINE_integer('post_chunks', 8, '') # the pure classification task only need 1 but to make consistent with other tasks one has to make up here

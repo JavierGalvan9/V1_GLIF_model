@@ -12,6 +12,8 @@ import matplotlib.ticker as ticker
 import seaborn as sns
 from scipy.stats import ks_2samp
 from v1_model_utils import other_v1_utils, training_utils, tf_utils, spatial_layout
+from v1_model_utils.loss_functions import (
+    FANO_PLAN_SEED, fano_sampling_plan, fano_shuffled_pool)
 from v1_model_utils.plotting_utils import InputActivityFigure, PopulationActivity
 from v1_model_utils.model_metrics_analysis import ModelMetricsAnalysis
 from v1_model_utils.model_metrics_analysis import calculate_Firing_Rate, get_borders, draw_borders
@@ -192,7 +194,8 @@ def pop_fano(spikes, bin_sizes):
 
 class OsiDsiCallbacks:
     def __init__(self, network, lgn_input, bkg_input, flags, logdir, current_epoch=0,
-                 pre_delay=50, post_delay=50, model_variables_init=None):
+                 pre_delay=50, post_delay=50, model_variables_init=None,
+                 neuron_ids=None):
         self.n_neurons = int(network.get('n_nodes', flags.neurons))
         self.n_edges = network['n_edges'] + len(lgn_input['weights'])
         self.network = network
@@ -208,6 +211,7 @@ class OsiDsiCallbacks:
             np.ceil(stim_duration/flags.seq_len)) * flags.seq_len
         self.current_epoch = current_epoch
         self.model_variables_dict = model_variables_init
+        self.neuron_ids = neuron_ids
         # Tracking inference performance metrics
         self.inference_times = []
         self.inference_memory = []
@@ -839,31 +843,34 @@ class OsiDsiCallbacks:
         # using the simulation length, limit bin_sizes to define at least 5 bins
         bin_sizes_mask = bin_sizes < (t_end - t_start)/5
         bin_sizes = bin_sizes[bin_sizes_mask]
-        # Vectorize the sampling process
-        sample_size = 70
-        sample_std = 30
-        sample_counts = np.random.normal(
-            sample_size, sample_std, n_samples).astype(int)
-        # ensure that the sample counts are at least 15 and less than the number of neurons
-        sample_counts = np.clip(sample_counts, 15, n_e_neurons)
-        # trial_ids =np.random.choice(np.arange(n_trials), n_samples, replace=False)
-        trial_ids = np.random.randint(n_trials, size=n_samples)
 
-        # Generate Fano factors across random samples
+        # Sample exactly the way SynchronizationLoss does, so this figure
+        # measures the statistic the training loss optimises rather than a
+        # near-miss of it. `fano_sampling_plan` fixes the sub-population sizes,
+        # draws neurons without replacement within a shuffling epoch, and
+        # assigns trials in balanced fashion — which rounds the sample count up
+        # to a multiple of `n_trials`, so `n_samples` acts as a lower bound.
+        plan = fano_sampling_plan(
+            n_e_neurons, n_samples, n_trials, seed=FANO_PLAN_SEED
+        )
+        pool = fano_shuffled_pool(node_id_e, plan['n_epochs'], np.random.default_rng())
+        # positions is [n_trials, per_trial * max_count]; slot (trial, j) reads
+        # sample trial * per_trial + j.
+        sample_ids = pool[plan['positions']].reshape(
+            n_trials, plan['per_trial'], plan['max_count'])
+
+        # Generate Fano factors across the sampled sub-populations
         fanos = []
-        for i in range(n_samples):
-            random_trial_id = trial_ids[i]
-            sample_num = sample_counts[i]
-            sample_ids = np.random.choice(node_id_e, sample_num, replace=False)
-            # selected_spikes = np.concatenate([spikes_timestamps[random_trial_id][np.isin(node_id, sample_ids), :]])
-            # selected_spikes = selected_spikes[~np.isnan(selected_spikes)]
-            # selected_spikes = new_spikes[random_trial_id][:, np.isin(node_id, sample_ids)]
-            selected_spikes = spikes[random_trial_id][:, sample_ids]
-            selected_spikes = np.sum(selected_spikes, axis=1)
-            # if there are spikes use pop_fano
-            if np.sum(selected_spikes) > 0:
-                fano = pop_fano(selected_spikes, bin_sizes)
-                fanos.append(fano)
+        for trial_id in range(n_trials):
+            for j in range(plan['per_trial']):
+                slot_ids = sample_ids[trial_id, j]
+                slot_mask = plan['neuron_mask'][trial_id, j] > 0
+                selected_spikes = spikes[trial_id][:, slot_ids[slot_mask]]
+                selected_spikes = np.sum(selected_spikes, axis=1)
+                # if there are spikes use pop_fano
+                if np.sum(selected_spikes) > 0:
+                    fano = pop_fano(selected_spikes, bin_sizes)
+                    fanos.append(fano)
 
         fanos = np.array(fanos)
         # mean_fano = np.mean(fanos, axis=0)
@@ -888,10 +895,10 @@ class OsiDsiCallbacks:
         # Calculate mean, standard deviation, and SEM of the Fano factors
         evoked_fanos_mean = np.nanmean(evoked_fanos, axis=0)
         evoked_fanos_std = np.nanstd(evoked_fanos, axis=0)
-        evoked_fanos_sem = evoked_fanos_std / np.sqrt(n_samples)
+        evoked_fanos_sem = evoked_fanos_std / np.sqrt(max(evoked_fanos.shape[0], 1))
         spontaneous_fanos_mean = np.nanmean(spontaneous_fanos, axis=0)
         spontaneous_fanos_std = np.nanstd(spontaneous_fanos, axis=0)
-        spontaneous_fanos_sem = spontaneous_fanos_std / np.sqrt(n_samples)
+        spontaneous_fanos_sem = spontaneous_fanos_std / np.sqrt(max(spontaneous_fanos.shape[0], 1))
 
         # Find the frequency of maximum Fano factor
         np.nanmax(evoked_fanos_mean)
@@ -1167,7 +1174,8 @@ class OsiDsiCallbacks:
                                                 self.flags.evoked_duration,
                                                 spontaneous_init=0, spontaneous_end=self.pre_delay,
                                                 core_radius=self.flags.plot_core_radius, df_directory=self.images_dir, save_df=True,
-                                                neuropixels_df=self.flags.neuropixels_df)
+                                                neuropixels_df=self.flags.neuropixels_df,
+                                                neuron_ids=self.neuron_ids)
         # Figure for OSI/DSI boxplots
         metrics_analysis(metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"],
                          directory=boxplots_dir, filename=f'Epoch_{self.current_epoch}')

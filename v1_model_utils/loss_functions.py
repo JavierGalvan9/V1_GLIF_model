@@ -704,32 +704,6 @@ def temporal_mean(
     return tf.reduce_sum(counts_per_sample) / tf.cast(element_count, dtype)
 
 
-def boolean_mask_neurons(
-    values, mask, full_tensor_element_limit=_INT32_MAX
-):
-    """Mask neurons, splitting time only when a GPU op would exceed int32."""
-    element_count = values.shape.num_elements()
-    if element_count is None:
-        raise ValueError("Neuron masking requires statically known dimensions.")
-    if element_count <= full_tensor_element_limit:
-        return tf.boolean_mask(values, mask, axis=2)
-
-    batch_size, sequence_length, n_neurons = values.shape
-    max_chunk_length = full_tensor_element_limit // (batch_size * n_neurons)
-    if max_chunk_length < 1:
-        raise ValueError(
-            "One batch-time slice exceeds the configured element limit."
-        )
-    return tf.concat(
-        [
-            tf.boolean_mask(
-                values[:, start:start + max_chunk_length], mask, axis=2
-            )
-            for start in range(0, sequence_length, max_chunk_length)
-        ],
-        axis=1,
-    )
-
 def sample_firing_rates(firing_rates, n_neurons, rnd_seed):
     """Return a stochastic inverse-CDF target for legacy use only."""
     # Sort the original firing rates
@@ -1117,6 +1091,129 @@ class SpikeRateDistributionTarget:
     def __call__(self, spikes, trim=True):
         return self.loss_from_rates(self.rates_from_spikes(spikes, trim=trim))
 
+# --------------------------------------------------------------------------- #
+# Canonical Fano sampling definition
+#
+# Shared by SynchronizationLoss (the training loss) and
+# OsiDsiCallbacks.fano_factor (the analysis figure) so the two cannot drift
+# apart. Everything about which neurons and which trial each sample reads is
+# decided here; only the per-call shuffle is drawn by the caller, because the
+# loss needs TensorFlow's replica-aware stateless RNG while the analysis path
+# is plain NumPy.
+# --------------------------------------------------------------------------- #
+FANO_SAMPLE_SIZE_MEAN = 70
+FANO_SAMPLE_SIZE_STDDEV = 30
+FANO_SAMPLE_SIZE_MIN = 15
+# Default seed for the sample-size ladder. Shared so that the training loss and
+# the analysis figure produce the same plan without having to pass it around;
+# SynchronizationLoss's own `seed` argument defaults to the same value.
+FANO_PLAN_SEED = 42
+
+
+def fano_sampling_plan(n_pool, n_samples, n_trials, seed=FANO_PLAN_SEED):
+    """Neuron and trial assignment for the population Fano statistic.
+
+    Each sample is a sub-population of excitatory neurons drawn from a shuffled
+    pool, read from one trial. Sizes follow
+    ``clip(normal(70, 30), 15, n_pool)`` and are fixed for a given
+    ``(n_pool, n_samples, n_trials, seed)``, so the whole assignment is static
+    and can be precomputed once instead of resampled per call.
+
+    Two properties are worth stating explicitly.
+
+    *Neurons are drawn without replacement within a shuffling epoch.* The pool
+    is walked in contiguous chunks; when the next chunk would run off the end
+    the pool is reshuffled and the walk restarts, which is a new epoch. Sample
+    sizes sum to about ``70 * n_samples``, so a pool larger than that needs one
+    epoch and never reshuffles, while a smaller pool reshuffles repeatedly.
+
+    *Trials are assigned in balanced fashion rather than i.i.d. uniformly.* The
+    sample count is rounded **up** to ``n_trials * ceil(n_samples / n_trials)``
+    so every trial serves exactly the same number of samples. This is
+    stratified sampling over the same population: it estimates the same
+    quantity, and because the Fano factor varies substantially from trial to
+    trial it does so with materially lower variance than an i.i.d. assignment,
+    which would weight the trials by a random multinomial count. The cost is
+    that ``n_samples`` is a lower bound rather than an exact count.
+
+    Args:
+      n_pool: number of neurons available to sample from.
+      n_samples: requested number of samples; rounded up as described above.
+      n_trials: number of trials in the batch.
+      seed: fixes the sample-size ladder and hence the whole plan.
+
+    Returns:
+      dict with
+        ``per_trial``    samples served by each trial,
+        ``n_effective``  ``n_trials * per_trial``, the realised sample count,
+        ``counts``       ``[n_effective]`` sub-population size of each sample,
+        ``offsets``      ``[n_effective]`` start of each sample in the pool,
+        ``n_epochs``     number of pool shuffles a call needs,
+        ``max_count``    largest sub-population size,
+        ``positions``    ``[n_trials, per_trial * max_count]`` int32 index into
+                         the concatenated per-epoch pools,
+        ``neuron_mask``  ``[n_trials, per_trial, max_count]`` float32, 1 where a
+                         slot holds a real neuron and 0 where it is padding.
+    """
+    if n_pool < FANO_SAMPLE_SIZE_MIN:
+        raise ValueError(
+            f"Fano sampling needs at least {FANO_SAMPLE_SIZE_MIN} neurons in the "
+            f"pool, got {n_pool}."
+        )
+    if n_trials < 1 or n_samples < 1:
+        raise ValueError(f"n_trials={n_trials} and n_samples={n_samples} must be >= 1.")
+
+    per_trial = int(np.ceil(n_samples / n_trials))
+    n_effective = n_trials * per_trial
+
+    rng = np.random.default_rng(seed)
+    counts = np.clip(
+        rng.normal(FANO_SAMPLE_SIZE_MEAN, FANO_SAMPLE_SIZE_STDDEV, n_effective).astype(np.int64),
+        FANO_SAMPLE_SIZE_MIN,
+        n_pool,
+    )
+
+    # Walk the pool in contiguous chunks, reshuffling when it is exhausted.
+    epoch = 0
+    previous_id = 0
+    offsets = np.empty(n_effective, dtype=np.int64)
+    for i, count in enumerate(counts):
+        if previous_id + count > n_pool:
+            epoch += 1
+            previous_id = 0
+        offsets[i] = epoch * n_pool + previous_id
+        previous_id += count
+    n_epochs = epoch + 1
+    max_count = int(counts.max())
+
+    # Slot (trial b, within-trial j) serves sample b * per_trial + j.
+    column = np.arange(max_count, dtype=np.int64)[None, :]
+    positions = offsets[:, None] + column
+    neuron_mask = column < counts[:, None]
+    # Padding slots are pointed at a legal address and zeroed by the mask.
+    positions = np.where(neuron_mask, positions, 0)
+
+    return dict(
+        per_trial=per_trial,
+        n_effective=n_effective,
+        counts=counts,
+        offsets=offsets,
+        n_epochs=n_epochs,
+        max_count=max_count,
+        positions=positions.reshape(n_trials, per_trial * max_count).astype(np.int32),
+        neuron_mask=neuron_mask.reshape(n_trials, per_trial, max_count).astype(np.float32),
+    )
+
+
+def fano_shuffled_pool(pool_ids, n_epochs, rng):
+    """NumPy counterpart of the loss's per-call pool draw.
+
+    One independent shuffle of ``pool_ids`` per epoch, concatenated, so that
+    ``fano_sampling_plan``'s ``positions`` address it directly.
+    """
+    return np.concatenate([rng.permutation(pool_ids) for _ in range(n_epochs)])
+
+
 class SynchronizationLoss(Layer):
     def __init__(self, network, stimulus_type='drifting_gratings', sync_cost=10., t_start=0., t_end=0.5, n_samples=50, neuropixels_data_dir='Synchronization_data',
                  data_dir='GLIF_network', dtype=tf.float32, core_mask=None, seed=42, **kwargs):
@@ -1176,30 +1273,16 @@ class SynchronizationLoss(Layer):
                 )
             excitatory_mask &= core_mask
 
-        self._core_excitatory_mask = tf.constant(excitatory_mask, dtype=tf.bool)
-        self.node_id_e = tf.range(
-            np.count_nonzero(excitatory_mask), dtype=tf.int32
-        )
-        # Keep population sizes fixed for the loss lifetime. Trial and neuron
-        # selections remain random on each invocation.
-        sample_counts_seed = tf.random.experimental.stateless_fold_in(
-            self._base_seed_pair, tf.constant(2, dtype=tf.int32)
-        )
-        sample_counts = tf.cast(
-            tf.random.stateless_normal(
-                [self._n_samples],
-                seed=sample_counts_seed,
-                mean=70,
-                stddev=30,
-                dtype=self._dtype,
-            ),
-            tf.int32,
-        )
-        self._sample_counts = tf.clip_by_value(
-            sample_counts,
-            clip_value_min=15,
-            clip_value_max=tf.shape(self.node_id_e)[0],
-        )
+        # Neurons are selected in *original* neuron space and gathered straight
+        # out of the full spike tensor, so no [batch, duration,
+        # n_core_excitatory] masked copy is built and no same-sized scatter
+        # appears in the backward pass.
+        self._core_e_indices_np = np.flatnonzero(excitatory_mask).astype(np.int32)
+        self._n_pool = int(self._core_e_indices_np.size)
+        self._plan_seed = int(seed)
+        # The plan depends on the batch size, which is not known until the first
+        # call, so it is built lazily and cached per batch size.
+        self._plan_cache = {}
         # Pre-define bin sizes (same as experimental data)
         bin_sizes = np.logspace(-3, 0, 20)
         # using the simulation length, limit bin_sizes to define at least 2 bins
@@ -1242,6 +1325,32 @@ class SynchronizationLoss(Layer):
         )
         return tf.gather(values, tf.argsort(random_keys, stable=True))
 
+    def _plan(self, n_trials):
+        """Sampling plan for this batch size, from the shared definition."""
+        plan = self._plan_cache.get(n_trials)
+        if plan is None:
+            plan = fano_sampling_plan(
+                self._n_pool, self._n_samples, n_trials, seed=self._plan_seed
+            )
+            self._plan_cache[n_trials] = plan
+        return plan
+
+    def _draw_pool(self, call_seed, n_epochs):
+        """One independent shuffle of the core-excitatory ids per epoch.
+
+        ``fano_sampling_plan`` decides *where* each sample reads; this decides
+        *what is there*, and is the only randomness left per call besides
+        nothing else at all — trials are fixed by the balanced assignment.
+        """
+        values = tf.constant(self._core_e_indices_np, dtype=tf.int32)
+        shuffles = []
+        for epoch in range(n_epochs):
+            epoch_seed = tf.random.experimental.stateless_fold_in(
+                call_seed, tf.constant(3 + epoch, dtype=tf.int32)
+            )
+            shuffles.append(self._stateless_shuffle(values, epoch_seed))
+        return shuffles[0] if n_epochs == 1 else tf.concat(shuffles, axis=0)
+
     @tf.function(jit_compile=True)
     def pop_fano_tf(self, spikes):
         fanos = tf.TensorArray(dtype=self._dtype, size=len(self._bin_sizes_ms))
@@ -1270,53 +1379,43 @@ class SynchronizationLoss(Layer):
 
         if trim:
             spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
-        spikes = boolean_mask_neurons(spikes, self._core_excitatory_mask)
         duration_ms = tf.cast(tf.shape(spikes)[1], tf.int32)
         bin_limit_ms = duration_ms // 2
         bin_sizes_mask = self._bin_sizes_ms_tf < bin_limit_ms
         experimental_fanos_mean = tf.boolean_mask(self.experimental_fanos_mean, bin_sizes_mask)
 
-        # choose random trials to sample from (usually we only have 1 trial to sample from)
-        n_trials = tf.shape(spikes)[0]
-        call_seed = self._next_seed_pair()
-        sample_trials_seed = tf.random.experimental.stateless_fold_in(
-            call_seed, tf.constant(1, dtype=tf.int32)
-        )
-        shuffled_ids_seed = tf.random.experimental.stateless_fold_in(
-            call_seed, tf.constant(3, dtype=tf.int32)
-        )
-        sample_trials = tf.random.stateless_uniform(
-            [self._n_samples],
-            seed=sample_trials_seed,
-            minval=0,
-            maxval=n_trials,
-            dtype=tf.int32,
-        )
-        shuffled_e_ids = self._stateless_shuffle(self.node_id_e, shuffled_ids_seed)
-        selected_spikes_sample = tf.TensorArray(spikes.dtype, size=self._n_samples)
-        previous_id = tf.constant(0, dtype=tf.int32)
-        for i in tf.range(self._n_samples):
-            sample_num = self._sample_counts[i] # 40 #68
-            sample_trial = sample_trials[i] # 0
-            ## randomly choose sample_num ids from self.node_id_e with replacement
-            ## sample_ids = tf.random.shuffle(self.node_id_e)[:sample_num]
-            ## randomly choose sample_num ids from shuffled_ids without replacement
-            if previous_id + sample_num > tf.size(shuffled_e_ids):
-                reshuffle_seed = tf.random.experimental.stateless_fold_in(
-                    call_seed, tf.cast(i + 1000, tf.int32)
-                )
-                shuffled_e_ids = self._stateless_shuffle(shuffled_e_ids, reshuffle_seed)
-                previous_id = tf.constant(0, dtype=tf.int32)
-            sample_ids = shuffled_e_ids[previous_id:previous_id+sample_num]
-            previous_id += sample_num
-
-            selected_spikes = tf.reduce_sum(
-                tf.gather(spikes[sample_trial], sample_ids, axis=1),
-                axis=-1,
+        n_trials, duration = spikes.shape[0], spikes.shape[1]
+        if n_trials is None or duration is None:
+            raise ValueError(
+                "SynchronizationLoss needs statically known batch and sequence "
+                f"dimensions, got {spikes.shape}."
             )
-            selected_spikes_sample = selected_spikes_sample.write(i, selected_spikes)
+        plan = self._plan(n_trials)
+        per_trial, max_count = plan["per_trial"], plan["max_count"]
 
-        selected_spikes_sample = selected_spikes_sample.stack()
+        call_seed = self._next_seed_pair()
+        shuffled_e_ids = self._draw_pool(call_seed, plan["n_epochs"])
+        sample_ids = tf.gather(
+            shuffled_e_ids, tf.constant(plan["positions"], dtype=tf.int32)
+        )
+
+        # One gather for every sample at once. The previous implementation ran
+        # an n_samples-iteration tf.while_loop whose dynamically indexed
+        # `spikes[sample_trial]` slice forced a dense per-trial gradient to be
+        # zero-filled and accumulated on every iteration, and whose
+        # data-dependent reshuffle test synchronised the host each time round.
+        # Balanced trial assignment is what lets this be a single batched
+        # gather: sample slots are already grouped by the trial they read.
+        gathered = tf.gather(spikes, sample_ids, axis=2, batch_dims=1)
+        gathered = tf.reshape(gathered, [n_trials, duration, per_trial, max_count])
+        neuron_mask = tf.constant(plan["neuron_mask"], dtype=gathered.dtype)
+        selected_spikes_sample = tf.reduce_sum(
+            gathered * neuron_mask[:, None, :, :], axis=3
+        )
+        selected_spikes_sample = tf.reshape(
+            tf.transpose(selected_spikes_sample, [0, 2, 1]),
+            [n_trials * per_trial, duration],
+        )
         if selected_spikes_sample.dtype != self._dtype:
             selected_spikes_sample = tf.cast(selected_spikes_sample, self._dtype)
 

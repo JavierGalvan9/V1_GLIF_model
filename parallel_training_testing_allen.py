@@ -7,6 +7,7 @@ import argparse
 # import tensorflow as tf
 # import tensorflow as tf
 from v1_model_utils import toolkit
+from v1_model_utils import spatial_layout
 # # script_path = "bash d
 
 # Create argument parser
@@ -21,6 +22,16 @@ parser.add_argument('--comment', default='', type=str)
 parser.add_argument('--delays', default='100,0', type=str)
 parser.add_argument('--scale', default='2,2', type=str)
 parser.add_argument('--dtype', default='float32', type=str)
+parser.add_argument(
+    '--neuron_layout', default='morton', type=str,
+    choices=list(spatial_layout.LAYOUTS),
+    help='Runtime neuron numbering passed to both scripts.',
+)
+parser.add_argument(
+    '--lgn_row_order', default='original', type=str,
+    choices=list(spatial_layout.LGN_ROW_ORDERS),
+    help='Runtime LGN row numbering passed to both scripts.',
+)
 
 parser.add_argument('--optimizer', default='exp_adam', type=str)
 parser.add_argument('--learning_rate', default=0.005, type=float)
@@ -71,7 +82,7 @@ parser.add_argument('--cue_duration', default=40, type=int)
 # parser.add_argument('--validation_examples', default=16, type=int)
 parser.add_argument('--seed', default=3000, type=int)
 parser.add_argument('--neurons_per_output', default=16, type=int)
-parser.add_argument('--fano_samples', default=500, type=int)
+parser.add_argument('--fano_samples', default=512, type=int)
 
 # parser.add_argument('--float16', default=False, action='store_true')
 # parser.add_argument('--caching', default=True, action='store_true')
@@ -89,6 +100,8 @@ parser.set_defaults(train_recurrent=True)
 parser.add_argument('--train_recurrent_per_type', default=False, action='store_true')
 parser.add_argument('--train_input', default=False, action='store_true')
 parser.add_argument('--train_noise', default=False, action='store_true')
+parser.add_argument('--compute_lgn_activity_gradient', default=False, action='store_true')
+parser.add_argument('--compute_bkg_activity_gradient', default=False, action='store_true')
 parser.add_argument('--sequential_stimuli', default=False, action='store_true')
 parser.add_argument('--debug_gradients', default=False, action='store_true')
 
@@ -195,10 +208,10 @@ def main():
         # if value != parser.get_default(name) and name in ['learning_rate', 'rate_cost', 'voltage_cost', 'osi_cost', 'temporal_f', 'n_input', 'seq_len']:
         # if value != parser.get_default(name):
         if name not in ['seed', 'print_only']:
-            if type(value) == bool and value == False:
+            if isinstance(value, bool) and not value:
                 training_script += f"--no{name} "
                 evaluation_script += f"--no{name} "
-            elif type(value) == bool and value == True:
+            elif isinstance(value, bool) and value:
                 training_script += f"--{name} "
                 evaluation_script += f"--{name} "
             else:
