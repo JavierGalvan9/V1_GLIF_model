@@ -58,6 +58,10 @@ def main():
     architecture = normalize_architecture(
         args.architecture or active_gpu_architecture()
     )
+    architecture_flags = (
+        *BUILD_FLAGS,
+        f"-DV1_PAIR_WMMA={int(int(architecture) >= 120)}",
+    )
     prefix = Path(sys.prefix)
     nvcc = prefix / "bin/nvcc"
     cxx = os.environ.get("CXX", "g++-11")
@@ -78,7 +82,7 @@ def main():
             nvcc, "-std=c++17", "-O3", "-x", "cu", "-c",
             HERE / "csr_recurrent_ops.cu.cc", "-o", cu_object,
             "-DGOOGLE_CUDA=1",
-            *BUILD_FLAGS,
+            *architecture_flags,
             f"-gencode=arch=compute_{architecture},code=sm_{architecture}",
             f"-gencode=arch=compute_{architecture},code=compute_{architecture}",
             "-Xcompiler=-fPIC", f"-I{cuda_include}", *compile_flags,
@@ -90,7 +94,7 @@ def main():
         ])
         temporary_output.replace(output)
     write_build_metadata(
-        HERE, "csr_recurrent_ops", architecture, build_flags=BUILD_FLAGS
+        HERE, "csr_recurrent_ops", architecture, build_flags=architecture_flags
     )
     print(output)
 

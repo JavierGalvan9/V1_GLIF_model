@@ -3,6 +3,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <type_traits>
 
 #include "tensorflow/core/framework/op_kernel.h"
@@ -50,6 +51,9 @@ using GPUDevice = Eigen::GpuDevice;
 #endif
 #ifndef V1_DIRECT_CSR
 #define V1_DIRECT_CSR 0
+#endif
+#ifndef V1_PAIR_WMMA
+#define V1_PAIR_WMMA 0
 #endif
 
 // With direct-CSR weights the caller keeps `weights` and `weight_grad` in CSR
@@ -607,6 +611,79 @@ __global__ void BackwardBatchLaneKernel(
       FromFloat<T>(local_spike_grad * AsFloat(*dampening));
 }
 
+// FP16 batch-32 specialization: one CSR row per two-warp block. Each warp
+// processes interleaved 16-edge tiles. Spike gradients retain the FP32
+// projection; only weight-gradient dot products are converted to half for
+// tensor-core execution.
+template <typename W>
+__global__ void BackwardTensorRowKernel(
+    int64_t n_pre, const Eigen::half* spikes, const float* projected,
+    const W* weights, const uint32* pair_ids, const uint32* edge_ids,
+    const uint32* row_splits, const uint32* nonempty_rows, int64_t n_rows,
+    const Eigen::half* dampening, Eigen::half* spike_grad,
+    float* weight_grad) {
+  namespace wmma = nvcuda::wmma;
+  constexpr int kBatch = 32;
+  constexpr int kWarps = 2;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int64_t row_id = blockIdx.x;
+  if (row_id >= n_rows) return;
+
+  __shared__ __half matrix_a[kWarps][16 * 32];
+  __shared__ __half matrix_b[kWarps][32 * 16];
+  __shared__ float matrix_c[kWarps][16 * 16];
+  __shared__ float spike_partials[kWarps][32];
+
+  const uint32 pre = nonempty_rows[row_id];
+  const uint32 start = row_splits[pre];
+  const uint32 end = row_splits[pre + 1];
+  const float spike = AsFloat(spikes[static_cast<int64_t>(lane) * n_pre + pre]);
+#pragma unroll
+  for (int row = 0; row < 16; ++row) {
+    matrix_a[warp][row * 32 + lane] = __float2half(spike);
+  }
+
+  float local_spike_grad = 0.0f;
+  for (uint32 base = start + warp * 16; base < end; base += kWarps * 16) {
+#pragma unroll
+    for (int column = 0; column < 16; ++column) {
+      const uint32 csr = base + column;
+      float value = 0.0f;
+      if (csr < end) {
+        const uint32 edge = V1_EDGE_INDEX(csr);
+        value = projected[static_cast<int64_t>(pair_ids[csr]) * kBatch + lane];
+        local_spike_grad += value * AsFloat(weights[edge]);
+      }
+      matrix_b[warp][column * 32 + lane] = __float2half(value);
+    }
+    __syncwarp();
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+    wmma::fill_fragment(c, 0.0f);
+    wmma::load_matrix_sync(a, matrix_a[warp], 32);
+    wmma::load_matrix_sync(b, matrix_b[warp], 32);
+    wmma::mma_sync(c, a, b, c);
+    wmma::load_matrix_sync(a, matrix_a[warp] + 16, 32);
+    wmma::load_matrix_sync(b, matrix_b[warp] + 16, 32);
+    wmma::mma_sync(c, a, b, c);
+    wmma::store_matrix_sync(matrix_c[warp], c, 16, wmma::mem_row_major);
+    __syncwarp();
+    if (lane < 16 && base + lane < end) {
+      weight_grad[V1_EDGE_INDEX(base + lane)] = matrix_c[warp][lane];
+    }
+  }
+
+  spike_partials[warp][lane] = local_spike_grad;
+  __syncthreads();
+  if (warp == 0) {
+    spike_grad[static_cast<int64_t>(lane) * n_pre + pre] = FromFloat<Eigen::half>(
+        (spike_partials[0][lane] + spike_partials[1][lane]) *
+        AsFloat(*dampening));
+  }
+}
+
 #define V1_BATCH_CASE(BATCH, TILE, LAUNCH) \
   case BATCH:                              \
     LAUNCH(BATCH, TILE);                   \
@@ -827,16 +904,30 @@ Status LaunchPairProjectedBackward(
       n_basis, current_grad.flat<T>().data(), basis.flat<T>().data(),
       pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),
       projected));
-  constexpr int kLaneThreads = 128;
-  constexpr int kLaneWarps = kLaneThreads / 32;
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      BackwardBatchLaneKernel<T, W, 32, kLaneWarps>,
-      static_cast<int>((n_rows + kLaneWarps - 1) / kLaneWarps), kLaneThreads, 0,
-      device.stream(), spikes.dim_size(1), spikes.flat<T>().data(), projected,
-      weights.flat<W>().data(), pair_ids.flat<uint32>().data(),
-      edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),
-      nonempty_rows.flat<uint32>().data(), n_rows, dampening.flat<T>().data(),
-      spike_grad->flat<T>().data(), weight_grad->flat<float>().data()));
+#if V1_PAIR_WMMA
+  if constexpr (std::is_same<T, Eigen::half>::value) {
+    constexpr int kTensorThreads = 64;
+    TF_RETURN_IF_ERROR(GpuLaunchKernel(
+        BackwardTensorRowKernel<W>, static_cast<int>(n_rows), kTensorThreads, 0,
+        device.stream(), spikes.dim_size(1), spikes.flat<T>().data(), projected,
+        weights.flat<W>().data(), pair_ids.flat<uint32>().data(),
+        edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),
+        nonempty_rows.flat<uint32>().data(), n_rows, dampening.flat<T>().data(),
+        spike_grad->flat<T>().data(), weight_grad->flat<float>().data()));
+  } else
+#endif
+  {
+    constexpr int kLaneThreads = 128;
+    constexpr int kLaneWarps = kLaneThreads / 32;
+    TF_RETURN_IF_ERROR(GpuLaunchKernel(
+        BackwardBatchLaneKernel<T, W, 32, kLaneWarps>,
+        static_cast<int>((n_rows + kLaneWarps - 1) / kLaneWarps), kLaneThreads,
+        0, device.stream(), spikes.dim_size(1), spikes.flat<T>().data(),
+        projected, weights.flat<W>().data(), pair_ids.flat<uint32>().data(),
+        edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),
+        nonempty_rows.flat<uint32>().data(), n_rows, dampening.flat<T>().data(),
+        spike_grad->flat<T>().data(), weight_grad->flat<float>().data()));
+  }
   return OkStatus();
 }
 

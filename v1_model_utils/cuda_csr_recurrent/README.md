@@ -27,9 +27,17 @@ that mirror them across that boundary.
 At batch 32 with the four-column basis, the backward pass projects each distinct
 `(postsynaptic neuron, synapse type)` pair onto the basis once rather than once
 per edge (1,675,548 pairs for 84,132,910 edges in the 203,816-neuron network),
-and maps one batch sample per warp lane. `pair_projection_applies` gates this
-strictly on that shape; every other batch size and basis dimension keeps the
-general kernel. Measured 17.7 s -> 8.2 s per training update at batch 32.
+then uses a two-warp tensor-row kernel for FP16 weight-gradient dot products.
+Spike-gradient accumulation and the compact projection remain FP32.
+`pair_projection_applies` gates the compact path strictly on batch 32 and four
+basis columns; FP32 and every other batch size or basis dimension retain the
+established batch-lane/general kernels. On the 203,816-neuron training workload,
+the tensor-row specialization measured 5.54% faster end to end than the prior
+production kernel. Process VRAM was unchanged, while TensorFlow peak allocation
+was 276 MiB higher in the matched ten-update comparison.
+The build enables this specialization for SM120 and newer architectures; older
+architectures retain the previous batch-lane path until independently
+benchmarked.
 
 ## Neuron layout
 

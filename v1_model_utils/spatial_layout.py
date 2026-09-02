@@ -224,6 +224,18 @@ class LgnRowOrder:
     def is_identity(self):
         return self.mode == LGN_ORIGINAL
 
+    def to_runtime(self, values, axis=-1):
+        """Gather canonical LGN-aligned values into runtime row order."""
+        if self.is_identity:
+            return values
+        values = np.asarray(values)
+        if values.shape[axis] != self.n_rows:
+            raise ValueError(
+                f"axis {axis} has length {values.shape[axis]}, "
+                f"expected {self.n_rows} LGN rows"
+            )
+        return np.take(values, self.new_to_old, axis=axis)
+
     def relabel(self, ids):
         """Translate canonical LGN row ids into runtime ids."""
         return self._map_ids(ids, self.old_to_new)

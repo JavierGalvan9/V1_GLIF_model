@@ -63,7 +63,8 @@ def calculate_Firing_Rate(z, stimulus_init=500, stimulus_end=2500, temporal_axis
 
 def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angles=range(0,360, 45),
                       n_selected_neurons=None, core_radius=None, remove_zero_rate_neurons=False,
-                      directory='', save_df=False, data_dir='GLIF_network'):
+                      directory='', save_df=False, data_dir='GLIF_network',
+                      neuron_ids=None):
 
     # Get the pop names of the neurons
     if n_selected_neurons is not None:
@@ -75,19 +76,38 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
 
     # Get the number of neurons and DG angles
     n_neurons = len(pop_names)
-    node_ids = np.arange(n_neurons)
+    node_ids = (
+        np.arange(n_neurons)
+        if neuron_ids is None
+        else np.asarray(neuron_ids)
+    )
     # Get the firing rates for every neuron and DG angle
     # all_rates = np.array([g["Ave_Rate(Hz)"] for _, g in rates_df.groupby("DG_angle")]).T
     n_trials, n_angles, n_neurons = firingRates.shape
+    if node_ids.shape != (n_neurons,) or len(pop_names) != n_neurons:
+        raise ValueError(
+            "neuron_ids, population names, and firing rates must describe "
+            "the same neurons"
+        )
+    if np.unique(node_ids).size != node_ids.size:
+        raise ValueError("neuron_ids must be unique")
     all_direction_rates = np.mean(firingRates, axis=0)
     average_all_direction_rates = np.mean(all_direction_rates, axis=0)
 
     # Save the results in a dataframe
     if os.path.exists(os.path.join(directory, "v1_features_df.csv")):
         osi_dsi_df = pd.read_csv(os.path.join(directory, "v1_features_df.csv"), sep=" ")
+        if "node_id" not in osi_dsi_df or osi_dsi_df["node_id"].duplicated().any():
+            raise ValueError("existing v1_features_df.csv has invalid node_id values")
+        osi_dsi_df = osi_dsi_df.set_index("node_id")
+        if not pd.Index(node_ids).isin(osi_dsi_df.index).all():
+            raise ValueError(
+                "existing v1_features_df.csv does not contain the requested neurons"
+            )
+        osi_dsi_df = osi_dsi_df.reindex(node_ids)
+        osi_dsi_df["pop_name"] = pop_names
     else:
-        osi_dsi_df = pd.DataFrame()
-        osi_dsi_df["node_id"] = node_ids
+        osi_dsi_df = pd.DataFrame(index=pd.Index(node_ids, name="node_id"))
         osi_dsi_df["pop_name"] = pop_names
 
     if session == 'drifting_gratings':
@@ -139,9 +159,11 @@ def calculate_OSI_DSI(firingRates, network, session='drifting_gratings', DG_angl
 
     if save_df:
         os.makedirs(directory, exist_ok=True)
-        osi_dsi_df.to_csv(os.path.join(directory, "v1_features_df.csv"), sep=" ", index=False)
+        osi_dsi_df.sort_index().to_csv(
+            os.path.join(directory, "v1_features_df.csv"), sep=" "
+        )
 
-    return osi_dsi_df
+    return osi_dsi_df.reset_index()
 
 def compute_ks_statistics(df, metric='Ave_Rate(Hz)', data_source1='V1 GLIF model', data_source2='Neuropixels', min_n_sample=15):
     """
@@ -547,7 +569,8 @@ class ModelMetricsAnalysis:
 
     def __init__(self, spikes, DG_angles, network, data_dir='GLIF_network',
                  drifting_gratings_init=None, drifting_gratings_end=None, spontaneous_init=None, spontaneous_end=None,
-                 core_radius=400, save_df=False, df_directory='Metrics_analysis', neuropixels_df='v1_OSI_DSI_DF.csv'):
+                 core_radius=400, save_df=False, df_directory='Metrics_analysis', neuropixels_df='v1_OSI_DSI_DF.csv',
+                 neuron_ids=None):
         self.n_neurons = network['n_nodes']
         self.network = network
         self.data_dir = data_dir
@@ -555,6 +578,7 @@ class ModelMetricsAnalysis:
         self.drifting_gratings_end = drifting_gratings_end
         self.spontaneous_init = spontaneous_init
         self.spontaneous_end = spontaneous_end
+        neuron_ids = None if neuron_ids is None else np.asarray(neuron_ids)
 
         self.neuropixels_df = neuropixels_df
 
@@ -571,6 +595,8 @@ class ModelMetricsAnalysis:
             self.core_mask = other_v1_utils.isolate_core_neurons(self.network, radius=self.core_radius, data_dir=self.data_dir)
             if spikes.shape[3] != np.sum(self.core_mask) and spikes.shape[3] == len(self.core_mask):
                 spikes = spikes[:, :, :, self.core_mask]
+                if neuron_ids is not None:
+                    neuron_ids = neuron_ids[self.core_mask]
         else:
             self.core_mask = np.full(self.n_neurons, True)
         analysis_core_radius = self.core_radius if self.core_radius > 0 else None
@@ -579,13 +605,15 @@ class ModelMetricsAnalysis:
             firingRates = calculate_Firing_Rate(spikes, stimulus_init=self.drifting_gratings_init,
                                                 stimulus_end=self.drifting_gratings_end, temporal_axis=2)
             self.metrics_df = calculate_OSI_DSI(firingRates, self.network, session='drifting_gratings', DG_angles=DG_angles, n_selected_neurons=None,
-                                                core_radius=analysis_core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df, data_dir=self.data_dir)
+                                                core_radius=analysis_core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df, data_dir=self.data_dir,
+                                                neuron_ids=neuron_ids)
         # Calculate the spontaneous metrics
         if self.spontaneous_init is not None:
             spontaneous_firingRates = calculate_Firing_Rate(spikes, stimulus_init=self.spontaneous_init,
                                                             stimulus_end=self.spontaneous_end, temporal_axis=2)
             self.metrics_df = calculate_OSI_DSI(spontaneous_firingRates, self.network, session='spontaneous', DG_angles=DG_angles,
-                                                n_selected_neurons=None, core_radius=analysis_core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df, data_dir=self.data_dir)
+                                                n_selected_neurons=None, core_radius=analysis_core_radius, remove_zero_rate_neurons=False, directory=df_directory, save_df=save_df, data_dir=self.data_dir,
+                                                neuron_ids=neuron_ids)
 
     def __call__(self, metrics=["Rate at preferred direction (Hz)", "OSI", "DSI"], axis=None,
                  directory='', filename=''):

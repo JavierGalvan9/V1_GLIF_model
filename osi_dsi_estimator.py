@@ -288,8 +288,15 @@ def main(_):
     stim_duration = flags.spont_duration + flags.evoked_duration
     sim_duration = int(np.ceil(stim_duration/flags.seq_len)) * flags.seq_len
     post_delay = sim_duration - stim_duration
+    tracked_runtime_ids = (
+        np.arange(network['n_nodes'])
+        if output_neuron_ids is None
+        else output_neuron_ids
+    )
+    canonical_neuron_ids = neuron_layout.new_to_old[tracked_runtime_ids]
     callbacks = OsiDsiCallbacks(network, lgn_input, bkg_input, flags, logdir, current_epoch=current_epoch,
-                                pre_delay=flags.spont_duration, post_delay=post_delay, model_variables_init=model_variables_dict)
+                                pre_delay=flags.spont_duration, post_delay=post_delay, model_variables_init=model_variables_dict,
+                                neuron_ids=canonical_neuron_ids)
 
     n_iterations = int(np.ceil(flags.n_trials_per_angle / per_replica_batch_size))
     chunk_size = flags.seq_len
@@ -362,7 +369,11 @@ def main(_):
 
         if angle_id == 0:
             # Raster plot for 0 degree orientation
-            callbacks.single_trial_callbacks(lgn_spikes.numpy(), spikes[:, 0, :, :], y=angle)
+            callbacks.single_trial_callbacks(
+                lgn_row_order.to_runtime(lgn_spikes.numpy()),
+                spikes[:, 0, :, :],
+                y=angle,
+            )
             if voltages is not None:
                 voltage_path = os.path.join(logdir, "voltage_trace.npy")
                 # Columns follow the runtime numbering; save them canonically so
@@ -472,7 +483,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer('examples_in_epoch', 32, '')
     absl.app.flags.DEFINE_integer('validation_examples', 16, '')
     absl.app.flags.DEFINE_integer('n_trials_per_angle', 10, '')
-    absl.app.flags.DEFINE_integer('fano_samples', 500, '')
+    absl.app.flags.DEFINE_integer('fano_samples', 512, '')
 
     # absl.app.flags.DEFINE_boolean('float16', False, '')
     absl.app.flags.DEFINE_boolean('caching', True, '')
