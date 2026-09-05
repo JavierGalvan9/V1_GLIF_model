@@ -101,8 +101,30 @@ python multi_training.py --data_dir GLIF_network \
     --neurons 0 --seq_len 500 --n_epochs 75 --steps_per_epoch 25 \
     --batch_size 5 --optimizer exp_adam --learning_rate 0.005 \
     --rate_cost 10000 --voltage_cost 1 --sync_cost 1.5 --osi_cost 20 \
-    --train_recurrent
+    --train_recurrent --gradient_checkpointing
 ```
+
+`multi_training.py` is also the production multi-GPU entry point. It starts one
+TensorFlow worker per visible GPU before CUDA is initialized. Batch flags remain
+per-replica for backward compatibility:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python multi_training.py --n_gpus 2 \
+    --batch_size 4 --grating_batch_size 2 --gray_batch_size 2 \
+    --data_dir GLIF_network --neurons 0 --seq_len 500 \
+    --train_recurrent --train_noise --gradient_checkpointing
+```
+
+This example has global batch 8. The equivalent convenience form is
+`--n_gpus 2 --global_batch_size 8`; the grating/gray ratio must resolve to
+integer per-replica batches. Multi-GPU CUDA training requires GPUs with the
+same compute capability and uses NCCL `MultiWorkerMirroredStrategy`. Only the
+chief writes checkpoints, TensorBoard data, plots, and final artifacts.
+
+The CUDA operators are built automatically when the architecture-specific
+cache is missing or stale. Caches for A100 (`sm80`), RTX 3090 (`sm86`), L40S /
+RTX 6000 Ada (`sm89`), and RTX Pro 6000 Blackwell (`sm120`) coexist; building
+for one architecture does not replace the others.
 
 Note: Running with batch size 5 requires ~40 GB of VRAM. If you have less VRAM, reduce the batch size.
 
@@ -114,6 +136,24 @@ Parameters:
 - `--train_recurrent`: Enable training of recurrent connections
 - `--optimizer`: Optimizer used for the paper-aligned runs (`exp_adam`)
 - `--learning_rate`: Learning rate used in the reported configuration (`0.005`)
+- `--gradient_checkpointing`: Enable exact-BPTT activation recomputation. The
+  default `segmented` implementation stores recurrent state only at temporal
+  chunk boundaries and recomputes the chunks in reverse during backpropagation.
+- `--gradient_checkpoint_chunk_size`: Number of timesteps per recomputed chunk
+  (default: `25`). Smaller chunks reduce peak VRAM at the cost of additional
+  loop overhead.
+- `--pack_spike_checkpoints`: Store the binary recurrent spike-delay state at
+  temporal checkpoint boundaries in a bit-packed `int32` representation. This
+  is opt-in while its end-to-end memory and runtime trade-off is evaluated.
+- `--n_gpus`: Number of already-visible GPUs to use (default: `1`).
+- `--global_batch_size`: Optional global batch divided evenly across workers;
+  when zero, the existing per-replica batch flags are used.
+
+For the 203,816-neuron model at sequence length 500 and batch size 1, chunk
+sizes 25, 50, and 100 measured approximately 17.9, 26.2, and 43.6 GiB of peak
+TensorFlow allocation, respectively, with similar steady-state step times.
+Whole-sequence recomputation and chunk size 250 exceeded 96 GiB. These figures
+depend on the connectivity, losses, TensorFlow build, and GPU architecture.
 
 #### Evaluating Orientation and Direction Selectivity
 
@@ -121,8 +161,31 @@ To evaluate OSI/DSI metrics after training, or to rerun a checkpointed model:
 
 ```bash
 python osi_dsi_estimator.py --data_dir GLIF_network \
-    --neurons 0 --n_trials_per_angle 10 --restore_from "/path/to/model/checkpoint"
+    --neurons 0 --n_trials_per_angle 10 --restore_from "/path/to/model/checkpoint" \
+    --track_core_only
 ```
+
+`output_spike_dtype` controls only the spike sequence exposed by the recurrent
+layer. The OSI/DSI core-neuron path uses `tf.float32` inside the GPU RNN and
+converts completed chunks to `uint8`; this avoids per-timestep host transfers.
+Other callers can request `tf.uint8`, `tf.float16`, or `tf.float32` explicitly.
+The recurrent state remains in the model's configured compute dtype.
+
+Pass `--track_voltage` to save the selected neurons' first-trial membrane
+voltage trace to `voltage_trace.npy`. Voltage sequences are not materialized
+when this flag is disabled.
+
+`create_model(..., acceleration="auto")` selects the CUDA synaptic-current and
+state-transition implementations when the visible GPUs are compatible, and
+otherwise uses TensorFlow. Use `acceleration="cuda"` to require CUDA or
+`acceleration="tensorflow"` for the reference implementation. The fused state
+kernel supports `surrogate_gradient="triangular"`, `"gaussian"`, and
+`"slayer"`; the legacy `pseudo_gauss=True` option selects Gaussian.
+
+Compiled CUDA operators are stored outside the repository in an ABI- and
+architecture-keyed cache. Set `V1_CUDA_CACHE_DIR` to override the default
+`~/.cache/v1_glif/cuda` location. Missing or stale operators rebuild
+automatically; intermediate object files are discarded after linking.
 
 ## Visual Stimuli
 

@@ -155,6 +155,7 @@ def ensure_artifact(
     build_module,
     architecture=None,
     build_flags=(),
+    build_args=(),
 ):
     """Return a fresh architecture-specific artifact, building it if needed.
 
@@ -183,6 +184,7 @@ def ensure_artifact(
         build_module,
         "--architecture",
         architecture,
+        *map(str, build_args),
     ]
     with lock_path.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

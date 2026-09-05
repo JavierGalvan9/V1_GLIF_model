@@ -110,6 +110,12 @@ parser.add_argument('--neuron_output', default=False, action='store_true')
 
 # parser.add_argument('--visualize_test', default=False, action='store_true')
 parser.add_argument('--pseudo_gauss', default=False, action='store_true')
+parser.add_argument(
+    '--surrogate_gradient',
+    default='triangular',
+    choices=['triangular', 'gaussian', 'slayer'],
+)
+parser.add_argument('--pack_spike_checkpoints', default=False, action='store_true')
 parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
 parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')

@@ -23,21 +23,24 @@ REGISTER_OP("V1FusedSpikeShift")
 
 REGISTER_OP("V1FusedSpikeShiftBackward")
     .Attr("T: {half, float}")
+    .Attr("surrogate: {'triangular', 'gaussian', 'slayer'} = 'triangular'")
     .Input("voltage: T")
     .Input("refractory: bool")
     .Input("spike_grad: T")
     .Input("history_grad: T")
-    .Input("dampening: T")
+    .Input("sigma: T")
+    .Input("amplitude: T")
     .Output("voltage_grad: T")
     .Output("old_history_grad: T")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       shape_inference::ShapeHandle voltage, refractory, spike_grad, history_grad,
-          dampening;
+          sigma, amplitude;
       TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 2, &voltage));
       TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 2, &refractory));
       TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 2, &spike_grad));
       TF_RETURN_IF_ERROR(c->WithRank(c->input(3), 2, &history_grad));
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(4), 0, &dampening));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(4), 0, &sigma));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(5), 0, &amplitude));
       TF_RETURN_IF_ERROR(c->Merge(voltage, refractory, &voltage));
       TF_RETURN_IF_ERROR(c->Merge(voltage, spike_grad, &voltage));
       c->set_output(0, voltage);

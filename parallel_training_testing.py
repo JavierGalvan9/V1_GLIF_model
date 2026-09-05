@@ -170,6 +170,11 @@ parser.add_argument('--neuron_output', default=False, action='store_true')
 
 # parser.add_argument('--visualize_test', default=False, action='store_true')
 parser.add_argument('--pseudo_gauss', default=False, action='store_true')
+parser.add_argument(
+    '--surrogate_gradient',
+    default='triangular',
+    choices=['triangular', 'gaussian', 'slayer'],
+)
 parser.add_argument('--current_input', default=False, action='store_true')
 parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
 parser.add_argument('--reset_every_step', default=False, action='store_true')
@@ -179,6 +184,7 @@ parser.add_argument('--uniform_weights', default=False, action='store_true')
 parser.add_argument('--gradient_checkpointing', dest='gradient_checkpointing', action='store_true')
 parser.add_argument('--nogradient_checkpointing', dest='gradient_checkpointing', action='store_false')
 parser.set_defaults(gradient_checkpointing=True)
+parser.add_argument('--pack_spike_checkpoints', default=False, action='store_true')
 parser.add_argument('--rotation', default='ccw', type=str)
 parser.add_argument('--print_only', default=False, action='store_true', help='Only print the commands without submitting them')
 parser.add_argument('--neuropixels_df', default='Neuropixels_data/OSI_DSI_neuropixels_v4.csv', type=str, help='File name of the Neuropixels DataFrame for OSI/DSI analysis')
@@ -246,10 +252,10 @@ def main():
 
     # Define the job submission commands for the training and evaluation scripts
     if flags.low_memory_gpu:
-        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtx3090", "-m", "64", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
+        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtx3090", "-m", "80", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
     else:
         # training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{16 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the L40S GPU with 48GB of memory
-        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtxpro6000", "-c", f"{16 * flags.n_gpus}", "-m", "64", "-t", "48:00"] # choose the rtx6000 GPU with 64GB of memory
+        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtxpro6000", "-c", f"{16 * flags.n_gpus}", "-m", "80", "-t", "48:00"] # choose the rtx6000 GPU with 64GB of memory
 
     evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
     # evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "80", "-c", "8", "-t", "3:00"]
@@ -275,6 +281,7 @@ def main():
                 'n_gpus', 'grating_batch_size', 'gray_batch_size',
                 'debug_gradients', 'global_clipnorm',
                 'detach_reset', 'detach_asc_reset',
+                'pack_spike_checkpoints',
             } or name.startswith('rolling_'):
                 continue
 
@@ -296,9 +303,9 @@ def main():
     else:
         _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
 
-    initial_evaluation_command = _initial_evaluation_command + [_initial_evaluation_script]
-    eval_job_id = submit_job(initial_evaluation_command)
-    eval_job_ids.append(eval_job_id)
+    # initial_evaluation_command = _initial_evaluation_command + [_initial_evaluation_script]
+    # eval_job_id = submit_job(initial_evaluation_command)
+    # eval_job_ids.append(eval_job_id)
 
     for i in range(flags.n_runs):
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...

@@ -36,6 +36,7 @@ def _load_ops():
             sources=sources + (HERE / "glif_state_ops.cc", HERE / "glif_state_ops.cu.cc"),
             build_module="v1_model_utils.cuda_glif_state.build",
             build_flags=BUILD_FLAGS,
+            build_args=("--stem", "glif_state_ops"),
         )
         spike = ensure_artifact(
             HERE,
@@ -46,6 +47,7 @@ def _load_ops():
             ),
             build_module="v1_model_utils.cuda_glif_state.build",
             build_flags=BUILD_FLAGS,
+            build_args=("--stem", "spike_history_ops"),
         )
         _GLIF_OPS = tf.load_op_library(str(glif))
         _SPIKE_OPS = tf.load_op_library(str(spike))
@@ -137,7 +139,9 @@ def _spike_and_shift(voltage, refractory, history, *, cell):
     refractory = tf.cast(refractory, tf.bool)
 
     @tf.custom_gradient
-    def transition(voltage_value, refractory_value, history_value, dampening):
+    def transition(
+        voltage_value, refractory_value, history_value, sigma, amplitude
+    ):
         spikes, new_history = spike_ops.v1_fused_spike_shift(
             voltage_value, refractory_value, history_value
         )
@@ -149,10 +153,12 @@ def _spike_and_shift(voltage, refractory, history, *, cell):
                 spike_ops.v1_fused_spike_shift_backward(
                     voltage_value, refractory_value, spike_gradient,
                     history_gradient,
-                    dampening,
+                    sigma,
+                    amplitude,
+                    surrogate=cell._surrogate_gradient,
                 )
             )
-            return voltage_gradient, None, history_gradient_old, None
+            return voltage_gradient, None, history_gradient_old, None, None
 
         return (spikes, new_history), grad
 
@@ -160,6 +166,7 @@ def _spike_and_shift(voltage, refractory, history, *, cell):
         voltage,
         refractory,
         history,
+        tf.cast(cell._gauss_std, voltage.dtype),
         tf.cast(cell._dampening_factor, voltage.dtype),
     )
 
@@ -167,14 +174,7 @@ def _spike_and_shift(voltage, refractory, history, *, cell):
 def update_glif_state(
     z_buf, v, r, asc, psc_rise, psc, rec_inputs, *, cell
 ):
-    """Return spikes and the six next recurrent state tensors.
-
-    The pseudo-Gaussian surrogate intentionally remains on the TensorFlow
-    reference path because this CUDA adapter implements the triangular
-    surrogate only.
-    """
-    if cell._pseudo_gauss:
-        raise ValueError("CUDA state transition does not support pseudo_gauss")
+    """Return spikes and the six next recurrent state tensors."""
     prev_z = z_buf[:, :cell._n_neurons]
     new_v, new_r, new_asc, new_rise, new_psc = _dense_state(
         prev_z, v, r, asc, psc_rise, psc, rec_inputs, cell=cell

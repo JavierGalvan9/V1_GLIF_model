@@ -51,6 +51,28 @@ def slayer_pseudo(v_scaled, sigma, amplitude):
     return tf.math.exp(-sigma * tf.abs(v_scaled)) * amplitude
 
 
+SURROGATE_GRADIENTS = ("triangular", "gaussian", "slayer")
+
+
+def resolve_surrogate_gradient(surrogate_gradient=None, pseudo_gauss=False):
+    """Resolve the surrogate name while preserving the legacy Gaussian flag."""
+    if surrogate_gradient is None:
+        return "gaussian" if pseudo_gauss else "triangular"
+    surrogate_gradient = str(surrogate_gradient).lower()
+    if surrogate_gradient not in SURROGATE_GRADIENTS:
+        choices = ", ".join(SURROGATE_GRADIENTS)
+        raise ValueError(
+            f"surrogate_gradient must be one of {choices}; got "
+            f"{surrogate_gradient!r}"
+        )
+    if pseudo_gauss and surrogate_gradient != "gaussian":
+        raise ValueError(
+            "pseudo_gauss=True conflicts with "
+            f"surrogate_gradient={surrogate_gradient!r}"
+        )
+    return surrogate_gradient
+
+
 @tf.custom_gradient
 def _range_voltage_penalty_mean(voltage, inverse_n_neurons):
     """Compute the neuron mean and return it in the voltage compute dtype."""
@@ -584,6 +606,7 @@ class V1Column(tf.keras.layers.Layer):
         batch_size=1,
         bkg_firing_rate=250,
         pseudo_gauss=False,
+        surrogate_gradient=None,
         train_recurrent=True,
         train_recurrent_per_type=True,
         train_input=False,
@@ -645,7 +668,10 @@ class V1Column(tf.keras.layers.Layer):
         )
         self._detach_reset = bool(detach_reset)
         self._detach_asc_reset = bool(detach_asc_reset)
-        self._pseudo_gauss = pseudo_gauss
+        self._surrogate_gradient = resolve_surrogate_gradient(
+            surrogate_gradient, pseudo_gauss
+        )
+        self._pseudo_gauss = self._surrogate_gradient == "gaussian"
         self._lr_scale = tf.constant(lr_scale, dtype=self.compute_dtype)
         self._scales_recurrent_inputs = float(lr_scale) != 1.0
         # self._spike_gradient = spike_gradient
@@ -685,8 +711,6 @@ class V1Column(tf.keras.layers.Layer):
                 f"{acceleration!r}"
             )
         cuda_available = _has_homogeneous_cuda_devices()
-        if acceleration == "cuda" and self._pseudo_gauss:
-            raise ValueError("acceleration='cuda' does not support pseudo_gauss")
         if acceleration == "cuda" and not cuda_available:
             raise RuntimeError(
                 "acceleration='cuda' requires visible GPUs with one compute capability"
@@ -696,9 +720,7 @@ class V1Column(tf.keras.layers.Layer):
         )
         self.acceleration = acceleration
         self._synaptic_current_backend = "cuda" if use_cuda else "tensorflow"
-        self._state_backend = (
-            "cuda" if use_cuda and not self._pseudo_gauss else "tensorflow"
-        )
+        self._state_backend = "cuda" if use_cuda else "tensorflow"
         self.resolved_acceleration = (
             "cuda"
             if self._state_backend == "cuda"
@@ -1306,7 +1328,7 @@ class V1Column(tf.keras.layers.Layer):
             seed=noise_seed,
             lam=self.bkg_spike_prob,
             dtype=tf.int32,
-        )
+        ) # this operation is done in the CPU (no support for stateless poisson in GPU). However, the operation is done in parallel with GPU work so it only adds a small communication overhead. Do not try to optimize this to run in GPU, as it will be slower than the current implementation.
 
         if self._synaptic_current_backend == "cuda":
             activity = tf.cast(rest_of_brain, dtype=self.compute_dtype)
@@ -1573,8 +1595,12 @@ class V1Column(tf.keras.layers.Layer):
         # v_sc = (new_v - self.v_th) / self.normalizer # normalized is 1 for scaled voltage
         if self._state_backend != "cuda":
             v_sc = new_v - self.v_th
-            if self._pseudo_gauss:
+            if self._surrogate_gradient == "gaussian":
                 new_z = spike_gauss(v_sc, self._gauss_std, self._dampening_factor)
+            elif self._surrogate_gradient == "slayer":
+                new_z = spike_slayer(
+                    v_sc, self._gauss_std, self._dampening_factor
+                )
             else:
                 new_z = spike_function(v_sc, self._dampening_factor)
 
@@ -1727,6 +1753,7 @@ def create_model(
     max_delay=0,
     batch_size=None,
     pseudo_gauss=False,
+    surrogate_gradient=None,
     hard_reset=False,
     current_input=False,
     use_dummy_state_input=False,
@@ -1779,6 +1806,7 @@ def create_model(
         detach_asc_reset=detach_asc_reset,
         max_delay=max_delay,
         pseudo_gauss=pseudo_gauss,
+        surrogate_gradient=surrogate_gradient,
         batch_size=batch_size,
         train_recurrent=train_recurrent,
         train_recurrent_per_type=train_recurrent_per_type,
@@ -1924,12 +1952,15 @@ def build_sequence_and_state_model(model, rsnn_layer, name="rsnn_sequence_and_st
 class SegmentedRecomputeRunner:
     """Run an RNN in recomputed temporal chunks while preserving exact BPTT."""
 
+    _PACKED_SPIKES_PER_WORD = 31
+
     def __init__(
         self,
         core_model,
         sequence_length,
         chunk_size,
         differentiate_inputs=True,
+        pack_spike_checkpoints=False,
     ):
         sequence_length = int(sequence_length)
         chunk_size = int(chunk_size)
@@ -1944,6 +1975,7 @@ class SegmentedRecomputeRunner:
         self.sequence_length = sequence_length
         self.chunk_size = chunk_size
         self.differentiate_inputs = bool(differentiate_inputs)
+        self.pack_spike_checkpoints = bool(pack_spike_checkpoints)
         self.n_full_chunks = sequence_length // chunk_size
         self.remainder_size = sequence_length % chunk_size
         self.chunk_sizes = tuple(
@@ -1952,6 +1984,31 @@ class SegmentedRecomputeRunner:
         )
         self.n_chunks = len(self.chunk_sizes)
         self.n_sequence_outputs = len(tf.nest.flatten(core_model.output[0]))
+
+    def _pack_spikes(self, spikes):
+        """Pack a binary rank-two spike state into positive int32 words."""
+        width = spikes.shape[-1]
+        if spikes.shape.rank != 2 or width is None:
+            raise ValueError(
+                "Packed spike checkpoints require a rank-two state with a "
+                "static width."
+            )
+        word_bits = self._PACKED_SPIKES_PER_WORD
+        padding = (-width) % word_bits
+        bits = tf.cast(spikes, tf.int32)
+        if padding:
+            bits = tf.pad(bits, ((0, 0), (0, padding)))
+        bits = tf.reshape(bits, (tf.shape(bits)[0], -1, word_bits))
+        shifts = tf.range(word_bits, dtype=tf.int32)
+        return tf.reduce_sum(tf.bitwise.left_shift(bits, shifts), axis=-1)
+
+    def _unpack_spikes(self, packed, width, dtype):
+        """Restore binary spike values from positive int32 words."""
+        shifts = tf.range(self._PACKED_SPIKES_PER_WORD, dtype=tf.int32)
+        bits = tf.bitwise.bitwise_and(
+            tf.bitwise.right_shift(packed[..., tf.newaxis], shifts), 1
+        )
+        return tf.cast(tf.reshape(bits, (tf.shape(packed)[0], -1))[:, :width], dtype)
 
     def _run_chunk(self, inputs, *state):
         outputs = self.core_model((inputs, tuple(state)))
@@ -1990,15 +2047,24 @@ class SegmentedRecomputeRunner:
             for spec in sequence_specs
         )
         state_arrays = tuple(
-            tf.TensorArray(dtype=value.dtype, size=self.n_chunks, clear_after_read=True)
-            for value in initial_state
+            tf.TensorArray(
+                dtype=(tf.int32 if self.pack_spike_checkpoints and index == 0 else value.dtype),
+                size=self.n_chunks,
+                clear_after_read=True,
+            )
+            for index, value in enumerate(initial_state)
         )
 
         def run_full_chunk(chunk_index, arrays, states, history):
             chunk = self._slice_chunk(inputs, chunk_index, self.chunk_size, time_check)
             history = tuple(
-                array.write(chunk_index, value)
-                for array, value in zip(history, states)
+                array.write(
+                    chunk_index,
+                    self._pack_spikes(value)
+                    if self.pack_spike_checkpoints and index == 0
+                    else value,
+                )
+                for index, (array, value) in enumerate(zip(history, states))
             )
             flat_outputs = self._run_chunk(chunk, *states)
             chunk_sequences = flat_outputs[:self.n_sequence_outputs]
@@ -2021,8 +2087,13 @@ class SegmentedRecomputeRunner:
         if self.remainder_size:
             remainder_index = tf.constant(self.n_full_chunks)
             state_arrays = tuple(
-                array.write(remainder_index, value)
-                for array, value in zip(state_arrays, state)
+                array.write(
+                    remainder_index,
+                    self._pack_spikes(value)
+                    if self.pack_spike_checkpoints and index == 0
+                    else value,
+                )
+                for index, (array, value) in enumerate(zip(state_arrays, state))
             )
             chunk = self._slice_chunk(
                 inputs, remainder_index, self.remainder_size, time_check
@@ -2062,7 +2133,7 @@ class SegmentedRecomputeRunner:
                 clear_after_read=True,
             ),
         ) if inputs_are_differentiable else ()
-        state_dtypes = tuple(array.dtype for array in state_arrays)
+        state_dtypes = tuple(value.dtype for value in final_state)
         state_cotangents = tuple(
             (
                 gradient if gradient is not None else tf.zeros_like(final_state[index])
@@ -2087,6 +2158,17 @@ class SegmentedRecomputeRunner:
             boundary_state = tuple(
                 array.read(chunk_index) for array in state_arrays
             )
+            if self.pack_spike_checkpoints:
+                spike_width = final_state[0].shape[-1]
+                if spike_width is None:
+                    raise ValueError(
+                        "Packed spike checkpoints require a static spike-state width."
+                    )
+                boundary_state = (
+                    self._unpack_spikes(
+                        boundary_state[0], spike_width, final_state[0].dtype
+                    ),
+                ) + boundary_state[1:]
             differentiable_state_indices = tuple(
                 index for index, value in enumerate(boundary_state)
                 if value.dtype.is_floating or value.dtype.is_complex

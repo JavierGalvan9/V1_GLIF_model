@@ -156,6 +156,9 @@ def main(_):
                 train_recurrent_per_type=False,
                 neuron_output=flags.neuron_output,
                 pseudo_gauss=flags.pseudo_gauss,
+                surrogate_gradient=(
+                    "gaussian" if flags.pseudo_gauss else flags.surrogate_gradient
+                ),
                 use_state_input=True,
                 return_state=True,
                 hard_reset=flags.hard_reset,
@@ -505,6 +508,12 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('neuron_output', False, '')
     # absl.app.flags.DEFINE_boolean('hard_only', False, '')
     absl.app.flags.DEFINE_boolean('pseudo_gauss', False, '')
+    absl.app.flags.DEFINE_enum(
+        'surrogate_gradient',
+        'triangular',
+        ['triangular', 'gaussian', 'slayer'],
+        'Surrogate derivative used for spike generation.',
+    )
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
     absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", False, "")
     absl.app.flags.DEFINE_boolean("reset_every_step", False, "")

@@ -35,10 +35,11 @@ __global__ void ForwardKernel(int64 count, int64 neurons, int64 width,
 }
 
 template <typename T>
-__global__ void BackwardKernel(int64 history_count, int64 neuron_count,
-                               int64 neurons, int64 width, const T* voltage,
+__global__ void BackwardKernel(int64 history_count, int64 neurons, int64 width,
+                               const T* voltage,
                                const bool* refractory, const T* spike_grad,
-                               const T* history_grad, const T* dampening,
+                               const T* history_grad, const T* sigma,
+                               const T* amplitude, int surrogate,
                                T* voltage_grad, T* old_history_grad) {
   GPU_1D_KERNEL_LOOP(index, history_count) {
     const int64 batch = index / width;
@@ -46,21 +47,29 @@ __global__ void BackwardKernel(int64 history_count, int64 neuron_count,
     old_history_grad[index] = column + neurons < width
                                   ? history_grad[index + neurons]
                                   : static_cast<T>(0.0f);
-    if (index < neuron_count) {
-      const int64 neuron_batch = index / neurons;
-      const int64 neuron = index - neuron_batch * neurons;
-      const float v = ToFloat(voltage[index]);
-      const float triangle = fmaxf(1.0f - fabsf(v), 0.0f);
-      // Preserve TensorFlow's compute-dtype rounding order exactly:
-      // upstream * (dampening * max(1 - abs(v), 0)).
-      const T triangle_value = static_cast<T>(triangle);
+    if (column < neurons) {
+      const int64 neuron_index = batch * neurons + column;
+      const float v = ToFloat(voltage[neuron_index]);
+      const float scale = ToFloat(sigma[0]);
+      float shape;
+      if (surrogate == 1) {
+        shape = expf(-(v * v) / (scale * scale));
+      } else if (surrogate == 2) {
+        shape = expf(-scale * fabsf(v));
+      } else {
+        shape = fmaxf(1.0f - fabsf(v), 0.0f);
+      }
+      // Preserve TensorFlow's compute-dtype rounding order: cast the shape
+      // before multiplying it by the surrogate amplitude.
+      const T shape_value = static_cast<T>(shape);
       const T derivative = static_cast<T>(
-          ToFloat(dampening[0]) * ToFloat(triangle_value));
+          ToFloat(amplitude[0]) * ToFloat(shape_value));
       const T upstream = static_cast<T>(
-          ToFloat(spike_grad[index]) +
-          ToFloat(history_grad[neuron_batch * width + neuron]));
-      voltage_grad[index] = static_cast<T>(
-          refractory[index] ? 0.0f : ToFloat(upstream) * ToFloat(derivative));
+          ToFloat(spike_grad[neuron_index]) + ToFloat(history_grad[index]));
+      voltage_grad[neuron_index] = static_cast<T>(
+          refractory[neuron_index]
+              ? 0.0f
+              : ToFloat(upstream) * ToFloat(derivative));
     }
   }
 }
@@ -98,20 +107,27 @@ class ForwardOp : public OpKernel {
 template <typename T>
 class BackwardOp : public OpKernel {
  public:
-  explicit BackwardOp(OpKernelConstruction* context) : OpKernel(context) {}
+  explicit BackwardOp(OpKernelConstruction* context) : OpKernel(context) {
+    string surrogate;
+    OP_REQUIRES_OK(context, context->GetAttr("surrogate", &surrogate));
+    surrogate_ = surrogate == "gaussian" ? 1 : surrogate == "slayer" ? 2 : 0;
+  }
   void Compute(OpKernelContext* context) override {
     const Tensor& voltage = context->input(0);
     const Tensor& refractory = context->input(1);
     const Tensor& spike_grad = context->input(2);
     const Tensor& history_grad = context->input(3);
-    const Tensor& dampening = context->input(4);
+    const Tensor& sigma = context->input(4);
+    const Tensor& amplitude = context->input(5);
     OP_REQUIRES(context,
                 voltage.shape() == refractory.shape() && voltage.shape() == spike_grad.shape(),
                 errors::InvalidArgument("neuron tensor shapes differ"));
     OP_REQUIRES(context, voltage.dim_size(0) == history_grad.dim_size(0),
                 errors::InvalidArgument("batch dimensions differ"));
-    OP_REQUIRES(context, TensorShapeUtils::IsScalar(dampening.shape()),
-                errors::InvalidArgument("dampening must be scalar"));
+    OP_REQUIRES(context, TensorShapeUtils::IsScalar(sigma.shape()),
+                errors::InvalidArgument("sigma must be scalar"));
+    OP_REQUIRES(context, TensorShapeUtils::IsScalar(amplitude.shape()),
+                errors::InvalidArgument("amplitude must be scalar"));
     const int64 neurons = voltage.dim_size(1);
     const int64 width = history_grad.dim_size(1);
     OP_REQUIRES(context, neurons > 0 && width % neurons == 0,
@@ -125,11 +141,15 @@ class BackwardOp : public OpKernel {
     OP_REQUIRES_OK(context, GpuLaunchKernel(
         BackwardKernel<T>, config.block_count, config.thread_per_block, 0,
         context->eigen_device<GPUDevice>().stream(), history_count,
-        voltage.NumElements(), neurons, width, voltage.flat<T>().data(),
+        neurons, width, voltage.flat<T>().data(),
         refractory.flat<bool>().data(), spike_grad.flat<T>().data(),
-        history_grad.flat<T>().data(), dampening.flat<T>().data(),
+        history_grad.flat<T>().data(), sigma.flat<T>().data(),
+        amplitude.flat<T>().data(), surrogate_,
         voltage_grad->flat<T>().data(), old_history_grad->flat<T>().data()));
   }
+
+ private:
+  int surrogate_;
 };
 
 #define REGISTER(T)                                                        \

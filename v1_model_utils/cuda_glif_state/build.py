@@ -60,6 +60,11 @@ def _build(stem, architecture, prefix, cxx, nvcc, compile_flags, link_flags):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--architecture", default=os.environ.get("V1_CUDA_ARCH"))
+    parser.add_argument(
+        "--stem",
+        choices=("glif_state_ops", "spike_history_ops"),
+        help="Build only one operator; by default both are built.",
+    )
     args = parser.parse_args()
     architecture = normalize_architecture(
         args.architecture or active_gpu_architecture()
@@ -71,7 +76,8 @@ def main():
     cxx = os.environ.get("CXX", "g++-11")
     compile_flags = tf.sysconfig.get_compile_flags()
     link_flags = tf.sysconfig.get_link_flags()
-    for stem in ("glif_state_ops", "spike_history_ops"):
+    stems = (args.stem,) if args.stem else ("glif_state_ops", "spike_history_ops")
+    for stem in stems:
         _build(
             stem, architecture, prefix, cxx, nvcc, compile_flags, link_flags
         )

@@ -218,7 +218,10 @@ def main(_):
         f'gray={gray_batch_size}\n'
     )
     print(f'Training with current input: {flags.current_input}')
-    print(f'Pseudo derivative gaussian: {flags.pseudo_gauss}')
+    surrogate_gradient = (
+        "gaussian" if flags.pseudo_gauss else flags.surrogate_gradient
+    )
+    print(f'Surrogate gradient: {surrogate_gradient}')
 
     # Load or create the network building files configuration
     t0 = time()
@@ -294,6 +297,7 @@ def main(_):
             train_recurrent_per_type=flags.train_recurrent_per_type,
             neuron_output=flags.neuron_output,
             pseudo_gauss=flags.pseudo_gauss,
+            surrogate_gradient=surrogate_gradient,
             use_state_input=True,
             return_state=True,
             hard_reset=flags.hard_reset,
@@ -552,6 +556,7 @@ def main(_):
                 sequence_length=flags.seq_len,
                 chunk_size=flags.gradient_checkpoint_chunk_size,
                 differentiate_inputs=False,
+                pack_spike_checkpoints=flags.pack_spike_checkpoints,
             )
             print(
                 "Gradient checkpointing: segmented exact BPTT "
@@ -2036,6 +2041,12 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean("float16", False, "")
     absl.app.flags.DEFINE_boolean("hard_reset", False, "")
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
+    absl.app.flags.DEFINE_enum(
+        "surrogate_gradient",
+        "triangular",
+        ["triangular", "gaussian", "slayer"],
+        "Surrogate derivative used for spike generation.",
+    )
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
     absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
     absl.app.flags.DEFINE_boolean("spontaneous_training", False, "")
@@ -2043,6 +2054,11 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
+    absl.app.flags.DEFINE_boolean(
+        "pack_spike_checkpoints",
+        True,
+        "Bit-pack binary recurrent spike state stored at temporal checkpoint boundaries.",
+    )
     absl.app.flags.DEFINE_boolean(
         "use_online_voltage_loss",
         True,
