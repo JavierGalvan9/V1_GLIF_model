@@ -532,12 +532,53 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
     #     return reg_loss * self._strength
 
 
+def _grouped_emd(values, group_order, sorted_initial_values, group_slices, n_groups):
+    """Mean per-group Wasserstein-1 distance with an analytic gradient.
+
+    Sorting is a permutation, so it is locally constant in ``values`` and drops
+    out of the derivative: d|sort(x)_k - y_k| / dx is ``sign(...)`` scattered
+    back through the argsort. Caching that permutation in the forward turns the
+    whole backward into one gather and one scatter, instead of differentiating
+    through ``n_groups`` sorts and the group gather.
+    """
+
+    @tf.custom_gradient
+    def emd(x):
+        grouped_x = tf.gather(x, group_order)
+        group_losses, positions, sensitivities = [], [], []
+        for start, end in group_slices:
+            x_i = grouped_x[start:end]
+            order = tf.argsort(x_i)
+            deviation = tf.gather(x_i, order) - sorted_initial_values[start:end]
+            group_losses.append(tf.reduce_mean(tf.abs(deviation)))
+            positions.append(order + start)
+            sensitivities.append(
+                tf.sign(deviation) / float((end - start) * n_groups)
+            )
+        reg_loss = tf.reduce_mean(tf.stack(group_losses))
+        # Compose the two permutations once so the backward is a single scatter
+        # straight into the caller's edge order.
+        targets = tf.gather(group_order, tf.concat(positions, axis=0))
+        derivative = tf.concat(sensitivities, axis=0)
+
+        def grad(upstream):
+            return tf.scatter_nd(
+                targets[:, tf.newaxis], derivative * upstream, tf.shape(x)
+            )
+
+        return reg_loss, grad
+
+    return emd(values)
+
+
 class EarthMoversDistanceRegularizer(Layer):
     """
     EMD Regularizer that penalizes the Earth Mover's Distance (Wasserstein-1) between the current and initial
     synaptic weight distributions, per edge type, averaged over all edge types.
     Uses one flat gather followed by contiguous group slices during execution.
     Group metadata is prepared on CPU and stored as non-trainable local state.
+    The backward pass is analytic (see :func:`_grouped_emd`) rather than
+    differentiated through the per-group sorts.
     """
 
     def __init__(self, strength, network, dtype=tf.float32):
@@ -573,17 +614,18 @@ class EarthMoversDistanceRegularizer(Layer):
         index_dtype = tf.int32 if order_np.size <= np.iinfo(np.int32).max else tf.int64
         self._n_groups = n_groups
         self.num_unique = tf.constant(n_groups, dtype=tf.int32)
+        # Static group boundaries: they turn the per-group work into an
+        # unrolled sequence of independent slices the runtime can overlap,
+        # instead of a serialized tf.while_loop over dynamic row splits.
+        self._group_slices = tuple(
+            (int(row_splits_np[i]), int(row_splits_np[i + 1]))
+            for i in range(n_groups)
+        )
         self._group_order = tf.Variable(
             order_np,
             dtype=index_dtype,
             trainable=False,
             name="emd_group_order",
-        )
-        self._row_splits = tf.Variable(
-            row_splits_np,
-            dtype=tf.int64,
-            trainable=False,
-            name="emd_row_splits",
         )
         self._sorted_initial_values = tf.Variable(
             sorted_initial_flat_np,
@@ -602,16 +644,13 @@ class EarthMoversDistanceRegularizer(Layer):
         if self._n_groups == 0:
             return tf.reduce_sum(x) * tf.cast(0.0, self._dtype)
 
-        grouped_x = tf.gather(x, self._group_order)
-        emd_losses = tf.TensorArray(self._dtype, size=self._n_groups)
-        for i in tf.range(self._n_groups):
-            start = self._row_splits[i]
-            end = self._row_splits[i + 1]
-            x_i = grouped_x[start:end]
-            y_i = self._sorted_initial_values[start:end]
-            emd = tf.reduce_mean(tf.abs(tf.sort(x_i) - y_i))
-            emd_losses = emd_losses.write(i, emd)
-        reg_loss = tf.reduce_mean(emd_losses.stack())
+        reg_loss = _grouped_emd(
+            x,
+            tf.convert_to_tensor(self._group_order),
+            tf.convert_to_tensor(self._sorted_initial_values),
+            self._group_slices,
+            self._n_groups,
+        )
         return reg_loss * self._strength
 
 
@@ -1214,6 +1253,33 @@ def fano_shuffled_pool(pool_ids, n_epochs, rng):
     return np.concatenate([rng.permutation(pool_ids) for _ in range(n_epochs)])
 
 
+@tf.function(jit_compile=True)
+def _gather_population_traces(
+    spikes, sample_ids, neuron_mask, n_trials, duration, per_trial, max_count
+):
+    """Sum each sample's sub-population into one population trace per sample.
+
+    XLA-compiled for correctness, not for speed. TensorFlow's stock GPU gather
+    indexes its operand with int32, so once ``spikes`` passes 2**31 elements it
+    reads the wrong addresses and its gradient aborts the whole process with
+    ``Check failed: work_element_count >= 0``. ``spikes`` is
+    ``[batch, duration, n_neurons]`` and crosses that line at a per-loss batch
+    of 64 on the 203,816-neuron network and 128 on the 66,652-neuron one --
+    both inside the range we want to train at. XLA does its own indexing and
+    was measured exact up to 7.8e9 elements, while also being faster and
+    allocating less than the stock kernel. See ``int32_overflow_audit_20260902/``.
+
+    Balanced trial assignment is what lets this be a single batched gather:
+    sample slots are already grouped by the trial they read.
+    """
+    gathered = tf.gather(spikes, sample_ids, axis=2, batch_dims=1)
+    gathered = tf.reshape(gathered, [n_trials, duration, per_trial, max_count])
+    selected = tf.reduce_sum(gathered * neuron_mask[:, None, :, :], axis=3)
+    return tf.reshape(
+        tf.transpose(selected, [0, 2, 1]), [n_trials * per_trial, duration]
+    )
+
+
 class SynchronizationLoss(Layer):
     def __init__(self, network, stimulus_type='drifting_gratings', sync_cost=10., t_start=0., t_end=0.5, n_samples=50, neuropixels_data_dir='Synchronization_data',
                  data_dir='GLIF_network', dtype=tf.float32, core_mask=None, seed=42, **kwargs):
@@ -1404,17 +1470,10 @@ class SynchronizationLoss(Layer):
         # `spikes[sample_trial]` slice forced a dense per-trial gradient to be
         # zero-filled and accumulated on every iteration, and whose
         # data-dependent reshuffle test synchronised the host each time round.
-        # Balanced trial assignment is what lets this be a single batched
-        # gather: sample slots are already grouped by the trial they read.
-        gathered = tf.gather(spikes, sample_ids, axis=2, batch_dims=1)
-        gathered = tf.reshape(gathered, [n_trials, duration, per_trial, max_count])
-        neuron_mask = tf.constant(plan["neuron_mask"], dtype=gathered.dtype)
-        selected_spikes_sample = tf.reduce_sum(
-            gathered * neuron_mask[:, None, :, :], axis=3
-        )
-        selected_spikes_sample = tf.reshape(
-            tf.transpose(selected_spikes_sample, [0, 2, 1]),
-            [n_trials * per_trial, duration],
+        neuron_mask = tf.constant(plan["neuron_mask"], dtype=spikes.dtype)
+        selected_spikes_sample = _gather_population_traces(
+            spikes, sample_ids, neuron_mask,
+            n_trials, duration, per_trial, max_count,
         )
         if selected_spikes_sample.dtype != self._dtype:
             selected_spikes_sample = tf.cast(selected_spikes_sample, self._dtype)
@@ -1454,6 +1513,30 @@ class VoltageRegularization:
         self._dtype = dtype
         self._penalty_mode = penalty_mode
         self._core_mask = core_mask
+        # Neuron selection is done by index, not by boolean mask, and inside
+        # the compiled loss rather than before it. tf.boolean_mask is a gather,
+        # and TensorFlow's stock GPU gather indexes its operand with int32, so
+        # applied to the full [batch, time, neurons] voltage sequence it is
+        # silently wrong above 2**31 elements -- a shape reached at batch 64 on
+        # the 203,816-neuron network. XLA does its own indexing and is correct
+        # there, but it needs the selected size known at compile time, which a
+        # boolean mask does not give it. See int32_overflow_audit_20260902/.
+        self._core_indices = None
+        if core_mask is not None:
+            static_mask = tf.get_static_value(core_mask)
+            if static_mask is None:
+                raise ValueError(
+                    "VoltageRegularization core_mask must be statically known."
+                )
+            self._core_indices = tf.constant(
+                np.flatnonzero(np.asarray(static_mask, dtype=bool)).astype(np.int32)
+            )
+
+    def _select_core_neurons(self, voltages):
+        """Restrict to the core neurons. Called from inside the XLA region."""
+        if self._core_indices is None:
+            return voltages
+        return tf.gather(voltages, self._core_indices, axis=2)
 
     @tf.function(jit_compile=True)
     def _safe_global_mean(self, penalty):
@@ -1465,13 +1548,18 @@ class VoltageRegularization:
         - If N > 65504, TensorFlow casts N to fp16 and overflows, causing RuntimeWarning.
 
         Strategy:
-        - Keep elementwise-heavy math in fp16.
-        - Reduce batch/time first in fp16 (small divisors).
+        - Reduce batch/time first (small divisors).
         - Reduce the final neuron axis in fp32 (small intermediate tensor).
+
+        The penalty reaching here is already fp32: squaring in fp16 overflows
+        to inf for a neuron whose voltage has drifted past a few hundred, and
+        one such neuron makes the whole loss non-finite. XLA fuses the cast
+        into the elementwise kernel, so the fp16 input tensor is still the
+        only large buffer.
         """
-        penalty = tf.reduce_mean(penalty, axis=0)  # divide by batch size (tipically  < 65504)
-        penalty = tf.reduce_mean(penalty, axis=0)  # divide by sequence length (tipically  < 65504)
-        return tf.reduce_mean(tf.cast(penalty, tf.float32), axis=0)  # divide by number of neurons (tipically > 65504, thus in fp32)
+        penalty = tf.reduce_mean(penalty, axis=0)  # divide by batch size
+        penalty = tf.reduce_mean(penalty, axis=0)  # divide by sequence length
+        return tf.reduce_mean(penalty, axis=0)  # divide by number of neurons
 
     @tf.function(jit_compile=True)
     def _compute_range_loss(self, voltages):
@@ -1483,19 +1571,21 @@ class VoltageRegularization:
         """
         # Equivalent single-branch form of max(0, v-1)^2 + max(0, -v)^2.
         # Keeping it as one branch can reduce intermediate tensor pressure.
+        voltages = tf.cast(self._select_core_neurons(voltages), tf.float32)
         penalty = tf.square(tf.nn.relu(tf.abs(voltages - 0.5) - 0.5))
         return self._safe_global_mean(penalty)
 
     @tf.function(jit_compile=True)
     def _compute_threshold_loss(self, voltages):
         """JIT-compiled threshold loss computation."""
+        voltages = tf.cast(self._select_core_neurons(voltages), tf.float32)
         penalty = tf.square(voltages - 1.0)
         return self._safe_global_mean(penalty)
 
     def __call__(self, voltages):
 
-        if self._core_mask is not None:
-            voltages = tf.boolean_mask(voltages, self._core_mask, axis=2)
+        # The core-neuron selection now happens inside _compute_*_loss, which
+        # is XLA-compiled; see _select_core_neurons for why.
 
         # No need to cast voltages to self._dtype for the loss computation, since the loss is computed in fp32 anyway. Just ensure it's in a floating point format.
         # if voltages.dtype != self._dtype:
@@ -1914,7 +2004,7 @@ class OrientationSelectivityLoss:
 
         return model_fr
 
-    def neuropixels_fr_loss(self, spikes, angle):
+    def neuropixels_fr_loss(self, mean_spikes, duration, angle):
         # if the trget fr is not set, construct them
         if not hasattr(self, "_target_frs"):
 
@@ -1929,8 +2019,9 @@ class OrientationSelectivityLoss:
                 self._target_frs[key] = self.vonmises_model_fr(structure, key)
                 # TODO: convert it to tensor if needed.
 
-        # assuming 1 ms bins
-        spike_rates = tf.reduce_mean(spikes, axis=[0, 1]) / spikes.shape[1] * 1000
+        # assuming 1 ms bins. `mean_spikes` is already the time average, so the
+        # batch average of it equals the old reduce_mean over axes [0, 1].
+        spike_rates = tf.reduce_mean(mean_spikes, axis=0) / duration * 1000
         angle_bins = tf.constant(np.arange(-90, 91, 10), dtype=self._dtype)
         nbins = angle_bins.shape[0] - 1
         # now, process each layer
@@ -1972,16 +2063,18 @@ class OrientationSelectivityLoss:
         final_loss = tf.reduce_mean(tf.stack(losses)) * self._osi_cost
         return final_loss
 
-    def crowd_spikes_loss(self, spikes, angle):
+    def crowd_spikes_loss(self, mean_spikes, angle):
         # I need to access the tuning angle. of all the neurons.
         angle = tf.cast(angle, self._dtype)
 
+        # `mean_spikes` is [batch, neurons], already averaged over time, so the
+        # neuron mask is a gather over a tensor millions of times smaller than
+        # the spike sequence it used to be applied to.
         if self._core_mask is not None:
-            spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
+            mean_spikes = tf.boolean_mask(mean_spikes, self._core_mask, axis=1)
 
         delta_angle = self.calculate_delta_angle(angle, self._tuning_angles)
         # sum spikes in _z, and multiply with delta_angle.
-        mean_spikes = tf.reduce_mean(spikes, axis=[1])
         mean_angle = mean_spikes * delta_angle
         # Here, the expected value with random firing to subtract
         # (this prevents the osi loss to drive the firing rates to go to zero.)
@@ -2477,12 +2570,28 @@ class OrientationSelectivityLoss:
             )
 
         spikes = spike_trimming(spikes, pre_delay=self._pre_delay, post_delay=self._post_delay, trim=trim)
+        duration = spikes.shape[1]
+        if duration is None:
+            raise ValueError(
+                "The spike-based OSI/DSI methods need a statically known "
+                f"sequence length, got {spikes.shape}."
+            )
 
-        if spikes.dtype != self._dtype:
-            spikes = tf.cast(spikes, self._dtype)
+        # Collapse time before anything else touches the tensor. The previous
+        # order -- cast the whole [batch, time, neurons] tensor, then mask it,
+        # then reduce over time -- ran three ops that index their operand with
+        # int32 on GPU and are therefore silently wrong above 2**31 elements,
+        # which this shape passes at batch 64 on the 203,816-neuron network.
+        # Time-averaging commutes with both the cast and the neuron mask, so
+        # doing it first is exact and leaves every later op working on the
+        # small [batch, neurons] tensor. `temporal_sum` carries its own
+        # int32-safe chunking. See int32_overflow_audit_20260902/.
+        mean_spikes = temporal_sum(spikes, dtype=self._dtype) / tf.cast(
+            duration, self._dtype
+        )
 
         if self._method == "crowd_spikes":
-            return self.crowd_spikes_loss(spikes, angle)
+            return self.crowd_spikes_loss(mean_spikes, angle)
         if self._method == "neuropixels_fr":
-            return self.neuropixels_fr_loss(spikes, angle)
+            return self.neuropixels_fr_loss(mean_spikes, duration, angle)
         raise ValueError(f"Unknown OSI/DSI loss method: {self._method}")
