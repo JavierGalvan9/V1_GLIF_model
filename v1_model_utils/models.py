@@ -75,40 +75,42 @@ def resolve_surrogate_gradient(surrogate_gradient=None, pseudo_gauss=False):
 
 @tf.custom_gradient
 def _range_voltage_penalty_mean(voltage, inverse_n_neurons):
-    """Compute the neuron mean and return it in the voltage compute dtype."""
-    centered = voltage - tf.cast(0.5, voltage.dtype)
-    outside = tf.nn.relu(tf.abs(centered) - tf.cast(0.5, voltage.dtype))
-    mean_penalty = (
-        tf.reduce_sum(tf.cast(tf.square(outside), tf.float32), axis=1)
-        * inverse_n_neurons
-    )
-    mean_penalty = tf.cast(mean_penalty, voltage.dtype)
+    """Compute the neuron mean of the range penalty, accumulated in fp32.
+
+    The square is taken in fp32, not in the fp16 compute dtype. A single
+    neuron drifting past |v - 0.5| - 0.5 > 256 -- which nothing in the LIF
+    update bounds, since a strongly inhibited neuron never spikes and so
+    never resets -- overflows the fp16 square to inf, and that inf then
+    poisons the whole batch mean. Only the voltage penalty reduces over
+    every neuron, so it surfaces as a non-finite voltage loss while every
+    other loss keeps evolving normally.
+    """
+    voltage_fp32 = tf.cast(voltage, tf.float32)
+    centered = voltage_fp32 - 0.5
+    outside = tf.nn.relu(tf.abs(centered) - 0.5)
+    mean_penalty = tf.reduce_sum(tf.square(outside), axis=1) * inverse_n_neurons
 
     def grad(dy):
-        gradient_factor = (
-            tf.cast(2.0, voltage.dtype) * outside * tf.sign(centered)
-        )
-        reduction_gradient = dy[:, None] * tf.cast(inverse_n_neurons, voltage.dtype)
-        return reduction_gradient * gradient_factor, None
+        # Keep the gradient in fp32 too, then hand it back in the voltage
+        # dtype: 2 * outside overflows fp16 on the same excursions.
+        gradient_factor = 2.0 * outside * tf.sign(centered)
+        reduction_gradient = tf.cast(dy, tf.float32)[:, None] * inverse_n_neurons
+        return tf.cast(reduction_gradient * gradient_factor, voltage.dtype), None
 
     return mean_penalty, grad
 
 
 @tf.custom_gradient
 def _threshold_voltage_penalty_mean(voltage, inverse_n_neurons):
-    """Compute the threshold mean and return it in the voltage compute dtype."""
-    offset = voltage - tf.cast(1.0, voltage.dtype)
-    mean_penalty = (
-        tf.reduce_sum(tf.cast(tf.square(offset), tf.float32), axis=1)
-        * inverse_n_neurons
-    )
-    mean_penalty = tf.cast(mean_penalty, voltage.dtype)
+    """Compute the threshold mean in fp32; see _range_voltage_penalty_mean."""
+    offset = tf.cast(voltage, tf.float32) - 1.0
+    mean_penalty = tf.reduce_sum(tf.square(offset), axis=1) * inverse_n_neurons
 
     def grad(dy):
         # Compute the gradient of the mean penalty with respect to the voltage.
-        gradient_factor = tf.cast(2.0, voltage.dtype) * offset
-        reduction_gradient = dy[:, None] * tf.cast(inverse_n_neurons, voltage.dtype)
-        return reduction_gradient * gradient_factor, None
+        gradient_factor = 2.0 * offset
+        reduction_gradient = tf.cast(dy, tf.float32)[:, None] * inverse_n_neurons
+        return tf.cast(reduction_gradient * gradient_factor, voltage.dtype), None
 
     return mean_penalty, grad
 
@@ -989,6 +991,7 @@ class V1Column(tf.keras.layers.Layer):
                 n_pre=self.lgn_input_dense_shape[1],
                 n_post=self.lgn_input_dense_shape[0],
                 weights_csr_ordered=self._weights_csr_ordered,
+                needs_backward=train_input or self._compute_lgn_activity_gradient,
             )
         else:
             self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64)
@@ -1027,6 +1030,7 @@ class V1Column(tf.keras.layers.Layer):
                 n_pre=self.bkg_input_dense_shape[1],
                 n_post=self.bkg_input_dense_shape[0],
                 weights_csr_ordered=self._weights_csr_ordered,
+                needs_backward=train_noise or self._compute_bkg_activity_gradient,
             )
         else:
             self.pre_bkg_ind_table = make_pre_ind_table(
@@ -1507,7 +1511,10 @@ class V1Column(tf.keras.layers.Layer):
 
         state = (z0_buf, v0, r0, asc, psc_rise0, psc0, noise_step0)
         if self._track_voltage_penalty:
-            state += (tf.zeros((batch_size,), self.compute_dtype),)
+            # fp32 accumulator: the running sum spans seq_len steps, and in
+            # fp16 the per-step increments fall below one ulp of the sum long
+            # before the sum itself grows large.
+            state += (tf.zeros((batch_size,), tf.float32),)
         return state
 
     def _voltage_penalty_mean_step(self, voltage):
