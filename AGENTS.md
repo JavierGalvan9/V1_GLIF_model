@@ -1,5 +1,20 @@
 
+
+
+This repo contains the implementation of a v1 cortical model represented as a recurrent spiking neural .
+
+## CodeGraph
+
+This repository is indexed by CodeGraph (a `.codegraph/` directory exists at the repo root). Reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
+
 # General Directives
+
+Persistent setup and execution guidance for coding agents working in this repository.
+When writing code do it in a pythonic style, and when possible recycle existing code patterns and utilities and follow the conventions of the existing codebase. In general, less lines of code and less new patterns are better, as long as the code is clear and maintainable.
+Ask me any necessary questions one by one as they come up to clarify the task and the context before writing code, and do not make assumptions about what I want without asking. Always ask if you are unsure about any aspect of the task or the code you are writing, dont infer things that are not strictly clear. Every question should come with a proposed answer based on the context you have, but I will be the one to confirm or correct your assumptions. Do not make assumptions about my preferences or intentions without asking, and do not assume that you understand the task fully without asking clarifying questions. Always ask if you are unsure about any aspect of the task or the code you are writing.
 
 ## Verification (non-negotiable)
 Do NOT report success unless:

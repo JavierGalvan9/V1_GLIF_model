@@ -94,12 +94,83 @@ def split_combined_outputs(outputs, grating_batch_size):
     return split_with_compact_gradient(outputs)
 
 
+def int32_safe_cast(values, dtype, chunk_size=25,
+                    full_tensor_element_limit=np.iinfo(np.int32).max):
+    """Cast without launching a single kernel above the int32 element limit.
+
+    TensorFlow's stock GPU cast -- like every non-XLA unary elementwise op --
+    indexes its operand with int32. Above 2**31 elements it silently returns
+    wrong values *and* writes outside its output buffer, corrupting whatever
+    the allocator happened to place next, so the damage does not even look
+    like it came from the cast. Casting one time slice at a time keeps every
+    kernel small. Rejoining along axis 1 is safe at any total size because
+    TensorFlow picks concat's index type from the flattened column count
+    (time * features within one batch row), not from the element count --
+    unlike axis 0, which is exactly the element count and does break.
+    See int32_overflow_audit_20260902/.
+    """
+    if values.dtype == dtype:
+        return values
+    element_count = values.shape.num_elements()
+    if element_count is not None and element_count <= full_tensor_element_limit:
+        return tf.cast(values, dtype)
+    if values.shape.rank is None or values.shape.rank < 2:
+        raise ValueError(
+            "int32-safe casting needs a rank>=2 tensor with time on axis 1, "
+            f"got shape {values.shape}."
+        )
+    sequence_length = values.shape[1]
+    if sequence_length is None:
+        raise ValueError(
+            "int32-safe casting requires a static sequence length, got "
+            f"shape {values.shape}."
+        )
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    return tf.concat(
+        [
+            tf.cast(values[:, start:start + chunk_size], dtype)
+            for start in range(0, sequence_length, chunk_size)
+        ],
+        axis=1,
+    )
+
+
+def require_int32_safe_rnn_output(batch_size, seq_len, n_neurons,
+                                  full_tensor_element_limit=None):
+    """Refuse an un-checkpointed run whose RNN output exceeds the int32 limit.
+
+    Without gradient checkpointing, Keras assembles the RNN output with
+    ``TensorArray.stack()`` -- an axis-0 concat of ``seq_len`` slices, whose
+    GPU kernel indexes the result with int32. Above 2**31 elements it returns
+    the wrong spikes with no error raised at all, and every loss downstream is
+    then computed on garbage. There is no cheap way to make Keras' stack safe,
+    so refuse the configuration rather than produce plausible-looking numbers.
+
+    The segmented runner is unaffected: it rejoins its chunks along axis 1,
+    where TensorFlow picks the index type from ``seq_len * n_neurons`` rather
+    than from the element count. See ``int32_overflow_audit_20260902/``.
+    """
+    if full_tensor_element_limit is None:
+        full_tensor_element_limit = int(np.iinfo(np.int32).max)
+    elements = int(batch_size) * int(seq_len) * int(n_neurons)
+    if elements > full_tensor_element_limit:
+        raise ValueError(
+            "Gradient checkpointing is disabled, but the RNN output "
+            f"[{batch_size}, {seq_len}, {n_neurons}] is {elements:,} elements, "
+            f"past the {full_tensor_element_limit:,} TensorFlow's stock GPU "
+            "kernels index correctly. Keras assembles that output with "
+            "TensorArray.stack(), which is silently wrong above the limit. "
+            "Pass --gradient_checkpointing, or lower --batch_size / --seq_len "
+            "so the product stays under it."
+        )
+    return elements
+
+
 def concatenate_stimulus_batches(grating, spontaneous, dtype):
     """Cast sub-batches before concatenating an int32-unsafe full batch."""
-    if grating.dtype != dtype:
-        grating = tf.cast(grating, dtype)
-    if spontaneous.dtype != dtype:
-        spontaneous = tf.cast(spontaneous, dtype)
+    grating = int32_safe_cast(grating, dtype)
+    spontaneous = int32_safe_cast(spontaneous, dtype)
     return tf.concat([grating, spontaneous], axis=0)
 
 
@@ -564,6 +635,9 @@ def main(_):
                 f"chunk_size={segmented_extractor.chunk_size})."
             )
         else:
+            require_int32_safe_rnn_output(
+                real_batch_size, flags.seq_len, network["n_nodes"]
+            )
             print("Gradient checkpointing disabled.")
         # State-only model to avoid storing full sequences when only the final state is needed.
         try:
@@ -662,8 +736,7 @@ def main(_):
             return extractor_model((x, state_vars))
 
     def run_extractor(_x, _state_variables):
-        if _x.dtype == tf.bool:
-            _x = tf.cast(_x, dtype)
+        _x = int32_safe_cast(_x, dtype)
         seed_helper.advance_noise_seed()
         _state_variables = models.reset_voltage_penalty_state(
             rsnn_layer.cell, _state_variables
@@ -1218,8 +1291,7 @@ def main(_):
 
     def generate_gray_state():
         x = generate_spontaneous_spikes(real_batch_size)
-        if x.dtype == tf.bool:
-            x = tf.cast(x, dtype)
+        x = int32_safe_cast(x, dtype)
         init_state = rsnn_layer.cell.zero_state(real_batch_size, dtype=dtype)
         seed_helper.advance_noise_seed()
         inputs = [x]
