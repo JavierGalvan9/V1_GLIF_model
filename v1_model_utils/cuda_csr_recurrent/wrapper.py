@@ -30,13 +30,29 @@ def _active_rows_or_pairs(values, basis_values):
     return tf.where(values != tf.cast(0, values.dtype))
 
 
+def _edge_index_tensor(order):
+    """Upload the CSR-to-original permutation only when a kernel reads it.
+
+    With :data:`DIRECT_CSR` the kernels index weights by CSR position, so
+    ``V1_EDGE_INDEX`` expands to the position itself and no kernel ever
+    dereferences this input - it is four dead bytes per edge on the device.
+    The resource operator validates its length against ``post_ids``, so that
+    path keeps the real permutation.
+    """
+    if DIRECT_CSR and not resource_mode_enabled():
+        return tf.zeros((0,), tf.uint32)
+    return tf.constant(order, tf.uint32)
+
+
 @dataclass(frozen=True)
 class CsrConnectivity:
     """Presynaptic CSR metadata with an original-edge permutation.
 
     ``edge_ids`` maps a CSR position to the edge's index in the caller's
-    original order. ``edge_order`` is the same permutation kept on the host, so
-    weights can be moved between the two orders without a device round trip.
+    original order; it is empty when :data:`DIRECT_CSR` makes the kernels index
+    weights by CSR position instead. ``edge_order`` is the same permutation
+    kept on the host, so weights can be moved between the two orders without a
+    device round trip.
     """
 
     post_ids: tf.Tensor
@@ -196,7 +212,7 @@ def build_csr_connectivity(
         post_ids=tf.constant(indices[order, 0], tf.uint32),
         synapse_types=tf.constant(synapse_types[order], tf.uint8),
         row_splits=tf.constant(row_splits, tf.uint32),
-        edge_ids=tf.constant(order, tf.uint32),
+        edge_ids=_edge_index_tensor(order),
         nonempty_rows=tf.constant(nonempty_rows, tf.uint32),
         n_pre=int(n_pre),
         n_post=int(n_post),

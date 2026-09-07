@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 
 from v1_model_utils.cuda_operator_cache import ensure_artifact
-from v1_model_utils.cuda_csr_external.build import BUILD_FLAGS
+from v1_model_utils.cuda_csr_external.build import BUILD_FLAGS, DIRECT_CSR
 from v1_model_utils.cuda_csr_recurrent.build import (
     BUILD_FLAGS as RECURRENT_BUILD_FLAGS,
 )
@@ -35,12 +35,27 @@ def _active_rows_or_pairs(values, basis_values):
     return tf.where(values != tf.cast(0, values.dtype))
 
 
+def _edge_index_tensor(order):
+    """Upload the CSR-to-original permutation only when a kernel reads it.
+
+    Mirrors the recurrent operator: with :data:`DIRECT_CSR` compiled in,
+    ``V1_EDGE_INDEX`` expands to the CSR position and no kernel dereferences
+    this input. The resource operator checks its length, so it keeps the real
+    permutation.
+    """
+    if DIRECT_CSR and not resource_mode_enabled():
+        return tf.zeros((0,), tf.uint32)
+    return tf.constant(order, tf.uint32)
+
+
 @dataclass(frozen=True)
 class CsrConnectivity:
     """Presynaptic CSR metadata with original-edge weight ordering.
 
     ``edge_order`` mirrors ``edge_ids`` on the host so weights can move between
-    the caller's order and CSR order without a device round trip.
+    the caller's order and CSR order without a device round trip. ``edge_ids``
+    itself is empty under :data:`DIRECT_CSR`, and the ``pair_*`` projection
+    metadata is empty for a connectivity whose backward never runs.
     """
 
     post_ids: tf.Tensor
@@ -58,10 +73,27 @@ class CsrConnectivity:
     pair_posts: tf.Tensor | None = None
     pair_types: tf.Tensor | None = None
     n_pairs: int = 0
+    incoming_row_splits: tf.Tensor | None = None
+    incoming_pre_ids: tf.Tensor | None = None
+    incoming_edge_ids: tf.Tensor | None = None
+    incoming_types: tf.Tensor | None = None
 
 
-def _compact_pairs(post_ids, synapse_types):
-    """Return the unique postsynaptic/type projection shared by each edge."""
+def _compact_pairs(post_ids, synapse_types, needed=True):
+    """Return the unique postsynaptic/type projection shared by each edge.
+
+    Only the backward kernels project onto the basis per pair, so a
+    connectivity that is never differentiated - LGN input under
+    ``--notrain_input`` with no activity gradient - carries empty metadata
+    instead of one uint32 per edge that nothing reads.
+    """
+    if not needed:
+        return {
+            "pair_ids": tf.zeros((0,), tf.uint32),
+            "pair_posts": tf.zeros((0,), tf.uint32),
+            "pair_types": tf.zeros((0,), tf.uint8),
+            "n_pairs": 0,
+        }
     codes = post_ids.astype(np.uint64) * 256 + synapse_types.astype(np.uint64)
     unique_codes, pair_ids = np.unique(codes, return_inverse=True)
     return {
@@ -69,6 +101,34 @@ def _compact_pairs(post_ids, synapse_types):
         "pair_posts": tf.constant((unique_codes >> 8).astype(np.uint32), tf.uint32),
         "pair_types": tf.constant((unique_codes & 255).astype(np.uint8), tf.uint8),
         "n_pairs": int(unique_codes.size),
+    }
+
+
+def _bkg_incoming_metadata(
+    post_ids, synapse_types, row_splits, n_pre, n_post, weights_csr_ordered
+):
+    """Build the fixed-four incoming CSR used by the BKG forward fast path."""
+    if (
+        resource_mode_enabled()
+        or not weights_csr_ordered
+        or n_pre != 100
+        or len(post_ids) != 4 * n_post
+    ):
+        return {}
+    post_counts = np.bincount(post_ids, minlength=n_post)
+    if post_counts.size != n_post or not np.all(post_counts == 4):
+        return {}
+    incoming_order = np.argsort(post_ids, kind="stable").astype(np.uint32)
+    pre_ids = np.repeat(
+        np.arange(n_pre, dtype=np.uint32), np.diff(row_splits).astype(np.int64)
+    )
+    return {
+        "incoming_row_splits": tf.constant(
+            np.arange(0, 4 * n_post + 1, 4, dtype=np.uint32)
+        ),
+        "incoming_pre_ids": tf.constant(pre_ids[incoming_order], tf.uint32),
+        "incoming_edge_ids": tf.constant(incoming_order, tf.uint32),
+        "incoming_types": tf.constant(synapse_types[incoming_order], tf.uint8),
     }
 
 
@@ -81,13 +141,16 @@ def kernel_variant(n_basis, batch_size):
 
 
 def build_csr_connectivity(
-    indices, synapse_types, n_pre, n_post, weights_csr_ordered=False
+    indices, synapse_types, n_pre, n_post, weights_csr_ordered=False,
+    needs_backward=True,
 ):
     """Create compact pre-CSR metadata while preserving edge weight order.
 
     Set ``weights_csr_ordered`` when the caller's edges already follow this
     operator's CSR order; the derived permutation is then asserted to be the
-    identity.
+    identity. Clear ``needs_backward`` when neither an activity nor a weight
+    gradient will ever be requested, so the per-edge pair projection is not
+    built or uploaded.
     """
     indices = np.asarray(indices)
     types = np.asarray(synapse_types)
@@ -128,14 +191,22 @@ def build_csr_connectivity(
         post_ids=tf.constant(ordered_posts, tf.uint32),
         synapse_types=tf.constant(ordered_types, tf.uint8),
         row_splits=tf.constant(offsets, tf.uint32),
-        edge_ids=tf.constant(order, tf.uint32),
+        edge_ids=_edge_index_tensor(order),
         nonempty_rows=tf.constant(np.flatnonzero(counts).astype(np.uint32)),
         n_pre=int(n_pre),
         n_post=int(n_post),
         n_edges=int(indices.shape[0]),
         edge_order=order,
         weights_csr_ordered=bool(weights_csr_ordered),
-        **_compact_pairs(ordered_posts, ordered_types),
+        **_compact_pairs(ordered_posts, ordered_types, needs_backward),
+        **_bkg_incoming_metadata(
+            ordered_posts,
+            ordered_types,
+            offsets,
+            int(n_pre),
+            int(n_post),
+            bool(weights_csr_ordered),
+        ),
     )
     if resource_mode_enabled():
         resource = initialize_resource(connectivity)
@@ -237,19 +308,35 @@ def calculate_external_csr_currents(
         pair_posts,
         pair_types,
     ):
-        active = _active_rows_or_pairs(values, basis_values)
-        currents = recurrent_ops.v1_csr_forward(
-            values,
-            active,
-            master_weights,
-            post_ids,
-            synapse_types,
-            row_splits,
-            edge_ids,
-            basis_values,
-            initial_values,
-            n_post=connectivity.n_post,
-        )
+        if (
+            connectivity.incoming_row_splits is not None
+            and basis_values.shape[-1] == 4
+        ):
+            currents = external_ops.bkg_csr_forward(
+                values,
+                master_weights,
+                connectivity.incoming_row_splits,
+                connectivity.incoming_pre_ids,
+                connectivity.incoming_edge_ids,
+                connectivity.incoming_types,
+                basis_values,
+                initial_values,
+                n_post=connectivity.n_post,
+            )
+        else:
+            active = _active_rows_or_pairs(values, basis_values)
+            currents = recurrent_ops.v1_csr_forward(
+                values,
+                active,
+                master_weights,
+                post_ids,
+                synapse_types,
+                row_splits,
+                edge_ids,
+                basis_values,
+                initial_values,
+                n_post=connectivity.n_post,
+            )
 
         def grad(upstream):
             if compute_activity_gradient:

@@ -58,9 +58,11 @@ def main():
     architecture = normalize_architecture(
         args.architecture or active_gpu_architecture()
     )
+    # The packed backward specialization is qualified on SM120 only; older
+    # architectures keep the batch-lane path until they are measured.
     architecture_flags = (
         *BUILD_FLAGS,
-        f"-DV1_PAIR_WMMA={int(int(architecture) >= 120)}",
+        f"-DV1_PACKED_BACKWARD={int(int(architecture) >= 120)}",
     )
     prefix = Path(sys.prefix)
     nvcc = prefix / "bin/nvcc"

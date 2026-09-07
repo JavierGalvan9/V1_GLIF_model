@@ -3,6 +3,29 @@
 
 using namespace tensorflow;
 
+REGISTER_OP("BkgCsrForward")
+    .Attr("T: {half, float}")
+    .Attr("n_post: int >= 1")
+    .Input("activity: T")
+    .Input("weights: float")
+    .Input("incoming_row_splits: uint32")
+    .Input("incoming_pre_ids: uint32")
+    .Input("incoming_edge_ids: uint32")
+    .Input("incoming_types: uint8")
+    .Input("basis: T")
+    .Input("initial: T")
+    .Output("currents: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle activity;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 2, &activity));
+      int n_post;
+      TF_RETURN_IF_ERROR(c->GetAttr("n_post", &n_post));
+      shape_inference::DimensionHandle rows;
+      TF_RETURN_IF_ERROR(c->Multiply(c->Dim(activity, 0), n_post, &rows));
+      c->set_output(0, c->Matrix(rows, 4));
+      return OkStatus();
+    });
+
 REGISTER_OP("ExternalCsrWeightBackward")
     .Attr("T: {half, float}")
     .Attr("n_post: int >= 1")

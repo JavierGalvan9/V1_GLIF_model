@@ -3,7 +3,6 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <mma.h>
 #include <type_traits>
 
 #include "tensorflow/core/framework/op_kernel.h"
@@ -52,8 +51,11 @@ using GPUDevice = Eigen::GpuDevice;
 #ifndef V1_DIRECT_CSR
 #define V1_DIRECT_CSR 0
 #endif
-#ifndef V1_PAIR_WMMA
-#define V1_PAIR_WMMA 0
+// Enables the packed batch-lane backward specialization. It uses no tensor
+// cores -- only vector loads and warp shuffles -- but it is qualified on SM120
+// only, so older architectures keep the batch-lane path until measured.
+#ifndef V1_PACKED_BACKWARD
+#define V1_PACKED_BACKWARD 0
 #endif
 
 // With direct-CSR weights the caller keeps `weights` and `weight_grad` in CSR
@@ -552,23 +554,50 @@ __global__ void PreprojectPairsBatch32Kernel(
   }
 }
 
-// Same compact projection, emitted as [pair, batch] so that one warp reading a
-// pair's whole batch touches a single 128-byte line. Consumed by
-// BackwardBatchLaneKernel, which assigns one batch sample per lane.
-template <typename T, int kBasis, int kBatch>
-__global__ void PreprojectPairsPairMajorKernel(
-    int64_t elements, int n_post, int n_basis, const T* current_grad,
+// Compact projection, emitted as [pair, batch] so that one warp reading a
+// pair's whole batch line touches a single 128-byte line.
+//
+// That output order is what the backward row kernels want, but writing it
+// directly makes consecutive threads take consecutive batch samples of one
+// pair, whose current gradients are `n_post * n_basis` apart -- 1.6 MiB on the
+// 203,816-neuron network. Each lane then pulls its own 32-byte sector for the
+// 8 bytes it needs, and a warp fetches 1 KiB to use 256 B.
+//
+// Pairs are sorted by (postsynaptic neuron, synapse type) and average 8.2 types
+// per neuron, so thirty-two consecutive pairs touch about four distinct
+// neurons. Reading pair-contiguous, transposing through shared memory and
+// writing batch-contiguous coalesces both halves. The padding keeps the
+// transpose read conflict-free: a 34-float row is 34 banks, and 34 is even but
+// coprime to 32 in the stride that matters here -- consecutive lanes land on
+// banks (34 * lane) % 32 = (2 * lane) % 32, so the row is read in two
+// conflict-free halves rather than one 32-way conflict.
+template <typename T, int kBasis, int kBatch, int kPairsPerTile>
+__global__ void PreprojectPairsTiledKernel(
+    int n_post, int n_basis, int64_t n_pairs, const T* current_grad,
     const T* basis, const uint32* pair_posts, const uint8* pair_types,
     float* projected) {
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
-    const int batch = static_cast<int>(index % kBatch);
-    const int64_t pair = index / kBatch;
-    const uint32 post = pair_posts[pair];
-    const uint32 type = pair_types[pair];
-    projected[index] = BasisProjection<T, kBasis>::Apply(
-        current_grad + (static_cast<int64_t>(batch) * n_post + post) * n_basis,
-        basis, type, n_basis);
+  constexpr int kTileElements = kPairsPerTile * kBatch;
+  __shared__ float tile[kBatch][kPairsPerTile + 2];
+  const int64_t pair_base = static_cast<int64_t>(blockIdx.x) * kPairsPerTile;
+  for (int index = threadIdx.x; index < kTileElements; index += blockDim.x) {
+    const int column = index % kPairsPerTile;
+    const int batch = index / kPairsPerTile;
+    const int64_t pair = pair_base + column;
+    float value = 0.0f;
+    if (pair < n_pairs) {
+      value = BasisProjection<T, kBasis>::Apply(
+          current_grad + (static_cast<int64_t>(batch) * n_post +
+                          pair_posts[pair]) * n_basis,
+          basis, pair_types[pair], n_basis);
+    }
+    tile[batch][column] = value;
+  }
+  __syncthreads();
+  for (int index = threadIdx.x; index < kTileElements; index += blockDim.x) {
+    const int batch = index % kBatch;
+    const int column = index / kBatch;
+    const int64_t pair = pair_base + column;
+    if (pair < n_pairs) projected[pair * kBatch + batch] = tile[batch][column];
   }
 }
 
@@ -611,76 +640,191 @@ __global__ void BackwardBatchLaneKernel(
       FromFloat<T>(local_spike_grad * AsFloat(*dampening));
 }
 
-// FP16 batch-32 specialization: one CSR row per two-warp block. Each warp
-// processes interleaved 16-edge tiles. Spike gradients retain the FP32
-// projection; only weight-gradient dot products are converted to half for
-// tensor-core execution.
+// Cache policy for the backward row kernel's operands.
+//
+// The projection is re-read once per edge sharing a pair (50.2 times on the
+// 203,816-neuron network) and is the only array with reuse. `pair_ids`,
+// `weights` and the `weight_grad` output are each touched exactly once per
+// edge, so evict-first hints keep their roughly 1 GiB of single-use traffic
+// from displacing the projection in L2.
+__device__ __forceinline__ uint32 LoadEdgeIndex(const uint32* address) {
+  return __ldcs(address);
+}
+
 template <typename W>
-__global__ void BackwardTensorRowKernel(
+__device__ __forceinline__ float LoadEdgeWeight(const W* address) {
+  if constexpr (std::is_same<W, float>::value) return __ldcs(address);
+  return AsFloat(*address);
+}
+
+__device__ __forceinline__ void StoreEdgeGrad(float* address, float value) {
+  __stcs(address, value);
+}
+
+// Reduce `partial[0 .. 2 * kHalf)` across the lane pair (lane, lane ^ kMask)
+// into `partial[0 .. kHalf)`, then recurse. One shuffle and one add per
+// surviving value, so a whole tile costs about one shuffle per edge -- against
+// a shared-memory round trip per tile for a tensor-core reduction.
+//
+// Each round drops the lane bit it reduced over into the surviving value's
+// index, so after the recursion lane l holds the value for index
+// bit-reverse(l). `ReverseBits` undoes that when the results are stored.
+template <int kHalf, int kMask>
+__device__ __forceinline__ void ButterflyReduce(float* partial, int lane) {
+  const bool upper = (lane & kMask) != 0;
+#pragma unroll
+  for (int index = 0; index < kHalf; ++index) {
+    const float keep = upper ? partial[kHalf + index] : partial[index];
+    const float send = upper ? partial[index] : partial[kHalf + index];
+    partial[index] = keep + __shfl_xor_sync(0xffffffff, send, kMask);
+  }
+  if constexpr (kHalf > 1) ButterflyReduce<kHalf / 2, kMask * 2>(partial, lane);
+}
+
+template <int kBits>
+__device__ __forceinline__ int ReverseBits(int value) {
+  int result = 0;
+#pragma unroll
+  for (int bit = 0; bit < kBits; ++bit) {
+    result |= ((value >> bit) & 1) << (kBits - 1 - bit);
+  }
+  return result;
+}
+
+// One lane's slice of a pair's projected batch line. A 16-byte load is the
+// widest a lane can issue, so it carries four FP32 batch samples.
+template <int kPack>
+struct PackedProjection {
+  __device__ __forceinline__ static void Load(const float* source, float* out);
+};
+
+template <>
+struct PackedProjection<4> {
+  __device__ __forceinline__ static void Load(const float* source, float* out) {
+    const ::float4 raw = *reinterpret_cast<const ::float4*>(source);
+    out[0] = raw.x;
+    out[1] = raw.y;
+    out[2] = raw.z;
+    out[3] = raw.w;
+  }
+};
+
+// FP16 batch-32 specialization: one CSR row per two-warp block, packed batch
+// lanes, butterfly weight-gradient reduction.
+//
+// Giving a lane `kPack` consecutive batch samples shrinks an edge from 32 lanes
+// to `32 / kPack`, so a warp splits into that many independent edge slots and
+// one load instruction serves all of them. At kPack = 4 a 32-edge tile issues
+// eight projection loads instead of thirty-two, and the descriptors
+// (`pair_ids`, `weights`) are read once cooperatively and broadcast with
+// `__shfl_sync` rather than re-read at one address by all 32 lanes. The bytes
+// moved are unchanged; the instruction count is not.
+//
+// The block holds 256 B of shared memory, so an SM runs its full 24 blocks.
+// Both outputs keep FP32 arithmetic: the spike gradient accumulates the FP32
+// projected value, and the butterfly sums the weight gradient in FP32.
+template <typename W, int kPack, int kWarps, int kTile>
+__global__ __launch_bounds__(32 * kWarps) void BackwardPackedRowKernel(
     int64_t n_pre, const Eigen::half* spikes, const float* projected,
     const W* weights, const uint32* pair_ids, const uint32* edge_ids,
     const uint32* row_splits, const uint32* nonempty_rows, int64_t n_rows,
     const Eigen::half* dampening, Eigen::half* spike_grad,
     float* weight_grad) {
-  namespace wmma = nvcuda::wmma;
   constexpr int kBatch = 32;
-  constexpr int kWarps = 2;
+  constexpr int kLanesPerEdge = kBatch / kPack;
+  constexpr int kSlots = 32 / kLanesPerEdge;
+  constexpr int kPerSlot = kTile / kSlots;
+  constexpr int kIndexBits = kPerSlot == 8 ? 3 : (kPerSlot == 4 ? 2 : 1);
+  static_assert(kTile == kSlots * kPerSlot, "tile must divide into edge slots");
+  static_assert(kPerSlot == (1 << kIndexBits), "slot depth must be a power of two");
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
+  const int slot = lane / kLanesPerEdge;
+  const int sub = lane % kLanesPerEdge;   // batch samples sub * kPack ... + kPack
   const int64_t row_id = blockIdx.x;
   if (row_id >= n_rows) return;
 
-  __shared__ __half matrix_a[kWarps][16 * 32];
-  __shared__ __half matrix_b[kWarps][32 * 16];
-  __shared__ float matrix_c[kWarps][16 * 16];
   __shared__ float spike_partials[kWarps][32];
 
   const uint32 pre = nonempty_rows[row_id];
   const uint32 start = row_splits[pre];
   const uint32 end = row_splits[pre + 1];
-  const float spike = AsFloat(spikes[static_cast<int64_t>(lane) * n_pre + pre]);
+  float spike[kPack];
+  float grad[kPack];
 #pragma unroll
-  for (int row = 0; row < 16; ++row) {
-    matrix_a[warp][row * 32 + lane] = __float2half(spike);
+  for (int sample = 0; sample < kPack; ++sample) {
+    spike[sample] = AsFloat(
+        spikes[static_cast<int64_t>(sub * kPack + sample) * n_pre + pre]);
+    grad[sample] = 0.0f;
   }
+  const int target = ReverseBits<kIndexBits>(sub & (kPerSlot - 1));
 
-  float local_spike_grad = 0.0f;
-  for (uint32 base = start + warp * 16; base < end; base += kWarps * 16) {
+  for (uint32 base = start + warp * kTile; base < end; base += kWarps * kTile) {
+    // One coalesced load of the tile's edge descriptors, broadcast to the batch
+    // lanes below instead of re-read by each of them.
+    const uint32 edge_lane = base + lane;
+    const bool own = lane < kTile && edge_lane < end;
+    const uint32 my_pair = own ? LoadEdgeIndex(pair_ids + edge_lane) : 0u;
+    const float my_weight =
+        own ? LoadEdgeWeight<W>(weights + V1_EDGE_INDEX(edge_lane)) : 0.0f;
+    float partial[kPerSlot];
 #pragma unroll
-    for (int column = 0; column < 16; ++column) {
-      const uint32 csr = base + column;
-      float value = 0.0f;
-      if (csr < end) {
-        const uint32 edge = V1_EDGE_INDEX(csr);
-        value = projected[static_cast<int64_t>(pair_ids[csr]) * kBatch + lane];
-        local_spike_grad += value * AsFloat(weights[edge]);
+    for (int step = 0; step < kPerSlot; ++step) {
+      const int column = kSlots * step + slot;
+      const uint32 pair = __shfl_sync(0xffffffff, my_pair, column);
+      const float weight = __shfl_sync(0xffffffff, my_weight, column);
+      float value[kPack];
+      if (base + column < end) {
+        PackedProjection<kPack>::Load(
+            projected + static_cast<int64_t>(pair) * kBatch + sub * kPack, value);
+      } else {
+#pragma unroll
+        for (int sample = 0; sample < kPack; ++sample) value[sample] = 0.0f;
       }
-      matrix_b[warp][column * 32 + lane] = __float2half(value);
+      float sum = 0.0f;
+#pragma unroll
+      for (int sample = 0; sample < kPack; ++sample) {
+        grad[sample] += value[sample] * weight;
+        sum += value[sample] * spike[sample];
+      }
+      partial[step] = sum;
     }
-    __syncwarp();
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
-    wmma::fill_fragment(c, 0.0f);
-    wmma::load_matrix_sync(a, matrix_a[warp], 32);
-    wmma::load_matrix_sync(b, matrix_b[warp], 32);
-    wmma::mma_sync(c, a, b, c);
-    wmma::load_matrix_sync(a, matrix_a[warp] + 16, 32);
-    wmma::load_matrix_sync(b, matrix_b[warp] + 16, 32);
-    wmma::mma_sync(c, a, b, c);
-    wmma::store_matrix_sync(matrix_c[warp], c, 16, wmma::mem_row_major);
-    __syncwarp();
-    if (lane < 16 && base + lane < end) {
-      weight_grad[V1_EDGE_INDEX(base + lane)] = matrix_c[warp][lane];
+    // Compact the slot's `kPerSlot` values down its lanes, then fold the lanes
+    // left holding duplicates of the same edge.
+    if constexpr (kPerSlot > 1) ButterflyReduce<kPerSlot / 2, 1>(partial, lane);
+#pragma unroll
+    for (int mask = kPerSlot; mask < kLanesPerEdge; mask <<= 1) {
+      partial[0] += __shfl_xor_sync(0xffffffff, partial[0], mask);
+    }
+    const uint32 edge = base + kSlots * target + slot;
+    if (sub < kPerSlot && edge < end) {
+      StoreEdgeGrad(weight_grad + V1_EDGE_INDEX(edge), partial[0]);
     }
   }
 
-  spike_partials[warp][lane] = local_spike_grad;
+  // Every slot accumulated the same batch samples from a different edge subset.
+#pragma unroll
+  for (int mask = kLanesPerEdge; mask < 32; mask <<= 1) {
+#pragma unroll
+    for (int sample = 0; sample < kPack; ++sample) {
+      grad[sample] += __shfl_xor_sync(0xffffffff, grad[sample], mask);
+    }
+  }
+  if (lane < kLanesPerEdge) {
+#pragma unroll
+    for (int sample = 0; sample < kPack; ++sample) {
+      spike_partials[warp][sub * kPack + sample] = grad[sample];
+    }
+  }
   __syncthreads();
   if (warp == 0) {
-    spike_grad[static_cast<int64_t>(lane) * n_pre + pre] = FromFloat<Eigen::half>(
-        (spike_partials[0][lane] + spike_partials[1][lane]) *
-        AsFloat(*dampening));
+    float total = 0.0f;
+#pragma unroll
+    for (int source = 0; source < kWarps; ++source) {
+      total += spike_partials[source][lane];
+    }
+    spike_grad[static_cast<int64_t>(lane) * n_pre + pre] =
+        FromFloat<Eigen::half>(total * AsFloat(*dampening));
   }
 }
 
@@ -894,22 +1038,27 @@ Status LaunchPairProjectedBackward(
       DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));
   float* projected = projected_tensor.flat<float>().data();
   constexpr int kProjectionThreads = 256;
-  const int projection_blocks = static_cast<int>(
-      (projected_elements + kProjectionThreads - 1) / kProjectionThreads);
+  constexpr int kPairsPerTile = 32;
   // Project each distinct (post, synapse type) pair once, pair-major so the
-  // batch-lane kernel reads one line per pair.
+  // backward kernel reads one line per pair.
   TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      PreprojectPairsPairMajorKernel<T, kBasis, 32>, projection_blocks,
-      kProjectionThreads, 0, device.stream(), projected_elements, n_post,
-      n_basis, current_grad.flat<T>().data(), basis.flat<T>().data(),
+      PreprojectPairsTiledKernel<T, kBasis, 32, kPairsPerTile>,
+      static_cast<int>((n_pairs + kPairsPerTile - 1) / kPairsPerTile),
+      kProjectionThreads, 0, device.stream(), n_post, n_basis, n_pairs,
+      current_grad.flat<T>().data(), basis.flat<T>().data(),
       pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),
       projected));
-#if V1_PAIR_WMMA
+#if V1_PACKED_BACKWARD
   if constexpr (std::is_same<T, Eigen::half>::value) {
-    constexpr int kTensorThreads = 64;
+    // Four FP32 batch samples per lane: eight lanes per edge, four edge slots
+    // per warp, two warps per CSR row, 32 edges per warp iteration.
+    constexpr int kPack = 4;
+    constexpr int kPackedWarps = 2;
+    constexpr int kPackedTile = 32;
     TF_RETURN_IF_ERROR(GpuLaunchKernel(
-        BackwardTensorRowKernel<W>, static_cast<int>(n_rows), kTensorThreads, 0,
-        device.stream(), spikes.dim_size(1), spikes.flat<T>().data(), projected,
+        BackwardPackedRowKernel<W, kPack, kPackedWarps, kPackedTile>,
+        static_cast<int>(n_rows), 32 * kPackedWarps, 0, device.stream(),
+        spikes.dim_size(1), spikes.flat<T>().data(), projected,
         weights.flat<W>().data(), pair_ids.flat<uint32>().data(),
         edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),
         nonempty_rows.flat<uint32>().data(), n_rows, dampening.flat<T>().data(),
@@ -1099,10 +1248,12 @@ class V1CsrBackwardPairProjectedOp : public OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output(
                                 1, TensorShape({n_edges_}), &weight_grad));
     auto device = context->eigen_device<GPUDevice>();
+    // Rows with no edges are never visited, so the spike gradient is cleared.
+    // The weight gradient is not: both backward kernels write every CSR
+    // position exactly once, and `nonempty_rows` covers every position, so
+    // clearing 321 MiB first would only cost write bandwidth.
     cudaMemsetAsync(spike_grad->flat<T>().data(), 0,
                     spike_grad->NumElements() * sizeof(T), device.stream());
-    cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
-                    weight_grad->NumElements() * sizeof(float), device.stream());
     OP_REQUIRES_OK(context, LaunchPairProjectedBackward<T, W, 4>(
                                 context, spikes, current_grad, weights,
                                 post_ids, synapse_types, row_splits, edge_ids,

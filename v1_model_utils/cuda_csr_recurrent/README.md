@@ -17,6 +17,21 @@ asserts that its own derived permutation is the identity, and
 `require_csr_ordered_weights` refuses to run an undeclared caller rather than
 silently pairing CSR positions with original-order weights.
 
+Because nothing then dereferences `edge_ids`, `build_csr_connectivity` sends an
+empty tensor for it instead of one dead `uint32` per edge — 321 MiB on the
+recurrent connectivity of the 203,816-neuron network, 365 MiB on LGN. The
+permutation stays on the host as `edge_order`, which is what `to_csr_order`,
+`to_original_order` and the checkpoint translation use. The external operator
+asserts the emptiness, so a caller that still uploads the permutation while the
+kernels ignore it fails loudly instead of wasting device memory. Distributed
+worker mode keeps the real tensor: its resource operator validates the length
+against `post_ids`.
+
+The `pair_*` projection metadata is only read by the backward kernels, so
+`cuda_csr_external.build_csr_connectivity(..., needs_backward=False)` skips it
+for a connectivity that is never differentiated — LGN input under
+`--notrain_input` with no activity gradient.
+
 Checkpoints are written in the network's original edge and neuron order, so
 existing checkpoints stay loadable and per-edge tools keep working;
 `V1Column.translate_checkpointed_layout` moves weights and the optimizer slots
@@ -27,17 +42,59 @@ that mirror them across that boundary.
 At batch 32 with the four-column basis, the backward pass projects each distinct
 `(postsynaptic neuron, synapse type)` pair onto the basis once rather than once
 per edge (1,675,548 pairs for 84,132,910 edges in the 203,816-neuron network),
-then uses a two-warp tensor-row kernel for FP16 weight-gradient dot products.
-Spike-gradient accumulation and the compact projection remain FP32.
-`pair_projection_applies` gates the compact path strictly on batch 32 and four
-basis columns; FP32 and every other batch size or basis dimension retain the
-established batch-lane/general kernels. On the 203,816-neuron training workload,
-the tensor-row specialization measured 5.54% faster end to end than the prior
-production kernel. Process VRAM was unchanged, while TensorFlow peak allocation
-was 276 MiB higher in the matched ten-update comparison.
-The build enables this specialization for SM120 and newer architectures; older
-architectures retain the previous batch-lane path until independently
-benchmarked.
+then runs a packed batch-lane row kernel over the result. Everything stays FP32:
+the projection, the spike-gradient accumulation, and the butterfly that reduces
+the weight gradient. `pair_projection_applies` gates the compact path strictly on
+batch 32 and four basis columns; FP32 and every other batch size or basis
+dimension retain the established batch-lane/general kernels. The build enables
+the packed specialization for SM120 and newer; older architectures retain the
+batch-lane path until independently benchmarked. It uses no tensor cores, so
+that gate is a qualification boundary rather than a hardware requirement.
+
+Three things make it fast, and none of them changes what the operation computes:
+
+- **Packed batch lanes.** A lane holds four consecutive batch samples instead of
+  one, so an edge needs eight lanes rather than 32 and one 16-byte load serves
+  four edge slots at once. A 32-edge tile issues eight projection loads instead
+  of 32. The bytes moved are unchanged.
+- **Butterfly weight-gradient reduction.** The cross-lane sum costs about one
+  shuffle per edge and no shared memory, replacing a shared-memory round trip
+  through a tensor-core fragment whose `mma_sync` was fifteen-sixteenths wasted
+  (every A row held the same spike vector). Shared memory per block falls from
+  6,400 B to 256 B, so an SM runs its full 24 blocks instead of 16.
+- **Tiled projection.** Writing the pair-major layout directly puts consecutive
+  threads on current gradients 1.6 MiB apart, so a warp fetches 1 KiB to use
+  256 B. Reading pair-contiguous and transposing through shared memory
+  coalesces both halves.
+
+The redundant 321 MiB `weight_grad` clear is also gone: both backward kernels
+write every CSR position exactly once.
+
+`BackwardPackedRowKernel` compiles to 44 registers and 256 bytes of shared
+memory with no stack frame and no spills; `PreprojectPairsTiledKernel` to 35
+registers and 4,352 bytes. Both leave an SM free to hold its full block
+complement.
+
+Measured on the 203,816-neuron network against the previous tensor-row
+production kernel, on an otherwise idle SM120 GPU:
+
+| | Previous | Current | Change |
+|---|---:|---:|---:|
+| Row kernel | 3.863 ms | 2.046 ms | -47.0% |
+| Compact projection | 0.355 ms | 0.220 ms | -38.0% |
+| Weight-gradient clear | 0.187 ms | removed | -100% |
+| Total device time | 4.416 ms | 2.277 ms | **-48.4%** |
+| Real training update | 5.811 s | 4.464 s | **-23.2%** |
+
+It is also *more accurate* than the kernel it replaces. Against the FP32
+batch-lane path, which never rounds anything to half, the previous tensor-row
+kernel's weight gradient carried 5.4e-6 mean absolute error because it converted
+the projected value to half for the tensor-core dot product; the packed kernel's
+carries 3.5e-12, and its spike gradient matches the previous kernel's accuracy.
+An FP16 projection would be a further 13 points faster but makes the spike
+gradient about 865 times less accurate, so it was not taken. See
+`wmma_recurrent_analysis_20260901/REPORT.md` for the full comparison, the
+variants that were screened and rejected, and what remains unqualified.
 
 ## Neuron layout
 
@@ -94,8 +151,8 @@ canonical row order). A 672x improvement in the cross-row locality proxy buying
 2% is the useful lesson here: for these kernels sector-count proxies track
 performance and reuse-distance proxies do not.
 
-It is implemented rather than skipped because a tensor-row WMMA kernel would
-make the same ordering pay through fragment reuse instead of cache capacity,
+It is implemented rather than skipped because the ordering also shapes the
+projection gather that the packed backward kernel spends most of its time on,
 which does not depend on the batch. See
 `Benchmarks_metrics/batch64_layout_20260902/` and
 `Benchmarks_metrics/lgn_row_order_20260902/`.
