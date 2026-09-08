@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
-import sys
 
 import tensorflow as tf
 
@@ -13,12 +12,13 @@ from v1_model_utils.cuda_operator_cache import (
     active_gpu_architecture,
     artifact_path,
     normalize_architecture,
+    resolve_cuda_build_toolchain,
     temporary_build_directory,
     write_build_metadata,
 )
 # The external operator shares the recurrent forward kernel, so the weight
 # ordering has to match it exactly.
-from v1_model_utils.cuda_csr_config import DIRECT_CSR
+from v1_model_utils.cuda_csr_config import DIRECT_CSR, architecture_kernel_flags
 
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +30,11 @@ BUILD_FLAGS = (
     "--expt-relaxed-constexpr",
     "--use_fast_math",
 )
+
+
+def build_flags_for(architecture):
+    """The complete compile-flag set for one target architecture."""
+    return (*BUILD_FLAGS, *architecture_kernel_flags(architecture))
 
 
 def _run(command):
@@ -48,11 +53,8 @@ def main():
     architecture = normalize_architecture(
         args.architecture or active_gpu_architecture()
     )
-    prefix = Path(sys.prefix)
-    nvcc = prefix / "bin/nvcc"
-    cxx = os.environ.get("CXX", "g++-11")
-    if not nvcc.exists():
-        raise FileNotFoundError(f"CUDA compiler not found at {nvcc}")
+    toolchain = resolve_cuda_build_toolchain(architecture)
+    nvcc, cxx = toolchain.nvcc, toolchain.cxx
     compile_flags = tf.sysconfig.get_compile_flags()
     link_flags = tf.sysconfig.get_link_flags()
     cuda_include = Path(tf.sysconfig.get_include()) / "third_party/gpus/cuda/include"
@@ -88,7 +90,7 @@ def main():
                 "-o",
                 cu_object,
                 "-DGOOGLE_CUDA=1",
-                *BUILD_FLAGS,
+                *build_flags_for(architecture),
                 f"-gencode=arch=compute_{architecture},code=sm_{architecture}",
                 f"-gencode=arch=compute_{architecture},code=compute_{architecture}",
                 "-Xcompiler=-fPIC",
@@ -106,14 +108,14 @@ def main():
                 "-o",
                 temporary_output,
                 *link_flags,
-                f"-L{prefix / 'lib'}",
+                f"-L{toolchain.library_directory}",
                 "-l:libcudart.so.12",
-                f"-Wl,-rpath,{prefix / 'lib'}",
+                f"-Wl,-rpath,{toolchain.library_directory}",
             ]
         )
         temporary_output.replace(output)
     write_build_metadata(
-        HERE, "csr_external_grad_ops", architecture, build_flags=BUILD_FLAGS
+        HERE, "csr_external_grad_ops", architecture, build_flags=build_flags_for(architecture)
     )
     print(output)
 

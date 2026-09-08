@@ -2,7 +2,6 @@ import numpy as np
 import tensorflow as tf
 import os
 import pickle as pkl
-from tensorflow.python.eager import record
 from .cuda_csr_recurrent import (
     build_csr_connectivity,
     calculate_recurrent_csr_currents,
@@ -13,6 +12,12 @@ from .cuda_csr_external import (
 )
 from . import spatial_layout
 from numba import njit
+
+
+def _keras_op(name, tensorflow_op):
+    """Use Keras 3 symbolic ops while retaining TensorFlow 2.15 support."""
+    keras_ops = getattr(tf.keras, "ops", None)
+    return getattr(keras_ops, name) if keras_ops is not None else tensorflow_op
 
 
 def _has_homogeneous_cuda_devices():
@@ -628,11 +633,10 @@ class V1Column(tf.keras.layers.Layer):
         edge_orders=None,
         lgn_row_order=None,
     ):
-        super().__init__()
+        super().__init__(autocast=False)
         # Disable Keras layer autocast so tensors keep explicit dtypes:
         # recurrent state buffers in compute_dtype, selected threshold-critical
         # parameters in variable_dtype.
-        self._autocast = False
         # Neuron numbering this cell was built in. Checkpoints stay canonical,
         # so the layout is what translates them; see translate_checkpointed_layout.
         self._neuron_layout = neuron_layout or spatial_layout.NeuronLayout.identity(
@@ -911,8 +915,10 @@ class V1Column(tf.keras.layers.Layer):
             individual_training = False
 
         # Scale the weights
-        self.recurrent_weight_values = tf.Variable(
-            weights * recurrent_weight_scale / lr_scale,
+        recurrent_values = weights * recurrent_weight_scale / lr_scale
+        self.recurrent_weight_values = self.add_weight(
+            shape=recurrent_values.shape,
+            initializer=tf.keras.initializers.Constant(recurrent_values),
             name="sparse_recurrent_weights",
             constraint=SignedConstraint(recurrent_weight_positive),
             trainable=individual_training,
@@ -977,8 +983,10 @@ class V1Column(tf.keras.layers.Layer):
         #     input_weights >= 0.0, name="input_weights_sign", trainable=False)
         # input_weight_positive = tf.constant(input_weights >= 0, dtype=tf.int8)
         input_weight_positive = tf.constant(input_weights >= 0, dtype=tf.bool)
-        self.input_weight_values = tf.Variable(
-            input_weights * input_weight_scale / lr_scale,
+        input_values = input_weights * input_weight_scale / lr_scale
+        self.input_weight_values = self.add_weight(
+            shape=input_values.shape,
+            initializer=tf.keras.initializers.Constant(input_values),
             name="sparse_input_weights",
             constraint=SignedConstraint(input_weight_positive),
             trainable=train_input,
@@ -1043,8 +1051,10 @@ class V1Column(tf.keras.layers.Layer):
         #     bkg_input_weights >= 0.0, name="bkg_input_weights_sign", trainable=False)
         # bkg_input_weight_positive = tf.constant(bkg_input_weights >= 0, dtype=tf.int8)
         bkg_input_weight_positive = tf.constant(bkg_input_weights >= 0, dtype=tf.bool)
-        self.bkg_input_weights = tf.Variable(
-            bkg_input_weights * input_weight_scale / lr_scale,
+        bkg_values = bkg_input_weights * input_weight_scale / lr_scale
+        self.bkg_input_weights = self.add_weight(
+            shape=bkg_values.shape,
+            initializer=tf.keras.initializers.Constant(bkg_values),
             name="rest_of_brain_weights",
             constraint=SignedConstraint(bkg_input_weight_positive),
             trainable=train_noise,
@@ -1195,7 +1205,11 @@ class V1Column(tf.keras.layers.Layer):
             )
         wanted = set(lengths)
         slots = {}
-        for slot in getattr(optimizer, "variables", lambda: ())():
+        # Keras 3 exposes `variables` as a list; Keras 2 exposed it as a method.
+        optimizer_variables = getattr(optimizer, "variables", ())
+        if callable(optimizer_variables):
+            optimizer_variables = optimizer_variables()
+        for slot in optimizer_variables:
             if len(slot.shape) == 1 and int(slot.shape[0]) in wanted:
                 slots.setdefault(int(slot.shape[0]), []).append(slot)
         return slots
@@ -1211,7 +1225,7 @@ class V1Column(tf.keras.layers.Layer):
         # if x_t.dtype != self.variable_dtype:
         #     x_t = tf.cast(x_t, dtype=self.variable_dtype)
 
-        i_in = tf.TensorArray(dtype=self.variable_dtype, size=self._n_syn_basis)
+        i_in = tf.TensorArray(dtype=self.compute_dtype, size=self._n_syn_basis)
         for r_id in range(self._n_syn_basis):
             input_weights_factors = tf.gather(self.synaptic_basis_weights[:, r_id], self.input_syn_ids, axis=0) # shape (n_input_synapses,)
             weights_syn_receptors = tf.cast(self.input_weight_values, self.compute_dtype) * input_weights_factors
@@ -1261,7 +1275,7 @@ class V1Column(tf.keras.layers.Layer):
                 activity = tf.stop_gradient(activity)
             return calculate_external_csr_currents(
                 activity,
-                self.input_weight_values,
+                tf.cast(self.input_weight_values, self.variable_dtype),
                 self.synaptic_basis_weights,
                 self.input_csr,
                 compute_activity_gradient=compute_activity_gradient,
@@ -1312,7 +1326,7 @@ class V1Column(tf.keras.layers.Layer):
 
     def calculate_noise_current(self, batch_size, noise_step, initial=None):
         n_post_neurons = self.bkg_input_dense_shape[0]
-        step_seed = tf.cast(noise_step[0], tf.int32)
+        step_seed = tf.cast(tf.reshape(noise_step, (-1,))[0], tf.int32)
         base_seed = tf.cast(self.noise_seed, tf.int32)
         replica_context = tf.distribute.get_replica_context()
         if replica_context is None:
@@ -1343,7 +1357,7 @@ class V1Column(tf.keras.layers.Layer):
                 activity = tf.stop_gradient(activity)
             return calculate_external_csr_currents(
                 activity,
-                self.bkg_input_weights,
+                tf.cast(self.bkg_input_weights, self.variable_dtype),
                 self.synaptic_basis_weights,
                 self.bkg_input_csr,
                 compute_activity_gradient=compute_activity_gradient,
@@ -1409,7 +1423,7 @@ class V1Column(tf.keras.layers.Layer):
         if self._synaptic_current_backend == "cuda":
             i_rec_flat = calculate_recurrent_csr_currents(
                 rec_z_buf,
-                self.recurrent_weight_values,
+                tf.cast(self.recurrent_weight_values, self.variable_dtype),
                 self.synaptic_basis_weights,
                 self._recurrent_dampening,
                 self.recurrent_csr,
@@ -1468,8 +1482,11 @@ class V1Column(tf.keras.layers.Layer):
         # new_v = self.decay * dampened_v + self.current_factor * c1 - tf.stop_gradient(prev_z)
         # Update the voltage according to the LIF equation and the refractory period
         # New r is a variable that accounts for the refractory period in which a neuron cannot spike
-        prev_spike = tf.cast(prev_z, dtype=self._refractory_state_dtype)
-        new_r = tf.stop_gradient(tf.maximum(r + prev_spike * self.t_ref_steps - 1, 0)) # prevent gradients from flowing through the refractory state
+        prev_spike = tf.cast(prev_z, dtype=r.dtype)
+        refractory_steps = tf.cast(self.t_ref_steps, r.dtype)
+        new_r = tf.stop_gradient(
+            tf.maximum(r + prev_spike * refractory_steps - 1, 0)
+        )  # prevent gradients from flowing through the refractory state
 
         if self._hard_reset:
             # Here we keep the voltage at the reset value during the refractory period
@@ -1482,6 +1499,16 @@ class V1Column(tf.keras.layers.Layer):
         return new_v, new_r, new_asc, new_psc_rise, new_psc
 
     @property
+    def output_size(self):
+        """Width of the packed per-timestep output returned by ``call``."""
+        visible_neurons = (
+            self._n_neurons
+            if self._output_neuron_ids is None
+            else int(self._output_neuron_ids.shape[0])
+        )
+        return visible_neurons * (2 if self._return_voltage_sequences else 1)
+
+    @property
     def state_size(self):
         # Define the state size of the network
         state_size = (
@@ -1491,10 +1518,10 @@ class V1Column(tf.keras.layers.Layer):
             self._n_neurons * 2,  # asc
             self._n_neurons * self._n_syn_basis,  # psc rise
             self._n_neurons * self._n_syn_basis,  # psc
-            tf.TensorShape([]),  # noise timestep counter
+            1,  # noise timestep counter
         )
         if self._track_voltage_penalty:
-            state_size += (tf.TensorShape([]),)
+            state_size += (1,)
         return state_size
 
     def zero_state(self, batch_size, dtype=tf.float32):
@@ -1507,14 +1534,14 @@ class V1Column(tf.keras.layers.Layer):
         asc = tf.zeros((batch_size, self._n_neurons * 2), self.compute_dtype)
         psc_rise0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), self.compute_dtype)
         psc0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), self.compute_dtype)
-        noise_step0 = tf.zeros((batch_size,), tf.int32)
+        noise_step0 = tf.zeros((batch_size, 1), tf.int32)
 
         state = (z0_buf, v0, r0, asc, psc_rise0, psc0, noise_step0)
         if self._track_voltage_penalty:
             # fp32 accumulator: the running sum spans seq_len steps, and in
             # fp16 the per-step increments fall below one ulp of the sum long
             # before the sum itself grows large.
-            state += (tf.zeros((batch_size,), tf.float32),)
+            state += (tf.zeros((batch_size, 1), tf.float32),)
         return state
 
     def _voltage_penalty_mean_step(self, voltage):
@@ -1634,21 +1661,29 @@ class V1Column(tf.keras.layers.Layer):
             if self._output_neuron_ids is None
             else tf.gather(new_z, self._output_neuron_ids, axis=1)
         )
-        visible_z = tf.cast(output_z, self._output_spike_dtype)
+        # Keras 3's RNN backend requires all nested per-step outputs to share a
+        # dtype.  Keep the recurrent output homogeneous and cast the exposed
+        # spike sequence after the RNN has stacked timesteps.
+        visible_z = tf.cast(output_z, self.compute_dtype)
         output_v = (
             new_v
             if self._output_neuron_ids is None
             else tf.gather(new_v, self._output_neuron_ids, axis=1)
         )
         outputs = (
-            (visible_z, output_v)
+            tf.concat((visible_z, output_v), axis=-1)
             if self._return_voltage_sequences
-            else (visible_z,)
+            else visible_z
         )
         new_noise_step = noise_step + 1
         new_state = (new_z_buf, new_v, new_r, new_asc, new_psc_rise, new_psc, new_noise_step)
         if self._track_voltage_penalty:
-            new_state += (voltage_penalty + self._voltage_penalty_mean_step(new_v),)
+            # ``state_size == 1`` represents a [batch, 1] recurrent state,
+            # whereas the neuron reduction naturally returns [batch].  Adding
+            # those tensors directly broadcasts to [batch, batch] for batches
+            # larger than one and violates the RNN loop's shape invariant.
+            penalty_step = self._voltage_penalty_mean_step(new_v)[:, None]
+            new_state += (voltage_penalty + penalty_step,)
 
         return outputs, new_state
 
@@ -1727,7 +1762,47 @@ class ClassificationReadoutLayer(tf.keras.layers.Layer):
         return config
 
 
+class FiringRateMetricLayer(tf.keras.layers.Layer):
+    """Track mean firing rate while passing spike tensors through unchanged."""
+
+    def __init__(self, **kwargs):
+        super().__init__(trainable=False, **kwargs)
+        self.rate = tf.keras.metrics.Mean(name="rate")
+
+    def call(self, spikes):
+        self.rate.update_state(tf.reduce_mean(spikes))
+        return spikes
+
+    @property
+    def metrics(self):
+        return [self.rate]
+
+
 # @profile
+@tf.keras.utils.register_keras_serializable(package="v1_model")
+class HeterogeneousStateRNN(tf.keras.layers.RNN):
+    """Keras RNN that preserves integer and floating recurrent state dtypes."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("autocast", False)
+        super().__init__(*args, **kwargs)
+
+    def call(self, sequences, initial_state=None, mask=None, training=False):
+        if initial_state is None:
+            initial_state = self.get_initial_state(batch_size=tf.shape(sequences)[0])
+        initial_state = [tf.convert_to_tensor(state) for state in initial_state]
+        last_output, outputs, states = self.inner_loop(
+            sequences=sequences,
+            initial_state=initial_state,
+            mask=mask,
+            training=training,
+        )
+        output = outputs if self.return_sequences else last_output
+        if self.return_state:
+            return output, *states
+        return output
+
+
 def create_model(
     network,
     lgn_input,
@@ -1850,7 +1925,7 @@ def create_model(
         # The code then copies the input tensors into the rnn_initial_state variable
         # using tf.nest.map_structure(). This creates a nested structure of tensors with
         # the same shape as the original zero_state structure.
-        rnn_initial_state = tf.nest.map_structure(tf.identity, initial_state_holder)
+        rnn_initial_state = initial_state_holder
     else:
         rnn_initial_state = zero_state
         initial_state_holder = None
@@ -1860,12 +1935,19 @@ def create_model(
     # layer. The output of the RNN layer is a tensor of shape (batch_size, seq_len,
     # neurons). The final state of the RNN layer is a tuple of tensors, each of shape
     # (batch_size, neurons).
-    rnn = tf.keras.layers.RNN(cell, return_sequences=True, return_state=return_state, name="rsnn")
+    rnn = HeterogeneousStateRNN(
+        cell,
+        return_sequences=True,
+        return_state=return_state,
+        name="rsnn",
+        autocast=False,
+    )
     # Keep provided state dtypes (notably fp32 v/r) instead of autocasting to compute_dtype.
-    rnn._autocast = False
 
     # Apply the rnn layer to the full_inputs tensor
     rsnn_out = rnn(full_inputs, initial_state=rnn_initial_state)
+
+    rsnn_out = _normalize_v1_rnn_outputs(rnn, rsnn_out)
 
     # Check if the return_state argument is True or False and assign the output of the
     # RNN layer to the hidden variable accordingly.
@@ -1876,7 +1958,11 @@ def create_model(
         hidden = rsnn_out
 
     spikes_dict = {}
-    spikes_dict['v1'] = tf.cast(hidden[0], dtype)
+    spikes_dict['v1'] = _keras_op("cast", tf.cast)(hidden[0], dtype)
+    if add_metric:
+        spikes_dict['v1'] = FiringRateMetricLayer(name="firing_rate_metric")(
+            spikes_dict['v1']
+        )
     # voltage = hidden[1]
 
     outputs_dict = {}
@@ -1909,9 +1995,12 @@ def create_model(
                 kernel_initializer=projection_initializer,
                 bias_initializer="zeros",
             )(spikes_dict[area])
-            mean_output = tf.reshape(output, (-1, int(seq_len / down_sample), down_sample, n_output))
-            mean_output = tf.reduce_mean(mean_output, axis=2)
-            mean_output = tf.nn.softmax(mean_output, axis=-1)
+            mean_output = _keras_op("reshape", tf.reshape)(
+                output,
+                (-1, int(seq_len / down_sample), down_sample, n_output),
+            )
+            mean_output = _keras_op("mean", tf.reduce_mean)(mean_output, axis=2)
+            mean_output = _keras_op("softmax", tf.nn.softmax)(mean_output, axis=-1)
             outputs_dict[area] = mean_output
 
     if use_state_input:
@@ -1928,32 +2017,65 @@ def create_model(
     # many_input_model = tf.keras.Model(inputs=inputs, outputs=[rsnn_out, outputs_dict['v1']])
     many_input_model = tf.keras.Model(inputs=inputs, outputs=[outputs_dict['v1']])
 
-    if add_metric:
-        # add the firing rate of the neurons as a metric to the model
-        # computes the mean of the spikes tensor along the second and third dimensions
-        # (which represent time and neurons),
-        rate = tf.reduce_mean(spikes_dict['v1'])
-        many_input_model.add_metric(rate, name="rate")
-
     return many_input_model
 
 
 def build_sequence_only_model(model, rsnn_layer, name="rsnn_sequences"):
     """Create a training model that returns only the RNN sequence outputs."""
-    return tf.keras.Model(
+    outputs = tf.nest.flatten(_normalize_v1_rnn_outputs(rsnn_layer, rsnn_layer.output))
+    sequence_count = _rnn_sequence_output_count(rsnn_layer, outputs)
+    result = tf.keras.Model(
         inputs=model.inputs,
-        outputs=rsnn_layer.output[0],
+        outputs=outputs[:sequence_count],
         name=name,
     )
+    result._v1_sequence_output_count = sequence_count
+    return result
 
 
 def build_sequence_and_state_model(model, rsnn_layer, name="rsnn_sequence_and_state"):
     """Expose the RNN sequence outputs and final state without the readout."""
-    return tf.keras.Model(
+    outputs = tf.nest.flatten(_normalize_v1_rnn_outputs(rsnn_layer, rsnn_layer.output))
+    sequence_count = _rnn_sequence_output_count(rsnn_layer, outputs)
+    result = tf.keras.Model(
         inputs=model.inputs,
-        outputs=rsnn_layer.output,
+        outputs=outputs,
         name=name,
     )
+    result._v1_sequence_output_count = sequence_count
+    return result
+
+
+def _rnn_sequence_output_count(rsnn_layer, outputs):
+    """Return the leading sequence count across Keras 2/3 RNN structures."""
+    cell = getattr(rsnn_layer, "cell", None)
+    if hasattr(cell, "_return_voltage_sequences"):
+        return 2 if cell._return_voltage_sequences else 1
+    output_size = getattr(cell, "output_size", None)
+    if output_size is not None:
+        return len(tf.nest.flatten(output_size))
+    # Repository readout layers historically expose spike and voltage sequences.
+    return min(2, len(outputs))
+
+
+def _normalize_v1_rnn_outputs(rsnn_layer, outputs):
+    """Restore the Keras 2 sequence/state layout from Keras 3's packed output."""
+    cell = getattr(rsnn_layer, "cell", None)
+    flat = tf.nest.flatten(outputs)
+    if cell is None:
+        return tuple(flat)
+    if not getattr(cell, "_return_voltage_sequences", False):
+        if flat:
+            flat[0] = _keras_op("cast", tf.cast)(flat[0], cell._output_spike_dtype)
+        return tuple(flat)
+    state_count = len(tf.nest.flatten(cell.state_size))
+    if len(flat) != state_count + 1:
+        return tuple(flat)
+    packed = flat[0]
+    width = cell._n_neurons if cell._output_neuron_ids is None else cell._output_neuron_ids.shape[0]
+    spikes, voltage = packed[..., :width], packed[..., width:]
+    spikes = _keras_op("cast", tf.cast)(spikes, cell._output_spike_dtype)
+    return ((spikes, voltage), *flat[1:])
 
 
 class SegmentedRecomputeRunner:
@@ -1990,7 +2112,19 @@ class SegmentedRecomputeRunner:
             for start in range(0, sequence_length, chunk_size)
         )
         self.n_chunks = len(self.chunk_sizes)
-        self.n_sequence_outputs = len(tf.nest.flatten(core_model.output[0]))
+        self.n_sequence_outputs = getattr(
+            core_model, "_v1_sequence_output_count", None
+        )
+        if self.n_sequence_outputs is None:
+            flat_outputs = tf.nest.flatten(core_model.output)
+            self.n_sequence_outputs = next(
+                (
+                    index
+                    for index, output in enumerate(flat_outputs)
+                    if len(output.shape) < 3
+                ),
+                len(flat_outputs),
+            )
 
     def _pack_spikes(self, spikes):
         """Pack a binary rank-two spike state into positive int32 words."""
@@ -2018,8 +2152,8 @@ class SegmentedRecomputeRunner:
         return tf.cast(tf.reshape(bits, (tf.shape(packed)[0], -1))[:, :width], dtype)
 
     def _run_chunk(self, inputs, *state):
-        outputs = self.core_model((inputs, tuple(state)))
-        return tuple(tf.nest.flatten(outputs[0])) + tuple(outputs[1:])
+        outputs = self.core_model([inputs, *state])
+        return tuple(tf.nest.flatten(outputs))
 
     def _slice_chunk(self, inputs, chunk_index, chunk_length, time_check=None):
         start = chunk_index * self.chunk_size
@@ -2035,15 +2169,17 @@ class SegmentedRecomputeRunner:
     def _assemble_chunks(self, array, output_spec, inputs):
         chunks = tuple(array.read(index) for index in range(self.n_chunks))
         sequence = chunks[0] if self.n_chunks == 1 else tf.concat(chunks, axis=1)
-        if output_spec.shape.rank is not None:
-            output_shape = output_spec.shape.as_list()
+        if len(output_spec.shape):
+            output_shape = list(output_spec.shape)
             output_shape[0] = inputs.shape[0]
             output_shape[1] = self.sequence_length
             sequence = tf.ensure_shape(sequence, output_shape)
         return sequence
 
     def _forward(self, inputs, initial_state, time_check):
-        sequence_specs = tf.nest.flatten(self.core_model.output[0])
+        sequence_specs = tf.nest.flatten(self.core_model.output)[
+            :self.n_sequence_outputs
+        ]
         sequence_arrays = tuple(
             tf.TensorArray(
                 dtype=spec.dtype,
@@ -2295,10 +2431,9 @@ class SegmentedRecomputeRunner:
 
         @tf.custom_gradient
         def segmented_rollout(inputs, *initial_state):
-            with record.stop_recording():
-                sequences, state, state_arrays = self._forward(
-                    inputs, initial_state, time_check
-                )
+            sequences, state, state_arrays = self._forward(
+                inputs, initial_state, time_check
+            )
             flat_outputs = sequences + state
 
             def grad(*output_gradients, variables=None):
@@ -2332,11 +2467,14 @@ def build_state_only_model(model, rsnn_layer, name="rsnn_state"):
     else:
         full_inputs = rnn_inputs
         state_inputs = []
-    state_rnn = tf.keras.layers.RNN(
-        rsnn_layer.cell, return_sequences=False, return_state=True, name=name
+    state_rnn = HeterogeneousStateRNN(
+        rsnn_layer.cell,
+        return_sequences=False,
+        return_state=True,
+        name=name,
+        autocast=False,
     )
     # Preserve heterogeneous state dtypes for the state rollout path as well.
-    state_rnn._autocast = False
     if state_inputs:
         state_out = state_rnn(full_inputs, initial_state=state_inputs)
     else:

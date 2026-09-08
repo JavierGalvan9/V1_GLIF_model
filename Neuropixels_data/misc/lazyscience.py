@@ -5,7 +5,6 @@ import sys
 from iminuit.pdg_format import pdg_format
 import iminuit
 import iminuit.cost
-from numba import jit, njit
 
 
 def spike_mle_nbinom(counts, estimator, inits, limits=None, do_minos=False):
@@ -31,7 +30,7 @@ def spike_mle_nbinom(counts, estimator, inits, limits=None, do_minos=False):
 
     m = iminuit.Minuit(cost_func, **argdict)
     m.limits["binom_n"] = (0, None)
-    if not (limits == None):
+    if limits is not None:
         for v in limits:
             m.limits[v] = limits[v]
 
@@ -58,7 +57,7 @@ def save(varlist, filename=None, mode="w"):
     # formatting the inputs
     if isinstance(varlist, str):
         varlist = [varlist]  # make it a list so that the following code work
-    if filename == None:
+    if filename is None:
         filename = varlist[0] + ".h5"
 
     # note that this next line is not a very good practice.
@@ -86,7 +85,9 @@ def quasi_poisson_sig_test_counts(
 ):
     arraydim = len(response_counts.shape)
     unit_axis = unit_axis % arraydim  # making it positive value
-    sumaxis = tuple(np.array(np.setdiff1d(range(arraydim), unit_axis), dtype=np.int))
+    sumaxis = tuple(
+        np.asarray(np.setdiff1d(range(arraydim), unit_axis), dtype=np.intp)
+    )
     ntrials = response_counts.size / response_counts.shape[unit_axis]
     total_duration = ntrials * window_size1
 
@@ -165,9 +166,6 @@ def cond_prob(truth_table1, truth_table2):
     p1e = efunc(p1, n)
     p2e = efunc(p2, n)
     n12 = np.count_nonzero(truth_table1 * truth_table2)
-    p12 = n12 / n
-    p12e = efunc(p12, n)
-
     p1g2 = n12 / n2
     p1g2e = efunc(p1g2, n2)
     p2g1 = n12 / n1
@@ -185,4 +183,3 @@ def cond_prob(truth_table1, truth_table2):
             p2g1e * 100,
         )
     )
-

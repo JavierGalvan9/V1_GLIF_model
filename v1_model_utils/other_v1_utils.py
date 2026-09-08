@@ -8,16 +8,13 @@ Created on Thu Jan  6 19:43:44 2022
 
 import pandas as pd
 import os
-import sys
 import glob
 import numpy as np
 import tensorflow as tf
 import h5py
 import time
 from scipy.ndimage import gaussian_filter1d
-parentDir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(parentDir, "general_utils"))
-import file_management
+from general_utils import file_management
 
 
 def pop_name_to_cell_type(pop_name, ignore_l5e_subtypes=False):
@@ -221,41 +218,31 @@ def voltage_spike_effect_correction(v, z, pre_spike_gap=2, post_spike_gap=3):
 
 
 def optimizers_match(current_optimizer, checkpoint_directory):
-    current_optimizer_vars = {v.name: v.shape.as_list() for v in current_optimizer.variables()}
-    checkpoint_vars = tf.train.list_variables(checkpoint_directory)
-    checkpoint_optimizer_vars = {name.split('/.ATTRIBUTES')[0]: value for name, value in checkpoint_vars if 'optimizer' in name}
-    if 'optimizer/loss_scale/current_loss_scale' in checkpoint_optimizer_vars or 'optimizer/loss_scale/good_steps' in checkpoint_optimizer_vars:
-        if len(current_optimizer_vars) != len(checkpoint_optimizer_vars)-3:
-            print('Checkpoint optimizer variables do not match the current optimizer variables.. Renewing optimizer...')
-            return False
-        else:
-            for name, desired_shape in current_optimizer_vars.items():
-                var_not_matched = True
-                for opt_var, opt_var_shape in checkpoint_optimizer_vars.items():
-                    if opt_var_shape == desired_shape: 
-                        var_not_matched = False
-                        del checkpoint_optimizer_vars[opt_var]
-                        break
-                if var_not_matched:
-                    print(f'{name} does not have a match')
-                    return False
-            return True
-    else:
-        if len(current_optimizer_vars) != len(checkpoint_optimizer_vars)-1:
-            print('Checkpoint optimizer variables do not match the current optimizer variables.. Renewing optimizer...')
-            return False
-        else:
-            for name, desired_shape in current_optimizer_vars.items():
-                var_not_matched = True
-                for opt_var, opt_var_shape in checkpoint_optimizer_vars.items():
-                    if opt_var_shape == desired_shape: 
-                        var_not_matched = False
-                        del checkpoint_optimizer_vars[opt_var]
-                        break
-                if var_not_matched:
-                    print(f'{name} does not have a match')
-                    return False
-            return True
+    variables = current_optimizer.variables
+    if callable(variables):
+        variables = variables()
+    current_shapes = sorted(tuple(variable.shape) for variable in variables)
+    checkpoint_variables = [
+        (name, tuple(shape))
+        for name, shape in tf.train.list_variables(checkpoint_directory)
+        if name.startswith("optimizer/")
+        and "/_trainable_variables/" not in name
+        and not name.startswith("optimizer/_trainable_variables/")
+    ]
+    checkpoint_shapes = sorted(shape for _, shape in checkpoint_variables)
+    if len(checkpoint_shapes) == len(current_shapes) + 1:
+        checkpoint_shapes = sorted(
+            shape
+            for name, shape in checkpoint_variables
+            if name != "optimizer/_learning_rate/.ATTRIBUTES/VARIABLE_VALUE"
+        )
+    matches = current_shapes == checkpoint_shapes
+    if not matches:
+        print(
+            "Checkpoint optimizer variables do not match the current optimizer "
+            "variables. Renewing optimizer..."
+        )
+    return matches
 
 ############################ DATA SAVING AND LOADING METHODS #########################
 class SaveSimDataHDF5:
@@ -392,9 +379,9 @@ def load_simulation_results(full_data_path, n_simulations=None, skip_first_simul
     if skip_first_simulation:
         n_simulations -= 1
         first_simulation += 1
-    if variables == None:
+    if variables is None:
         variables = ['v', 'z', 'input_current', 'recurrent_current', 'bottom_up_current', 'z_lgn']
-    if type(variables) == str:
+    if isinstance(variables, str):
         variables = [variables]
     data = {key: (np.empty((n_simulations, simulation_length, n_input), np.uint8) if key=='z_lgn' 
                   else np.empty((n_simulations, simulation_length, n_neurons), np.uint8) if key=='z' 
@@ -438,9 +425,9 @@ def load_simulation_results_hdf5(full_data_path, n_simulations=None, skip_first_
             n_simulations -= 1
             first_simulation += 1
         # Select the variables for the extraction
-        if variables == None:
+        if variables is None:
             variables = ['v', 'z', 'input_current', 'recurrent_current', 'bottom_up_current', 'z_lgn']
-        if type(variables) == str:
+        if isinstance(variables, str):
             variables = [variables]
         # Extract the simulation data
         data = {}

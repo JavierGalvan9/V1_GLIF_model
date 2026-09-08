@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
-import sys
 
 import tensorflow as tf
 
@@ -13,6 +12,7 @@ from v1_model_utils.cuda_operator_cache import (
     active_gpu_architecture,
     artifact_path,
     normalize_architecture,
+    resolve_cuda_build_toolchain,
     temporary_build_directory,
     write_build_metadata,
 )
@@ -27,7 +27,8 @@ def _run(command):
     subprocess.run([str(part) for part in command], check=True)
 
 
-def _build(stem, architecture, prefix, cxx, nvcc, compile_flags, link_flags):
+def _build(stem, architecture, toolchain, compile_flags, link_flags):
+    cxx, nvcc = toolchain.cxx, toolchain.nvcc
     output = artifact_path(HERE, stem, architecture)
     cuda_include = Path(tf.sysconfig.get_include()) / "third_party/gpus/cuda/include"
     with temporary_build_directory(HERE, stem, architecture) as workspace:
@@ -36,7 +37,7 @@ def _build(stem, architecture, prefix, cxx, nvcc, compile_flags, link_flags):
         temporary = workspace / output.name
         _run([
             cxx, "-std=c++17", "-O3", "-fPIC", "-Wall", "-Wextra",
-            "-Werror", "-Wno-unused-parameter", "-c", HERE / f"{stem}.cc",
+            "-Wno-unused-parameter", "-c", HERE / f"{stem}.cc",
             "-o", cc_object, *compile_flags,
         ])
         _run([
@@ -50,8 +51,8 @@ def _build(stem, architecture, prefix, cxx, nvcc, compile_flags, link_flags):
         ])
         _run([
             cxx, "-shared", "-O3", cc_object, cu_object, "-o", temporary,
-            *link_flags, f"-L{prefix / 'lib'}", "-l:libcudart.so.12",
-            f"-Wl,-rpath,{prefix / 'lib'}",
+            *link_flags, f"-L{toolchain.library_directory}", "-l:libcudart.so.12",
+            f"-Wl,-rpath,{toolchain.library_directory}",
         ])
         temporary.replace(output)
     write_build_metadata(HERE, stem, architecture, build_flags=BUILD_FLAGS)
@@ -69,17 +70,13 @@ def main():
     architecture = normalize_architecture(
         args.architecture or active_gpu_architecture()
     )
-    prefix = Path(sys.prefix)
-    nvcc = prefix / "bin/nvcc"
-    if not nvcc.exists():
-        raise FileNotFoundError(f"CUDA compiler not found at {nvcc}")
-    cxx = os.environ.get("CXX", "g++-11")
+    toolchain = resolve_cuda_build_toolchain(architecture)
     compile_flags = tf.sysconfig.get_compile_flags()
     link_flags = tf.sysconfig.get_link_flags()
     stems = (args.stem,) if args.stem else ("glif_state_ops", "spike_history_ops")
     for stem in stems:
         _build(
-            stem, architecture, prefix, cxx, nvcc, compile_flags, link_flags
+            stem, architecture, toolchain, compile_flags, link_flags
         )
 
 

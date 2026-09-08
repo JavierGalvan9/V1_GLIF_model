@@ -17,7 +17,18 @@ import time
 
 
 _WORKER_FLAG = "distributed_worker_index"
-_MULTI_WORKER_NCCL_ARCHITECTURES = {"86"}
+_MODE_FLAG = "distributed_mode"
+DISTRIBUTED_MODES = ("mirrored", "multi_worker")
+
+# Ampere consumer GPUs advertise CUDA peer-to-peer access that the driver
+# cannot actually service, and NCCL then stalls instead of falling back. Only
+# those architectures need the transport forced down to shared memory/host.
+_NO_PEER_ACCESS_ARCHITECTURES = {"86"}
+
+# Directory holding the non-chief worker logs, relative to the working
+# directory, so one process per GPU does not interleave its output on the
+# console.
+WORKER_LOG_DIRECTORY = "Distributed_worker_logs"
 
 
 @dataclass(frozen=True)
@@ -31,13 +42,22 @@ class TrainingLaunchPlan:
     per_replica_batch_size: int
     grating_batch_size: int
     gray_batch_size: int
+    mode: str = "mirrored"
 
     @property
     def launch_workers(self):
+        """Whether this process should fork one training worker per GPU.
+
+        Single-process ``MirroredStrategy`` is the default for every
+        architecture: the CSR connectivity now lives in a per-device operator
+        resource, so replicas no longer copy metadata across devices, and one
+        process avoids building the network once per GPU. One process per GPU
+        stays available through ``--distributed_mode multi_worker``.
+        """
         return (
             self.n_gpus > 1
             and self.worker_index is None
-            and self.compute_capability in _MULTI_WORKER_NCCL_ARCHITECTURES
+            and self.mode == "multi_worker"
         )
 
     @property
@@ -173,6 +193,11 @@ def plan_training_launch(
     worker_index = None if worker_value is None else int(worker_value)
     if worker_index is not None and not 0 <= worker_index < n_gpus:
         raise ValueError("distributed_worker_index is outside n_gpus.")
+    mode = _option(argv, _MODE_FLAG, "mirrored")
+    if mode not in DISTRIBUTED_MODES:
+        raise ValueError(
+            f"distributed_mode must be one of {DISTRIBUTED_MODES}, got {mode!r}."
+        )
 
     batch = int(_option(argv, "batch_size", 2))
     grating = int(_option(argv, "grating_batch_size", 1))
@@ -211,11 +236,9 @@ def plan_training_launch(
                 "Multi-GPU training requires GPUs with the same compute capability."
             )
         architecture = normalized_capabilities.pop()
-        if architecture not in {"80", "86", "89", "120"}:
-            raise ValueError(
-                f"Unsupported distributed GPU compute capability sm_{architecture}."
-            )
-    if worker_addresses is None and architecture in _MULTI_WORKER_NCCL_ARCHITECTURES:
+    if worker_addresses is None and n_gpus > 1 and worker_index is None and (
+        mode == "multi_worker"
+    ):
         worker_addresses = _reserve_worker_addresses(n_gpus)
 
     rewritten = _replace_options(
@@ -237,6 +260,7 @@ def plan_training_launch(
         per_replica_batch_size=batch,
         grating_batch_size=grating,
         gray_batch_size=gray,
+        mode=mode,
     )
 
 
@@ -253,8 +277,13 @@ def build_worker_processes(plan, *, base_environ=None, enabled=False):
         environ = dict(base_environ)
         environ["CUDA_VISIBLE_DEVICES"] = device
         environ["V1_DISTRIBUTED_WORKER"] = "1"
-        environ.setdefault("NCCL_P2P_DISABLE", "1")
+        if plan.compute_capability in _NO_PEER_ACCESS_ARCHITECTURES:
+            environ.setdefault("NCCL_P2P_DISABLE", "1")
         environ.setdefault("NCCL_DEBUG", "WARN")
+        if index:
+            # Only the chief keeps the console; the rest would triplicate every
+            # build and TensorFlow message.
+            environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
         environ["TF_CONFIG"] = json.dumps(
             {"cluster": cluster, "task": {"type": "worker", "index": index}},
             separators=(",", ":"),
@@ -280,10 +309,37 @@ def build_worker_processes(plan, *, base_environ=None, enabled=False):
     return tuple(workers)
 
 
-def launch_worker_processes(plan, *, enabled=False):
-    """Run all workers, propagate failures, and forward termination signals."""
+def worker_log_path(worker_index, directory=None):
+    """Return the log file a non-chief worker writes its output to."""
+    directory = WORKER_LOG_DIRECTORY if directory is None else directory
+    return os.path.join(directory, f"worker_{worker_index}.log")
+
+
+def launch_worker_processes(plan, *, enabled=False, log_directory=None):
+    """Run all workers, propagate failures, and forward termination signals.
+
+    The chief writes to the console. Every other worker gets its own log file
+    so a two-GPU run reads like a one-GPU run, and a failure in a non-chief
+    worker is still recoverable afterwards.
+    """
     specs = build_worker_processes(plan, enabled=enabled)
-    processes = [subprocess.Popen(spec.argv, env=spec.environ) for spec in specs]
+    log_directory = WORKER_LOG_DIRECTORY if log_directory is None else log_directory
+    processes = []
+    handles = []
+    for index, spec in enumerate(specs):
+        if index == 0:
+            processes.append(subprocess.Popen(spec.argv, env=spec.environ))
+            continue
+        path = worker_log_path(index, log_directory)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        handle = open(path, "w", encoding="utf-8")
+        handles.append(handle)
+        print(f"Worker {index} output: {path}", flush=True)
+        processes.append(
+            subprocess.Popen(
+                spec.argv, env=spec.environ, stdout=handle, stderr=handle
+            )
+        )
     previous_handlers = {}
 
     def terminate_workers(_signum=None, _frame=None):
@@ -311,6 +367,8 @@ def launch_worker_processes(plan, *, enabled=False):
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+        for handle in handles:
+            handle.close()
 
 
 def maybe_launch_training_workers(argv=None, environ=None):

@@ -160,9 +160,12 @@ which does not depend on the batch. See
 Build it in the project environment:
 
 ```bash
-conda activate neuro_tf2151
+conda activate neuro_tf221
 python -m v1_model_utils.cuda_csr_recurrent.build
 ```
+
+The build uses the CUDA 12.9 `nvcc` and C++ compiler installed in the active
+environment. Do not load a separate system CUDA toolkit before building.
 
 The default architecture is detected from the visible GPU. Set `V1_CUDA_ARCH`
 or pass `--architecture` to prebuild for another compute capability. Builds are

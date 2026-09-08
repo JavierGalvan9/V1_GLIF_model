@@ -1,17 +1,99 @@
 """Build and cache architecture-specific TensorFlow CUDA operators."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 
 import tensorflow as tf
+
+
+@dataclass(frozen=True)
+class CudaBuildToolchain:
+    """Executables and libraries used to build a TensorFlow CUDA operator."""
+
+    nvcc: Path
+    cxx: str
+    library_directory: Path
+    cuda_version: str
+
+
+def _command_version(command, *arguments):
+    return subprocess.check_output(
+        [str(command), *arguments], text=True, stderr=subprocess.STDOUT
+    ).strip()
+
+
+def resolve_cuda_build_toolchain(architecture):
+    """Resolve and validate the active environment's CUDA build toolchain."""
+    architecture = normalize_architecture(architecture)
+    prefix = Path(sys.prefix)
+    nvcc = Path(os.environ.get("CUDACXX", prefix / "bin" / "nvcc"))
+    if not nvcc.is_file():
+        raise FileNotFoundError(
+            f"CUDA compiler not found at {nvcc}. Install cuda-nvcc in the "
+            "active conda environment or set CUDACXX."
+        )
+
+    nvcc_output = _command_version(nvcc, "--version")
+    match = re.search(r"release\s+(\d+)\.(\d+)", nvcc_output)
+    if match is None:
+        raise RuntimeError(f"Could not determine CUDA compiler version from {nvcc}")
+    cuda_major, cuda_minor = map(int, match.groups())
+    if int(architecture) >= 120 and (cuda_major, cuda_minor) < (12, 8):
+        raise RuntimeError(
+            f"CUDA {cuda_major}.{cuda_minor} cannot compile native sm_{architecture}; "
+            "CUDA 12.8 or newer is required for Blackwell."
+        )
+
+    tensorflow_cuda = str(tf.sysconfig.get_build_info().get("cuda_version", ""))
+    tensorflow_major = tensorflow_cuda.split(".", 1)[0]
+    if tensorflow_major.isdigit() and int(tensorflow_major) != cuda_major:
+        raise RuntimeError(
+            f"TensorFlow was built for CUDA {tensorflow_cuda}, but {nvcc} is CUDA "
+            f"{cuda_major}.{cuda_minor}. Use a compiler from the same CUDA major."
+        )
+
+    configured_cxx = os.environ.get("CXX")
+    conda_cxx = prefix / "bin" / "x86_64-conda-linux-gnu-c++"
+    cxx = configured_cxx or (
+        str(conda_cxx) if conda_cxx.is_file() else shutil.which("c++")
+    )
+    if not cxx:
+        raise FileNotFoundError(
+            "No C++ compiler found. Install gxx_linux-64 or set CXX."
+        )
+
+    library_candidates = [prefix / "lib"]
+    library_candidates.extend(
+        sorted((prefix / "lib").glob("python*/site-packages/nvidia/cuda_runtime/lib"))
+    )
+    library_directory = next(
+        (
+            directory
+            for directory in library_candidates
+            if (directory / "libcudart.so.12").exists()
+        ),
+        None,
+    )
+    if library_directory is None:
+        raise FileNotFoundError(
+            "libcudart.so.12 was not found in the active conda environment."
+        )
+    return CudaBuildToolchain(
+        nvcc=nvcc,
+        cxx=cxx,
+        library_directory=library_directory,
+        cuda_version=f"{cuda_major}.{cuda_minor}",
+    )
 
 
 def normalize_architecture(architecture):
@@ -98,6 +180,7 @@ def metadata_path(directory, stem, architecture):
 def build_environment(architecture):
     """Describe ABI-sensitive inputs shared by every TensorFlow CUDA build."""
     build_info = tf.sysconfig.get_build_info()
+    toolchain = resolve_cuda_build_toolchain(architecture)
     return {
         "architecture": normalize_architecture(architecture),
         "tensorflow": tf.__version__,
@@ -105,6 +188,11 @@ def build_environment(architecture):
         "tensorflow_cudnn": str(build_info.get("cudnn_version", "unknown")),
         "compile_flags": list(tf.sysconfig.get_compile_flags()),
         "link_flags": list(tf.sysconfig.get_link_flags()),
+        "nvcc": str(toolchain.nvcc),
+        "nvcc_cuda": toolchain.cuda_version,
+        "cxx": toolchain.cxx,
+        "cxx_version": _command_version(toolchain.cxx, "--version").splitlines()[0],
+        "cuda_library_directory": str(toolchain.library_directory),
     }
 
 
@@ -167,6 +255,11 @@ def ensure_artifact(
     architecture = normalize_architecture(
         architecture or active_gpu_architecture()
     )
+    # A build-flag set that varies by architecture is passed as a callable so
+    # the recorded metadata matches what was actually compiled, and changing
+    # the rule invalidates the cache.
+    if callable(build_flags):
+        build_flags = build_flags(architecture)
     output = artifact_path(directory, stem, architecture)
     metadata = metadata_path(directory, stem, architecture)
     sources = tuple(Path(source) for source in sources)

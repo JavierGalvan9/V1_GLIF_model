@@ -1541,8 +1541,8 @@ class Callbacks:
         try:
             p = self._save_canonical(self.latest_manager)
             print(f'Latest model saved in {p}\n')
-        except Exception:
-            print("Saving failed. Maybe next time?")
+        except Exception as error:
+            print(f"Saving failed ({error!r}). Maybe next time?")
 
     def save_best_model(self):
         # self.step_counter.assign_add(1)
@@ -1550,8 +1550,8 @@ class Callbacks:
         try:
             p = self._save_canonical(self.best_manager)
             print(f'Model saved in {p}\n')
-        except Exception:
-            print("Saving failed. Maybe next time?")
+        except Exception as error:
+            print(f"Saving failed ({error!r}). Maybe next time?")
 
     def plot_losses_curves(self):
         # Define labels and components

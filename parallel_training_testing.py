@@ -123,6 +123,12 @@ parser.add_argument('--loss_core_radius', default=400.0, type=float)
 parser.add_argument('--plot_core_radius', default=400.0, type=float)
 
 parser.add_argument('--n_gpus', default=1, type=int)
+parser.add_argument(
+    '--gpu_type', default='rtxpro6000',
+    choices=['rtx3090', 'L40S', 'rtxpro6000'],
+    help='Scheduler GPU class for training jobs.',
+)
+parser.add_argument('--walltime', default='48:00', help='Scheduler wall time.')
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=75, type=int)
 parser.add_argument('--batch_size', default=2, type=int)
@@ -251,11 +257,11 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    if flags.low_memory_gpu:
-        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtx3090", "-m", "80", "-c", "4", "-t", "36:00"] # choose which ever gpu is available
-    else:
-        # training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "L40S", "-c", f"{16 * flags.n_gpus}", "-m", "48", "-t", "48:00"] # choose the L40S GPU with 48GB of memory
-        training_commands = ["run", "-g", f"{flags.n_gpus}", "-G", "rtxpro6000", "-c", f"{16 * flags.n_gpus}", "-m", "80", "-t", "48:00"] # choose the rtx6000 GPU with 64GB of memory
+    cpu_count = 4 if flags.low_memory_gpu else 16 * flags.n_gpus
+    training_commands = [
+        "run", "-g", str(flags.n_gpus), "-G", flags.gpu_type,
+        "-c", str(cpu_count), "-m", "80", "-t", flags.walltime,
+    ]
 
     evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
     # evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "80", "-c", "8", "-t", "3:00"]
@@ -267,13 +273,13 @@ def main():
 
     # Append each flag to the string
     for name, value in vars(flags).items():
-        if name not in ['seed', 'low_memory_gpu', 'print_only']:
+        if name not in ['seed', 'low_memory_gpu', 'print_only', 'gpu_type', 'walltime']:
             if isinstance(value, bool) and not value:
                 training_script += f"--no{name} "
             elif isinstance(value, bool) and value:
                 training_script += f"--{name} "
             else:
-                training_script += f"--{name} {value} "
+                training_script += f"--{name} {shlex.quote(str(value))} "
 
             # osi_dsi_estimator.py does not define training-only batch splits,
             # rolling-loss flags, or training debug flags.
@@ -290,7 +296,7 @@ def main():
             elif isinstance(value, bool) and value:
                 evaluation_script += f"--{name} "
             else:
-                evaluation_script += f"--{name} {value} "
+                evaluation_script += f"--{name} {shlex.quote(str(value))} "
 
     job_ids = []
     eval_job_ids = []

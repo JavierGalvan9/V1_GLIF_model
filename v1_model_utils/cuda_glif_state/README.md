@@ -13,5 +13,8 @@ Builds are architecture-keyed and validated against the active TensorFlow/CUDA
 environment:
 
 ```bash
-conda run -n neuro_tf2151 python -m v1_model_utils.cuda_glif_state.build
+conda run -n neuro_tf221 python -m v1_model_utils.cuda_glif_state.build
 ```
+
+The build uses the CUDA 12.9 `nvcc` and C++ compiler installed in the Conda
+environment. No system CUDA toolkit is required.

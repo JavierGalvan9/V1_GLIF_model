@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
-import sys
 
 import tensorflow as tf
 
@@ -13,10 +12,11 @@ from v1_model_utils.cuda_operator_cache import (
     active_gpu_architecture,
     artifact_path,
     normalize_architecture,
+    resolve_cuda_build_toolchain,
     temporary_build_directory,
     write_build_metadata,
 )
-from v1_model_utils.cuda_csr_config import DIRECT_CSR
+from v1_model_utils.cuda_csr_config import DIRECT_CSR, architecture_kernel_flags
 
 
 HERE = Path(__file__).resolve().parent
@@ -42,6 +42,11 @@ BUILD_FLAGS = (
 )
 
 
+def build_flags_for(architecture):
+    """The complete compile-flag set for one target architecture."""
+    return (*BUILD_FLAGS, *architecture_kernel_flags(architecture))
+
+
 def _run(command):
     print(shlex.join(str(part) for part in command), flush=True)
     subprocess.run([str(part) for part in command], check=True)
@@ -58,17 +63,9 @@ def main():
     architecture = normalize_architecture(
         args.architecture or active_gpu_architecture()
     )
-    # The packed backward specialization is qualified on SM120 only; older
-    # architectures keep the batch-lane path until they are measured.
-    architecture_flags = (
-        *BUILD_FLAGS,
-        f"-DV1_PACKED_BACKWARD={int(int(architecture) >= 120)}",
-    )
-    prefix = Path(sys.prefix)
-    nvcc = prefix / "bin/nvcc"
-    cxx = os.environ.get("CXX", "g++-11")
-    if not nvcc.exists():
-        raise FileNotFoundError(f"CUDA compiler not found at {nvcc}")
+    architecture_flags = build_flags_for(architecture)
+    toolchain = resolve_cuda_build_toolchain(architecture)
+    nvcc, cxx = toolchain.nvcc, toolchain.cxx
     compile_flags = tf.sysconfig.get_compile_flags()
     link_flags = tf.sysconfig.get_link_flags()
     cuda_include = Path(tf.sysconfig.get_include()) / "third_party/gpus/cuda/include"
@@ -91,8 +88,8 @@ def main():
         ])
         _run([
             cxx, "-shared", "-O3", cc_object, cu_object, "-o", temporary_output,
-            *link_flags, f"-L{prefix / 'lib'}", "-l:libcudart.so.12",
-            f"-Wl,-rpath,{prefix / 'lib'}",
+            *link_flags, f"-L{toolchain.library_directory}", "-l:libcudart.so.12",
+            f"-Wl,-rpath,{toolchain.library_directory}",
         ])
         temporary_output.replace(output)
     write_build_metadata(

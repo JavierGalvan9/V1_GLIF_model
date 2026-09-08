@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 
 from v1_model_utils.cuda_operator_cache import ensure_artifact
-from v1_model_utils.cuda_csr_recurrent.build import BUILD_FLAGS, DIRECT_CSR
+from v1_model_utils.cuda_csr_recurrent.build import build_flags_for, DIRECT_CSR
 from v1_model_utils.cuda_csr_resources import (
     initialize_resource,
     load_ops as load_resource_ops,
@@ -141,7 +141,7 @@ def _load_ops():
                 directory / "csr_recurrent_ops.cu.cc",
             ),
             build_module="v1_model_utils.cuda_csr_recurrent.build",
-            build_flags=BUILD_FLAGS,
+            build_flags=build_flags_for,
         )
         _OPS = tf.load_op_library(str(library))
     return _OPS
@@ -261,12 +261,9 @@ def calculate_recurrent_csr_currents(
     """
     require_csr_ordered_weights(connectivity, "recurrent connectivity")
     if connectivity.resource_name is not None:
-        # The resource operator has no `initial` input, so fall back to an
-        # explicit add rather than dropping it.
-        currents = _calculate_resource_currents(
-            spikes, weights, basis, dampening, connectivity
+        return _calculate_resource_currents(
+            spikes, weights, basis, dampening, connectivity, initial=initial
         )
-        return currents if initial is None else currents + initial
     ops = _load_ops()
 
     @tf.custom_gradient
@@ -359,17 +356,27 @@ def calculate_recurrent_csr_currents(
     )
 
 
-def _calculate_resource_currents(spikes, weights, basis, dampening, connectivity):
+def _calculate_resource_currents(
+    spikes, weights, basis, dampening, connectivity, initial=None
+):
     ops = load_resource_ops()
 
     @tf.custom_gradient
-    def fused(spike_values, weight_values, basis_values, dampening_value):
+    def fused(
+        spike_values, weight_values, basis_values, dampening_value, initial_values
+    ):
         active = _active_rows_or_pairs(spike_values, basis_values)
+        # Same gate as the tensor backend, so a replica running on the resource
+        # backend reaches the same specialized backward kernel.
+        use_pairs = pair_projection_applies(
+            spike_values, basis_values, connectivity
+        )
         currents = ops.v1_csr_forward_resource(
             spike_values,
             active,
             weight_values,
             basis_values,
+            initial_values,
             n_post=connectivity.n_post,
             resource_name=connectivity.resource_name,
         )
@@ -384,9 +391,26 @@ def _calculate_resource_currents(spikes, weights, basis, dampening, connectivity
                 n_post=connectivity.n_post,
                 n_edges=connectivity.n_edges,
                 resource_name=connectivity.resource_name,
+                pair_projected=use_pairs,
             )
-            return spike_grad, tf.cast(weight_grad, weight_values.dtype), None, None
+            # `initial` enters the output additively, so the upstream gradient
+            # passes straight through. With no accumulator the input is an
+            # empty sentinel and its gradient has to stay unset.
+            initial_grad = None if initial is None else current_grad
+            return (
+                spike_grad,
+                tf.cast(weight_grad, weight_values.dtype),
+                None,
+                None,
+                initial_grad,
+            )
 
         return currents, grad
 
-    return fused(spikes, weights, basis, tf.cast(dampening, spikes.dtype))
+    return fused(
+        spikes,
+        weights,
+        basis,
+        tf.cast(dampening, spikes.dtype),
+        empty_like_currents(basis) if initial is None else initial,
+    )

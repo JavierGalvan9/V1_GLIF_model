@@ -18,7 +18,7 @@ def freedman_diaconis(data, returnas="width"):
         If "width", return the estimated width for each histogram bin. 
         If "bins", return the number of bins suggested by rule.
     """
-    data = np.asarray(data, dtype=np.float_)
+    data = np.asarray(data, dtype=np.float64)
     IQR  = stats.iqr(data, rng=(25, 75), scale=1.0, nan_policy="omit")
     N    = data.size
     bw   = (2 * IQR) / np.power(N, 1/3)
@@ -50,7 +50,7 @@ def freedman_diaconis_bin_sizes(data, returnas="bins"):
         If returnas=="width", returns (width_x, width_y).
         If returnas=="bins", returns (bins_x, bins_y).
     """
-    data = np.asarray(data, dtype=np.float_)
+    data = np.asarray(data, dtype=np.float64)
     if data.ndim != 2 or data.shape[1] != 2:
         raise ValueError("Data should be a 2D array with shape (N, 2)")
 

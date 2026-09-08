@@ -47,7 +47,7 @@ constexpr int kThreads = V1_EXTERNAL_THREADS;
 template <typename T>
 __device__ __forceinline__ float4 LoadBkgFour(const T* values) {
   if constexpr (std::is_same<T, Eigen::half>::value) {
-    const uint2 packed = *reinterpret_cast<const uint2*>(values);
+    const ::uint2 packed = *reinterpret_cast<const ::uint2*>(values);
     const float2 low =
         __half22float2(*reinterpret_cast<const __half2*>(&packed.x));
     const float2 high =
@@ -62,10 +62,10 @@ __device__ __forceinline__ void StoreBkgFour(T* values, float4 result) {
   if constexpr (std::is_same<T, Eigen::half>::value) {
     const __half2 low = __floats2half2_rn(result.x, result.y);
     const __half2 high = __floats2half2_rn(result.z, result.w);
-    const uint2 packed =
+    const ::uint2 packed =
         make_uint2(*reinterpret_cast<const unsigned*>(&low),
                    *reinterpret_cast<const unsigned*>(&high));
-    *reinterpret_cast<uint2*>(values) = packed;
+    *reinterpret_cast<::uint2*>(values) = packed;
   } else {
     values[0] = result.x;
     values[1] = result.y;

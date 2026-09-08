@@ -162,3 +162,4 @@ forward_optimization_20260905/
 performance_figures/performance_figures.ipynb
 .gitignore
 Note_OSI_DSI_surrogate_loss (1).pdf
+Distributed_worker_logs/

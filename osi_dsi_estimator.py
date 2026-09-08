@@ -10,6 +10,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 # os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
+from v1_model_utils.cuda_caches import configure_cuda_caches
+configure_cuda_caches()  # before CUDA and XLA initialize
+
 import absl
 import copy
 import numpy as np
@@ -24,7 +27,7 @@ tf.get_logger().setLevel(logging.INFO)
 def main(_):
     flags = absl.app.flags.FLAGS
     # Allow for memory growth (also to observe memory consumption)
-    physical_devices = tf_utils.configure_gpu_memory_growth()
+    tf_utils.configure_gpu_memory_growth()
     # Display TensorFlow and CUDA runtime information for debugging and verification purposes.
     tf_utils.print_tensorflow_runtime_info()
 
@@ -50,7 +53,6 @@ def main(_):
     mixed_precision, dtype = tf_utils.configure_policy_and_dtype(flags.dtype)
 
     strategy = tf_utils.create_distribution_strategy(
-        physical_devices=physical_devices,
         single_gpu_strategy="mirrored",
     )
 

@@ -7,9 +7,9 @@ import numpy as np
 import tensorflow as tf
 
 from v1_model_utils.cuda_operator_cache import ensure_artifact
-from v1_model_utils.cuda_csr_external.build import BUILD_FLAGS, DIRECT_CSR
+from v1_model_utils.cuda_csr_external.build import build_flags_for, DIRECT_CSR
 from v1_model_utils.cuda_csr_recurrent.build import (
-    BUILD_FLAGS as RECURRENT_BUILD_FLAGS,
+    build_flags_for as recurrent_build_flags_for,
 )
 from v1_model_utils.cuda_csr_recurrent.wrapper import require_csr_ordered_weights
 from v1_model_utils.cuda_csr_resources import (
@@ -232,7 +232,7 @@ def _load_ops():
                 recurrent_directory / "csr_recurrent_ops.cu.cc",
             ),
             build_module="v1_model_utils.cuda_csr_recurrent.build",
-            build_flags=RECURRENT_BUILD_FLAGS,
+            build_flags=recurrent_build_flags_for,
         )
         directory = Path(__file__).parent
         library = ensure_artifact(
@@ -244,7 +244,7 @@ def _load_ops():
                 directory / "csr_external_grad_ops.cu.cc",
             ),
             build_module="v1_model_utils.cuda_csr_external.build",
-            build_flags=BUILD_FLAGS,
+            build_flags=build_flags_for,
         )
         _RECURRENT_OPS = tf.load_op_library(str(recurrent_library))
         _OPS = tf.load_op_library(str(library))
@@ -280,17 +280,15 @@ def calculate_external_csr_currents(
         raise ValueError("basis must be rank two")
     require_csr_ordered_weights(connectivity, "external connectivity")
     if connectivity.resource_name is not None:
-        # The resource operator has no `initial` input; add explicitly instead
-        # of dropping it.
-        currents = _calculate_resource_currents(
+        return _calculate_resource_currents(
             activity,
             weights,
             basis,
             connectivity,
+            initial=initial,
             compute_activity_gradient=compute_activity_gradient,
             compute_weight_gradient=compute_weight_gradient,
         )
-        return currents if initial is None else currents + initial
     recurrent_ops, external_ops = _load_ops()
 
     @tf.custom_gradient
@@ -405,19 +403,21 @@ def _calculate_resource_currents(
     basis,
     connectivity,
     *,
+    initial=None,
     compute_activity_gradient,
     compute_weight_gradient,
 ):
     ops = load_resource_ops()
 
     @tf.custom_gradient
-    def fused(values, master_weights, basis_values):
+    def fused(values, master_weights, basis_values, initial_values):
         active = _active_rows_or_pairs(values, basis_values)
         currents = ops.v1_csr_forward_resource(
             values,
             active,
             master_weights,
             basis_values,
+            initial_values,
             n_post=connectivity.n_post,
             resource_name=connectivity.resource_name,
         )
@@ -445,7 +445,10 @@ def _calculate_resource_currents(
                 weight_grad = tf.cast(weight_grad, master_weights.dtype)
             else:
                 weight_grad = None
-            return activity_grad, weight_grad, None
+            # `initial` is accumulated into the output, so its gradient is the
+            # upstream gradient unchanged; an absent accumulator keeps None.
+            initial_grad = None if initial is None else upstream
+            return activity_grad, weight_grad, None, initial_grad
 
         return currents, grad
 
@@ -453,4 +456,5 @@ def _calculate_resource_currents(
         tf.convert_to_tensor(activity),
         tf.convert_to_tensor(weights, tf.float32),
         tf.cast(basis, activity.dtype),
+        tf.zeros((0, 0), basis.dtype) if initial is None else initial,
     )

@@ -28,6 +28,8 @@ REGISTER_OP("V1CsrForwardResource")
     .Input("active_indices: int64")
     .Input("weights: float")
     .Input("basis: T")
+    // Currents to accumulate on top of, or an empty tensor to start from zero.
+    .Input("initial: T")
     .Output("currents: T")
     .SetShapeFn([](shape_inference::InferenceContext* context) {
       shape_inference::ShapeHandle spikes;
@@ -48,6 +50,9 @@ REGISTER_OP("V1CsrBackwardResource")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")
+    // Whether to run the compact pair-projected backward. The Python wrapper
+    // owns the decision so both connectivity backends share one gate.
+    .Attr("pair_projected: bool = false")
     .Input("spikes: T")
     .Input("current_grad: T")
     .Input("weights: float")

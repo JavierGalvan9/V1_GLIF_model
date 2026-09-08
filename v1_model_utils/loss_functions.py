@@ -9,10 +9,37 @@ try:
 except Exception:
     HAS_NUMBA = False
 
+import functools
 import os
 import sys
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
 import other_v1_utils
+
+
+def as_tensor(value):
+    """Return a plain tensor for TF/Keras variables, leaving anything else alone.
+
+    Keras 3 variables are not TF trace types, so handing one directly to a
+    `tf.function` makes TF fall back to `__array__` while tracing and raise
+    "numpy() is only available when eager execution is enabled". Reading the
+    variable first keeps the gradient path intact and gives `tf.function` a
+    tensor it can trace.
+    """
+    if isinstance(value, tf.Variable) or hasattr(value, "__tf_tensor__"):
+        return tf.convert_to_tensor(value)
+    return value
+
+
+def variable_safe(fn):
+    """Convert variable arguments to tensors before calling `fn`."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        args = tuple(as_tensor(a) for a in args)
+        kwargs = {k: as_tensor(v) for k, v in kwargs.items()}
+        return fn(*args, **kwargs)
+
+    return wrapper
 
 
 @njit(cache=True)
@@ -198,6 +225,7 @@ class MeanStiffRegularizer(Layer):
         self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
         self._target_mean_weights = tf.constant(initial_mean_weights, dtype=self._dtype)
 
+    @variable_safe
     @tf.function(jit_compile=True)
     def __call__(self, x):
 
@@ -272,6 +300,7 @@ class MeanStdStiffRegularizer(Layer):
         self.num_unique = tf.constant(self.num_unique, dtype=tf.int32)
         self._target_mean_weights = tf.constant(initial_mean_weights, dtype=self._dtype)
 
+    @variable_safe
     @tf.function(jit_compile=True)
     def __call__(self, x):
 
@@ -377,6 +406,7 @@ class StiffKLLogNormalRegularizer(Layer):
         self._target_log_mean = tf.constant(log_mean_all_np[valid_indices_np], dtype=self._dtype)
         self._target_log_std = tf.constant(log_std_all_np[valid_indices_np], dtype=self._dtype)
 
+    @variable_safe
     @tf.function(jit_compile=True)
     def __call__(self, x):
         if len(x.shape) > 1 and x.shape[1] == 1:
@@ -438,6 +468,7 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
         else:
             self._target_mean_weights = None
 
+    @variable_safe
     @tf.function(jit_compile=True)
     def __call__(self, x):
 
@@ -634,6 +665,7 @@ class EarthMoversDistanceRegularizer(Layer):
             name="emd_sorted_initial_values",
         )
 
+    @variable_safe
     @tf.function(jit_compile=False) # Do not use jit_compile=True. It uses a lot of memory.
     def __call__(self, x):
         if x.dtype != self._dtype:

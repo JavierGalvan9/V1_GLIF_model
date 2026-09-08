@@ -10,6 +10,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 # os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
+from v1_model_utils.cuda_caches import configure_cuda_caches
+configure_cuda_caches()  # before CUDA and XLA initialize
+
 from v1_model_utils import training_orchestration
 from v1_model_utils.training_bootstrap import TRAINING_LAUNCH_PLAN
 
@@ -233,7 +236,7 @@ def main(_):
         tf.config.set_visible_devices(all_gpus[flags.profile_gpu_index], "GPU")
         print(f"Profiling on physical GPU index {flags.profile_gpu_index}: {all_gpus[flags.profile_gpu_index]}")
     # Allow for memory growth (also to observe memory consumption)
-    physical_devices = tf_utils.configure_gpu_memory_growth()
+    tf_utils.configure_gpu_memory_growth()
     # Display TensorFlow and CUDA runtime information for debugging and verification purposes.
     tf_utils.print_tensorflow_runtime_info()
 
@@ -262,7 +265,6 @@ def main(_):
     mixed_precision, dtype = tf_utils.configure_policy_and_dtype(flags.dtype)
 
     strategy = tf_utils.create_distribution_strategy(
-        physical_devices=physical_devices,
         single_gpu_strategy=flags.single_gpu_strategy,
         multi_worker=_TRAINING_LAUNCH_PLAN.worker_index is not None,
     )
@@ -965,8 +967,11 @@ def main(_):
         grad = tape.gradient(loss_for_grad, model.trainable_variables)
         grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
         grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
-            grad, flags.global_clipnorm
+            grad, flags.global_clipnorm, optimizer=optimizer
         )
+        # Replicas must reach the same finite/non-finite verdict before the
+        # loss-scale optimizer branches on it.
+        grad = optimizer_utils.synchronize_gradient_finiteness(grad)
 
         # # The optimizer will aggregate the gradients across replicas automatically before applying them by default,
         # # so the losses have to be properly scaled to account for the number of replicas
@@ -1029,8 +1034,11 @@ def main(_):
         grad = tape.gradient(loss_for_grad, model.trainable_variables)
         grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
         grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
-            grad, flags.global_clipnorm
+            grad, flags.global_clipnorm, optimizer=optimizer
         )
+        # Replicas must reach the same finite/non-finite verdict before the
+        # loss-scale optimizer branches on it.
+        grad = optimizer_utils.synchronize_gradient_finiteness(grad)
 
         if flags.debug_gradients:
             tf.print("[Sequential] pre-clip global norm:", gradient_global_norm)
@@ -1407,17 +1415,23 @@ def main(_):
                 rate_loss += annulus_evoked_rate_regularizer(spikes, trim=True)
         return tf.cast(rate_loss, tf.float32)
 
-    def distributed_validation_rate_loss(spikes, spontaneous):
+    @tf.function
+    def distributed_validation_rate_loss_tensor(spikes, spontaneous):
         replica_losses = strategy.run(
             validation_rate_loss_tensor,
             args=(spikes, spontaneous),
         )
+        return strategy.reduce(
+            tf.distribute.ReduceOp.MEAN,
+            replica_losses,
+            axis=None,
+        )
+
+    def distributed_validation_rate_loss(spikes, spontaneous):
+        # `spontaneous` stays a Python bool so the branch above is traced away;
+        # it only costs one extra trace.
         return float(
-            strategy.reduce(
-                tf.distribute.ReduceOp.MEAN,
-                replica_losses,
-                axis=None,
-            ).numpy()
+            distributed_validation_rate_loss_tensor(spikes, spontaneous).numpy()
         )
 
     def run_gray_validation_repeats(repeats):
@@ -1468,7 +1482,7 @@ def main(_):
         protocol_spikes = []
         representative = None
         completed = 0
-        protocol_mask = np.asarray(core_mask, dtype=bool)
+        protocol_mask = None if core_mask is None else np.asarray(core_mask, dtype=bool)
 
         while completed < repeats:
             keep = min(global_batch_size, repeats - completed)
@@ -1557,8 +1571,9 @@ def main(_):
 
         evoked_rates = np.stack(evoked_rates_by_angle, axis=1)
         protocol_spikes = np.stack(evoked_spikes_by_angle, axis=1)
-        osi_mask = np.asarray(core_mask, dtype=bool)
-        osi_rates = evoked_rates[:, :, osi_mask] if osi_mask is not None else evoked_rates
+        # `core_mask` is None when every neuron already lies inside the core.
+        osi_mask = None if core_mask is None else np.asarray(core_mask, dtype=bool)
+        osi_rates = evoked_rates if osi_mask is None else evoked_rates[:, :, osi_mask]
         osi_dsi_df = calculate_OSI_DSI(
             osi_rates,
             network,
@@ -1817,6 +1832,18 @@ def main(_):
                 if start_time is not None:
                     benchmark_step_times.append(time() - start_time)
                     benchmark_losses.append(float(step_values[0]))
+                if flags.benchmark_output:
+                    # One line per update so a stalled distributed run shows
+                    # which step stopped making progress.
+                    elapsed = (
+                        f"{benchmark_step_times[-1]:.3f} s"
+                        if start_time is not None
+                        else "warm-up"
+                    )
+                    print(
+                        f"Benchmark step {step + 1}/{benchmark_total_steps}: {elapsed}",
+                        flush=True,
+                    )
                 # break
             except tf.errors.ResourceExhaustedError as e:
                 raise RuntimeError(
@@ -2060,6 +2087,17 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer(
         'distributed_worker_index', -1,
         'Internal worker marker used by the multi-GPU launcher.',
+    )
+    absl.app.flags.DEFINE_enum(
+        'distributed_mode',
+        'mirrored',
+        list(training_orchestration.DISTRIBUTED_MODES),
+        "How n_gpus > 1 is executed. 'mirrored' runs one process holding one "
+        "replica per GPU and all-reduces gradients with NCCL; the CSR "
+        "connectivity lives in a per-device operator resource, so nothing is "
+        "copied between GPUs. 'multi_worker' forks one process per GPU and "
+        "uses MultiWorkerMirroredStrategy, which builds the network once per "
+        "GPU; keep it for hosts where in-process NCCL cannot be used.",
     )
     absl.app.flags.DEFINE_integer('neurons', 0, '')  # 0 to take all neurons
     absl.app.flags.DEFINE_integer("n_input", 17400, "")

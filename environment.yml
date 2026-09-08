@@ -1,32 +1,38 @@
-name: tf215
+name: neuro_tf221
 channels:
-    - conda-forge
-    - kaeldai
-    - defaults
+  - conda-forge
+  - nodefaults
 dependencies:
-    - pandas
-    - matplotlib
-    - tensorboard
-    - numba
-    - numpy=1.23.5
-    - seaborn
-    - h5py
-    - joblib
-    - memory_profiler
-    - pympler
-    - scipy
-    - lz4
-    - bmtk
-    - pip
-    - pip:
-        - tensorflow[and-cuda]==2.15.0.post1
-        - tensorboard-plugin-profile
-
-
-# Optional dependencies that may be useful
-# Uncomment if needed
-# tensorboard>=2.15.0
-
-# CUDA requirements
-# The model is tested with CUDA 11.8 and cuDNN 8.8.0
-# Make sure your system has compatible CUDA drivers installed
+  # Host toolchain. CUDA runtime libraries used by TensorFlow are installed by
+  # the tensorflow[and-cuda] extra below; cuda-nvcc supplies the in-environment
+  # compiler used for the repository's custom operations.
+  - python=3.12.14
+  - pip=26.2.1
+  - cuda-nvcc=12.9.86
+  # TensorFlow loads the host libstdc++ before custom operators. GCC 11 keeps
+  # those operators compatible with the Ubuntu 22.04 host ABI.
+  - gxx_linux-64=11.4.0
+  - pip:
+      - tensorflow[and-cuda]==2.21.0
+      - keras==3.15.1
+      - tensorboard==2.21.0
+      - numpy==2.5.3
+      - numba==0.67.0
+      - llvmlite==0.49.0
+      - scipy==1.18.1
+      - pandas==3.0.5
+      - matplotlib==3.11.1
+      - seaborn==0.13.2
+      - statsmodels==0.15.0
+      - scikit-learn==1.9.0
+      - tqdm==4.70.0
+      # TensorFlow 2.21 requires h5py <3.15.
+      - h5py==3.14.0
+      - joblib==1.6.0
+      - memory-profiler==0.61.0
+      - pympler==1.1
+      - lz4==4.4.5
+      - bmtk==1.2.0
+      - tensorboard-plugin-profile==2.23.1
+      - pytest==9.1.1
+      - ruff==0.15.8

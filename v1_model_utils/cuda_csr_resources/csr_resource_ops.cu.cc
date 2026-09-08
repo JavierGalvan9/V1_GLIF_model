@@ -79,10 +79,18 @@ Status ValidateMetadata(const Tensor& post_ids, const Tensor& synapse_types,
     return errors::InvalidArgument("CSR metadata tensors must be rank one");
   }
   if (post_ids.NumElements() != synapse_types.NumElements() ||
-      post_ids.NumElements() != edge_ids.NumElements() ||
-      post_ids.NumElements() != pair_ids.NumElements()) {
+      post_ids.NumElements() != edge_ids.NumElements()) {
     return errors::InvalidArgument(
         "post_ids, synapse_types, and edge_ids must have equal lengths");
+  }
+  // The per-edge pair projection only feeds the backward kernels. A
+  // connectivity declared without a backward (the LGN and BKG inputs) uploads
+  // it empty, so accept that and let the backward ops reject a missing
+  // projection if one is ever requested.
+  if (pair_ids.NumElements() != 0 &&
+      pair_ids.NumElements() != post_ids.NumElements()) {
+    return errors::InvalidArgument(
+        "pair_ids must be empty or match the edge count");
   }
   if (row_splits.NumElements() < 2) {
     return errors::InvalidArgument("row_splits must contain at least two values");
@@ -182,6 +190,7 @@ class V1CsrForwardResourceOp : public OpKernel {
     const Tensor& active = context->input(1);
     const Tensor& weights = context->input(2);
     const Tensor& basis = context->input(3);
+    const Tensor& initial = context->input(4);
     const Tensor& posts = resource->post_ids;
     const Tensor& types = resource->synapse_types;
     const Tensor& rows = resource->row_splits;
@@ -194,14 +203,31 @@ class V1CsrForwardResourceOp : public OpKernel {
     OP_REQUIRES(context, active.dims() == 2 && active.dim_size(1) == 2,
                 errors::InvalidArgument("active_indices must be [N,2]"));
     Tensor* output;
-    OP_REQUIRES_OK(context, context->allocate_output(
-                                0,
-                                TensorShape({spikes.dim_size(0) * n_post_,
-                                             basis.dim_size(1)}),
-                                &output));
+    const TensorShape shape(
+        {spikes.dim_size(0) * n_post_, basis.dim_size(1)});
+    const bool accumulate = initial.NumElements() > 0;
+    OP_REQUIRES(
+        context, !accumulate || initial.shape() == shape,
+        errors::InvalidArgument("initial must be empty or match the output shape"));
     auto device = context->eigen_device<GPUDevice>();
-    cudaMemsetAsync(output->flat<T>().data(), 0,
-                    output->NumElements() * sizeof(T), device.stream());
+    if (accumulate) {
+      // The scatter is atomic, so it can land directly on the previous
+      // source's currents. Taking that buffer over removes a full pass over a
+      // [batch * n_post, n_basis] tensor per current source, which is the
+      // largest elementwise traffic in the step.
+      OP_REQUIRES_OK(context,
+                     context->forward_input_or_allocate_output({4}, 0, shape,
+                                                               &output));
+      if (output->flat<T>().data() != initial.flat<T>().data()) {
+        cudaMemcpyAsync(output->flat<T>().data(), initial.flat<T>().data(),
+                        output->NumElements() * sizeof(T),
+                        cudaMemcpyDeviceToDevice, device.stream());
+      }
+    } else {
+      OP_REQUIRES_OK(context, context->allocate_output(0, shape, &output));
+      cudaMemsetAsync(output->flat<T>().data(), 0,
+                      output->NumElements() * sizeof(T), device.stream());
+    }
     if (basis.dim_size(1) == 4) {
       OP_REQUIRES_OK(context, LaunchForward<T, W, 4>(
                                   context, spikes, active, weights, posts, types,
@@ -226,6 +252,8 @@ class V1CsrBackwardResourceOp : public OpKernel {
     OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
     OP_REQUIRES_OK(context, context->GetAttr("n_edges", &n_edges_));
     OP_REQUIRES_OK(context, context->GetAttr("resource_name", &resource_name_));
+    OP_REQUIRES_OK(
+        context, context->GetAttr("pair_projected", &pair_projected_));
   }
 
   void Compute(OpKernelContext* context) override {
@@ -262,11 +290,40 @@ class V1CsrBackwardResourceOp : public OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output(
                                 1, TensorShape({n_edges_}), &weight_grad));
     auto device = context->eigen_device<GPUDevice>();
+    // Rows with no edges are never visited, so the spike gradient is cleared.
+    // The weight gradient is not when the pair-projected kernel runs: it writes
+    // every CSR position exactly once, and clearing the whole edge vector first
+    // would only cost write bandwidth - the same reasoning as the tensor
+    // backend's dedicated pair-projected operator.
     cudaMemsetAsync(spike_grad->flat<T>().data(), 0,
                     spike_grad->NumElements() * sizeof(T), device.stream());
-    cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
-                    weight_grad->NumElements() * sizeof(float), device.stream());
-    if (basis.dim_size(1) == 4) {
+    if (!pair_projected_) {
+      cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
+                      weight_grad->NumElements() * sizeof(float),
+                      device.stream());
+    }
+    // Mirror the tensor backend's specialization. `pair_projection_applies` in
+    // cuda_csr_recurrent/wrapper.py gates the compact pair-projected backward
+    // on the same measured hot shape, and a resource-backed replica has to
+    // reach that kernel too or replicated training pays a large penalty at
+    // exactly the production batch size.
+    OP_REQUIRES(
+        context,
+        !pair_projected_ ||
+            (resource->pair_ids.NumElements() ==
+                 resource->post_ids.NumElements() &&
+             resource->pair_posts.NumElements() > 0),
+        errors::InvalidArgument(
+            "the pair-projected backward was requested, but this resource "
+            "holds no per-edge pair projection"));
+    if (pair_projected_ && basis.dim_size(1) == 4) {
+      OP_REQUIRES_OK(context, LaunchPairProjectedBackward<T, W, 4>(
+                                  context, spikes, current_grad, weights, posts,
+                                  types, rows, edges, nonempty, basis, dampening,
+                                  resource->pair_ids, resource->pair_posts,
+                                  resource->pair_types, n_post_, spike_grad,
+                                  weight_grad));
+    } else if (basis.dim_size(1) == 4) {
       OP_REQUIRES_OK(context, LaunchBackward<T, W, 4>(
                                   context, spikes, current_grad, weights, posts,
                                   types, rows, edges, nonempty, basis, dampening,
@@ -283,6 +340,7 @@ class V1CsrBackwardResourceOp : public OpKernel {
   int n_post_;
   int n_edges_;
   string resource_name_;
+  bool pair_projected_ = false;
 };
 
 template <typename T>
@@ -323,6 +381,11 @@ class ExternalCsrWeightBackwardResourceOp : public OpKernel {
                     current_grad.dim_size(0) == activity.dim_size(0) * n_post_ &&
                     current_grad.dim_size(1) == basis.dim_size(1),
                 errors::InvalidArgument("current_grad has an incompatible shape"));
+    OP_REQUIRES(context, resource->pair_ids.NumElements() ==
+                             resource->post_ids.NumElements(),
+                errors::InvalidArgument(
+                    "this resource was initialized without the per-edge pair "
+                    "projection, so its backward cannot run"));
     Tensor* weight_grad;
     OP_REQUIRES_OK(context, context->allocate_output(
                                 0, TensorShape({n_edges_}), &weight_grad));
@@ -385,6 +448,11 @@ class ExternalCsrActivityBackwardResourceOp : public OpKernel {
                 weights.NumElements() == resource->post_ids.NumElements(),
                 errors::InvalidArgument(
                     "weights and resource metadata size mismatch"));
+    OP_REQUIRES(context, resource->pair_ids.NumElements() ==
+                             resource->post_ids.NumElements(),
+                errors::InvalidArgument(
+                    "this resource was initialized without the per-edge pair "
+                    "projection, so its backward cannot run"));
     const int64_t batch = current_grad.dim_size(0) / n_post_;
     const int64_t n_pre = resource->row_splits.NumElements() - 1;
     Tensor* activity_grad;

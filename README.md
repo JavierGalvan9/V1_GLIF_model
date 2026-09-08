@@ -42,8 +42,9 @@ This model simulates a cortical column in mouse V1, processing LGN input togethe
 
 ### Prerequisites
 
-- Python 3.11+
-- CUDA 11.8 and cuDNN 8.8.0 (for GPU acceleration)
+- Conda and an NVIDIA driver compatible with CUDA 12.9
+- The environment supplies Python 3.12, CUDA 12.9, and the matching compiler
+  and runtime libraries; no system CUDA toolkit is required
 - LaTeX (optional, for high-quality plot rendering)
 
 ### Installation
@@ -57,8 +58,35 @@ cd V1_GLIF_model
 2. Create the conda environment from `environment.yml`:
 ```bash
 conda env create -f environment.yml
-conda activate tf215
+conda activate neuro_tf221
 ```
+
+`environment.yml` pins all direct dependencies. After a validated environment
+update, regenerate the complete platform-specific lock with
+`conda env export -n neuro_tf221 | sed '/^prefix: /d' > environment.lock.yml`.
+
+Record the active driver, GPUs, TensorFlow CUDA/cuDNN build, compiler, and core
+Python package versions with:
+
+```bash
+python runtime_diagnostics.py
+```
+The lock records all
+resolved Conda and pip dependencies for exact Linux reproduction; use the
+portable `environment.yml` when resolving for a different platform.
+
+Confirm the active TensorFlow and CUDA toolchain before submitting GPU jobs:
+
+```bash
+python -c "import ctypes.util, keras, tensorflow as tf; print('TensorFlow', tf.__version__); print('Keras', keras.__version__); print(tf.sysconfig.get_build_info()); print('cudart', ctypes.util.find_library('cudart')); print(tf.config.list_physical_devices('GPU'))"
+nvcc --version
+nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv
+```
+
+TensorFlow's pip CUDA packages provide the runtime libraries while Conda's
+`cuda-nvcc` package provides the custom-operation compiler. The host driver
+must support the environment's CUDA 12.9 runtime. RTX 3090 (`sm86`), L40S
+(`sm89`), and RTX PRO 6000 Blackwell (`sm120`) are the qualification targets.
 
 3. Make the SONATA network available as `GLIF_network/` in the repository root, or point `--data_dir` to the network directory you built or downloaded by following the main repo instructions.
    The network should contain the usual SONATA subdirectories such as `network/` and `components/`.
@@ -104,22 +132,37 @@ python multi_training.py --data_dir GLIF_network \
     --train_recurrent --gradient_checkpointing
 ```
 
-`multi_training.py` is also the production multi-GPU entry point. It starts one
-TensorFlow worker per visible GPU before CUDA is initialized. Batch flags remain
-per-replica for backward compatibility:
+`multi_training.py` is also the production multi-GPU entry point. It runs one
+process holding one replica per visible GPU and all-reduces gradients with
+NCCL. Batch flags remain per-replica for backward compatibility:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python multi_training.py --n_gpus 2 \
-    --batch_size 4 --grating_batch_size 2 --gray_batch_size 2 \
+    --batch_size 32 --grating_batch_size 16 --gray_batch_size 16 \
     --data_dir GLIF_network --neurons 0 --seq_len 500 \
     --train_recurrent --train_noise --gradient_checkpointing
 ```
 
-This example has global batch 8. The equivalent convenience form is
-`--n_gpus 2 --global_batch_size 8`; the grating/gray ratio must resolve to
+This example has global batch 64. The equivalent convenience form is
+`--n_gpus 2 --global_batch_size 64`; the grating/gray ratio must resolve to
 integer per-replica batches. Multi-GPU CUDA training requires GPUs with the
-same compute capability and uses NCCL `MultiWorkerMirroredStrategy`. Only the
-chief writes checkpoints, TensorBoard data, plots, and final artifacts.
+same compute capability. Only the chief replica writes checkpoints, TensorBoard
+data, plots, and final artifacts.
+
+**Scale the global batch with the GPU count, not the other way round.** The
+recurrent operators are specialized for a static batch of 32 per replica, and
+step time is nearly flat in batch size below 16, so two GPUs sharing a *fixed*
+global batch of 32 are slower than one GPU doing all of it. On two RTX PRO 6000
+GPUs at 32 per replica the 66,652-neuron model reaches 34.3 samples/s against
+19.1 on one GPU, with balanced 17.3 GiB per GPU.
+
+`--distributed_mode` selects how `--n_gpus > 1` executes: `mirrored` (default)
+uses one process, and `multi_worker` forks one process per GPU with
+`MultiWorkerMirroredStrategy`. Multi-worker measured a few percent faster per
+step but builds the network once per GPU in host memory; its non-chief workers
+write to `Distributed_worker_logs/worker_<n>.log`. See
+`distributed_training_investigation/REPORT.md` for the measurements behind both
+of these.
 
 The CUDA operators are built automatically when the architecture-specific
 cache is missing or stale. Caches for A100 (`sm80`), RTX 3090 (`sm86`), L40S /
@@ -146,8 +189,10 @@ Parameters:
   temporal checkpoint boundaries in a bit-packed `int32` representation. This
   is opt-in while its end-to-end memory and runtime trade-off is evaluated.
 - `--n_gpus`: Number of already-visible GPUs to use (default: `1`).
-- `--global_batch_size`: Optional global batch divided evenly across workers;
+- `--global_batch_size`: Optional global batch divided evenly across replicas;
   when zero, the existing per-replica batch flags are used.
+- `--distributed_mode`: `mirrored` (default, one process) or `multi_worker`
+  (one process per GPU) when `--n_gpus > 1`.
 
 For the 203,816-neuron model at sequence length 500 and batch size 1, chunk
 sizes 25, 50, and 100 measured approximately 17.9, 26.2, and 43.6 GiB of peak
@@ -183,7 +228,8 @@ kernel supports `surrogate_gradient="triangular"`, `"gaussian"`, and
 `"slayer"`; the legacy `pseudo_gauss=True` option selects Gaussian.
 
 Compiled CUDA operators are stored outside the repository in an ABI- and
-architecture-keyed cache. Set `V1_CUDA_CACHE_DIR` to override the default
+architecture-keyed cache. They are built with `nvcc` and the C++ compiler from
+the active Conda environment. Set `V1_CUDA_CACHE_DIR` to override the default
 `~/.cache/v1_glif/cuda` location. Missing or stale operators rebuild
 automatically; intermediate object files are discarded after linking.
 
@@ -230,9 +276,10 @@ The `Neuropixels_data` directory contains experimental recordings that the model
 ## Dependencies
 
 The model requires specific package versions. Key dependencies include:
-- TensorFlow 2.15.0
-- NumPy 1.23.5
-- BMTK 1.0.8+ (Brain Modeling Toolkit)
+- Python 3.12
+- TensorFlow 2.21.0 and Keras 3
+- NumPy 2.5.3
+- BMTK 1.2.0 (Brain Modeling Toolkit)
 - See `environment.yml` for the complete list
 
 ## Citations

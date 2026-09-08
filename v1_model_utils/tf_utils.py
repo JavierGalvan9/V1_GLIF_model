@@ -112,16 +112,24 @@ def configure_policy_and_dtype(dtype_name):
 
 
 def create_distribution_strategy(
-    physical_devices=None,
+    devices=None,
     single_gpu_strategy="mirrored",
     multi_worker=False,
 ):
     """
     Create a distribution strategy using the common project defaults.
 
-    - Multi-worker Ampere: one process per GPU using NCCL.
-    - Multi-GPU Blackwell: one process using hierarchical copy as the
-      TensorFlow 2.15 compatibility fallback.
+    ``devices`` is the set of GPUs replicas may be placed on, defaulting to the
+    visible ones. Visibility is what matters, not the physical device list:
+    ``--profile_gpu_index`` hides every GPU but one without shortening that
+    list.
+
+    - Multi-GPU: one process, ``MirroredStrategy`` over NCCL all-reduce. The
+      connectivity metadata lives in a per-device operator resource (see
+      ``cuda_csr_resources``), so replicas no longer copy it between GPUs and
+      a single process is both the fastest and the most balanced option.
+    - Multi-worker: one process per GPU, kept for hosts where in-process NCCL
+      cannot be used. Requested explicitly, never selected automatically.
     - Single-GPU: MirroredStrategy (default) or OneDeviceStrategy.
     - CPU-only: OneDeviceStrategy('/cpu:0').
     """
@@ -133,31 +141,22 @@ def create_distribution_strategy(
             communication_options=communication_options
         )
 
-    if physical_devices is None:
-        physical_devices = tf.config.list_physical_devices("GPU")
-    visible_devices = tf.config.get_visible_devices("GPU") or physical_devices
-
-    if len(visible_devices) > 1:
-        device_details = tf.config.experimental.get_device_details(
-            physical_devices[0]
-        )
-        compute_capability = device_details.get("compute_capability", ())
-        if not compute_capability:
-            raise RuntimeError(
-                "Could not determine GPU compute capability for multi-GPU "
-                "strategy selection."
-            )
-        if int(compute_capability[0]) >= 10:
-            # Temporary fallback for Blackwell with TensorFlow 2.15. Replace
-            # with NCCL after the TensorFlow 2.21 CUDA stack is validated.
-            return tf.distribute.MirroredStrategy(
-                cross_device_ops=tf.distribute.HierarchicalCopyAllReduce()
-            )
-        raise RuntimeError(
-            "Pre-Blackwell multi-GPU training must use one worker per GPU."
+    if devices is None:
+        devices = tf.config.get_visible_devices("GPU") or tf.config.list_physical_devices(
+            "GPU"
         )
 
-    if len(visible_devices) == 1:
+    if len(devices) > 1:
+        # Replicas share one graph, so the CSR connectivity has to be resolved
+        # per device rather than placed once and copied. Declaring it here -
+        # before any entry point builds its model - keeps the strategy and the
+        # connectivity backend from disagreeing. An explicit setting wins.
+        os.environ.setdefault("V1_CSR_RESOURCE_MODE", "1")
+        return tf.distribute.MirroredStrategy(
+            cross_device_ops=tf.distribute.NcclAllReduce()
+        )
+
+    if len(devices) == 1:
         if single_gpu_strategy == "one_device":
             # dont use this strategy since single device gpu increases largely the memory required to allocate the pre_ind_table tensor on GPU memory, which is already large and can cause OOM errors. MirroredStrategy with one GPU does not have this issue (it places it in the CPU) and is more memory efficient.
             return tf.distribute.OneDeviceStrategy(device="/gpu:0")
@@ -459,10 +458,69 @@ def rebase_checkpointed_layout(model, to_runtime, optimizer=None):
         )
 
 
-def restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer=None):
+def restore_and_rebase(
+    checkpoint, checkpoint_directory, model, optimizer=None, require_optimizer=False
+):
     """Restore an original-order checkpoint into a possibly relabelled model."""
-    checkpoint.restore(checkpoint_directory).expect_partial()  # .assert_consumed()
+    status = checkpoint.restore(checkpoint_directory)
+    if require_optimizer:
+        legacy_optimizer_restored = _restore_keras2_optimizer_slots(
+            checkpoint_directory, optimizer
+        )
+        try:
+            if legacy_optimizer_restored:
+                status.assert_nontrivial_match()
+                status.expect_partial()
+            else:
+                status.assert_existing_objects_matched()
+        except AssertionError as error:
+            raise ValueError(
+                "The checkpoint optimizer state is incomplete or incompatible with "
+                "the current TensorFlow/Keras optimizer. Refusing to silently reset "
+                "requested training state."
+            ) from error
+    else:
+        status.expect_partial()
     rebase_checkpointed_layout(model, to_runtime=True, optimizer=optimizer)
+
+
+def _restore_keras2_optimizer_slots(checkpoint_directory, optimizer):
+    """Map Keras 2's positional optimizer slots onto Keras 3 variables."""
+    if optimizer is None:
+        return False
+    reader = tf.train.load_checkpoint(checkpoint_directory)
+    keys = reader.get_variable_to_shape_map()
+    prefix = "optimizer/_variables/"
+    legacy_keys = sorted(
+        (
+            key
+            for key in keys
+            if key.startswith(prefix) and key.endswith("/.ATTRIBUTES/VARIABLE_VALUE")
+        ),
+        key=lambda key: int(key[len(prefix):].split("/", 1)[0]),
+    )
+    if not legacy_keys:
+        return False
+    variables = list(optimizer.variables)
+    slots = [
+        variable
+        for variable in variables
+        if variable is not optimizer.iterations
+        and "learning_rate" not in variable.name
+    ]
+    if len(legacy_keys) != len(slots):
+        raise ValueError(
+            "The TensorFlow 2.15 checkpoint contains "
+            f"{len(legacy_keys)} optimizer slots, but Keras 3 created {len(slots)}."
+        )
+    for key, variable in zip(legacy_keys, slots):
+        value = reader.get_tensor(key)
+        if tuple(value.shape) != tuple(variable.shape):
+            raise ValueError(
+                f"Checkpoint slot {key} has shape {value.shape}, expected {variable.shape}."
+            )
+        variable.assign(value)
+    return True
 
 
 def restore_training_checkpoint(
@@ -507,7 +565,10 @@ def restore_training_checkpoint(
             print('Checkpoint restored with a new optimizer.')
         else:
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-            restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
+            restore_and_rebase(
+                checkpoint, checkpoint_directory, model, optimizer,
+                require_optimizer=True,
+            )
             print('Checkpoint restored!')
         return checkpoint, optimizer, checkpoint_directory
 
@@ -536,7 +597,10 @@ def restore_training_checkpoint(
             print('Checkpoint restored with a new optimizer.')
         else:
             checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-            restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
+            restore_and_rebase(
+                checkpoint, checkpoint_directory, model, optimizer,
+                require_optimizer=True,
+            )
             print('Checkpoint restored!')
         return checkpoint, optimizer, checkpoint_directory
 
