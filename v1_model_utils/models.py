@@ -2078,6 +2078,39 @@ def _normalize_v1_rnn_outputs(rsnn_layer, outputs):
     return ((spikes, voltage), *flat[1:])
 
 
+# Unfused, the pack/unpack chain materialises int32 intermediates up to 31x the
+# packed size, costing ~26 ms per step at 203,816 neurons. It is pure elementwise
+# work plus a trailing reduce, which XLA fuses into a single kernel, bringing
+# that to ~1 ms (21-29x across runs). jit_compile is scoped to these two
+# functions rather than enabled globally because autoclustering the whole graph
+# breaks the Ragged/Sparse custom-gradient path (see tf_utils.py).
+#
+# They are module-level rather than decorated methods so that ``self`` stays out
+# of the traced signature: tf.function keys its trace cache on the instance, so
+# decorating the methods would recompile once per runner and keep each instance
+# alive for as long as its trace is cached.
+@tf.function(jit_compile=True)
+def _pack_spike_words(spikes, word_bits):
+    """Pack a [batch, width] binary state into positive int32 words."""
+    padding = (-spikes.shape[-1]) % word_bits
+    bits = tf.cast(spikes, tf.int32)
+    if padding:
+        bits = tf.pad(bits, ((0, 0), (0, padding)))
+    bits = tf.reshape(bits, (tf.shape(bits)[0], -1, word_bits))
+    shifts = tf.range(word_bits, dtype=tf.int32)
+    return tf.reduce_sum(tf.bitwise.left_shift(bits, shifts), axis=-1)
+
+
+@tf.function(jit_compile=True)
+def _unpack_spike_words(packed, width, dtype, word_bits):
+    """Restore the first ``width`` binary values from positive int32 words."""
+    shifts = tf.range(word_bits, dtype=tf.int32)
+    bits = tf.bitwise.bitwise_and(
+        tf.bitwise.right_shift(packed[..., tf.newaxis], shifts), 1
+    )
+    return tf.cast(tf.reshape(bits, (tf.shape(packed)[0], -1))[:, :width], dtype)
+
+
 class SegmentedRecomputeRunner:
     """Run an RNN in recomputed temporal chunks while preserving exact BPTT."""
 
@@ -2134,22 +2167,13 @@ class SegmentedRecomputeRunner:
                 "Packed spike checkpoints require a rank-two state with a "
                 "static width."
             )
-        word_bits = self._PACKED_SPIKES_PER_WORD
-        padding = (-width) % word_bits
-        bits = tf.cast(spikes, tf.int32)
-        if padding:
-            bits = tf.pad(bits, ((0, 0), (0, padding)))
-        bits = tf.reshape(bits, (tf.shape(bits)[0], -1, word_bits))
-        shifts = tf.range(word_bits, dtype=tf.int32)
-        return tf.reduce_sum(tf.bitwise.left_shift(bits, shifts), axis=-1)
+        return _pack_spike_words(spikes, self._PACKED_SPIKES_PER_WORD)
 
     def _unpack_spikes(self, packed, width, dtype):
         """Restore binary spike values from positive int32 words."""
-        shifts = tf.range(self._PACKED_SPIKES_PER_WORD, dtype=tf.int32)
-        bits = tf.bitwise.bitwise_and(
-            tf.bitwise.right_shift(packed[..., tf.newaxis], shifts), 1
+        return _unpack_spike_words(
+            packed, width, dtype, self._PACKED_SPIKES_PER_WORD
         )
-        return tf.cast(tf.reshape(bits, (tf.shape(packed)[0], -1))[:, :width], dtype)
 
     def _run_chunk(self, inputs, *state):
         outputs = self.core_model([inputs, *state])
