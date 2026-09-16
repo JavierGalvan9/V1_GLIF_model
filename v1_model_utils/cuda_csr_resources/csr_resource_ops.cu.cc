@@ -316,13 +316,33 @@ class V1CsrBackwardResourceOp : public OpKernel {
         errors::InvalidArgument(
             "the pair-projected backward was requested, but this resource "
             "holds no per-edge pair projection"));
-    if (pair_projected_ && basis.dim_size(1) == 4) {
-      OP_REQUIRES_OK(context, LaunchPairProjectedBackward<T, W, 4>(
-                                  context, spikes, current_grad, weights, posts,
-                                  types, rows, edges, nonempty, basis, dampening,
-                                  resource->pair_ids, resource->pair_posts,
-                                  resource->pair_types, n_post_, spike_grad,
-                                  weight_grad));
+    if (pair_projected_) {
+      const int64_t batch = spikes.dim_size(0);
+      const bool specialized =
+          basis.dim_size(1) == 4 && batch <= 512 &&
+          (batch & (batch - 1)) == 0;
+      if (specialized) {
+        OP_REQUIRES_OK(context, LaunchPairProjectedBackward<T, W, 4>(
+                                    context, spikes, current_grad, weights,
+                                    posts, types, rows, edges, nonempty, basis,
+                                    dampening, resource->pair_ids,
+                                    resource->pair_posts, resource->pair_types,
+                                    n_post_, spike_grad, weight_grad));
+      } else if (basis.dim_size(1) == 4) {
+        OP_REQUIRES_OK(context, LaunchGenericPairProjectedBackward<T, W, 4>(
+                                    context, spikes, current_grad, weights,
+                                    rows, edges, nonempty, basis, dampening,
+                                    resource->pair_ids, resource->pair_posts,
+                                    resource->pair_types, n_post_, spike_grad,
+                                    weight_grad));
+      } else {
+        OP_REQUIRES_OK(context, LaunchGenericPairProjectedBackward<T, W, 0>(
+                                    context, spikes, current_grad, weights,
+                                    rows, edges, nonempty, basis, dampening,
+                                    resource->pair_ids, resource->pair_posts,
+                                    resource->pair_types, n_post_, spike_grad,
+                                    weight_grad));
+      }
     } else if (basis.dim_size(1) == 4) {
       OP_REQUIRES_OK(context, LaunchBackward<T, W, 4>(
                                   context, spikes, current_grad, weights, posts,
@@ -390,9 +410,13 @@ class ExternalCsrWeightBackwardResourceOp : public OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output(
                                 0, TensorShape({n_edges_}), &weight_grad));
     auto device = context->eigen_device<GPUDevice>();
-    cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
-                    weight_grad->NumElements() * sizeof(float),
-                    device.stream());
+    if (!external_resource_kernel::UsesCompactWeightPath<T>(
+            activity.dim_size(0), basis.dim_size(1),
+            resource->pair_posts.NumElements())) {
+      cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
+                      weight_grad->NumElements() * sizeof(float),
+                      device.stream());
+    }
     if (basis.dim_size(1) == 4) {
       OP_REQUIRES_OK(context,
                      external_resource_kernel::LaunchWeightBackward<T, 4>(

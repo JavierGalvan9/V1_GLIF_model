@@ -1,18 +1,18 @@
-"""Public-interface regression tests for recurrent CUDA currents."""
+"""Public-interface regression tests for external CUDA currents."""
 
 import numpy as np
 import pytest
 import tensorflow as tf
 
-from v1_model_utils.cuda_csr_recurrent.wrapper import (
+from v1_model_utils.cuda_csr_external.wrapper import (
     build_csr_connectivity,
-    calculate_recurrent_csr_currents,
+    calculate_external_csr_currents,
 )
 
 
 @pytest.mark.parametrize("batch,n_basis", ((32, 4), (32, 3), (33, 5)))
-def test_pair_projection_matches_independent_reference(batch, n_basis):
-    rng = np.random.default_rng(20260902)
+def test_external_gradients_match_independent_reference(batch, n_basis):
+    rng = np.random.default_rng(20260915 + batch + n_basis)
     n_pre, n_post, n_types = 7, 11, 3
     pre = np.repeat(np.arange(n_pre), (19, 2, 33, 1, 17, 5, 24))
     post = rng.integers(0, n_post, pre.size, dtype=np.int64)
@@ -28,24 +28,21 @@ def test_pair_projection_matches_independent_reference(batch, n_basis):
         weights_csr_ordered=True,
     )
 
-    spikes_np = (rng.random((batch, n_pre)) < 0.25).astype(np.float16)
+    activity_np = (rng.random((batch, n_pre)) < 0.2).astype(np.float16)
     weights_np = rng.normal(size=pre.size).astype(np.float32)
     basis_np = rng.normal(size=(n_types, n_basis)).astype(np.float16)
     upstream_np = rng.normal(size=(batch, n_post, n_basis)).astype(np.float16)
-    dampening = np.float16(0.1)
-
-    spikes = tf.Variable(spikes_np)
+    activity = tf.Variable(activity_np)
     weights = tf.Variable(weights_np)
     basis = tf.constant(basis_np)
     with tf.GradientTape() as tape:
-        currents = calculate_recurrent_csr_currents(
-            spikes, weights, basis, dampening, connectivity
+        currents = calculate_external_csr_currents(
+            activity, weights, basis, connectivity
         )
         loss = tf.reduce_sum(currents * tf.reshape(upstream_np, currents.shape))
-    spike_grad, weight_grad = tape.gradient(loss, (spikes, weights))
+    activity_grad, weight_grad = tape.gradient(loss, (activity, weights))
 
-    expected_currents = np.zeros((batch, n_post, n_basis), dtype=np.float32)
-    expected_spike_grad = np.zeros((batch, n_pre), dtype=np.float32)
+    expected_activity_grad = np.zeros((batch, n_pre), dtype=np.float32)
     expected_weight_grad = np.zeros(pre.size, dtype=np.float32)
     for edge, (target, source) in enumerate(indices):
         projection = np.sum(
@@ -53,24 +50,16 @@ def test_pair_projection_matches_independent_reference(batch, n_basis):
             * basis_np[synapse_types[edge]].astype(np.float32),
             axis=1,
         )
-        expected_currents[:, target] += (
-            spikes_np[:, source, None].astype(np.float32)
-            * weights_np[edge]
-            * basis_np[synapse_types[edge]].astype(np.float32)
-        )
-        expected_spike_grad[:, source] += projection * weights_np[edge] * dampening
+        expected_activity_grad[:, source] += projection * weights_np[edge]
         expected_weight_grad[edge] = np.sum(
-            projection * spikes_np[:, source].astype(np.float32)
+            projection * activity_np[:, source].astype(np.float32)
         )
 
     np.testing.assert_allclose(
-        currents.numpy().reshape(batch, n_post, n_basis),
-        expected_currents.astype(np.float16),
+        activity_grad.numpy(),
+        expected_activity_grad.astype(np.float16),
         rtol=3e-3,
         atol=1e-2,
-    )
-    np.testing.assert_allclose(
-        spike_grad.numpy(), expected_spike_grad.astype(np.float16), rtol=3e-3, atol=1e-2
     )
     np.testing.assert_allclose(
         weight_grad.numpy(), expected_weight_grad, rtol=3e-3, atol=1e-2

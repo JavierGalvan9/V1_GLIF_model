@@ -257,7 +257,7 @@ def main():
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
     # Define the job submission commands for the training and evaluation scripts
-    cpu_count = 4 if flags.low_memory_gpu else 16 * flags.n_gpus
+    cpu_count = 4 if flags.low_memory_gpu else 8 * flags.n_gpus # even when using just 2 cpus the performance with respect to 8 degrades in 2-3% speed
     training_commands = [
         "run", "-g", str(flags.n_gpus), "-G", flags.gpu_type,
         "-c", str(cpu_count), "-m", "80", "-t", flags.walltime,

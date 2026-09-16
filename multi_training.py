@@ -281,7 +281,7 @@ def main(_):
     global_gray_batch_size = gray_batch_size * strategy.num_replicas_in_sync
     print(f'Per replica batch size: {per_replica_batch_size}')
     if flags.sequential_stimuli:
-        print('Sequential stimuli updates enabled (memory friendly).')
+        print('Sequential stimuli substeps enabled (memory friendly, gradients accumulated).')
         print(f'Model batch size: {real_batch_size}')
     else:
         print(f'Real batch size (evoked+spont): {real_batch_size}')
@@ -414,6 +414,16 @@ def main(_):
             optimizer,
             learning_rate,
             mixed_precision_module=mixed_precision,
+        )
+
+        # Sequential mode splits a step into a grating and a gray substep whose
+        # gradients belong to the same update, so the leading substep parks its
+        # gradients here. The combined step needs no buffer: it backpropagates
+        # both stimuli at once.
+        gradient_accumulator = (
+            optimizer_utils.GradientAccumulator(model.trainable_variables)
+            if flags.sequential_stimuli
+            else None
         )
 
         model_variables_dict['Best'] = {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
@@ -1012,6 +1022,11 @@ def main(_):
             return total_loss, mean_aux, _out
 
     def train_step_sequential(x, y, x_spontaneous, state_variables, trim, spontaneous=False, return_sequences=False):
+        # The gray-screen substep closes the step. `spontaneous` arrives as a
+        # Python bool - the step is traced once per substep - so which substep
+        # applies the update is settled while tracing, and the accumulation
+        # needs no graph-level branch.
+        closes_step = bool(spontaneous)
         spontaneous = tf.cast(spontaneous, tf.bool)
         metric_weight = tf.cast(0.5, tf.float32)
         _x = tf.cond(spontaneous, lambda: x_spontaneous, lambda: x)
@@ -1032,21 +1047,29 @@ def main(_):
             loss_for_grad = optimizer_utils.scale_loss_for_optimizer(optimizer, _loss)
 
         grad = tape.gradient(loss_for_grad, model.trainable_variables)
-        grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
-        grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
-            grad, flags.global_clipnorm, optimizer=optimizer
-        )
-        # Replicas must reach the same finite/non-finite verdict before the
-        # loss-scale optimizer branches on it.
-        grad = optimizer_utils.synchronize_gradient_finiteness(grad)
 
-        if flags.debug_gradients:
-            tf.print("[Sequential] pre-clip global norm:", gradient_global_norm)
-            grad = _print_and_check_gradients(
-                grad, "[Sequential]", spontaneous=spontaneous
+        if closes_step:
+            # Both halves of the step have now contributed, so the sum of their
+            # gradients - the gradient train_step_combined computes in one
+            # backward pass - updates the weights once.
+            grad = gradient_accumulator.drain(grad)
+            grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
+            grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
+                grad, flags.global_clipnorm, optimizer=optimizer
             )
+            # Replicas must reach the same finite/non-finite verdict before the
+            # loss-scale optimizer branches on it.
+            grad = optimizer_utils.synchronize_gradient_finiteness(grad)
 
-        optimizer.apply_gradients(zip(grad, model.trainable_variables))
+            if flags.debug_gradients:
+                tf.print("[Sequential] pre-clip global norm:", gradient_global_norm)
+                grad = _print_and_check_gradients(
+                    grad, "[Sequential]", spontaneous=spontaneous
+                )
+
+            optimizer.apply_gradients(zip(grad, model.trainable_variables))
+        else:
+            gradient_accumulator.accumulate(grad)
 
         train_loss.update_state(
             _loss * strategy.num_replicas_in_sync, sample_weight=metric_weight
@@ -2202,7 +2225,7 @@ if __name__ == '__main__':
         "Detach the spike from the after-spike-current increment gradient path.",
     )
     absl.app.flags.DEFINE_boolean(
-        "sequential_stimuli", False, "Run evoked and spontaneous stimuli sequentially but convergence would be slower and worse (memory friendly; intended for batch_size=1).")
+        "sequential_stimuli", False, "Roll the evoked and spontaneous stimuli out in separate substeps and accumulate their gradients into a single optimizer update (memory friendly; equivalent update to the single-shot step).")
     absl.app.flags.DEFINE_boolean(
         "profile_train_step",
         False,

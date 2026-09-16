@@ -73,7 +73,7 @@ def enable_tensorflow_optimizations(enabled=True):
             # "disable_model_pruning": False, # needs to be false to allow pruning of training subgraph
             "min_graph_nodes": 0, # good to set to 0 to allow optimization of small subgraphs, which is important for our model with many small ops
         })
-        ## tf.config.optimizer.set_jit("autoclustering") # does not work here because of Ragged/Sparse custom-gradient path
+        ## tf.config.optimizer.set_jit("autoclustering") # does not work here because of Ragged/Sparse custom-gradient path. eitherwise its a regression
 
 
 def configure_policy_and_dtype(dtype_name):

@@ -19,19 +19,13 @@ from v1_model_utils.cuda_csr_resources import (
 )
 
 
-SPECIALIZED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+SPECIALIZED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 _OPS = None
 _RECURRENT_OPS = None
 
 
 def _active_rows_or_pairs(values, basis_values):
-    """Use grouped CSR rows only for the measured static fast paths."""
-    if values.shape[0] in (1, 2, 4, 8, 16, 32, 64, 128) and basis_values.shape[-1] == 4:
-        row_ids = tf.cast(
-            tf.where(tf.reduce_any(values != tf.cast(0, values.dtype), axis=0))[:, 0],
-            tf.int64,
-        )
-        return tf.stack((tf.zeros_like(row_ids), row_ids), axis=1)
+    """Return active ``(batch, presynaptic row)`` pairs."""
     return tf.where(values != tf.cast(0, values.dtype))
 
 

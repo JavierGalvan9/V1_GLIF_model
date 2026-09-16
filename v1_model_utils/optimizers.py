@@ -17,6 +17,74 @@ def _uses_keras_3():
 # from tensorflow.python.util.tf_export import keras_export
 
 
+class GradientAccumulator:
+    """Holds a step's substep gradients until a single update applies them.
+
+    ``--sequential_stimuli`` rolls the drifting-grating and the gray-screen
+    halves of a training step out one after the other, which halves the
+    activations the backward pass has to keep alive. The weights may only move
+    once both halves have contributed, so the leading substeps add their
+    gradients here and the closing one applies the sum - the same gradient the
+    single-shot step computes from the concatenated batch.
+
+    Keras 3 offers this as ``gradient_accumulation_steps`` on the optimizer,
+    but it selects the updating substep with a ``tf.cond`` whose update branch
+    all-reduces the gradients. A collective inside control flow is not allowed
+    in a replica context, so that path raises under every ``MirroredStrategy``,
+    including a single-GPU one. Here the substep is a Python-level fact - the
+    training step is traced once per substep - so the accumulation needs no
+    branching at all.
+
+    The buffers hold each replica's own partial gradient, which the optimizer
+    all-reduces when it applies them, exactly as it does for an unaccumulated
+    step. Under a loss-scale optimizer they hold scaled gradients; the scale
+    only changes when an update is applied, so it is constant across the
+    substeps of one step and unscaling the sum is unscaling each addend.
+    """
+
+    def __init__(self, trainable_variables):
+        self._buffers = [
+            tf.Variable(
+                tf.zeros_like(variable),
+                trainable=False,
+                name=f"gradient_accumulator/{variable.name}",
+                synchronization=tf.VariableSynchronization.ON_READ,
+                aggregation=tf.VariableAggregation.SUM,
+            )
+            for variable in trainable_variables
+        ]
+
+    @staticmethod
+    def _add(buffer, gradient):
+        if isinstance(gradient, tf.IndexedSlices):
+            return buffer.scatter_add(gradient)
+        return buffer.assign_add(tf.cast(gradient, buffer.dtype))
+
+    def accumulate(self, gradients):
+        """Store a substep's gradients, leaving the weights untouched."""
+        for buffer, gradient in zip(self._buffers, gradients):
+            if gradient is not None:
+                self._add(buffer, gradient)
+
+    def drain(self, gradients):
+        """Return the step's summed gradients and clear the buffers.
+
+        Substeps roll the same model out on different stimuli, so a variable
+        the tape cannot reach in the closing substep was unreachable in the
+        earlier ones too; those positions stay ``None`` and the optimizer skips
+        them as it would in an unaccumulated step.
+        """
+        totals = []
+        for buffer, gradient in zip(self._buffers, gradients):
+            if gradient is None:
+                totals.append(None)
+                continue
+            self._add(buffer, gradient)
+            totals.append(buffer.read_value())
+            buffer.assign(tf.zeros(buffer.shape, buffer.dtype))
+        return totals
+
+
 def build_learning_rate(flags):
     if flags.lr_schedule == "none":
         print(f"Learning-rate schedule: none (constant lr={flags.learning_rate:.6g})")
@@ -46,11 +114,15 @@ def build_learning_rate(flags):
 
 
 def create_optimizer(flags, learning_rate, trainable_variables, mixed_precision_module=None):
-    keras_3_loss_scaling = flags.dtype == "float16" and _uses_keras_3()
+    # Keras 3 unscales gradients inside LossScaleOptimizer, so the train step
+    # never sees the gradients the update is built from and clipping belongs on
+    # the optimizer. Keras 3 also gives every optimizer a `scale_loss` method,
+    # so the train step cannot tell a wrapped optimizer from a bare one and has
+    # to hand clipping over for both. The optimizer all-reduces after clipping,
+    # which is where the train step used to clip.
+    optimizer_clips = _uses_keras_3() and getattr(flags, "global_clipnorm", 0) > 0
     optimizer_kwargs = {}
-    if keras_3_loss_scaling and getattr(flags, "global_clipnorm", 0) > 0:
-        # Keras 3 unscales gradients inside LossScaleOptimizer, so clipping
-        # belongs on the wrapped optimizer and happens after unscaling.
+    if optimizer_clips:
         optimizer_kwargs["global_clipnorm"] = flags.global_clipnorm
     if flags.optimizer == "adam":
         base_optimizer = tf.keras.optimizers.Adam(
@@ -79,8 +151,14 @@ def create_optimizer(flags, learning_rate, trainable_variables, mixed_precision_
     # Both the wrapper and its inner optimizer must have created their state
     # before TensorFlow can match optimizer slots from a checkpoint.
     base_optimizer.build(trainable_variables)
+    base_optimizer.clips_gradients_internally = optimizer_clips
 
     return base_optimizer
+
+
+def optimizer_clips_gradients(optimizer):
+    """Whether the optimizer applies ``--global_clipnorm`` on its own."""
+    return bool(getattr(optimizer, "clips_gradients_internally", False))
 
 
 def optimizer_supports_loss_scaling(optimizer):
@@ -100,7 +178,7 @@ def scale_loss_for_optimizer(optimizer, loss):
 
 def unscale_gradients_for_optimizer(optimizer, gradients):
     # Keras 3 LossScaleOptimizer performs this step inside apply_gradients.
-    if hasattr(optimizer, "scale_loss"):
+    if _uses_keras_3():
         return gradients
     if hasattr(optimizer, "get_unscaled_gradients"):
         return optimizer.get_unscaled_gradients(gradients)
@@ -204,9 +282,9 @@ def clip_gradients_by_global_norm(gradients, clip_norm, optimizer=None):
     present_indices = [index for index, gradient in enumerate(gradients) if gradient is not None]
     present = [gradients[index] for index in present_indices]
     global_norm = tf.linalg.global_norm(present)
-    if optimizer is not None and hasattr(optimizer, "scale_loss"):
-        # Keras 3's wrapper will unscale and delegate clipping to the inner
-        # optimizer configured by create_optimizer().
+    if optimizer is not None and optimizer_clips_gradients(optimizer):
+        # create_optimizer() configured the optimizer to clip after unscaling
+        # and after averaging any accumulated micro-gradients.
         dynamic_scale = getattr(optimizer, "dynamic_scale", None)
         if dynamic_scale is not None:
             global_norm /= tf.cast(dynamic_scale, global_norm.dtype)

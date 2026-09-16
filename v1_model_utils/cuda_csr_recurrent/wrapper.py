@@ -15,18 +15,12 @@ from v1_model_utils.cuda_csr_resources import (
 )
 
 
-SPECIALIZED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+SPECIALIZED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 _OPS = None
 
 
 def _active_rows_or_pairs(values, basis_values):
-    """Use grouped CSR rows only for the measured static fast paths."""
-    if values.shape[0] in (1, 2, 4, 8, 16, 32, 64, 128) and basis_values.shape[-1] == 4:
-        row_ids = tf.cast(
-            tf.where(tf.reduce_any(values != tf.cast(0, values.dtype), axis=0))[:, 0],
-            tf.int64,
-        )
-        return tf.stack((tf.zeros_like(row_ids), row_ids), axis=1)
+    """Return active ``(batch, presynaptic row)`` pairs."""
     return tf.where(values != tf.cast(0, values.dtype))
 
 
@@ -235,14 +229,16 @@ def build_csr_connectivity(
 def pair_projection_applies(spike_values, basis_values, connectivity):
     """Whether the compact pair-projected backward specialization can run.
 
-    It is written for the measured hot shape only: a static batch of 32 with the
-    four-column synaptic basis. Everything else keeps the general kernel.
+    It uses specialized basis-4/power-of-two kernels where available and the
+    optimized generic pair-projected path above its measured crossover.
     """
     if connectivity.pair_ids is None or connectivity.n_pairs == 0:
         return False
     batch = spike_values.shape[0]
     n_basis = basis_values.shape[-1]
-    return batch == 32 and n_basis == 4
+    specialized = n_basis == 4 and batch in SPECIALIZED_BATCH_SIZES
+    optimized_generic = (n_basis != 4 and batch >= 2) or (n_basis == 4 and batch >= 32)
+    return spike_values.dtype == tf.float16 and (specialized or optimized_generic)
 
 
 def empty_like_currents(basis):
@@ -282,10 +278,9 @@ def calculate_recurrent_csr_currents(
         pair_types,
         initial_values,
     ):
-        active = _active_rows_or_pairs(spike_values, basis_values)
         currents = ops.v1_csr_forward(
             spike_values,
-            active,
+            _active_rows_or_pairs(spike_values, basis_values),
             weight_values,
             post_ids,
             synapse_types,
