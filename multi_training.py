@@ -692,6 +692,17 @@ def main(_):
         val_osi_dsi_loss = tf.keras.metrics.Mean()
         val_sync_loss = tf.keras.metrics.Mean()
 
+        # Both tuples are ordered the way `callbacks.compose_str` reads them.
+        train_metrics = (
+            train_loss,
+            train_firing_rate,
+            train_rate_loss,
+            train_voltage_loss,
+            train_regularizer_loss,
+            train_osi_dsi_loss,
+            train_sync_loss,
+        )
+
         validation_metrics = (
             val_loss,
             val_firing_rate,
@@ -703,20 +714,56 @@ def main(_):
         )
 
         def reset_train_metrics():
-            training_utils.reset_metrics(
-                (
-                    train_loss,
-                    train_firing_rate,
-                    train_rate_loss,
-                    train_voltage_loss,
-                    train_regularizer_loss,
-                    train_osi_dsi_loss,
-                    train_sync_loss,
-                )
-            )
+            training_utils.reset_metrics(train_metrics)
 
         def reset_validation_metrics():
             training_utils.reset_metrics(validation_metrics)
+
+        def make_running_metric_reader(metrics):
+            """Read a group of running `Mean` metrics in one round trip.
+
+            The metrics live in the strategy scope, so their `total`/`count`
+            accumulators are ON_READ mirrored variables and every
+            `metric.result()` evaluated in cross-replica context becomes a
+            reduction of its own - a device-to-host copy, a host reduction and
+            a broadcast back, each with a synchronization. Seven of those per
+            training step are what fill the log with `Reduce to
+            .../device:CPU:0 then broadcast`.
+
+            Summing the accumulators inside a single `strategy.run` and
+            reducing the stacked pairs once gives exactly the same numbers -
+            `Mean.result()` is `total / count`, and summing both terms across
+            replicas is what the per-metric reduction already did - for one
+            round trip instead of one per metric. With a single replica there
+            is nothing to reduce, so the local values are read directly and
+            nothing crosses the device boundary at all.
+            """
+            def read_accumulators():
+                return tf.stack(
+                    [
+                        [tf.convert_to_tensor(metric.total),
+                         tf.convert_to_tensor(metric.count)]
+                        for metric in metrics
+                    ]
+                )
+
+            @tf.function
+            def read_metrics():
+                per_replica = strategy.run(read_accumulators)
+                if strategy.num_replicas_in_sync == 1:
+                    accumulators = strategy.experimental_local_results(per_replica)[0]
+                else:
+                    accumulators = strategy.reduce(
+                        tf.distribute.ReduceOp.SUM, per_replica, axis=None
+                    )
+                return tf.math.divide_no_nan(
+                    accumulators[:, 0], accumulators[:, 1]
+                )
+
+            return read_metrics
+
+        read_train_metrics = make_running_metric_reader(train_metrics)
+        read_validation_metrics = make_running_metric_reader(validation_metrics)
 
         # Load the spontaneous probabilities once (seq_len, n_input)
         spontaneous_prob_base = stim_dataset.load_or_compute_spontaneous_lgn_probabilities(
@@ -832,7 +879,15 @@ def main(_):
 
         # keep final scalar aggregation in float32
         voltage_loss = voltage_loss_from_source(voltage_source)
-        spontaneous = tf.cast(spontaneous, tf.bool)
+        # `spontaneous` is a Python bool at every call site, so which family of
+        # losses applies is settled while tracing. Casting it to a tensor and
+        # branching with `tf.cond` built a graph whose two branches disagreed
+        # on output type, which TensorFlow reported every run as `Type
+        # inference failed ... invalid graph that escaped type checking`, and
+        # left a Merge node that made Grappler skip loop optimization on the
+        # enclosing subgraph. Selecting the branch in Python builds only the
+        # branch that applies, so neither can arise.
+        spontaneous = bool(spontaneous)
 
         def _evoked_losses():
             v1_rates_per_sample = (
@@ -890,9 +945,10 @@ def main(_):
                 tf.reduce_mean(v1_rates_per_sample),
             )
 
-        rate_loss, osi_dsi_loss, sync_loss, firing_rate = tf.cond(
-            spontaneous, _spontaneous_losses, _evoked_losses
-        )
+        if spontaneous:
+            rate_loss, osi_dsi_loss, sync_loss, firing_rate = _spontaneous_losses()
+        else:
+            rate_loss, osi_dsi_loss, sync_loss, firing_rate = _evoked_losses()
 
         _aux = dict(
             rate_loss=rate_loss,
@@ -1027,16 +1083,18 @@ def main(_):
         # applies the update is settled while tracing, and the accumulation
         # needs no graph-level branch.
         closes_step = bool(spontaneous)
-        spontaneous = tf.cast(spontaneous, tf.bool)
         metric_weight = tf.cast(0.5, tf.float32)
-        _x = tf.cond(spontaneous, lambda: x_spontaneous, lambda: x)
+        # Selecting the stimulus and the state slice in Python keeps the
+        # branch where it is actually decided; the `tf.cond` form this
+        # replaces also left a Merge node that blocked loop optimization.
+        _x = x_spontaneous if spontaneous else x
+        state_slice = (
+            slice(grating_batch_size, None)
+            if spontaneous
+            else slice(None, grating_batch_size)
+        )
         _state_variables = tf.nest.map_structure(
-            lambda state: tf.cond(
-                spontaneous,
-                lambda: state[grating_batch_size:],
-                lambda: state[:grating_batch_size],
-            ),
-            state_variables,
+            lambda state: state[state_slice], state_variables
         )
 
         with tf.GradientTape() as tape:
@@ -1080,11 +1138,7 @@ def main(_):
         train_voltage_loss.update_state(_aux["voltage_loss"], sample_weight=metric_weight)
         train_regularizer_loss.update_state(_aux["regularizer_loss"], sample_weight=metric_weight)
         train_sync_loss.update_state(_aux["sync_loss"], sample_weight=metric_weight)
-        osi_weight = tf.where(
-            spontaneous,
-            tf.constant(0.0, dtype=tf.float32),
-            metric_weight,
-        )
+        osi_weight = tf.constant(0.0, dtype=tf.float32) if spontaneous else metric_weight
         train_osi_dsi_loss.update_state(_aux["osi_dsi_loss"], sample_weight=osi_weight)
 
         if return_sequences:
@@ -1205,16 +1259,7 @@ def main(_):
                 distributed_train_step(x, y, x_spontaneous, state_variables, trim, return_sequences=False)
             model_spikes = (None, None)
 
-        rate_loss = train_rate_loss.result()
-        voltage_loss = train_voltage_loss.result()
-        regularizers_loss = train_regularizer_loss.result()
-        sync_loss = train_sync_loss.result()
-        osi_dsi_loss = train_osi_dsi_loss.result()
-        _loss = train_loss.result()
-        rate = train_firing_rate.result()
-
-        step_values = [_loss, rate, rate_loss, voltage_loss,
-                       regularizers_loss, osi_dsi_loss, sync_loss]
+        step_values = tf.unstack(read_train_metrics())
 
         return model_spikes, step_values
 
@@ -1672,7 +1717,7 @@ def main(_):
         x_rep, z_rep, y_rep = representative_evoked
         x_spont_rep, z_spont_rep = spont_result["representative"]
         return (
-            [metric.result().numpy() for metric in validation_metrics],
+            list(read_validation_metrics().numpy()),
             x_rep,
             z_rep,
             y_rep,
@@ -1921,9 +1966,7 @@ def main(_):
             protocol_angles_epoch,
         ) = run_protocol_validation()
 
-        train_values = [a.result().numpy() for a in [train_loss, train_firing_rate,
-                                                     train_rate_loss, train_voltage_loss, train_regularizer_loss,
-                                                     train_osi_dsi_loss, train_sync_loss]]
+        train_values = list(read_train_metrics().numpy())
         metric_values = train_values + val_values
 
         stop = callbacks.on_epoch_end(
@@ -2033,7 +2076,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('voltage_cost', 1., '')
     absl.app.flags.DEFINE_float('osi_cost', 20., '')
     absl.app.flags.DEFINE_float('annulus_loss_weight', 0.1, '')
-    absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
+    absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 0., '')
     absl.app.flags.DEFINE_float(
         'rolling_decay',
         -1.0,
