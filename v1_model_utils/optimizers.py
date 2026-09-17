@@ -1,12 +1,36 @@
 
-import tensorflow as tf
 from math import pi
+
+import tensorflow as tf
 
 
 def _uses_keras_3():
     """Return whether TensorFlow exposes the standalone Keras 3 API."""
     version = getattr(tf.keras, "version", None)
     return version is not None and int(version().split(".", 1)[0]) >= 3
+
+
+@tf.function(jit_compile=True)
+def _dense_exponentiated_adam_update(
+    weights,
+    momentums,
+    velocities,
+    gradient,
+    alpha,
+    beta_1,
+    beta_2,
+    epsilon,
+):
+    """Fuse the large dense ExponentiatedAdam update into one XLA cluster."""
+    new_momentums = momentums + (gradient - momentums) * (1 - beta_1)
+    new_velocities = velocities + (
+        tf.square(gradient) - velocities
+    ) * (1 - beta_2)
+    adam_gradient = new_momentums / (tf.sqrt(new_velocities) + epsilon)
+    signs = tf.sign(weights)
+    signs = tf.where(tf.equal(signs, 0), tf.ones_like(signs), signs)
+    new_weights = weights * tf.exp(-alpha * adam_gradient * signs)
+    return new_weights, new_momentums, new_velocities
 
 # import tensorflow.compat.v2 as tf
 
@@ -431,6 +455,7 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
         self.beta_2 = beta_2
         self.epsilon = epsilon
         self.amsgrad = amsgrad
+        self.jit_compile = bool(jit_compile)
 
     def build(self, var_list):
         """Initialize optimizer variables.
@@ -609,6 +634,22 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
             self._assign(variable, variable * multipliers)
 
         else:
+            if self.jit_compile and not self.amsgrad:
+                new_weights, new_m, new_v = _dense_exponentiated_adam_update(
+                    tf.convert_to_tensor(variable),
+                    tf.convert_to_tensor(m),
+                    tf.convert_to_tensor(v),
+                    gradient,
+                    alpha,
+                    beta_1_t,
+                    beta_2_t,
+                    tf.cast(self.epsilon, variable.dtype),
+                )
+                self._assign(m, new_m)
+                self._assign(v, new_v)
+                self._assign(variable, new_weights)
+                return
+
             # Dense gradient
             # 1) Update m
             self._assign_add(m, (gradient - m) * (1 - beta_1_t))
@@ -641,6 +682,7 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
                 "beta_2": self.beta_2,
                 "epsilon": self.epsilon,
                 "amsgrad": self.amsgrad,
+                "jit_compile": self.jit_compile,
             }
         )
         return config
