@@ -1,6 +1,7 @@
 import os
 import pickle as pkl
 import json
+import hashlib
 import tensorflow as tf
 import h5py
 import numpy as np
@@ -10,6 +11,48 @@ import sys
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 import other_v1_utils
 # from memory_profiler import profile
+
+
+_V1_CACHE_VERSION = 2
+
+
+def _v1_cache_provenance(flags, n_neurons):
+    """Describe every input that can change a cached, ready-to-run V1 model."""
+    config_names = (
+        "seed", "n_input", "core_only", "connected_selection",
+        "random_weights", "uniform_weights", "loss_core_radius",
+        "n_output", "neurons_per_output",
+    )
+    config = {name: getattr(flags, name) for name in config_names}
+    config["n_neurons"] = n_neurons
+
+    data_dir = os.path.abspath(os.fspath(flags.data_dir))
+    source_paths = (
+        os.path.join(data_dir, "tf_data", "network_dat.pkl"),
+        os.path.join(data_dir, "tf_data", "lgn_input_dat.pkl"),
+        os.path.join(data_dir, "tf_data", "bkg_input_dat.pkl"),
+        os.path.join(data_dir, "network", "v1_nodes.h5"),
+        os.path.join(data_dir, "network", "v1_node_types.csv"),
+        os.path.join(data_dir, "network", "bkg_nodes.h5"),
+    )
+    sources = {}
+    for path in source_paths:
+        try:
+            stat = os.stat(path)
+        except FileNotFoundError:
+            sources[os.path.relpath(path, data_dir)] = None
+        else:
+            sources[os.path.relpath(path, data_dir)] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+
+    serialized = json.dumps(
+        {"version": _V1_CACHE_VERSION, "config": config, "sources": sources},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def sort_indices(indices, *arrays):
@@ -249,7 +292,7 @@ def load_network(
     elif n_neurons > 0 and n_neurons <= n_nodes: # this condition randomly selects neurons from the whole V1
         legit_neurons = np.arange(n_nodes)
         take_inds = rd.choice(legit_neurons, size=n_neurons, replace=False)
-        sel = np.empty(n_nodes, dtype=np.bool_)
+        sel = np.zeros(n_nodes, dtype=np.bool_)
         sel[take_inds] = True
     
     else: # if no condition is met, all neurons are selected
@@ -299,7 +342,6 @@ def load_network(
             v[i] = node_type["params"][k]
 
     # GET THE EDGES INFORMATION
-    t0 = time()
     edges = d["edges"]
     n_edges = 0
     dense_shape = (n_nodes, n_nodes)
@@ -320,7 +362,7 @@ def load_network(
         source_tf_ids = source_tf_ids[edge_exists]
         weights_tf = edge["params"]["weight"][edge_exists].astype(np.float32)
         if random_weights:
-            np.random.shuffle(weights_tf)
+            rd.shuffle(weights_tf)
 
 
         n_new_edge = len(target_tf_ids)
@@ -792,13 +834,23 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     # file_dir = os.path.split(__file__)[0]
     cache_dir = os.path.join(flags.data_dir, "tf_data")
     cache_path = os.path.join(cache_dir, f"V1_network_{flag_str}.pkl")
+    provenance = _v1_cache_provenance(flags, n_neurons)
     print(f"> Looking for cached V1 model in {cache_path}")
     
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "rb") as f:
-                network, lgn_input, bkg_input = pkl.load(f)
+                cached = pkl.load(f)
+            if (
+                isinstance(cached, dict)
+                and cached.get("version") == _V1_CACHE_VERSION
+                and cached.get("provenance") == provenance
+            ):
+                network, lgn_input, bkg_input = cached["payload"]
                 print(f"> Sucessfully restored V1 model from {cache_path}")
+            else:
+                print(f"> Cached V1 model provenance does not match; rebuilding {cache_path}")
+                store = True
         except Exception as e:
             print(e)
             store = True
@@ -811,8 +863,18 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     if store:
         # os.makedirs(os.path.join(file_dir, ".cache"), exist_ok=True)
         os.makedirs(cache_dir, exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pkl.dump((network, lgn_input, bkg_input), f)
+        provenance = _v1_cache_provenance(flags, n_neurons)
+        temporary_path = f"{cache_path}.{os.getpid()}.tmp"
+        with open(temporary_path, "wb") as f:
+            pkl.dump(
+                {
+                    "version": _V1_CACHE_VERSION,
+                    "provenance": provenance,
+                    "payload": (network, lgn_input, bkg_input),
+                },
+                f,
+            )
+        os.replace(temporary_path, cache_path)
         print(f"> Cached V1 model in {cache_path}")
 
     return network, lgn_input, bkg_input

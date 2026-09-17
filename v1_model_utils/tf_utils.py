@@ -80,7 +80,7 @@ def configure_policy_and_dtype(dtype_name):
     """
     Set TensorFlow mixed-precision policy and return the matching tf.DType.
 
-    Supported values: float16, bfloat16, float32
+    Supported values: float16, float32
     """
     dtype_name = tf.dtypes.as_dtype(dtype_name).name
 
@@ -88,16 +88,12 @@ def configure_policy_and_dtype(dtype_name):
         policy_name = "mixed_float16"
         resolved_dtype = tf.float16
         print("Mixed precision (float16) enabled!")
-    elif dtype_name == "bfloat16":
-        policy_name = "mixed_bfloat16"
-        resolved_dtype = tf.bfloat16
-        print("Mixed precision (bfloat16) enabled!")
     elif dtype_name == "float32":
         policy_name = "float32"
         resolved_dtype = tf.float32
     else:
         raise ValueError(
-            f"Unsupported dtype '{dtype_name}'. Use one of: float16, bfloat16, float32."
+            f"Unsupported dtype '{dtype_name}'. Use one of: float16, float32."
         )
 
     if version.parse(tf.__version__) < version.parse("2.4.0"):
@@ -538,19 +534,20 @@ def restore_training_checkpoint(
     checkpoint = None
     checkpoint_directory = None
 
-    if flags.ckpt_dir != '' and os.path.exists(
-        os.path.join(flags.ckpt_dir, checkpoint_subdir)
-    ):
-        checkpoint_directory = tf.train.latest_checkpoint(
-            os.path.join(flags.ckpt_dir, checkpoint_subdir)
-        )
-        if checkpoint_directory is None:
-            print(
-                f"No checkpoint found in {os.path.join(flags.ckpt_dir, checkpoint_subdir)}. Starting from scratch...\n"
+    if flags.restore_from != '':
+        if not os.path.exists(flags.restore_from):
+            raise FileNotFoundError(
+                f"Explicit restore_from path does not exist: {flags.restore_from}"
             )
-            return checkpoint, optimizer, checkpoint_directory
+        checkpoint_directory = tf.train.latest_checkpoint(flags.restore_from)
+        if checkpoint_directory is None:
+            raise FileNotFoundError(
+                f"Explicit restore_from path contains no checkpoint: {flags.restore_from}"
+            )
 
-        print(f'Restoring checkpoint from {checkpoint_directory}...')
+        print(
+            f'Restoring checkpoint from {checkpoint_directory} with the restore_from option...'
+        )
         optimizer_continuing = optimizers_match(optimizer, checkpoint_directory)
         if not optimizer_continuing:
             print("Optimizer does not match the checkpoint. Using a new optimizer.")
@@ -572,17 +569,19 @@ def restore_training_checkpoint(
             print('Checkpoint restored!')
         return checkpoint, optimizer, checkpoint_directory
 
-    if flags.restore_from != '' and os.path.exists(flags.restore_from):
-        checkpoint_directory = tf.train.latest_checkpoint(flags.restore_from)
+    if flags.ckpt_dir != '' and os.path.exists(
+        os.path.join(flags.ckpt_dir, checkpoint_subdir)
+    ):
+        checkpoint_directory = tf.train.latest_checkpoint(
+            os.path.join(flags.ckpt_dir, checkpoint_subdir)
+        )
         if checkpoint_directory is None:
             print(
-                f"No checkpoint found in {flags.restore_from}. Starting from scratch...\n"
+                f"No checkpoint found in {os.path.join(flags.ckpt_dir, checkpoint_subdir)}. Starting from scratch...\n"
             )
             return checkpoint, optimizer, checkpoint_directory
 
-        print(
-            f'Restoring checkpoint from {checkpoint_directory} with the restore_from option...'
-        )
+        print(f'Restoring checkpoint from {checkpoint_directory}...')
         optimizer_continuing = optimizers_match(optimizer, checkpoint_directory)
         if not optimizer_continuing:
             print("Optimizer does not match the checkpoint. Using a new optimizer.")
@@ -694,7 +693,7 @@ def infer_checkpoint_model_dtype(checkpoint_directory):
         if not tensor_name.startswith('model/'):
             continue
         dtype_name = _dtype_name_from_ckpt_dtype(raw_dtype)
-        if dtype_name in ('float16', 'bfloat16', 'float32'):
+        if dtype_name in ('float16', 'float32'):
             model_dtype_names.add(dtype_name)
 
     if len(model_dtype_names) == 1:
@@ -705,10 +704,8 @@ def infer_checkpoint_model_dtype(checkpoint_directory):
         print(f'Found mixed model dtypes in checkpoint: {sorted_names}')
         # Mixed-precision checkpoints commonly contain float32 plus one low-precision
         # dtype. Prefer the low-precision dtype as the checkpoint model dtype.
-        if 'float16' in model_dtype_names and 'bfloat16' not in model_dtype_names:
+        if 'float16' in model_dtype_names:
             return 'float16'
-        if 'bfloat16' in model_dtype_names and 'float16' not in model_dtype_names:
-            return 'bfloat16'
     return None
 
 

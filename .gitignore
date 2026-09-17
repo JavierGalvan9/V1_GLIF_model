@@ -144,7 +144,6 @@ tests/
 !tests/test_cuda_glif_state.py
 docs/research/spikingjelly_performance_optimizations.md
 .claude/skills/
-tests/
 .mcp.json
 parallel_training_testing.py
 v1_model_utils/optimizers.py
@@ -166,3 +165,4 @@ Distributed_worker_logs/
 generic_kernel_optimization_20260915/
 profiling_analysis_20260915/
 recurrent_forward_latency_20260915/
+tests/*

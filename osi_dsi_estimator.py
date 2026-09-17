@@ -1,5 +1,6 @@
 import matplotlib
 matplotlib.use('agg')# to avoid GUI request on clusters
+# ruff: noqa: E402  # CUDA cache configuration must precede TensorFlow imports.
 import os
 
 # Define the environment variables for optimal GPU performance
@@ -20,12 +21,13 @@ import tensorflow as tf
 from time import time
 import logging
 from v1_model_utils import tf_utils
-from v1_model_utils import cuda_csr_recurrent, spatial_layout
+from v1_model_utils import cuda_csr_recurrent, spatial_layout, training_utils
 tf.get_logger().setLevel(logging.INFO)
 
 
 def main(_):
     flags = absl.app.flags.FLAGS
+    training_utils.validate_n_input(flags.n_input)
     # Allow for memory growth (also to observe memory consumption)
     tf_utils.configure_gpu_memory_growth()
     # Display TensorFlow and CUDA runtime information for debugging and verification purposes.
@@ -420,7 +422,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('delays', '100,0', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')
     absl.app.flags.DEFINE_string('optimizer', 'exp_adam', '')
-    absl.app.flags.DEFINE_string('dtype', 'float32', '')
+    absl.app.flags.DEFINE_enum(
+        'dtype', 'float32', ['float16', 'float32'], 'Model numeric dtype.'
+    )
     absl.app.flags.DEFINE_enum(
         'acceleration',
         'auto',

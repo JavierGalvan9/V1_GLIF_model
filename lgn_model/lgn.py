@@ -186,7 +186,15 @@ class LGN(object):
                 h5_path=lgn_node_path,
             )
 
-        # CHANGE 1: Apply n_input selection immediately after loading data
+        # Apply input selection immediately after loading data.  Reject invalid
+        # requests here as well as at the CLIs so direct library callers cannot
+        # create a dataset whose declared width disagrees with the LGN model.
+        if n_input is not None:
+            n_input = int(n_input)
+            if not 1 <= n_input <= len(d):
+                raise ValueError(
+                    f"n_input must be between 1 and {len(d)}, got {n_input}."
+                )
         if n_input is not None and n_input < len(d):
             # Select first n_input neurons
             d = d.iloc[:n_input].copy()

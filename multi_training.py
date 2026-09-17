@@ -1,5 +1,6 @@
 import matplotlib
 matplotlib.use('agg')# to avoid GUI request on clusters
+# ruff: noqa: E402  # CUDA cache configuration must precede TensorFlow imports.
 import os
 
 # Define the environment variables for optimal GPU performance
@@ -31,6 +32,7 @@ import logging
 from v1_model_utils import tf_utils
 from v1_model_utils import spatial_layout
 from v1_model_utils import cuda_csr_recurrent
+from v1_model_utils import training_utils
 
 _TRAINING_LAUNCH_PLAN = TRAINING_LAUNCH_PLAN
 tf.get_logger().setLevel(logging.INFO)
@@ -176,6 +178,21 @@ def concatenate_stimulus_batches(grating, spontaneous, dtype):
     spontaneous = int32_safe_cast(spontaneous, dtype)
     return tf.concat([grating, spontaneous], axis=0)
 
+def validation_rate_loss_from_rates(
+    rates_hz, rate_regularizer, annulus_regularizer=None
+):
+    """Evaluate a protocol rate target once over all retained trials."""
+    rates = tf.reduce_mean(tf.cast(rates_hz, tf.float32), axis=0) / 1000.0
+    rate_loss = rate_regularizer.loss_from_rates(rates)
+    if annulus_regularizer is not None:
+        rate_loss += annulus_regularizer.loss_from_rates(rates)
+    return tf.cast(rate_loss, tf.float32)
+
+
+def sample_weighted_mean(values, sample_counts):
+    """Average batch summaries in proportion to retained sample counts."""
+    return float(np.average(values, weights=sample_counts))
+
 
 def sample_stateless_bernoulli_batch(
     probability,
@@ -224,6 +241,7 @@ def sample_stateless_bernoulli_batch(
 
 def main(_):
     flags = absl.app.flags.FLAGS
+    training_utils.validate_n_input(flags.n_input)
     if flags.profile_gpu_index >= 0:
         all_gpus = tf.config.list_physical_devices("GPU")
         if not all_gpus:
@@ -245,7 +263,7 @@ def main(_):
     from v1_model_utils.callbacks import Callbacks
     import v1_model_utils.loss_functions as losses
     from v1_model_utils.model_metrics_analysis import calculate_OSI_DSI
-    from v1_model_utils import load_sparse, models, other_v1_utils, training_utils
+    from v1_model_utils import load_sparse, models, other_v1_utils
     from v1_model_utils import optimizers as optimizer_utils
 
     # Configure seed for reproducibility
@@ -280,11 +298,6 @@ def main(_):
     global_grating_batch_size = grating_batch_size * strategy.num_replicas_in_sync
     global_gray_batch_size = gray_batch_size * strategy.num_replicas_in_sync
     print(f'Per replica batch size: {per_replica_batch_size}')
-    if flags.sequential_stimuli:
-        print('Sequential stimuli substeps enabled (memory friendly, gradients accumulated).')
-        print(f'Model batch size: {real_batch_size}')
-    else:
-        print(f'Real batch size (evoked+spont): {real_batch_size}')
     print(f'Global batch size: {global_batch_size}')
     print(
         f'Stimulus batch sizes (per replica): grating={grating_batch_size}, '
@@ -337,7 +350,9 @@ def main(_):
         )
         print("Edge layout: csr")
 
-    pre_delay, post_delay = training_utils.parse_delays(flags.delays)
+    pre_delay, post_delay = training_utils.parse_delays(
+        flags.delays, seq_len=flags.seq_len
+    )
     delays = [pre_delay, post_delay]
 
     # Define the scope in which the model training will be executed
@@ -1059,8 +1074,7 @@ def main(_):
         }
 
         # Backpropagation of the model (metrics)
-        mean_loss = (evoked_loss + spont_loss) / 2.0
-        train_loss.update_state(mean_loss * strategy.num_replicas_in_sync)
+        train_loss.update_state(total_loss * strategy.num_replicas_in_sync)
         rate = (
             evoked_aux["firing_rate"]
             * tf.cast(grating_batch_size, tf.float32)
@@ -1472,43 +1486,13 @@ def main(_):
         trimmed = spikes[:, delays[0]:flags.seq_len - delays[1], :]
         return np.mean(trimmed.astype(np.float32), axis=1) * 1000.0
 
-    def validation_rate_loss_tensor(spikes, spontaneous):
-        if spontaneous:
-            rate_loss = spont_rate_regularizer(spikes, trim=True)
-            if annulus_mask is not None:
-                rate_loss += annulus_spont_rate_regularizer(spikes, trim=True)
-        else:
-            rate_loss = evoked_rate_regularizer(spikes, trim=True)
-            if annulus_mask is not None:
-                rate_loss += annulus_evoked_rate_regularizer(spikes, trim=True)
-        return tf.cast(rate_loss, tf.float32)
-
-    @tf.function
-    def distributed_validation_rate_loss_tensor(spikes, spontaneous):
-        replica_losses = strategy.run(
-            validation_rate_loss_tensor,
-            args=(spikes, spontaneous),
-        )
-        return strategy.reduce(
-            tf.distribute.ReduceOp.MEAN,
-            replica_losses,
-            axis=None,
-        )
-
-    def distributed_validation_rate_loss(spikes, spontaneous):
-        # `spontaneous` stays a Python bool so the branch above is traced away;
-        # it only costs one extra trace.
-        return float(
-            distributed_validation_rate_loss_tensor(spikes, spontaneous).numpy()
-        )
-
     def run_gray_validation_repeats(repeats):
         spont_rates = []
-        spont_rate_losses = []
         spont_voltage_losses = []
         spont_sync_losses = []
         representative = None
         completed = 0
+        retained_counts = []
 
         while completed < repeats:
             keep = min(global_batch_size, repeats - completed)
@@ -1518,11 +1502,9 @@ def main(_):
             )
             state = distributed_generate_gray_state()
             z, v = distributed_validation_step(x, state)
-            rate_loss = distributed_validation_rate_loss(z, spontaneous=True)
             x_local, z_local, v_local = collect_local_validation_outputs(x, z, v, keep)
             z_np = z_local.numpy()
             spont_rates.append(trimmed_rates_hz(z_np))
-            spont_rate_losses.append(rate_loss)
             spont_voltage_losses.append(float(voltage_loss_from_source(v_local).numpy()))
             spont_sync_losses.append(
                 float(tf.cast(spont_sync_loss(z_local, trim=True), tf.float32).numpy())
@@ -1532,24 +1514,37 @@ def main(_):
                     x_local[:1],
                     z_local[:1],
                 )
+            retained_counts.append(keep)
             completed += keep
 
+        spont_rates = np.concatenate(spont_rates, axis=0)
         return {
-            "spont_rates": np.concatenate(spont_rates, axis=0),
-            "spont_rate_loss": float(np.mean(spont_rate_losses)),
-            "spont_voltage_loss": float(np.mean(spont_voltage_losses)),
-            "spont_sync_loss": float(np.mean(spont_sync_losses)),
+            "spont_rates": spont_rates,
+            "spont_rate_loss": float(
+                validation_rate_loss_from_rates(
+                    spont_rates,
+                    spont_rate_regularizer,
+                    annulus_spont_rate_regularizer
+                    if annulus_mask is not None else None,
+                ).numpy()
+            ),
+            "spont_voltage_loss": sample_weighted_mean(
+                spont_voltage_losses, retained_counts
+            ),
+            "spont_sync_loss": sample_weighted_mean(
+                spont_sync_losses, retained_counts
+            ),
             "representative": representative,
         }
 
     def run_osi_dsi_validation_repeats(probability, angle, repeats, collect_spikes=False):
         evoked_rates = []
-        evoked_rate_losses = []
         evoked_voltage_losses = []
         evoked_sync_losses = []
         protocol_spikes = []
         representative = None
         completed = 0
+        retained_counts = []
         protocol_mask = None if core_mask is None else np.asarray(core_mask, dtype=bool)
 
         while completed < repeats:
@@ -1557,11 +1552,9 @@ def main(_):
             x = distributed_sample_probability_batch(probability, per_replica_batch_size)
             state = distributed_generate_gray_state()
             z_evoked, v_evoked = distributed_validation_step(x, state)
-            rate_loss = distributed_validation_rate_loss(z_evoked, spontaneous=False)
             x_local, z_evoked, v_evoked = collect_local_validation_outputs(x, z_evoked, v_evoked, keep)
             z_evoked_np = z_evoked.numpy()
             evoked_rates.append(trimmed_rates_hz(z_evoked_np))
-            evoked_rate_losses.append(rate_loss)
             evoked_voltage_losses.append(float(voltage_loss_from_source(v_evoked).numpy()))
             evoked_sync_losses.append(
                 float(tf.cast(evoked_sync_loss(z_evoked, trim=True), tf.float32).numpy())
@@ -1577,16 +1570,29 @@ def main(_):
                     z_evoked[:1],
                     tf.constant([[float(angle)]], dtype=dtype),
                 )
+            retained_counts.append(keep)
             completed += keep
 
+        evoked_rates = np.concatenate(evoked_rates, axis=0)
         collected_protocol_spikes = None
         if collect_spikes:
             collected_protocol_spikes = np.concatenate(protocol_spikes, axis=0)
         return {
-            "evoked_rates": np.concatenate(evoked_rates, axis=0),
-            "evoked_rate_loss": float(np.mean(evoked_rate_losses)),
-            "evoked_voltage_loss": float(np.mean(evoked_voltage_losses)),
-            "evoked_sync_loss": float(np.mean(evoked_sync_losses)),
+            "evoked_rates": evoked_rates,
+            "evoked_rate_loss": float(
+                validation_rate_loss_from_rates(
+                    evoked_rates,
+                    evoked_rate_regularizer,
+                    annulus_evoked_rate_regularizer
+                    if annulus_mask is not None else None,
+                ).numpy()
+            ),
+            "evoked_voltage_loss": sample_weighted_mean(
+                evoked_voltage_losses, retained_counts
+            ),
+            "evoked_sync_loss": sample_weighted_mean(
+                evoked_sync_losses, retained_counts
+            ),
             "protocol_spikes": collected_protocol_spikes,
             "representative": representative,
         }
@@ -2038,7 +2044,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('delays', '0,0', '')
     # absl.app.flags.DEFINE_string('neuron_model', 'GLIF3', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')
-    absl.app.flags.DEFINE_string('dtype', 'float16', '')
+    absl.app.flags.DEFINE_enum(
+        'dtype', 'float16', ['float16', 'float32'], 'Model numeric dtype.'
+    )
     absl.app.flags.DEFINE_enum(
         'acceleration',
         'auto',

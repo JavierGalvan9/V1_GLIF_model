@@ -13,7 +13,10 @@ def reset_metrics(metrics):
         reset_metric(metric)
 
 
-def parse_delays(delays):
+MAX_LGN_INPUTS = 17400
+
+
+def parse_delays(delays, seq_len=None):
     parts = [a.strip() for a in str(delays).split(",") if a.strip() != ""]
     if len(parts) != 2:
         raise ValueError(
@@ -24,7 +27,22 @@ def parse_delays(delays):
         raise ValueError(
             f"Invalid --delays value '{delays}'. Delays must be non-negative."
         )
+    if seq_len is not None and pre_delay + post_delay >= seq_len:
+        raise ValueError(
+            f"Invalid --delays value '{delays}' for seq_len={seq_len}. "
+            "Delay trimming must leave at least one timestep."
+        )
     return pre_delay, post_delay
+
+
+def validate_n_input(n_input, max_n_input=MAX_LGN_INPUTS):
+    """Return a valid LGN input count or raise a user-facing error."""
+    n_input = int(n_input)
+    if not 1 <= n_input <= max_n_input:
+        raise ValueError(
+            f"n_input must be between 1 and {max_n_input}, got {n_input}."
+        )
+    return n_input
 
 
 def infer_effective_sequence_length(flags):
@@ -40,4 +58,3 @@ def infer_effective_sequence_length(flags):
     if getattr(flags, "sequential_stimuli", False):
         return seq_len
     return 2 * seq_len
-

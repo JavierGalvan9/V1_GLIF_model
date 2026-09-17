@@ -6,6 +6,7 @@ import argparse
 import shlex
 from v1_model_utils import toolkit
 from v1_model_utils import spatial_layout
+from v1_model_utils import training_utils
 # # script_path = "bash d
 
 # Create argument parser
@@ -19,7 +20,7 @@ parser.add_argument('--restore_from', default='', type=str)
 parser.add_argument('--comment', default='', type=str)
 parser.add_argument('--delays', default='0,0', type=str)
 parser.add_argument('--scale', default='2,2', type=str)
-parser.add_argument('--dtype', default='float32', type=str, choices=['float16', 'float32', 'bfloat16'])
+parser.add_argument('--dtype', default='float32', type=str, choices=['float16', 'float32'])
 parser.add_argument(
     '--neuron_layout', default='morton', type=str,
     choices=list(spatial_layout.LAYOUTS),
@@ -138,7 +139,10 @@ parser.add_argument('--neurons', default=0, type=int)
 parser.add_argument('--steps_per_epoch', default=25, type=int)
 parser.add_argument('--val_steps', default=1, type=int)
 
-parser.add_argument('--n_input', default=17400, type=int)
+parser.add_argument(
+    '--n_input', default=17400, type=training_utils.validate_n_input,
+    help='Number of LGN inputs (1..17400).',
+)
 parser.add_argument('--seq_len', default=500, type=int)
 parser.add_argument('--n_trials_per_angle', default=10, type=int)
 # parser.add_argument('--n_cues', default=3, type=int)
