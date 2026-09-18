@@ -664,7 +664,11 @@ def restore_evaluation_checkpoint(
 
         print(f'{result_name} results for epoch {current_epoch} will be saved in: {logdir}\n')
     else:
-        print(f"No checkpoint found in {flags.ckpt_dir} or {flags.restore_from}. Starting from scratch...\n")
+        raise FileNotFoundError(
+            f"No checkpoint could be restored. Reason: "
+            f"No valid checkpoint found. Point --restore_from at a "
+            "directory that still holds its ckpt-*.index/.data files."
+        )
 
     return checkpoint, logdir, current_epoch
 
