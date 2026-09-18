@@ -810,9 +810,12 @@ def main(_):
             seed=flags.seed,
             output_dtype=dtype,
         )
-        # Handle the random seed for spontaneous spike generation and BKG noise
+        # Handle the random seed for spontaneous spike generation and BKG noise.
+        # Offset by run_session so successive training sessions of the SAME network
+        # (which must all use the same --seed to build an identical network for
+        # checkpoint restoration) still get distinct noise streams.
         seed_helper = tf_utils.DistributedSeedHelper(
-            flags.seed,
+            flags.seed + flags.run_session,
             rsnn_layer.cell.noise_stream,
             rsnn_layer.cell.noise_seed,
         )
@@ -1306,7 +1309,7 @@ def main(_):
             batch_size = input_context.get_per_replica_batch_size(
                 global_grating_batch_size
             )
-            pipeline_seed = flags.seed + 10000 + int(input_context.input_pipeline_id)
+            pipeline_seed = flags.seed + flags.run_session + 10000 + int(input_context.input_pipeline_id)
             _data_set = (stim_dataset.generate_drifting_grating_tuning(
                 seq_len=flags.seq_len,
                 pre_delay=delays[0],
@@ -1331,7 +1334,7 @@ def main(_):
             batch_size = input_context.get_per_replica_batch_size(
                 global_gray_batch_size
             )
-            pipeline_seed = flags.seed + 20000 + int(input_context.input_pipeline_id)
+            pipeline_seed = flags.seed + flags.run_session + 20000 + int(input_context.input_pipeline_id)
             _gray_data_set = (stim_dataset.generate_gray_screen_stimulus(
                 seq_len=flags.seq_len,
                 n_input=flags.n_input,

@@ -244,15 +244,15 @@ def main():
         if i == 0:
             new_training_command = training_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-J", f"{sim_name}_train_{i}"]
             if initial_benchmark_model:
-                new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i} --restore_from {initial_benchmark_model} "
+                new_training_script = training_script + f"--seed {flags.seed} --ckpt_dir {logdir} --run_session {i} --restore_from {initial_benchmark_model} "
             else:
-                new_training_script = training_script + f" --seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
+                new_training_script = training_script + f" --seed {flags.seed} --ckpt_dir {logdir} --run_session {i}"
             new_training_command = new_training_command + ["--wrap"] + [new_training_script]
             job_id = submit_job(new_training_command, flags.print_only)
         else:
             new_training_command = training_commands + ['-d', job_ids[i-1], "-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-J", f"{sim_name}_train_{i}"]
-            # new_training_script = training_script + f"--osi_cost 0.1 --rate_cost 10 --seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
-            new_training_script = training_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --run_session {i}"
+            # new_training_script = training_script + f"--osi_cost 0.1 --rate_cost 10 --seed {flags.seed} --ckpt_dir {logdir} --run_session {i}"
+            new_training_script = training_script + f"--seed {flags.seed} --ckpt_dir {logdir} --run_session {i}"
             new_training_command = new_training_command + ["--wrap"] + [new_training_script]
             job_id = submit_job(new_training_command, flags.print_only)
         job_ids.append(job_id)
@@ -261,14 +261,14 @@ def main():
             continue
         else:
             new_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-J", f"{sim_name}_test_{i}"]
-            new_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
+            new_evaluation_script = evaluation_script + f"--seed {flags.seed} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
             new_evaluation_command = new_evaluation_command + ["--wrap"] + [new_evaluation_script]
             eval_job_id = submit_job(new_evaluation_command, flags.print_only)
             eval_job_ids.append(eval_job_id)
 
     # Final evaluation with the best model
     final_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_final.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_final.err", "-J", f"{sim_name}_test_final"]
-    final_evaluation_script = evaluation_script + f"--seed {flags.seed + i} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
+    final_evaluation_script = evaluation_script + f"--seed {flags.seed} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
     final_evaluation_command = final_evaluation_command + ["--wrap"] + [final_evaluation_script]
     eval_job_id = submit_job(final_evaluation_command, flags.print_only)
     eval_job_ids.append(eval_job_id)

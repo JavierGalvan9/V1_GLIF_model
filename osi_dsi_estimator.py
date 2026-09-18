@@ -227,9 +227,12 @@ def main(_):
             seed=flags.seed,
             output_dtype=dtype,
         )
-        # Handle the random seed for spontaneous spike generation and BKG noise
+        # Handle the random seed for spontaneous spike generation and BKG noise.
+        # Offset by run_session so different evaluation sessions of the SAME network
+        # (which must all use the same --seed to rebuild an identical network for
+        # checkpoint restoration) still get distinct noise streams.
         seed_helper = tf_utils.DistributedSeedHelper(
-            flags.seed,
+            flags.seed + flags.run_session,
             rsnn_layer.cell.noise_stream,
             rsnn_layer.cell.noise_seed,
         )
