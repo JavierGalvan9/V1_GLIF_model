@@ -847,12 +847,12 @@ def compute_spike_rate_target_loss(rates, target_rates, dtype=tf.float32):
             model_rates, tf.random.shuffle(neuron_indices)
         )
         residual = tf.sort(model_rates) - value["sorted_target_rates"]
-        # tau = (tf.cast(neuron_indices, dtype) + 0.5) / tf.cast(
-        #     n_model_neurons, dtype
-        # )
-        tau = (tf.cast(neuron_indices, dtype) + 1.0) / tf.cast(
-                    n_model_neurons, dtype
-                )
+        tau = (tf.cast(neuron_indices, dtype) + 0.5) / tf.cast(
+            n_model_neurons, dtype
+        )
+        # tau = (tf.cast(neuron_indices, dtype) + 1.0) / tf.cast(
+        #             n_model_neurons, dtype
+        #         )
         total_loss += tf.reduce_sum(
             huber_quantile_loss(residual, tau, 0.002, dtype=dtype)
         )
@@ -1108,28 +1108,29 @@ class SpikeRateDistributionTarget:
             rates = type_rates_dict.get(cell_type, np.array([0.0], dtype=np.float32))
             neuron_ids = population_ids[cell_type]
             type_n_neurons = int(len(neuron_ids))
-            # target_firing_rates[cell_type] = {
-            #     "rates": rates,
-            #     "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
-            #     "n_model_neurons": type_n_neurons,
-            #     "sorted_target_rates": tf.convert_to_tensor(
-            #         self._rates_dampening
-            #         * interpolate_empirical_quantile_midpoints(
-            #             rates, type_n_neurons
-            #         ),
-            #         dtype=self._dtype,
-            #     ),
-            # }
             target_firing_rates[cell_type] = {
-                            "rates": rates,
-                            "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
-                            "n_model_neurons": type_n_neurons,
-                            "sorted_target_rates": tf.convert_to_tensor(
-                                self._rates_dampening
-                                * sample_firing_rates(rates, type_n_neurons, self._seed),
-                                dtype=self._dtype,
-                            ),
-                        }
+                "rates": rates,
+                "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
+                "n_model_neurons": type_n_neurons,
+                "sorted_target_rates": tf.convert_to_tensor(
+                    self._rates_dampening
+                    * interpolate_empirical_quantile_midpoints(
+                        rates, type_n_neurons
+                    ),
+                    dtype=self._dtype,
+                ),
+            }
+            # Sample from the empirical distribution
+            # target_firing_rates[cell_type] = {
+            #                 "rates": rates,
+            #                 "neuron_ids": tf.convert_to_tensor(neuron_ids, dtype=tf.int32),
+            #                 "n_model_neurons": type_n_neurons,
+            #                 "sorted_target_rates": tf.convert_to_tensor(
+            #                     self._rates_dampening
+            #                     * sample_firing_rates(rates, type_n_neurons, self._seed),
+            #                     dtype=self._dtype,
+            #                 ),
+            #             }
 
         return target_firing_rates
 
