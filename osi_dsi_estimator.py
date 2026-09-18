@@ -211,7 +211,46 @@ def main(_):
 
         # Build the sequence-and-state model used by the optimized Keras RNN loop.
         rsnn_layer = model.get_layer('rsnn')
-        extractor_model = tf.keras.Model(inputs=model.inputs, outputs=rsnn_layer.output)
+        sequence_and_state_model = models.build_sequence_and_state_model(
+            model, rsnn_layer, name="osi_dsi_sequence_and_state_extractor"
+        )
+        n_sequence_outputs = sequence_and_state_model._v1_sequence_output_count
+        # The per-replica batch here is --n_trials_per_angle, which is exactly the
+        # knob raised to tighten the OSI/DSI statistics. Above 2**31 elements the
+        # stock Keras RNN output assembly (TensorArray.stack) returns the wrong
+        # spikes with no error at all, so route it through the segmented runner --
+        # which rejoins along axis 1 and is int32-safe -- or refuse outright.
+        segmented_extractor = None
+        if flags.gradient_checkpointing:
+            segmented_extractor = models.SegmentedRecomputeRunner(
+                sequence_and_state_model,
+                sequence_length=flags.seq_len,
+                chunk_size=flags.gradient_checkpoint_chunk_size,
+                differentiate_inputs=False,
+                pack_spike_checkpoints=flags.pack_spike_checkpoints,
+            )
+            print(
+                "Segmented RNN rollout: "
+                f"{segmented_extractor.n_chunks} chunks, "
+                f"chunk_size={segmented_extractor.chunk_size}."
+            )
+        else:
+            training_utils.require_int32_safe_rnn_output(
+                per_replica_batch_size, flags.seq_len, network["n_nodes"]
+            )
+            print("Segmented RNN rollout disabled.")
+
+        # The gray-screen warm-up only needs the final state, so the state-only
+        # model keeps it from building a [batch, seq_len, n_neurons] sequence
+        # that is discarded immediately -- and from tripping the same limit.
+        try:
+            state_model = models.build_state_only_model(model, rsnn_layer)
+        except Exception as e:
+            state_model = None
+            print(
+                f"Warning: failed to build state-only model ({e}); "
+                "using the full sequence model for the gray state."
+            )
 
         # zero_state = rsnn_layer.cell.zero_state(per_replica_batch_size, dtype=dtype)
         # state_variables = tf.nest.map_structure(lambda a: tf.Variable(
@@ -254,14 +293,25 @@ def main(_):
             strategy=strategy,
         )
 
+    # Both paths return one flat tuple: the sequence outputs followed by the
+    # final state, so roll_out splits them the same way either way.
+    if segmented_extractor is not None:
+        def extractor_forward(_x, _state_variables):
+            return tuple(segmented_extractor(_x, _state_variables))
+    else:
+        def extractor_forward(_x, _state_variables):
+            return tuple(
+                tf.nest.flatten(sequence_and_state_model((_x, _state_variables)))
+            )
+
     def roll_out(_x, _state_variables):
         if _x.dtype == tf.bool:
             _x = tf.cast(_x, dtype)
         seed_helper.advance_noise_seed()
-        _out = extractor_model((_x, _state_variables))
-        sequences = _out[0]
+        _out = extractor_forward(_x, _state_variables)
+        sequences = _out[:n_sequence_outputs]
         voltage = sequences[1] if flags.track_voltage else ()
-        return sequences[0], voltage, tuple(_out[1:])
+        return sequences[0], voltage, tuple(_out[n_sequence_outputs:])
 
     @tf.function
     def distributed_roll_out(x, state_variables):
@@ -283,8 +333,12 @@ def main(_):
         prob = tf.tile(tf.expand_dims(spontaneous_prob, axis=0), [batch_size, 1, 1])
         gray_spikes = tf.cast(generate_spontaneous_spikes(prob), dtype)
         zero_state = rsnn_layer.cell.zero_state(batch_size, dtype=dtype)
-        _, _, new_state = roll_out(gray_spikes, zero_state)
-        return new_state
+        if state_model is None:
+            return roll_out(gray_spikes, zero_state)[2]
+        # Keep the noise stream advancing exactly once per gray rollout, as the
+        # roll_out path above does, so the two branches stay seed-compatible.
+        seed_helper.advance_noise_seed()
+        return tuple(tf.nest.flatten(state_model((gray_spikes, zero_state))))
 
     @tf.function
     def distributed_generate_gray_state(batch_size):
@@ -535,6 +589,16 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('restore_runtime_dtype_cast', True, 'Enable in-memory checkpoint dtype conversion when checkpoint and requested model dtype differ.')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
+    absl.app.flags.DEFINE_integer(
+        "gradient_checkpoint_chunk_size",
+        25,
+        "Temporal chunk size for the segmented RNN rollout.",
+    )
+    absl.app.flags.DEFINE_boolean(
+        "pack_spike_checkpoints",
+        True,
+        "Bit-pack binary recurrent spike state stored at temporal chunk boundaries.",
+    )
     absl.app.flags.DEFINE_boolean("track_core_only", False, "Track spikes only from core neurons to reduce memory usage")
     absl.app.flags.DEFINE_boolean("track_voltage", False, "Track and save membrane voltage traces during simulation")
     absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")

@@ -149,35 +149,9 @@ def int32_safe_cast(values, dtype, chunk_size=25,
     )
 
 
-def require_int32_safe_rnn_output(batch_size, seq_len, n_neurons,
-                                  full_tensor_element_limit=None):
-    """Refuse an un-checkpointed run whose RNN output exceeds the int32 limit.
-
-    Without gradient checkpointing, Keras assembles the RNN output with
-    ``TensorArray.stack()`` -- an axis-0 concat of ``seq_len`` slices, whose
-    GPU kernel indexes the result with int32. Above 2**31 elements it returns
-    the wrong spikes with no error raised at all, and every loss downstream is
-    then computed on garbage. There is no cheap way to make Keras' stack safe,
-    so refuse the configuration rather than produce plausible-looking numbers.
-
-    The segmented runner is unaffected: it rejoins its chunks along axis 1,
-    where TensorFlow picks the index type from ``seq_len * n_neurons`` rather
-    than from the element count. See ``int32_overflow_audit_20260902/``.
-    """
-    if full_tensor_element_limit is None:
-        full_tensor_element_limit = int(np.iinfo(np.int32).max)
-    elements = int(batch_size) * int(seq_len) * int(n_neurons)
-    if elements > full_tensor_element_limit:
-        raise ValueError(
-            "Gradient checkpointing is disabled, but the RNN output "
-            f"[{batch_size}, {seq_len}, {n_neurons}] is {elements:,} elements, "
-            f"past the {full_tensor_element_limit:,} TensorFlow's stock GPU "
-            "kernels index correctly. Keras assembles that output with "
-            "TensorArray.stack(), which is silently wrong above the limit. "
-            "Pass --gradient_checkpointing, or lower --batch_size / --seq_len "
-            "so the product stays under it."
-        )
-    return elements
+# Re-exported so multi_training callers (and the int32 regression tests) keep
+# a single definition shared with osi_dsi_estimator.
+require_int32_safe_rnn_output = training_utils.require_int32_safe_rnn_output
 
 
 def concatenate_stimulus_batches(grating, spontaneous, dtype):
