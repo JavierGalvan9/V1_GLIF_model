@@ -1412,6 +1412,12 @@ class Callbacks:
             if protocol_spikes is not None and protocol_angles is not None:
                 self.plot_protocol_validation_metrics(protocol_spikes, protocol_angles)
 
+        if not np.all(np.isfinite(metric_values)):
+            non_finite_keys = [k for k, v in zip(self.metrics_keys, metric_values) if not np.isfinite(v)]
+            print(f"[ Divergence detected at epoch {self.epoch}: non-finite metrics {non_finite_keys} "
+                  f"-- stopping training without updating the best checkpoint ]")
+            return True
+
         # # save latest model every 10 epochs
         # if self.epoch % 10 == 0:
         #     self.save_latest_model()
