@@ -1226,11 +1226,8 @@ class Callbacks:
                 json.dump(flags.flag_values_dict(), handle, indent=4)
 
         if checkpoint is None:
-            if save_optimizer:
-                checkpoint = tf.train.Checkpoint(
-                    optimizer=optimizer, model=model)
-            else:
-                checkpoint = tf.train.Checkpoint(model=model)
+            checkpoint = tf_utils.make_checkpoint(
+                model, optimizer if save_optimizer else None)
             self.min_val_loss = float('inf')
             self.no_improve_epochs = 0
             self.checkpoint_epochs = 0

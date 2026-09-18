@@ -218,6 +218,26 @@ def voltage_spike_effect_correction(v, z, pre_spike_gap=2, post_spike_gap=3):
 
 
 def optimizers_match(current_optimizer, checkpoint_directory):
+    from v1_model_utils import tf_utils
+
+    # Slot shapes are identical across optimizers of the same family (adam vs.
+    # exp_adam), so trust the recorded optimizer class whenever it is present.
+    checkpoint_identity = tf_utils.checkpoint_optimizer_identity(checkpoint_directory)
+    current_identity = tf_utils.optimizer_identity(current_optimizer)
+    if checkpoint_identity is not None:
+        if checkpoint_identity != current_identity:
+            print(
+                f"Checkpoint was written by optimizer '{checkpoint_identity}' but the "
+                f"current optimizer is '{current_identity}'. Renewing optimizer..."
+            )
+            return False
+    else:
+        print(
+            "Checkpoint records no optimizer class (written before optimizer "
+            "identity was stored); falling back to a shape-only comparison, which "
+            "cannot distinguish optimizers with identical slot shapes."
+        )
+
     variables = current_optimizer.variables
     if callable(variables):
         variables = variables()

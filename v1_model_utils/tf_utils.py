@@ -454,12 +454,53 @@ def rebase_checkpointed_layout(model, to_runtime, optimizer=None):
         )
 
 
+OPTIMIZER_ID_KEY = "optimizer_id/.ATTRIBUTES/VARIABLE_VALUE"
+
+
+def optimizer_identity(optimizer):
+    """A stable name for the optimizer *class*, unwrapping loss-scaling.
+
+    Slot shapes alone cannot tell Adam from ExponentiatedAdam (both keep one
+    momentum and one velocity per variable), so the class name is stored in the
+    checkpoint and compared on restore.
+    """
+    if optimizer is None:
+        return ""
+    inner = getattr(optimizer, "inner_optimizer", None)
+    return type(inner if inner is not None else optimizer).__name__
+
+
+def make_checkpoint(model, optimizer=None):
+    """Build a checkpoint that also records which optimizer wrote it."""
+    if optimizer is None:
+        return tf.train.Checkpoint(model=model)
+    return tf.train.Checkpoint(
+        optimizer=optimizer,
+        model=model,
+        optimizer_id=tf.Variable(optimizer_identity(optimizer), dtype=tf.string),
+    )
+
+
+def checkpoint_optimizer_identity(checkpoint_directory):
+    """Read the recorded optimizer class name, or None for legacy checkpoints."""
+    try:
+        reader = tf.train.load_checkpoint(checkpoint_directory)
+    except Exception:
+        return None
+    if OPTIMIZER_ID_KEY not in reader.get_variable_to_shape_map():
+        return None
+    value = reader.get_tensor(OPTIMIZER_ID_KEY)
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
 def restore_and_rebase(
     checkpoint, checkpoint_directory, model, optimizer=None, require_optimizer=False
 ):
     """Restore an original-order checkpoint into a possibly relabelled model."""
-    status = checkpoint.restore(checkpoint_directory)
     if require_optimizer:
+        status = checkpoint.restore(checkpoint_directory)
         legacy_optimizer_restored = _restore_keras2_optimizer_slots(
             checkpoint_directory, optimizer
         )
@@ -476,6 +517,23 @@ def restore_and_rebase(
                 "requested training state."
             ) from error
     else:
+        # The optimizer state is deliberately discarded here (renewed optimizer,
+        # or evaluation), but the *model* must still restore completely. Restore
+        # through a model-only checkpoint so that expect_partial() only forgives
+        # the optimizer keys and every model variable can still be asserted: a
+        # plain expect_partial() on the combined checkpoint lets a full
+        # shape/name mismatch through and leaves the model at random init.
+        model_checkpoint = tf.train.Checkpoint(model=model)
+        status = model_checkpoint.restore(checkpoint_directory)
+        try:
+            status.assert_existing_objects_matched()
+        except AssertionError as error:
+            raise ValueError(
+                f"Restoring {checkpoint_directory} left model variables unmatched, "
+                "so the model would silently run from random initialization. This "
+                "usually means the checkpoint was written by a model built with "
+                "different shapes, names or flags."
+            ) from error
         status.expect_partial()
     rebase_checkpointed_layout(model, to_runtime=True, optimizer=optimizer)
 
@@ -557,11 +615,11 @@ def restore_training_checkpoint(
                 model.trainable_variables,
                 mixed_precision_module=mixed_precision_module,
             )
-            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint = make_checkpoint(model, optimizer)
             restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
             print('Checkpoint restored with a new optimizer.')
         else:
-            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint = make_checkpoint(model, optimizer)
             restore_and_rebase(
                 checkpoint, checkpoint_directory, model, optimizer,
                 require_optimizer=True,
@@ -591,11 +649,11 @@ def restore_training_checkpoint(
                 model.trainable_variables,
                 mixed_precision_module=mixed_precision_module,
             )
-            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint = make_checkpoint(model, optimizer)
             restore_and_rebase(checkpoint, checkpoint_directory, model, optimizer)
             print('Checkpoint restored with a new optimizer.')
         else:
-            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            checkpoint = make_checkpoint(model, optimizer)
             restore_and_rebase(
                 checkpoint, checkpoint_directory, model, optimizer,
                 require_optimizer=True,
