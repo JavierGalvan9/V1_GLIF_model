@@ -1420,11 +1420,13 @@ class Callbacks:
         #     self.save_latest_model()
 
         if val_loss_value < self.min_val_loss:
-            self.min_val_loss = val_loss_value
             # if self.no_improve_epochs > 50: # plot the best model results if there has been at least 50 epochs from the last best model
             self.no_improve_epochs = 0
             if self.write_outputs and getattr(self.flags, "save_best_checkpoint", True):
-                self.save_best_model()
+                if self.save_best_model():
+                    self.min_val_loss = val_loss_value
+            else:
+                self.min_val_loss = val_loss_value
 
             if self.write_outputs:
                 self.plot_mean_firing_rate_boxplot(v1_spikes, y)
@@ -1454,7 +1456,7 @@ class Callbacks:
                     tf.summary.scalar(k, v, step=self.epoch)
 
         # EARLY STOPPING CONDITIONS
-        if (0 < self.flags.max_time < (time() - self.epoch_init_time) / 3600):
+        if (0 < self.flags.max_time < (time() - self.train_start_time) / 3600):
             print(
                 f'[ Maximum optimization time of {self.flags.max_time:.2f}h reached ]')
             stop = True
@@ -1550,8 +1552,10 @@ class Callbacks:
         try:
             p = self._save_canonical(self.best_manager)
             print(f'Model saved in {p}\n')
+            return True
         except Exception as error:
             print(f"Saving failed ({error!r}). Maybe next time?")
+            return False
 
     def plot_losses_curves(self):
         # Define labels and components
