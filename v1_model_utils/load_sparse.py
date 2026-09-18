@@ -56,8 +56,8 @@ def _v1_cache_provenance(flags, n_neurons):
 
 
 def sort_indices(indices, *arrays):
-    max_ind = np.max(indices) + 1
-    if np.iinfo(indices.dtype).max < max_ind * (max_ind + 1) :
+    max_ind = int(np.max(indices)) + 1
+    if max_ind * (max_ind + 1) > np.iinfo(indices.dtype).max:
         indices = indices.astype(np.int64)
     q = indices[:, 0] * max_ind + indices[:, 1]
     sorted_ind = np.argsort(q)
