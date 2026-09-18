@@ -50,9 +50,17 @@ def annulus_mask_from_core(core_mask):
 
 
 def update_rate_emas(v1_ema, v1_rates, decay, update_state=True):
-    """Update the training rate normalizer without mutating it in evaluation."""
+    """Update the training rate normalizer without mutating it in evaluation.
+
+    Called in replica context under a distribution strategy. `v1_ema` carries
+    `aggregation=MEAN`, so the per-replica new values are averaged into one
+    global-batch value before any replica's copy is written, and all replicas
+    keep reading the same normalizer.
+    """
     if update_state:
-        v1_ema.assign(decay * v1_ema + (1 - decay) * v1_rates)
+        v1_ema.assign(
+            tf.stop_gradient(decay * v1_ema + (1 - decay) * v1_rates)
+        )
 
 
 def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
@@ -566,7 +574,20 @@ def main(_):
                 v1_ema_value = default_v1_ema
             else:
                 v1_ema_value = restored_v1_ema
-        v1_ema = tf.Variable(v1_ema_value, trainable=False, name='V1_EMA')
+        # `aggregation=MEAN` is required, not cosmetic: the EMA is updated from
+        # inside `strategy.run`, i.e. in replica context. With the default
+        # `aggregation=NONE` TF 2.21 silently routes the assign through
+        # `_on_write_update_replica`, which writes only the calling replica's
+        # copy, so every replica would normalize the OSI/DSI loss by a different
+        # vector and the aggregated gradient would sum the gradients of N
+        # different objectives. With MEAN the assign all-reduces the per-replica
+        # values first and writes the same global-batch EMA to every replica.
+        v1_ema = tf.Variable(
+            v1_ema_value,
+            trainable=False,
+            name='V1_EMA',
+            aggregation=tf.VariableAggregation.MEAN,
+        )
 
         OSI_DSI_Loss = losses.OrientationSelectivityLoss(network=network, osi_cost=flags.osi_cost,
                                                          pre_delay=delays[0], post_delay=delays[1],
@@ -2005,7 +2026,7 @@ def main(_):
         reset_train_metrics()
         distributed_reset_validation_metrics()
 
-    normalizers = {'v1_ema': v1_ema.numpy()}
+    normalizers = {'v1_ema': np.asarray(v1_ema.read_value())}
     if flags.osi_loss_method in ("rolling_osi_emd", "adaptative_crowd_osi"):
         rolling_state = {"core": OSI_DSI_Loss.get_rolling_state()}
         if annulus_mask is not None:
