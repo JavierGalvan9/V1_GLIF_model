@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
+from v1_model_utils import csr_order
 from v1_model_utils.cuda_operator_cache import ensure_artifact
 from v1_model_utils.cuda_csr_external.build import build_flags_for, DIRECT_CSR
 from v1_model_utils.cuda_csr_recurrent.build import (
@@ -88,12 +89,11 @@ def _compact_pairs(post_ids, synapse_types, needed=True):
             "pair_types": tf.zeros((0,), tf.uint8),
             "n_pairs": 0,
         }
-    codes = post_ids.astype(np.uint64) * 256 + synapse_types.astype(np.uint64)
-    unique_codes, pair_ids = np.unique(codes, return_inverse=True)
+    unique_codes, pair_ids = csr_order.compact_pairs(post_ids, synapse_types)
     return {
         "pair_ids": tf.constant(pair_ids.astype(np.uint32), tf.uint32),
         "pair_posts": tf.constant((unique_codes >> 8).astype(np.uint32), tf.uint32),
-        "pair_types": tf.constant((unique_codes & 255).astype(np.uint8), tf.uint8),
+        "pair_types": tf.constant((unique_codes & 0xFF).astype(np.uint8), tf.uint8),
         "n_pairs": int(unique_codes.size),
     }
 
@@ -164,23 +164,25 @@ def build_csr_connectivity(
     if np.any(types < 0) or np.any(types > np.iinfo(np.uint8).max):
         raise ValueError("synapse types must fit uint8")
 
-    original = np.arange(indices.shape[0], dtype=np.uint32)
-    order = np.lexsort((original, indices[:, 0], indices[:, 1])).astype(
-        np.uint32, copy=False
-    )
+    keys = (indices[:, 1], indices[:, 0])
+    if weights_csr_ordered:
+        if not csr_order.is_identity_order(keys):
+            raise ValueError(
+                "edges were declared to be in CSR order but the derived "
+                "permutation is not the identity"
+            )
+        # The permutation is the identity, so every gather below it is too.
+        order = np.arange(indices.shape[0], dtype=np.uint32)
+        ordered_posts = indices[:, 0].astype(np.uint32, copy=False)
+        ordered_types = types.astype(np.uint8, copy=False)
+    else:
+        order = csr_order.edge_order(keys)
+        ordered_posts = indices[order, 0].astype(np.uint32, copy=False)
+        ordered_types = types[order].astype(np.uint8, copy=False)
     counts = np.bincount(indices[:, 1], minlength=n_pre).astype(np.uint64)
     offsets = np.empty(int(n_pre) + 1, dtype=np.uint32)
     offsets[0] = 0
     offsets[1:] = np.cumsum(counts, dtype=np.uint64).astype(np.uint32)
-    if weights_csr_ordered and not np.array_equal(
-        order, np.arange(order.size, dtype=order.dtype)
-    ):
-        raise ValueError(
-            "edges were declared to be in CSR order but the derived permutation "
-            "is not the identity"
-        )
-    ordered_posts = indices[order, 0].astype(np.uint32, copy=False)
-    ordered_types = types[order].astype(np.uint8, copy=False)
     connectivity = CsrConnectivity(
         post_ids=tf.constant(ordered_posts, tf.uint32),
         synapse_types=tf.constant(ordered_types, tf.uint8),
