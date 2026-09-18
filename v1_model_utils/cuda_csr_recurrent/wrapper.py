@@ -133,6 +133,7 @@ def _load_ops():
                 directory / "build.py",
                 directory / "csr_recurrent_ops.cc",
                 directory / "csr_recurrent_ops.cu.cc",
+                directory / "generic_backward_kernels.cuh",
             ),
             build_module="v1_model_utils.cuda_csr_recurrent.build",
             build_flags=build_flags_for,

@@ -60,7 +60,11 @@ def load_ops():
                 directory.parent
                 / "cuda_csr_recurrent/csr_recurrent_ops.cu.cc",
                 directory.parent
+                / "cuda_csr_recurrent/generic_backward_kernels.cuh",
+                directory.parent
                 / "cuda_csr_external/csr_external_grad_ops.cu.cc",
+                directory.parent
+                / "cuda_csr_external/generic_backward_kernels.cuh",
             ),
             build_module="v1_model_utils.cuda_csr_resources.build",
             build_flags=build_flags_for,
