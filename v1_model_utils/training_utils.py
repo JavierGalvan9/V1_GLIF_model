@@ -67,16 +67,19 @@ def require_int32_safe_rnn_output(batch_size, seq_len, n_neurons,
     """Refuse an un-checkpointed run whose RNN output exceeds the int32 limit.
 
     Without gradient checkpointing, Keras assembles the RNN output with
-    ``TensorArray.stack()`` -- an axis-0 concat of ``seq_len`` slices, whose
-    GPU kernel indexes the result with int32. Above 2**31 elements it returns
-    the wrong spikes with no error raised at all, and every loss or statistic
-    downstream is then computed on garbage. There is no cheap way to make
-    Keras' stack safe, so refuse the configuration rather than produce
+    ``TensorArray.stack()`` -- an axis-0 concat of ``seq_len`` slices. With 16
+    or more inputs TensorFlow's concat switches to a pointer-array GPU kernel
+    whose offsets are int32, so above 2**31 elements it returns the wrong
+    spikes with no error raised at all (measured on TF 2.21: 99.9% of the
+    elements wrong for a 500-slice stack at 1.52x the limit), and every loss
+    or statistic downstream is then computed on garbage. There is no cheap way
+    to make Keras' stack safe, so refuse the configuration rather than produce
     plausible-looking numbers.
 
     The segmented runner is unaffected: it rejoins its chunks along axis 1,
     where TensorFlow picks the index type from ``seq_len * n_neurons`` rather
-    than from the element count. See ``int32_overflow_audit_20260902/``.
+    than from the element count -- measured exact at 1.52x the limit with both
+    2 and 100 chunks.
     """
     if full_tensor_element_limit is None:
         full_tensor_element_limit = int(np.iinfo(np.int32).max)

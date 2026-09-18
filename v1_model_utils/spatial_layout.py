@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from v1_model_utils import csr_order
+
 
 CANONICAL = "canonical"
 MORTON = "morton"
@@ -318,8 +320,7 @@ def recurrent_csr_order(network, max_delay, dt=1.0):
     ).astype(np.int64)
     pre = indices[:, 1].astype(np.int64) + int(network["n_nodes"]) * (delay_steps - 1)
     types = np.asarray(synapses["syn_ids"])
-    original = np.arange(indices.shape[0], dtype=np.uint32)
-    return np.lexsort((original, types, indices[:, 0], pre)).astype(np.uint32)
+    return csr_order.edge_order((pre, indices[:, 0], types))
 
 
 def external_csr_order(source):
@@ -329,8 +330,7 @@ def external_csr_order(source):
     ``cuda_csr_external.build_csr_connectivity``.
     """
     indices = np.asarray(source["indices"])
-    original = np.arange(indices.shape[0], dtype=np.uint32)
-    return np.lexsort((original, indices[:, 0], indices[:, 1])).astype(np.uint32)
+    return csr_order.edge_order((indices[:, 1], indices[:, 0]))
 
 
 # Fields that are not per-edge even though their length can coincide with the
