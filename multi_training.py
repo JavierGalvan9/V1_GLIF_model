@@ -889,7 +889,7 @@ def main(_):
             return [_identity_gradient_with_control(g) for g in gradients]
 
     def _compute_losses_from_activity(
-        _z, voltage_source, y, spontaneous, trim, regularizers_loss, update_state=True
+        _z, voltage_source, y, spontaneous, trim, update_state=True
     ):
 
         # keep final scalar aggregation in float32
@@ -969,13 +969,12 @@ def main(_):
             rate_loss=rate_loss,
             voltage_loss=voltage_loss,
             osi_dsi_loss=osi_dsi_loss,
-            regularizer_loss=regularizers_loss,
             sync_loss=sync_loss,
             firing_rate=firing_rate,
         )
         # Rescale the losses based on the number of replicas
         _loss = tf.nn.scale_regularization_loss(
-            rate_loss + voltage_loss + regularizers_loss + osi_dsi_loss + sync_loss
+            rate_loss + voltage_loss + osi_dsi_loss + sync_loss
         )
 
         return _loss, _aux
@@ -995,11 +994,14 @@ def main(_):
                 rec_weight_regularizer(
                     rsnn_layer.cell.recurrent_weight_values), tf.float32
             )
+            regularizers_loss = tf.nn.scale_regularization_loss(regularizers_loss)
 
         _loss, _aux = _compute_losses_from_activity(
-            _z, voltage_source, y, spontaneous, trim, regularizers_loss,
-            update_state=update_loss_state,
+            _z, voltage_source, y, spontaneous, trim,
+            update_state=update_loss_state
         )
+        _loss += regularizers_loss
+        _aux["regularizer_loss"] = regularizers_loss
 
         return _out, _loss, _aux
 
@@ -1023,25 +1025,24 @@ def main(_):
                 rec_weight_regularizer(
                     rsnn_layer.cell.recurrent_weight_values), tf.float32
             )
+            regularizers_loss = tf.nn.scale_regularization_loss(regularizers_loss)
 
         evoked_loss, evoked_aux = _compute_losses_from_activity(
-            _z_evoked, voltage_source_evoked, y, False, trim, regularizers_loss,
-            update_state=update_loss_state,
+            _z_evoked, voltage_source_evoked, y, False, trim, update_state=update_loss_state
         )
         spont_loss, spont_aux = _compute_losses_from_activity(
-            _z_spont, voltage_source_spont, y, True, trim, regularizers_loss,
-            update_state=update_loss_state,
+            _z_spont, voltage_source_spont, y, True, trim, update_state=update_loss_state
         )
 
-        return _out, evoked_loss, spont_loss, evoked_aux, spont_aux
+        return _out, evoked_loss, spont_loss, regularizers_loss, evoked_aux, spont_aux
 
     def train_step_combined(x, y, x_spontaneous, state_variables, trim, return_sequences=False):
         # Forward propagation of the model (single call for evoked + spontaneous)
         with tf.GradientTape() as tape:
-            _out, evoked_loss, spont_loss, evoked_aux, spont_aux = roll_out_combined(
+            _out, evoked_loss, spont_loss, regularizers_loss, evoked_aux, spont_aux = roll_out_combined(
                 x, y, x_spontaneous, state_variables, trim=trim
             )
-            total_loss = tf.cast(evoked_loss + spont_loss, tf.float32)
+            total_loss = tf.cast(evoked_loss + spont_loss + regularizers_loss, tf.float32)
             loss_for_grad = optimizer_utils.scale_loss_for_optimizer(optimizer, total_loss)
 
         # Backpropagation of the model (gradients computation and application)
@@ -1068,8 +1069,8 @@ def main(_):
         mean_aux = {
             "rate_loss": (evoked_aux["rate_loss"] + spont_aux["rate_loss"]) / 2.0,
             "voltage_loss": (evoked_aux["voltage_loss"] + spont_aux["voltage_loss"]) / 2.0,
+            "regularizer_loss": regularizers_loss,
             "osi_dsi_loss": evoked_aux["osi_dsi_loss"],
-            "regularizer_loss": evoked_aux["regularizer_loss"],
             "sync_loss": (evoked_aux["sync_loss"] + spont_aux["sync_loss"]) / 2.0,
         }
 
