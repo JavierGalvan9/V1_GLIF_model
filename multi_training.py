@@ -1088,11 +1088,11 @@ def main(_):
         optimizer.apply_gradients(zip(grad, model.trainable_variables))
 
         mean_aux = {
-            "rate_loss": (evoked_aux["rate_loss"] + spont_aux["rate_loss"]) / 2.0,
-            "voltage_loss": (evoked_aux["voltage_loss"] + spont_aux["voltage_loss"]) / 2.0,
+            "rate_loss": (evoked_aux["rate_loss"] + spont_aux["rate_loss"]),
+            "voltage_loss": (evoked_aux["voltage_loss"] + spont_aux["voltage_loss"]),
             "regularizer_loss": regularizers_loss,
             "osi_dsi_loss": evoked_aux["osi_dsi_loss"],
-            "sync_loss": (evoked_aux["sync_loss"] + spont_aux["sync_loss"]) / 2.0,
+            "sync_loss": (evoked_aux["sync_loss"] + spont_aux["sync_loss"]),
         }
 
         # Backpropagation of the model (metrics)
@@ -1690,7 +1690,7 @@ def main(_):
         )
         rate_loss = (
             float(np.mean(evoked_rate_losses)) + float(spont_result["spont_rate_loss"])
-        ) / 2.0
+        )
 
         osi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
         dsi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
@@ -1717,10 +1717,10 @@ def main(_):
         osi_dsi_loss = flags.osi_cost * (osi_emd + dsi_emd)
         voltage_loss = (
             float(np.mean(evoked_voltage_losses)) + float(spont_result["spont_voltage_loss"])
-        ) / 2.0
+        )
         sync_loss = (
             float(np.mean(evoked_sync_losses)) + float(spont_result["spont_sync_loss"])
-        ) / 2.0
+        )
 
         regularizer_loss = 0.
         if flags.train_recurrent and flags.recurrent_weight_regularization > 0:
