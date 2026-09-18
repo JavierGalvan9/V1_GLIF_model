@@ -340,23 +340,8 @@ def load_training_state(logdir, restore_from=""):
 
 
 def resolve_performance_statistics_path(logdir):
-    """Resolve the aggregate performance CSV location from a run logdir."""
-    abs_logdir = os.path.abspath(logdir)
-    current = abs_logdir
-
-    while True:
-        if os.path.basename(current) == "Simulation_results":
-            return os.path.join(current, "performance_statistics.csv")
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-
-    # Fallback for tests or ad hoc directories that are not under Simulation_results.
-    parent = os.path.dirname(abs_logdir)
-    grandparent = os.path.dirname(parent)
-    results_root = grandparent if grandparent and grandparent != parent else parent
-    return os.path.join(results_root, "performance_statistics.csv")
+    """Resolve the per-run performance CSV location for a run logdir."""
+    return os.path.join(os.path.abspath(logdir), "performance_statistics.csv")
 
 
 def append_performance_statistics(
@@ -374,19 +359,8 @@ def append_performance_statistics(
     mode,
 ):
     stats_file = resolve_performance_statistics_path(logdir)
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-    canonical_repo_stats_file = os.path.join(
-        repo_root, "Simulation_results", "performance_statistics.csv"
-    )
-
-    if (
-        os.path.abspath(stats_file) == canonical_repo_stats_file
-        and not os.path.exists(stats_file)
-    ):
-        os.makedirs(os.path.dirname(stats_file), exist_ok=True)
-
     file_exists = os.path.isfile(stats_file)
-    sim_name = os.path.basename(os.path.normpath(logdir))
+    sim_name = extract_sim_name(logdir)
     os.makedirs(os.path.dirname(stats_file), exist_ok=True)
 
     with open(stats_file, "a", encoding="utf-8") as handle:

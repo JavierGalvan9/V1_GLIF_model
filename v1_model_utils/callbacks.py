@@ -1437,7 +1437,7 @@ class Callbacks:
 
             if self.write_outputs and v1_spikes_spont is not None:
                 self.plot_spontaneous_boxplot(v1_spikes_spont, y)
-                self.plot_raster(x, v1_spikes, y, stimulus_type='spontaneous')
+                self.plot_raster(x_spont, v1_spikes_spont, y, stimulus_type='spontaneous')
                 # self.composed_raster(x, v1_spikes, x_spont, v1_spikes_spont, y)
                 # self.composed_raster(x, v1_spikes, x_spont, v1_spikes_spont, y, plot_core_only=False)
                 # self.plot_lgn_activity(x, x_spont)
