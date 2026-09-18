@@ -405,7 +405,14 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
         w <- w * exp(- alpha * m / (sqrt(v) + epsilon) * sign(w)),
 
     preserving the rest of the Adam algorithm (moments `m`, `v`, AMSGrad, etc.).
-    By default, `sign(0) = +1` so zero-valued parameters can still move off zero.
+
+    Note that `w == 0` is an absorbing state of this update: the `sign(0) = +1`
+    fallback below only fixes the *direction* of the exponent, and `0 * exp(x)`
+    is still 0, so a zero-valued parameter can never move off zero. Sign-
+    constrained weights avoid this by being clamped to a small non-zero floor
+    rather than to 0 (see `WEIGHT_FLOOR` in `v1_model_utils/models.py`); the
+    fallback is kept as a guard for any variable not covered by such a
+    constraint.
 
     Sparse updates are applied consistently via `scatter_mul()` on the affected
     slices only.

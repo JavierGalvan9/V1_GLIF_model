@@ -561,26 +561,89 @@ def get_active_synapse_metadata_table(indices, syn_ids, non_zero_cols, pre_ind_t
 
     return active_post_ids, active_syn_ids, post_in_degree, all_synapse_inds
 
+def _uniform_delay_steps(delays, dt, name):
+    """Number of timesteps of afferent delay carried by an input population.
+
+    The LGN and background projections assign a single delay to every edge, so
+    the whole population can be delayed by shifting its spike stream instead of
+    expanding the connectivity over delay slots. A delay of ``k`` steps means the
+    spikes emitted at time ``t`` reach the postsynaptic current at ``t + k``;
+    ``k = 1`` is the minimum (and matches the recurrent convention).
+    """
+    if delays is None:
+        return 1
+    delays = np.asarray(delays, dtype=np.float64)
+    if delays.size == 0:
+        return 1
+    steps = np.round(np.maximum(delays, dt) / dt).astype(np.int32)
+    unique_steps = np.unique(steps)
+    if unique_steps.size > 1:
+        print(
+            f"    > WARNING: {name} delays are not uniform "
+            f"({unique_steps.min()}-{unique_steps.max()} steps); "
+            f"using the most common value."
+        )
+        steps_value = int(np.bincount(steps).argmax())
+    else:
+        steps_value = int(unique_steps[0])
+    steps_value = max(steps_value, 1)
+    print(f"    > {name} afferent delay: {steps_value} timestep(s)")
+    return steps_value
+
+
+# Smallest magnitude a sign-constrained (Dale's law) weight may take.
+#
+# ExponentiatedAdam updates weights multiplicatively (w <- w * exp(...)), so
+# w == 0 is an absorbing state: a weight that ever reaches exactly zero can
+# never move again, yet keeps consuming optimizer slots and bandwidth. Two
+# routes lead there -- the signed constraints below (tf.nn.relu maps a
+# wrong-signed weight to exactly 0) and float32 underflow of a weight the
+# optimizer has shrunk far enough. Clamping to +/- this floor instead of 0
+# keeps the constrained weight space {|w| >= WEIGHT_FLOOR, sign(w) = s_i}
+# closed under both the optimizer step and the constraint.
+#
+# The value is a pure numerical guard, not a biophysical prior: it sits ~18
+# orders of magnitude above the smallest normal float32 (1.18e-38) and ~13
+# orders below the smallest weight magnitude seen in trained checkpoints
+# (~2e-7), so it never binds during normal training.
+WEIGHT_FLOOR = 1e-20
+
+
+def _signed_clamp(w, condition, floor):
+    """Project `w` onto its allowed sign, keeping |w| >= `floor`."""
+    floor = tf.constant(floor, dtype=w.dtype)
+    return tf.where(condition, tf.maximum(w, floor), tf.minimum(w, -floor))
+
+
 class SignedConstraint(tf.keras.constraints.Constraint):
-    def __init__(self, positive):
+    def __init__(self, positive, floor=WEIGHT_FLOOR):
         # self._positive = positive
         self.condition = positive
+        self.floor = floor
 
     def __call__(self, w):
         # condition = tf.greater(self._positive, 0)  # yields bool
-        sign_corrected_w = tf.where(self.condition, tf.nn.relu(w), -tf.nn.relu(-w))
-        return sign_corrected_w
+        return _signed_clamp(w, self.condition, self.floor)
+
+    def get_config(self):
+        return {"floor": self.floor}
 
 
 class SparseSignedConstraint(tf.keras.constraints.Constraint):
-    def __init__(self, mask, positive):
+    def __init__(self, mask, positive, floor=WEIGHT_FLOOR):
         self._mask = mask
         self._positive = positive
+        self.floor = floor
 
     def __call__(self, w):
         condition = tf.greater(self._positive, 0)  # yields bool
-        sign_corrected_w = tf.where(condition, tf.nn.relu(w), -tf.nn.relu(-w))
+        sign_corrected_w = _signed_clamp(w, condition, self.floor)
+        # Entries outside the mask are structural non-synapses, not shrunken
+        # weights: they stay exactly zero and receive no gradient.
         return tf.where(self._mask, sign_corrected_w, tf.zeros_like(sign_corrected_w))
+
+    def get_config(self):
+        return {"floor": self.floor}
 
 
 class ClipConstraint(tf.keras.constraints.Constraint):
@@ -755,14 +818,11 @@ class V1Column(tf.keras.layers.Layer):
         psc_initial_np = np.tile(psc_initial_np, self._n_neurons)
         self.psc_initial = tf.constant(psc_initial_np[None, :], dtype=self.compute_dtype) # expand the dimension for processing different receptor types
 
-        # Determine the maximum delay from the network data
+        # Determine the maximum delay from the network data. Only the recurrent
+        # delays live in the z ring buffer; the afferent (LGN/BKG) delays are
+        # applied separately below, so they must not inflate that buffer.
         rec_delays = np.array(network["synapses"]["delays"])
-        all_delays = [rec_delays]
-        if "delays" in lgn_input:
-            all_delays.append(np.array(lgn_input["delays"]))
-        if "delays" in bkg_input:
-            all_delays.append(np.array(bkg_input["delays"]))
-        data_max_delay = int(np.ceil(np.max(np.concatenate(all_delays)) / dt))
+        data_max_delay = int(np.ceil(np.max(rec_delays) / dt))
         if max_delay > 0:
             self.max_delay = min(data_max_delay, max_delay)
         else:
@@ -962,10 +1022,18 @@ class V1Column(tf.keras.layers.Layer):
         input_syn_ids = np.array(lgn_input["syn_ids"])
         # Scale down the input weights
         input_weights = (input_weights/ voltage_scale[self._node_type_ids[input_indices[:, 0]]])
-        # # Introduce the delays in the postsynaptic neuron indices
-        # input_delays = np.array(lgn_input["delays"])
-        # input_delays = np.round(np.clip(input_delays, dt, self.max_delay)/dt).astype(np.int32)
-        # input_indices[:, 1] = input_indices[:, 1] + self._n_neurons * (input_delays - 1)
+        # Afferent delay. Every LGN edge carries the same delay, so instead of
+        # expanding the presynaptic index over delay slots (which would need a
+        # ring buffer of n_inputs * max_delay) the whole LGN stream is read out
+        # `_lgn_delay_steps - 1` timesteps late; see call().
+        self._lgn_delay_steps = _uniform_delay_steps(
+            lgn_input.get("delays"), dt, "LGN"
+        )
+        # A one-step delay needs no buffer: the input of the current timestep
+        # already acts on the current timestep's current, as prev_z does.
+        self._lgn_delay_buffer_width = self.input_dim * (self._lgn_delay_steps - 1)
+        self._lgn_delay_state_index = 7
+        self._voltage_penalty_state_index = 8 if self._lgn_delay_buffer_width else 7
         if self._synaptic_current_backend == "cuda":
             # Retain the legacy checkpoint object without occupying GPU memory;
             # CUDA execution consumes the compact CSR tensors below instead.
@@ -1017,10 +1085,12 @@ class V1Column(tf.keras.layers.Layer):
         bkg_input_syn_ids = np.array(bkg_input['syn_ids'])
         # Scale down the background input weights
         bkg_input_weights = (bkg_input_weights/voltage_scale[self._node_type_ids[bkg_input_indices[:, 0]]])
-        # # Introduce the delays in the postsynaptic neuron indices
-        # bkg_input_delays = np.array(bkg_input['delays'])
-        # bkg_input_delays = np.round(np.clip(bkg_input_delays, dt, self.max_delay)/dt).astype(np.int32)
-        # bkg_input_indices[:, 1] = bkg_input_indices[:, 1] + self._n_neurons * (bkg_input_delays - 1)
+        # The background input is generated in-model as a stationary Poisson
+        # process, so shifting it in time leaves its statistics unchanged and no
+        # delay buffer is needed. The value is recorded for reference only.
+        self._bkg_delay_steps = _uniform_delay_steps(
+            bkg_input.get("delays"), dt, "BKG"
+        )
         if self._synaptic_current_backend == "cuda":
             with tf.device("/CPU:0"):
                 self.bkg_input_indices = tf.Variable(
@@ -1520,6 +1590,11 @@ class V1Column(tf.keras.layers.Layer):
             self._n_neurons * self._n_syn_basis,  # psc
             1,  # noise timestep counter
         )
+        # The LGN buffer precedes the penalty accumulator: several helpers,
+        # reset_voltage_penalty_state() among them, address that accumulator as
+        # the last state element.
+        if self._lgn_delay_buffer_width:
+            state_size += (self._lgn_delay_buffer_width,)  # pending LGN frames
         if self._track_voltage_penalty:
             state_size += (1,)
         return state_size
@@ -1537,6 +1612,12 @@ class V1Column(tf.keras.layers.Layer):
         noise_step0 = tf.zeros((batch_size, 1), tf.int32)
 
         state = (z0_buf, v0, r0, asc, psc_rise0, psc0, noise_step0)
+        if self._lgn_delay_buffer_width:
+            state += (
+                tf.zeros(
+                    (batch_size, self._lgn_delay_buffer_width), self.compute_dtype
+                ),
+            )
         if self._track_voltage_penalty:
             # fp32 accumulator: the running sum spans seq_len steps, and in
             # fp16 the per-step increments fall below one ulp of the sum long
@@ -1567,13 +1648,26 @@ class V1Column(tf.keras.layers.Layer):
         # Get all the model inputs
         # external_current = inputs[:, :self._n_neurons*self._n_syn_basis] # external inputs shape (1, 399804)
         # bkg_noise = inputs[:, self._n_neurons*self._n_syn_basis:-self._n_neurons]
-        lgn_input = self._permute_lgn_input(inputs[:, :self.input_dim])
+        lgn_input = inputs[:, :self.input_dim]
 
         batch_size = tf.cast(tf.shape(inputs)[0], dtype=tf.int64)
 
         # Extract the network variables from the state
         z_buf, v, r, asc, psc_rise, psc, noise_step = state[:7]
-        voltage_penalty = state[7] if self._track_voltage_penalty else None
+        # Afferent delay: the LGN frame that acts on this timestep was emitted
+        # `_lgn_delay_steps - 1` steps ago. Newest frame first, as for z_buf.
+        if self._lgn_delay_buffer_width:
+            lgn_buf = state[self._lgn_delay_state_index]
+            new_lgn_buf = tf.concat(
+                [lgn_input, lgn_buf[:, :-self.input_dim]], axis=1
+            )
+            lgn_input = lgn_buf[:, -self.input_dim:]
+        lgn_input = self._permute_lgn_input(lgn_input)
+        voltage_penalty = (
+            state[self._voltage_penalty_state_index]
+            if self._track_voltage_penalty
+            else None
+        )
         # Get previous spikes
         prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
 
@@ -1677,6 +1771,8 @@ class V1Column(tf.keras.layers.Layer):
         )
         new_noise_step = noise_step + 1
         new_state = (new_z_buf, new_v, new_r, new_asc, new_psc_rise, new_psc, new_noise_step)
+        if self._lgn_delay_buffer_width:
+            new_state += (new_lgn_buf,)
         if self._track_voltage_penalty:
             # ``state_size == 1`` represents a [batch, 1] recurrent state,
             # whereas the neuron reduction naturally returns [batch].  Adding
