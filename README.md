@@ -61,8 +61,13 @@ conda env create -f environment.yml
 conda activate neuro_tf221
 ```
 
-`environment.yml` pins all direct dependencies. After a validated environment
-update, regenerate the complete platform-specific lock with
+`environment.yml` is the single source of truth for the environment name and
+the pinned direct dependencies. `neuro_tf221` (TensorFlow 2.21.0 / Keras 3.15.1
+/ NumPy 2.5.3 / Python 3.12) is the only supported environment; the older
+`neuro_tf2151` environment (TF 2.15 / Keras 2.15 / NumPy 1.x) is retired and
+must not be used for tests, checks, or jobs. After a validated environment
+update, bump the pins in `environment.yml`, mirror the name and versions in
+`AGENTS.md`, and regenerate the complete platform-specific lock with
 `conda env export -n neuro_tf221 | sed '/^prefix: /d' > environment.lock.yml`.
 
 Record the active driver, GPUs, TensorFlow CUDA/cuDNN build, compiler, and core
@@ -277,8 +282,8 @@ The `Neuropixels_data` directory contains experimental recordings that the model
 
 The model requires specific package versions. Key dependencies include:
 - Python 3.12
-- TensorFlow 2.21.0 and Keras 3
-- NumPy 2.5.3
+- TensorFlow 2.21.0 and Keras 3.15.1
+- NumPy 2.5.3 (NumPy 2 semantics; NumPy 1 is not supported)
 - BMTK 1.2.0 (Brain Modeling Toolkit)
 - See `environment.yml` for the complete list
 

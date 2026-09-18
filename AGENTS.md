@@ -54,11 +54,14 @@ Re-read files before editing
 ## Environment Setup
 - use python3 and conda for environment management.
 - Preferred: conda environment.
-- Default environment for tests and script checks: `neuro_tf2151`
+- Default environment for tests and script checks: `neuro_tf221` (TensorFlow 2.21.0 / Keras 3.15.1 / NumPy 2.5.3 / Python 3.12).
+- `environment.yml` is the single source of truth for the environment name and the pinned direct dependencies; `environment.lock.yml` is the exact Linux lock. If this file ever disagrees with `environment.yml`, `environment.yml` wins and this file must be updated.
+- The legacy `neuro_tf2151` environment (TF 2.15 / Keras 2.15 / NumPy 1.x) is retired. Do not run tests, checks, or jobs in it, and do not write code that assumes Keras 2 or NumPy 1 semantics.
+- Target Keras 3 and NumPy 2: avoid Keras-2-only `tf.keras` APIs, and do not rely on NumPy 1 integer or dtype-promotion behaviour (NumPy 2 wraps int64 products silently, so size/shape guards must be computed with Python ints).
 - Do not hardcode CUDA/CUDNN assumptions in code edits. Validate runtime values from the active environment when needed.
 - Quick runtime check:
 ```bash
-conda activate neuro_tf2151
+conda activate neuro_tf221
 python -c "import tensorflow as tf, ctypes.util; print('CUDA', tf.sysconfig.get_build_info().get('cuda_version')); print('CUDNN', tf.sysconfig.get_build_info().get('cudnn_version')); print('cudart', ctypes.util.find_library('cudart'))"
 ```
 
@@ -77,7 +80,7 @@ ssh nuredduna
 - Activate environment and run from project path:
 ```bash
 cd /home/jgalvan/Desktop/Neurocoding/V1_GLIF_model
-conda activate neuro_tf2151
+conda activate neuro_tf221
 ```
 
 - Submit a GPU job with the cluster `run` helper:
@@ -101,7 +104,7 @@ run -t 1:00 -c 4 -m 24 -g 1 -G L40S -i bash
 - Activate environment and run from project path:
 ```bash
 cd /home/jgalvan/Desktop/Neurocoding/V1_GLIF_model
-conda activate neuro_tf2151
+conda activate neuro_tf221
 ```
 
 - Run the desired training/testing script.
