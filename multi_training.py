@@ -113,14 +113,16 @@ def int32_safe_cast(values, dtype, chunk_size=25,
 
     TensorFlow's stock GPU cast -- like every non-XLA unary elementwise op --
     indexes its operand with int32. Above 2**31 elements it silently returns
-    wrong values *and* writes outside its output buffer, corrupting whatever
-    the allocator happened to place next, so the damage does not even look
-    like it came from the cast. Casting one time slice at a time keeps every
-    kernel small. Rejoining along axis 1 is safe at any total size because
-    TensorFlow picks concat's index type from the flattened column count
-    (time * features within one batch row), not from the element count --
-    unlike axis 0, which is exactly the element count and does break.
-    See int32_overflow_audit_20260902/.
+    wrong values (measured on TF 2.21: 17% of the elements wrong at
+    [32, 500, 203816]); on TF 2.15 the same call aborted with
+    CUDA_ERROR_ILLEGAL_ADDRESS instead. Casting one time slice at a time keeps
+    every kernel small. Rejoining along axis 1 is safe at any total size
+    because TensorFlow picks concat's index type from the flattened column
+    count (time * features within one batch row), not from the element count.
+    What breaks on axis 0 is the *many-input* concat: TensorFlow switches to a
+    pointer-array kernel with int32 offsets at 16 or more inputs, so an axis-0
+    concat is exact past the limit with 2, 4 or 8 inputs and silently wrong
+    with 16 or more (measured on TF 2.21 at 1.52x the limit).
     """
     if values.dtype == dtype:
         return values
@@ -357,6 +359,7 @@ def main(_):
             voltage_gradient_dampening=flags.voltage_gradient_dampening,
             detach_reset=flags.detach_reset,
             detach_asc_reset=flags.detach_asc_reset,
+            integration_scheme=flags.integration_scheme,
             gauss_std=flags.gauss_std,
             lr_scale=flags.lr_scale,
             train_input=flags.train_input,
@@ -575,7 +578,8 @@ def main(_):
                                                          rolling_batch_size=grating_batch_size,
                                                          rolling_gradient_correction=flags.rolling_gradient_correction,
                                                          rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
-                                                         rolling_warmup=flags.rolling_warmup)
+                                                         rolling_warmup=flags.rolling_warmup,
+                                                         batch_emd_alignment_weight=flags.batch_emd_alignment_weight)
         # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
         # model.add_loss(lambda: OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
@@ -601,7 +605,8 @@ def main(_):
                                                                      rolling_batch_size=grating_batch_size,
                                                                      rolling_gradient_correction=flags.rolling_gradient_correction,
                                                                      rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
-                                                                     rolling_warmup=flags.rolling_warmup)
+                                                                     rolling_warmup=flags.rolling_warmup,
+                                                                     batch_emd_alignment_weight=flags.batch_emd_alignment_weight)
             # placeholder_angle = tf.constant(0, dtype=tf.float32, shape=(per_replica_batch_size, 1))
             # model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
@@ -1422,7 +1427,8 @@ def main(_):
         population_ids,
         target_scale=1.0,
     ):
-        emds = []
+        weighted_emds = []
+        cell_type_sizes = []
         for cell_type in losses.CELL_TYPE_ORDER:
             node_ids = np.asarray(population_ids.get(cell_type, []), dtype=np.int32)
             if node_ids.size == 0:
@@ -1435,9 +1441,10 @@ def main(_):
                 target_values.dropna().to_numpy(dtype=np.float32) * float(target_scale),
             )
             if emd is not None:
-                emds.append(emd)
+                weighted_emds.append(emd * node_ids.size)
+                cell_type_sizes.append(node_ids.size)
 
-        return float(np.mean(emds))
+        return float(np.sum(weighted_emds) / np.sum(cell_type_sizes))
 
     def load_neuropixels_targets(neuropixels_df):
         features = [
@@ -2109,6 +2116,11 @@ if __name__ == '__main__':
         True,
         'Ramp rolling OSI/DSI loss by current EMA effective sample size during cold start.',
     )
+    absl.app.flags.DEFINE_float(
+        'batch_emd_alignment_weight',
+        1.0,
+        'Weight of the batch_osi_emd imaginary-component penalty; 0 disables it.',
+    )
     absl.app.flags.DEFINE_float('dampening_factor', 0.1, '')
     absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.1, "")
     absl.app.flags.DEFINE_float(
@@ -2273,6 +2285,12 @@ if __name__ == '__main__':
         "detach_asc_reset",
         False,
         "Detach the spike from the after-spike-current increment gradient path.",
+    )
+    absl.app.flags.DEFINE_enum(
+        "integration_scheme",
+        "exact",
+        ["exact", "euler"],
+        "Membrane step integrator: 'exact' solves the linear subthreshold system in closed form, 'euler' reproduces the legacy scheme, which holds the synaptic current at its start-of-step value.",
     )
     absl.app.flags.DEFINE_boolean(
         "sequential_stimuli", False, "Roll the evoked and spontaneous stimuli out in separate substeps and accumulate their gradients into a single optimizer update (memory friendly; equivalent update to the single-shot step).")

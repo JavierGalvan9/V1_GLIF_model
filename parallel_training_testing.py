@@ -54,6 +54,7 @@ parser.add_argument(
         'crowd_osi',
         'adaptative_crowd_osi',
         'rolling_osi_emd',
+        'batch_osi_emd',
         'crowd_spikes',
         'neuropixels_fr',
     ],
@@ -100,6 +101,7 @@ parser.add_argument(
     action='store_false',
 )
 parser.set_defaults(rolling_warmup=True)
+parser.add_argument('--batch_emd_alignment_weight', default=1.0, type=float)
 
 parser.add_argument('--dampening_factor', default=0.1, type=float)
 parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
@@ -108,6 +110,7 @@ parser.add_argument('--voltage_gradient_dampening', default=0.0, type=float)
 parser.add_argument('--detach_reset', dest='detach_reset', action='store_true')
 parser.add_argument('--nodetach_reset', dest='detach_reset', action='store_false')
 parser.set_defaults(detach_reset=True)
+parser.add_argument('--integration_scheme', type=str, default='exact', choices=['exact', 'euler'])
 parser.add_argument('--detach_asc_reset', dest='detach_asc_reset', action='store_true')
 parser.add_argument('--nodetach_asc_reset', dest='detach_asc_reset', action='store_false')
 parser.set_defaults(detach_asc_reset=False)
@@ -294,7 +297,7 @@ def main():
                 'debug_gradients', 'global_clipnorm',
                 'detach_reset', 'detach_asc_reset',
                 'pack_spike_checkpoints',
-            } or name.startswith('rolling_'):
+            } or name.startswith(('rolling_', 'batch_emd_')):
                 continue
 
             if isinstance(value, bool) and not value:

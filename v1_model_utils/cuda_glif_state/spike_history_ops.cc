@@ -3,9 +3,11 @@
 
 using namespace tensorflow;
 
+// The membrane is float32 whatever the compute dtype is; T is the dtype of the
+// spikes and of the delayed spike history, which follow the compute dtype.
 REGISTER_OP("V1FusedSpikeShift")
     .Attr("T: {half, float}")
-    .Input("voltage: T")
+    .Input("voltage: float")
     .Input("refractory: bool")
     .Input("history: T")
     .Output("spikes: T")
@@ -24,13 +26,13 @@ REGISTER_OP("V1FusedSpikeShift")
 REGISTER_OP("V1FusedSpikeShiftBackward")
     .Attr("T: {half, float}")
     .Attr("surrogate: {'triangular', 'gaussian', 'slayer'} = 'triangular'")
-    .Input("voltage: T")
+    .Input("voltage: float")
     .Input("refractory: bool")
     .Input("spike_grad: T")
     .Input("history_grad: T")
-    .Input("sigma: T")
-    .Input("amplitude: T")
-    .Output("voltage_grad: T")
+    .Input("sigma: float")
+    .Input("amplitude: float")
+    .Output("voltage_grad: float")
     .Output("old_history_grad: T")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       shape_inference::ShapeHandle voltage, refractory, spike_grad, history_grad,

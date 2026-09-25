@@ -135,7 +135,7 @@ def main(_):
     with strategy.scope():
         t0 = time()
 
-        def build_model_with_dtype(model_dtype):
+        def build_model_with_dtype(model_dtype, compact_output=flags.track_core_only):
             temp_model = models.create_model(
                 network,
                 lgn_input,
@@ -166,19 +166,19 @@ def main(_):
                 use_state_input=True,
                 return_state=True,
                 hard_reset=flags.hard_reset,
+                integration_scheme=flags.integration_scheme,
                 add_metric=False,
                 max_delay=flags.max_delay,  # 0 = auto-compute from SONATA data
                 current_input=flags.current_input,
                 use_dummy_state_input=False,
                 seed=flags.seed,
                 acceleration=flags.acceleration,
-                # A full-neuron uint8 Keras RNN output triggers a host-backed
-                # TensorArray and repeated PCIe copies. Keep compact core-neuron
-                # sequences floating on GPU and quantize once per completed chunk.
+                # The recurrent state stays in compute dtype; only the exposed,
+                # already-stacked compact spike sequence is quantized for inference.
                 output_spike_dtype=(
-                    tf.float32 if flags.track_core_only else tf.uint8
+                    tf.uint8 if compact_output else None
                 ),
-                output_neuron_ids=output_neuron_ids,
+                output_neuron_ids=output_neuron_ids if compact_output else None,
                 return_voltage_sequences=flags.track_voltage,
                 neuron_layout=neuron_layout,
                 edge_orders=edge_orders,
@@ -199,10 +199,16 @@ def main(_):
         checkpoint, logdir, current_epoch = tf_utils.restore_evaluation_checkpoint(
             flags,
             model,
-            build_model_with_dtype,
+            lambda model_dtype: build_model_with_dtype(
+                model_dtype, compact_output=False
+            ),
             logdir,
             current_epoch=current_epoch,
             result_name="OSI/DSI",
+            runtime_cast_ignored_variables={
+                "projection_v1/kernel",
+                "projection_v1/bias",
+            } if flags.track_core_only else (),
         )
 
         # model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
@@ -560,6 +566,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('plot_core_radius', 400.0, '') # 0 is not using core plot
 
     absl.app.flags.DEFINE_boolean('hard_reset', False, '')
+    absl.app.flags.DEFINE_enum(
+        "integration_scheme", "exact", ["exact", "euler"],
+        "Membrane step integrator; must match the value used for training.")
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', False, '')
     absl.app.flags.DEFINE_boolean('compute_lgn_activity_gradient', False, '')

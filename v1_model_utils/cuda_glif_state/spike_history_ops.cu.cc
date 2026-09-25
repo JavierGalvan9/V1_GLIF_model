@@ -17,7 +17,7 @@ __device__ __forceinline__ float ToFloat(T value) {
 
 template <typename T>
 __global__ void ForwardKernel(int64 count, int64 neurons, int64 width,
-                              const T* voltage, const bool* refractory,
+                              const float* voltage, const bool* refractory,
                               const T* history, T* spikes, T* new_history) {
   GPU_1D_KERNEL_LOOP(index, count) {
     const int64 batch = index / width;
@@ -25,7 +25,7 @@ __global__ void ForwardKernel(int64 count, int64 neurons, int64 width,
     if (column < neurons) {
       const int64 neuron_index = batch * neurons + column;
       const T spike = static_cast<T>(
-          !refractory[neuron_index] && ToFloat(voltage[neuron_index]) > 0.0f);
+          !refractory[neuron_index] && voltage[neuron_index] > 0.0f);
       spikes[neuron_index] = spike;
       new_history[index] = spike;
     } else {
@@ -36,11 +36,11 @@ __global__ void ForwardKernel(int64 count, int64 neurons, int64 width,
 
 template <typename T>
 __global__ void BackwardKernel(int64 history_count, int64 neurons, int64 width,
-                               const T* voltage,
+                               const float* voltage,
                                const bool* refractory, const T* spike_grad,
-                               const T* history_grad, const T* sigma,
-                               const T* amplitude, int surrogate,
-                               T* voltage_grad, T* old_history_grad) {
+                               const T* history_grad, const float* sigma,
+                               const float* amplitude, int surrogate,
+                               float* voltage_grad, T* old_history_grad) {
   GPU_1D_KERNEL_LOOP(index, history_count) {
     const int64 batch = index / width;
     const int64 column = index - batch * width;
@@ -49,8 +49,8 @@ __global__ void BackwardKernel(int64 history_count, int64 neurons, int64 width,
                                   : static_cast<T>(0.0f);
     if (column < neurons) {
       const int64 neuron_index = batch * neurons + column;
-      const float v = ToFloat(voltage[neuron_index]);
-      const float scale = ToFloat(sigma[0]);
+      const float v = voltage[neuron_index];
+      const float scale = sigma[0];
       float shape;
       if (surrogate == 1) {
         shape = expf(-(v * v) / (scale * scale));
@@ -59,17 +59,14 @@ __global__ void BackwardKernel(int64 history_count, int64 neurons, int64 width,
       } else {
         shape = fmaxf(1.0f - fabsf(v), 0.0f);
       }
-      // Preserve TensorFlow's compute-dtype rounding order: cast the shape
-      // before multiplying it by the surrogate amplitude.
-      const T shape_value = static_cast<T>(shape);
-      const T derivative = static_cast<T>(
-          ToFloat(amplitude[0]) * ToFloat(shape_value));
+      // Preserve TensorFlow's rounding order: both consumers of a spike read
+      // it in T, so the upstream gradient is summed in T before it meets the
+      // float32 surrogate of the float32 membrane.
       const T upstream = static_cast<T>(
           ToFloat(spike_grad[neuron_index]) + ToFloat(history_grad[index]));
-      voltage_grad[neuron_index] = static_cast<T>(
-          refractory[neuron_index]
-              ? 0.0f
-              : ToFloat(upstream) * ToFloat(derivative));
+      voltage_grad[neuron_index] = refractory[neuron_index]
+          ? 0.0f
+          : ToFloat(upstream) * (shape * amplitude[0]);
     }
   }
 }
@@ -99,7 +96,7 @@ class ForwardOp : public OpKernel {
     OP_REQUIRES_OK(context, GpuLaunchKernel(
         ForwardKernel<T>, config.block_count, config.thread_per_block, 0,
         context->eigen_device<GPUDevice>().stream(), count, neurons, width,
-        voltage.flat<T>().data(), refractory.flat<bool>().data(), history.flat<T>().data(),
+        voltage.flat<float>().data(), refractory.flat<bool>().data(), history.flat<T>().data(),
         spikes->flat<T>().data(), new_history->flat<T>().data()));
   }
 };
@@ -141,11 +138,11 @@ class BackwardOp : public OpKernel {
     OP_REQUIRES_OK(context, GpuLaunchKernel(
         BackwardKernel<T>, config.block_count, config.thread_per_block, 0,
         context->eigen_device<GPUDevice>().stream(), history_count,
-        neurons, width, voltage.flat<T>().data(),
+        neurons, width, voltage.flat<float>().data(),
         refractory.flat<bool>().data(), spike_grad.flat<T>().data(),
-        history_grad.flat<T>().data(), sigma.flat<T>().data(),
-        amplitude.flat<T>().data(), surrogate_,
-        voltage_grad->flat<T>().data(), old_history_grad->flat<T>().data()));
+        history_grad.flat<T>().data(), sigma.flat<float>().data(),
+        amplitude.flat<float>().data(), surrogate_,
+        voltage_grad->flat<float>().data(), old_history_grad->flat<T>().data()));
   }
 
  private:

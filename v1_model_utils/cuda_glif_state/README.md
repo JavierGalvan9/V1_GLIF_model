@@ -5,6 +5,13 @@ training and ordinary Keras simulation. It fuses the dense state update and the
 spike/refractory/history update while preserving the
 legacy `V1Column` output and state interface.
 
+Precision is split by state block, whatever the Keras policy: the membrane
+and after-spike currents and every propagator constant are float32, while the
+synaptic state (`psc_rise`, `psc`), its input currents and the spike buffers
+follow the compute dtype. The four per-(neuron, basis) constants are packed as
+`[syn_decay, psc_initial, psc_factor, psc_rise_factor]` and read with one
+`float4` load.
+
 The CUDA backward kernel supports the `triangular`, `gaussian`, and `slayer`
 surrogate gradients selected through `surrogate_gradient`. The legacy
 `pseudo_gauss=True` option remains an alias for `surrogate_gradient="gaussian"`.

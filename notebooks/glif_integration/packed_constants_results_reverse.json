@@ -1,0 +1,64 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "architecture": "120",
+  "tensorflow": "2.21.0",
+  "source_sha256": {
+    "baseline": "9bd196fefbd18d39e33972c9cbaffd7345d5f7dc1ec77776930061e014b8ac87",
+    "packed": "cab179636532824cc51bd55a51a68f7208b5d6e8413ca6689852710c231d70f9"
+  },
+  "steps": 32,
+  "timing_order": [
+    "packed",
+    "baseline"
+  ],
+  "rows": [
+    {
+      "n": 51978,
+      "batch": 8,
+      "dtype": "float16",
+      "max_abs_difference": 0.0,
+      "packed_forward_us": 18.067319615511224,
+      "baseline_forward_us": 17.893453332362697,
+      "forward_ratio": 1.009716753938943,
+      "packed_backward_us": 21.903146262047812,
+      "baseline_backward_us": 22.46517760795541,
+      "backward_ratio": 0.9749821098361328
+    },
+    {
+      "n": 51978,
+      "batch": 8,
+      "dtype": "float32",
+      "max_abs_difference": 1.1920928955078125e-07,
+      "packed_forward_us": 32.54279727116227,
+      "baseline_forward_us": 34.57485217950307,
+      "forward_ratio": 0.9412273724905336,
+      "packed_backward_us": 38.403024518629536,
+      "baseline_backward_us": 38.74157482641749,
+      "backward_ratio": 0.9912613178657596
+    },
+    {
+      "n": 51978,
+      "batch": 32,
+      "dtype": "float16",
+      "max_abs_difference": 0.0,
+      "packed_forward_us": 59.61887291050516,
+      "baseline_forward_us": 59.6456702623982,
+      "forward_ratio": 0.999550724272606,
+      "packed_backward_us": 72.15260484372266,
+      "baseline_backward_us": 74.44602670148015,
+      "backward_ratio": 0.9691934954842675
+    },
+    {
+      "n": 51978,
+      "batch": 32,
+      "dtype": "float32",
+      "max_abs_difference": 1.1920928955078125e-07,
+      "packed_forward_us": 128.89756180811673,
+      "baseline_forward_us": 131.7569513048511,
+      "forward_ratio": 0.9782979989411072,
+      "packed_backward_us": 146.47738498752005,
+      "baseline_backward_us": 149.50216791476123,
+      "backward_ratio": 0.9797676316709617
+    }
+  ]
+}

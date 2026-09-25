@@ -1,0 +1,1021 @@
+\documentclass[11pt,a4paper,numbers=noenddot]{scrartcl}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[nochapters,eulerchapternumbers,beramono,pdfspacing,dottedtoc]{classicthesis}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage[backend=biber,style=numeric,sorting=none,maxbibnames=4,giveninits=true]{biblatex}
+\addbibresource{references.bib}
+
+\captionsetup{font=small,labelfont={small,sc},textfont=small}
+\setcapindent{0pt}
+
+% ---------------------------------------------------------------- notation
+% Symbols follow Galvan Fraile (2025), Sections 1.2-1.3.
+\newcommand{\dt}{\delta t}
+\newcommand{\Isyn}{I^{\mathrm{syn}}}
+\newcommand{\Csyn}{C^{\mathrm{syn}}}
+\newcommand{\Iext}{I^{\mathrm{ext}}}
+\newcommand{\Iint}{I^{\mathrm{int}}}
+\newcommand{\amem}{\alpha}
+\newcommand{\asyn}{\alpha_{r}}
+\newcommand{\Acoef}{\mathcal{A}}
+\newcommand{\Bcoef}{\mathcal{B}}
+\newcommand{\Dcoef}{\mathcal{D}}
+\newcommand{\Rcoef}{\mathcal{R}}
+\newcommand{\Scoef}{\mathcal{S}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+% classicthesis keeps a wide margin for notes; figures may use it.
+\newlength{\fullwidth}
+\setlength{\fullwidth}{\dimexpr\textwidth+\marginparwidth+\marginparsep\relax}
+\newcommand{\widefigure}[2][\fullwidth]{%
+  \makebox[\textwidth][l]{\includegraphics[width=#1]{#2}}}
+% A table may use the margin too; captured in a box so \makebox stays balanced.
+\newsavebox{\widetablebox}
+\newenvironment{widetable}%
+  {\begin{lrbox}{\widetablebox}\begin{minipage}{\fullwidth}\small\centering}%
+  {\end{minipage}\end{lrbox}%
+   \noindent\makebox[\textwidth][l]{\usebox{\widetablebox}}}
+
+\input{numbers}
+
+\begin{document}
+
+\title{\rmfamily\normalfont\spacedallcaps{Exact Propagators for the GLIF3 Step}}
+\subtitle{\rmfamily\normalfont\spacedlowsmallcaps{%
+Replacing the Euler step on the synaptic current in the V1 model}}
+\author{}
+\date{}
+\maketitle
+\vspace{-3.5em}
+
+\begin{abstract}
+\noindent
+The V1 cortical model advances each GLIF3 neuron with a step of
+$\dt = 1\,$ms. The synaptic and after-spike currents obey linear equations,
+and the original code already used their exact one-step solutions; only the
+membrane update was approximate. It used a
+\emph{Euler} step, which freezes the total synaptic current at its
+start-of-step value for the whole millisecond, and applies the reset and the
+after-spike current of a spike one step late. With a fastest synaptic basis
+of $\tau_1 = \tauSynFast\,$ms, that current rises and falls by an order of
+magnitude \emph{inside} one step. Together the two approximations are the
+dominant error of the simulation --- not, as one might assume, the
+\code{float16} arithmetic used during training --- and at $\sim$10\,Hz the
+event timing contributes the larger share. We derive the exact one-step propagator for the coupled
+(synaptic, after-spike, membrane) system, following the construction of
+Rotter and Diesmann~\cite{rotter1999exact}, and fold the spike events into
+the same constants. Against a float64 ground truth obtained by a third,
+independent method, the relative RMS error of the membrane potential falls by
+a factor of $\gainSpk$, and the fraction of spikes reproduced at exactly the
+right millisecond rises from $\matchEuler\,\%$ to $\matchExact\,\%$. The new
+step requires no additional state variables and costs $\kernelRatio\times$
+the time of the fused CUDA kernel it replaces. In the \code{float16}
+configuration training actually uses, the gain is $\gainSpkHalf\times$ rather
+than $\gainSpk$, and the binding constraint is no longer the integrator but
+the \code{float16} storage of the propagator constants --- which, being shared
+across the batch and the sequence, would cost $\constantWidenMB\,$MB in total
+to widen.
+\end{abstract}
+
+\vspace{1em}
+\tableofcontents
+\vspace{1em}
+
+% =========================================================================
+\section{The model and its discretisation}
+\label{sec:model}
+
+\subsection{Continuous-time dynamics}
+
+We follow the notation of~\cite{galvan2025thesis}. A GLIF3
+neuron~\cite{mihalas2009generalized,teeter2018generalized} carries a membrane
+potential $V(t)$ and two after-spike currents (ASCs) $I^{s}(t)$,
+$s\in\{1,2\}$, obeying
+%
+\begin{equation}
+\label{eq:glif3}
+\tau_m\frac{\mathrm{d}V(t)}{\mathrm{d}t}
+  = -\bigl(V(t)-E_L\bigr) + R_m I(t),
+\qquad
+\frac{\mathrm{d}I^{s}(t)}{\mathrm{d}t} = -k^{s}I^{s}(t),
+\end{equation}
+%
+with $\tau_m = R_m C_m$ and $I(t) = \Iint(t) + \Iext(t)$ the total input
+current, where $\Iint(t)=\sum_s I^{s}(t)$
+(cf.~\cite{galvan2025thesis}, Eq.~1.8). At a spike time $t$, where
+$V(t) > V_{th}$,
+%
+\begin{equation}
+\label{eq:reset}
+V(t^{+}) \leftarrow E_L,
+\qquad
+I^{s}(t^{+}) \leftarrow I^{s}(t) + \delta I^{s},
+\end{equation}
+%
+with $\delta I^{s}$ the constant ASC increment
+(cf.~\cite{galvan2025thesis}, Eq.~1.9).
+
+The external current is generated by current-based synapses with
+alpha-function kernels. Writing $\Csyn \equiv \dot{\Isyn} + \Isyn/\tau_s$
+reduces the second-order kernel to the first-order
+pair~\cite{rotter1999exact,sterratt2023principles}
+%
+\begin{equation}
+\label{eq:alpha}
+\frac{\mathrm{d}\Isyn}{\mathrm{d}t} = -\frac{\Isyn}{\tau_s} + \Csyn,
+\qquad
+\frac{\mathrm{d}\Csyn}{\mathrm{d}t} = -\frac{\Csyn}{\tau_s}
+  + \frac{e}{\tau_s}\,W_{ji}\,z_i(t - d_{ji}),
+\end{equation}
+%
+(cf.~\cite{galvan2025thesis}, Eq.~1.25), with $z_i$ the presynaptic spike
+train and $d_{ji}$ the axonal delay.
+
+In the V1 model~\cite{billeh2020systematic} each synapse is decomposed over
+$R=\nBasis$ receptor bases with fixed time constants $\tau_r$, so every
+neuron $j$ carries a pair $(\Csyn_{j,r},\Isyn_{j,r})$ per basis. The total
+input current is
+%
+\begin{equation}
+\label{eq:total}
+I_j(t) = \sum_{r=1}^{R} \Isyn_{j,r}(t) + \sum_{s=1}^{2} I^{s}_j(t).
+\end{equation}
+%
+Normalising voltages by $\Delta V = V_{th}-E_L$ so that $E_L = 0$,
+$V_{th} = 1$ --- as the implementation does --- gives
+$R_m = 1/g$, with $g$ the leak conductance, and
+Eq.~\eqref{eq:glif3} becomes $\dot V = -V/\tau_m + I/C_m$.
+
+\subsection{The state vector}
+
+Collecting the $2R+3$ variables of one neuron into
+%
+\begin{equation}
+\label{eq:statevec}
+\bm{y}_j = \bigl(\Csyn_{j,1},\dots,\Csyn_{j,R},\;
+                 \Isyn_{j,1},\dots,\Isyn_{j,R},\;
+                 I^{1}_j,\,I^{2}_j,\; V_j\bigr)^{\!\top},
+\end{equation}
+%
+Eqs.~\eqref{eq:glif3}--\eqref{eq:alpha} read $\dot{\bm y}_j = \bm{M}_j\bm{y}_j$
+between spikes, with a constant, lower-triangular generator $\bm{M}_j$. This
+is the observation on which everything below rests: \emph{between spikes the
+GLIF3 neuron is a linear time-invariant system}, so its one-step transition
+has a closed form and need not be approximated at all.
+
+% =========================================================================
+\section{The previous scheme, and why it fails here}
+\label{sec:previous}
+
+\subsection{What was implemented}
+
+The implementation advanced the state over $[t, t+\dt)$ as
+%
+\begin{align}
+\label{eq:old-csyn}
+\Csyn_{j,r}[t+\dt] &= \asyn\, \Csyn_{j,r}[t]
+  + \frac{e}{\tau_r}\sum_{\mathrm{src}}\sum_i
+    W^{\mathrm{src}}_{ji}\, z^{\mathrm{src}}_i[t-d_{ji}],
+\\
+\label{eq:old-isyn}
+\Isyn_{j,r}[t+\dt] &= \asyn\, \Isyn_{j,r}[t] + \dt\,\asyn\, \Csyn_{j,r}[t],
+\\
+\label{eq:old-asc}
+I^{s}_j[t+\dt] &= \beta_s\, I^{s}_j[t] + S_j[t]\,\delta I^{s},
+\\
+\label{eq:old-v}
+V_j[t+\dt] &= \amem V_j[t] + (1-\amem)R_m\, I_j[t] - S_j[t]\,\Delta V,
+\end{align}
+%
+with the decay factors $\amem = e^{-\dt/\tau_m}$,
+$\asyn = e^{-\dt/\tau_r}$ and $\beta_s = e^{-k^{s}\dt}$, and $S_j[t]$ the
+spike indicator of~\cite{galvan2025thesis}, Eq.~1.4. Equations
+\eqref{eq:old-csyn}--\eqref{eq:old-v} are Eqs.~1.27 and~1.10 of the thesis,
+specialised to $E_L = 0$.
+
+Two points deserve emphasis before we criticise anything.
+
+First, Eqs.~\eqref{eq:old-csyn}--\eqref{eq:old-asc} are \emph{already
+exact}. For $\Csyn$ and $I^{s}$ this is plain exponential decay. For $\Isyn$
+it is less obvious: the term $\dt\,\asyn\Csyn_{j,r}[t]$ in
+Eq.~\eqref{eq:old-isyn} looks like $\Csyn$ held constant over the step, even
+though $\Csyn$ decays during it. Over one step with no arriving spike,
+Eq.~\eqref{eq:alpha} gives $\Csyn(t+u) = e^{-u/\tau_r}\Csyn(t)$ for
+$u\in[0,\dt]$. Substituting
+%
+\begin{equation}
+\label{eq:isyn-exact}
+\Isyn(t+u) = e^{-u/\tau_r}\bigl(\Isyn(t) + u\,\Csyn(t)\bigr)
+\end{equation}
+%
+into Eq.~\eqref{eq:alpha} gives
+$\frac{\mathrm{d}}{\mathrm{d}u}\Isyn = -\Isyn/\tau_r + e^{-u/\tau_r}\Csyn(t)
+= -\Isyn/\tau_r + \Csyn(t+u)$. Eq.~\eqref{eq:isyn-exact} therefore solves the
+equation exactly, time-varying $\Csyn$ included. At $u=\dt$ it is
+Eq.~\eqref{eq:old-isyn}. It is exact because $\Csyn$ and $\Isyn$ share the
+time constant $\tau_r$. Once that common decay is factored out,
+$e^{u/\tau_r}\Csyn(t+u) = \Csyn(t)$ really is constant over the step, and
+the factor $\dt$ is its exact integral. As an example, take
+$\tau_r = \dt = 1\,$ms, $\Isyn(t)=0$ and $\Csyn(t)=1$. Then
+Eq.~\eqref{eq:old-isyn} gives $\Isyn(t+\dt) = e^{-1} \approx 0.37$, the
+exact value. A genuine forward-Euler step,
+$\Isyn + \dt(\Csyn - \Isyn/\tau_r)$, would give $1$. Arriving spikes enter
+$\Csyn$ at a step boundary, which is exact for events on the time grid
+(Section~\ref{sec:arrival}). After every step, all synaptic and after-spike
+states hold their exact values, and nothing in their update needs
+improving.
+
+Second, Eq.~\eqref{eq:old-v} is not forward Euler either: the homogeneous
+part carries the exact factor $e^{-\dt/\tau_m}$ rather than
+$1-\dt/\tau_m$. It is an \emph{exponential Euler} step, and it would be exact
+if $I_j$ were constant across the step. The approximation is entirely in that
+last clause. We refer to Eq.~\eqref{eq:old-v} throughout as the \emph{Euler}
+scheme, following the thesis, and note that what it approximates is a
+\emph{zero-order hold} on the current: $I_j$ is held at its start-of-step value and the factor
+$1-\amem = \int_0^{\dt} e^{-(\dt-u)/\tau_m}\,\mathrm{d}u / \tau_m$
+is the integral of the membrane kernel against that constant.
+
+\subsection{When an arriving spike takes effect}
+\label{sec:arrival}
+
+In Eq.~\eqref{eq:old-csyn} the new input is added to $\Csyn$ without being
+decayed, and Eq.~\eqref{eq:old-isyn} uses the old $\Csyn_{j,r}[t]$. Both
+are exact if the spike arrives at the \emph{end} of the step, $t+\dt$. The
+delta in Eq.~\eqref{eq:alpha} makes $\Csyn$ jump by $eW_{ji}/\tau_r$ at the
+arrival time, while $\Isyn$, the integral of $\Csyn$, is continuous. A jump at
+$t+\dt$ has no time left to decay within the step and has not yet
+contributed to $\Isyn$. From the next step on, it decays and feeds $\Isyn$
+through Eq.~\eqref{eq:isyn-exact}.
+
+Placing the arrival at the end of the step is what makes the delays come out
+right. Let a presynaptic neuron $i$ spike at grid point $t_n$. That spike is
+computed from $V_i[t_n]$, and the synapse onto $j$, with delay
+$d_{ji} = d\,\dt$, reads it $d-1$ steps later. The jump then lands at the end
+of that step, at $t_n + d\,\dt$. This is exactly the delay in the data. Had
+the jump been placed at the start of the same step, every synapse would act
+one step early, and the shortest delay of $1\,$ms would become
+instantaneous. Both conventions solve Eq.~\eqref{eq:alpha} exactly; they
+differ only in the arrival time they assign. The afferent LGN input follows
+the same rule.
+
+The neuron's own spike is the opposite case. It happens at $t_n$, the start
+of the step that follows it, so its reset and after-spike increment belong
+at the start of that step (Section~\ref{sec:timing}):
+%
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+event & occurs at & enters the step \\
+\midrule
+own spike: reset and $\delta I^{s}$ & $t_n$ & at the start of $[t_n, t_{n+1})$ \\
+arrival at $j$ with delay $d\,\dt$ & $t_n + d\,\dt$ & at the end of $[t_{n+d-1}, t_{n+d})$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Why holding the current is not a small approximation}
+
+Holding the current constant is defensible when it varies slowly
+compared with $\dt$. Figure~\ref{fig:timescales} shows that in this model it
+does not. The four receptor bases have
+$\tau_r \in \{\tauSynFast, 1.88, 3.63, \tauSynSlow\}\,$ms against
+$\dt = 1\,$ms, while the membrane constants span
+$\tauMemMin$--$\tauMemMax\,$ms (median $\tauMemMed\,$ms) across the
+$\nCellTypes$ cell types. The alpha kernel driven by the fastest basis peaks
+at $t = \tau_1 \approx \dt$: it rises from zero to its maximum and begins to
+decay \emph{within the first step after the presynaptic spike}.
+
+\begin{figure}[t]
+  \centering
+  \widefigure[\fullwidth]{figures/timescales.pdf}
+  \caption[Timescales versus the integration step]{%
+    \textbf{The synaptic timescales collide with the step.}
+    \emph{Left:} distribution of membrane time constants $\tau_m$ over the
+    $\nCellTypes$ GLIF3 cell types (blue), with the four receptor-basis
+    constants $\tau_r$ (orange) and the step $\dt$ (dotted).
+    \emph{Right:} the alpha current $\Isyn_{j,1}(t)$ produced by one
+    presynaptic spike on the fastest basis (blue), against the staircase the
+    Euler step integrates in its place (orange). Because
+    $\Isyn_{j,r}(t_s) = 0$ at the arrival time, Euler assigns the spike's
+    own step a current of exactly zero.}
+  \label{fig:timescales}
+\end{figure}
+
+The right panel of Figure~\ref{fig:timescales} makes the failure concrete.
+A newly arrived spike sets $\Csyn_{j,r}$, not $\Isyn_{j,r}$; the latter is
+still zero at the grid point. Euler therefore integrates the entire first
+millisecond of every postsynaptic current as \emph{zero}, and then lags by one
+step thereafter.
+
+\subsection{Two further inconsistencies in the event timing}
+\label{sec:timing}
+
+The same audit exposes two off-by-one-step errors in how spike events enter
+Eqs.~\eqref{eq:old-asc}--\eqref{eq:old-v}. A postsynaptic spike is emitted at
+grid point $t$ from $V_j[t]$, so its consequences act \emph{at} $t$ and must
+then propagate across $[t,t+\dt)$:
+%
+\begin{itemize}
+  \item the reset in Eq.~\eqref{eq:old-v} subtracts $\Delta V$ at the
+        \emph{end} of the step, giving $\amem V_j[t] - \Delta V$. A reset at
+        $t$ gives $\amem\bigl(V_j[t]-\Delta V\bigr)$ instead, a discrepancy of
+        $(1-\amem)\Delta V \approx \resetTimingError\,\Delta V$ at the median
+        $\tau_m$;
+  \item the ASC increment in Eq.~\eqref{eq:old-asc} is likewise added after
+        the decay, and the freshly injected ASC does not drive $V_j$ during
+        the step in which it appears.
+\end{itemize}
+
+\subsection{Event conventions against the fitted model}
+\label{sec:conventions}
+
+The GLIF3 parameters were fitted by Teeter
+\emph{et al.}~\cite{teeter2018generalized}, and the fitting procedure fixes
+where each spike event belongs. The fitting code\footnote{%
+\url{https://github.com/AllenInstitute/AllenSDK/blob/master/allensdk/internal/model/glif/ASGLM.py}
+and \code{create\_basis\_IPSP} in
+\url{https://github.com/AllenInstitute/AllenSDK/blob/master/allensdk/internal/model/GLM.py}.}
+regresses the sub-threshold voltage on basis currents
+$e^{-k^{s}(t-t_{\mathrm{sp}})}$ that start at spike initiation $t_{\mathrm{sp}}$,
+and only removes the samples inside the refractory window (the ``spike
+cut'') from the regression. The fitted ASC is therefore
+$\delta I^{s} e^{-k^{s}(t-t_{\mathrm{sp}})}$ from the spike onwards, and a current
+present before the spike decays through the window, as in their
+supplementary Eq.~6. The membrane is not modelled inside the window and
+restarts at $V_{\mathrm{reset}} = E_L$ when it ends.
+
+The exact step follows this on the grid. A spike detected at $t$ resets the
+membrane and injects $\delta I^{s}$ at the start of $[t, t+\dt)$, and both
+then evolve through the step (Eq.~\eqref{eq:events}). Further spikes are
+blocked until $t + \lceil t_{\mathrm{ref}}/\dt\rceil\dt$. Because the true
+crossing lies in $(t-\dt, t]$, that is the first grid point that can follow
+the end of the refractory window. Under a hard reset the membrane is held at
+$V_{\mathrm{reset}}$ up to the grid point before it. A trace of one spike through
+both backends, for both resets, reproduces these values to within
+$10^{-6}$ of the corresponding matrix-exponential solution.
+
+The implementation departs from Eq.~\eqref{eq:reset} in one deliberate
+respect. For training it resets by subtraction, $V \leftarrow V - \Delta V$,
+rather than to $E_L$, and lets the membrane integrate its input during the
+refractory period while only spiking is blocked. This keeps the overshoot
+$V_j[t]-V_{th}$ and the information the input carries through the
+refractory period. It is also a departure from the fit: the after-spike
+currents keep driving the membrane during the refractory period, while the
+fitted model does not simulate the membrane there and the hard reset holds
+it. Only with no input, no overshoot and no after-spike current does the
+soft reset return to $E_L$ as the hard reset does. The hard reset, which
+reproduces the fitted model on the $\dt$ grid, remains available. It used to fall back to the subtractive rule when the
+refractory period was a single step; it now resets to $V_{\mathrm{reset}}$ in that
+case too. The current network is not affected, since its shortest
+$t_{\mathrm{ref}}$ is $1.05\,$ms.
+
+NEST's \code{glif\_psc}~\cite{gewaltig2007nest}\footnote{%
+\url{https://github.com/nest/nest-simulator/blob/master/models/glif_psc.cpp},
+function \code{glif\_psc::update}.} also resets at the grid point where the
+crossing is detected, so the reset timing agrees. It differs in two ways,
+both inherited from the Allen simulator. It adds $\delta I^{s}$ undecayed at
+the \emph{end} of the refractory window, which does not match the fitted
+current above. It also counts the refractory period from the detection time
+as if the crossing happened exactly there, which delays the next spike by one
+step whenever the fractional part of $t_{\mathrm{ref}}$ is zero or at least
+one half.
+
+% =========================================================================
+\section{The exact step}
+\label{sec:exact}
+
+\subsection{Propagator}
+
+Since $\dot{\bm y}_j = \bm{M}_j \bm{y}_j$ is linear and time invariant, the
+exact transition over one step is the matrix exponential
+$\bm{y}_j[t+\dt] = e^{\bm{M}_j \dt}\,\bm{y}_j[t]$. This is the
+propagator-matrix construction of Rotter and
+Diesmann~\cite{rotter1999exact}, used by NEST for
+\code{iaf\_psc\_alpha}~\cite{gewaltig2007nest}. Only the last row is new: the
+first $2R+2$ rows reproduce Eqs.~\eqref{eq:old-csyn}--\eqref{eq:old-asc}.
+
+Integrating the membrane equation exactly rather than under a hold gives a
+convolution in place of a product,
+%
+\begin{equation}
+\label{eq:convolution}
+V_j(t+\dt) = e^{-\dt/\tau_m} V_j(t)
+  + \frac{1}{C_m}\int_{0}^{\dt}
+      e^{-(\dt-u)/\tau_m}\, I_j(t+u)\,\mathrm{d}u,
+\end{equation}
+%
+and because each source in Eq.~\eqref{eq:total} is a known exponential or
+alpha function on $[t,t+\dt)$, every integral is a constant. Writing
+$a = 1/\tau_m$ and $b_r = 1/\tau_r$, the resulting step is
+%
+\begin{equation}
+\label{eq:exact-v}
+\boxed{\;
+\begin{aligned}
+V_j[t+\dt] = {} & \amem V_j[t]
+  + \sum_{r=1}^{R}\Bigl(\Acoef_{j,r}\,\Isyn_{j,r}[t]
+                      + \Bcoef_{j,r}\,\Csyn_{j,r}[t]\Bigr) \\[0.2em]
+  & + \sum_{s=1}^{2}\Dcoef^{s}_{j}\,I^{s}_j[t]
+  + \bigl(\Rcoef_j + \Scoef_j\bigr)\, S_j[t]
+\end{aligned}\;}
+\end{equation}
+%
+with the coefficients
+%
+\begin{align}
+\label{eq:coefA}
+\Acoef_{j,r} &= \frac{1}{C_m}\int_0^{\dt} e^{-a(\dt-u)}e^{-b_r u}\,\mathrm{d}u
+   = \frac{1}{C_m}\,\frac{e^{-b_r \dt} - e^{-a\dt}}{a - b_r},
+\\
+\label{eq:coefB}
+\Bcoef_{j,r} &= \frac{1}{C_m}\int_0^{\dt} e^{-a(\dt-u)}\,u\,e^{-b_r u}\,\mathrm{d}u
+   = \frac{1}{C_m}\left[\frac{\dt\,e^{-b_r\dt}}{a-b_r}
+     - \frac{e^{-b_r\dt}-e^{-a\dt}}{(a-b_r)^{2}}\right],
+\\
+\label{eq:coefD}
+\Dcoef^{s}_{j} &= \frac{1}{C_m}\int_0^{\dt} e^{-a(\dt-u)}e^{-k^{s}u}\,\mathrm{d}u
+   = \frac{1}{C_m}\,\frac{e^{-k^{s}\dt} - e^{-a\dt}}{a - k^{s}} .
+\end{align}
+
+\subsection{Spike events}
+
+A postsynaptic spike does two distinct things to its own step, and applying
+both at the spike's grid point, then propagating them across the step,
+gives, for the subtractive reset the implementation uses
+(Section~\ref{sec:conventions}),
+
+\begin{equation}
+\label{eq:events}
+\underbrace{\Rcoef_j = -\amem\,\Delta V}_{\text{the reset}},
+\qquad
+\underbrace{\Scoef_j = \sum_{s=1}^{2}\Dcoef^{s}_{j}\,\delta I^{s}}_{%
+  \text{the ASC it injects}},
+\quad
+I^{s}_j[t+\dt] = \beta_s I^{s}_j[t]
+  + \underbrace{\beta_s\,\delta I^{s}}_{\widetilde{\delta I^{s}}}\,S_j[t].
+\end{equation}
+
+$\Rcoef_j$ is the reset, which now decays across the step rather than being
+subtracted at its end. $\Scoef_j$ is the drive the freshly injected after-spike
+current contributes to the membrane during that same step --- a term the
+Euler scheme did not have at all, because there the ASC only reached the
+membrane on the following step.
+
+Both multiply the same $S_j[t]$, so the forward pass could fold them into one
+constant and save an operation. They are deliberately kept apart, because
+the two training flags gate them separately. The flag \code{detach\_reset}
+cuts the gradient path from the spike to the reset, and
+\code{detach\_asc\_reset} cuts the path from the spike to the ASC. Folding them would make \code{detach\_reset} silently cut
+part of the ASC gradient too --- and $\Scoef_j$ reaches $\ascFracOfReset\,\%$ of
+$|\Rcoef_j|$ for some cell types, so that is not a rounding matter. Apart from
+that one extra multiply-add, Eq.~\eqref{eq:exact-v} has the same operation
+count on the spike term as Eq.~\eqref{eq:old-v}.
+
+\subsection{Removable singularities}
+
+Both $\Acoef_{j,r}$ and $\Dcoef^{s}_j$ carry a removable singularity at
+$a = b_r$ (respectively $a = k^{s}$), and $\Bcoef_{j,r}$ a double one. This
+is not a hypothetical concern: the slowest basis, $\tauSynSlow\,$ms, lies
+inside the membrane range $\tauMemMin$--$\tauMemMax\,$ms, so some cell types
+land on the degeneracy to within rounding. Writing $x = (a-b_r)\dt$ and
+%
+\begin{equation}
+\label{eq:stable}
+\Acoef_{j,r} = \frac{\dt\, e^{-a\dt}}{C_m}\cdot\frac{e^{x}-1}{x},
+\qquad
+\Bcoef_{j,r} = \frac{\dt^{2} e^{-a\dt}}{C_m}\cdot
+  \frac{e^{x}(x-1)+1}{x^{2}},
+\end{equation}
+%
+both factors are entire, and at $x = 0$ reduce to
+$\Acoef = \dt\,e^{-a\dt}/C_m$ and $\Bcoef = \tfrac12 \dt^{2}e^{-a\dt}/C_m$.
+
+Being entire is not the same as being computable, and the second factor is a
+trap. Written as it stands, $e^{x}(x-1)+1$ subtracts two quantities of size
+$1$ to produce one of size $x^{2}/2$, so it forfeits $2\log_{10}(1/|x|)$
+significant digits --- eight of them at $x = 10^{-4}$. The band is reached in
+practice: across the $\nCellTypes$ cell types the smallest $|x|$ is
+$1.8\times10^{-3}$. Rewriting through
+%
+\begin{equation}
+\label{eq:phi2}
+\frac{e^{x}(x-1)+1}{x^{2}} = 1 + (x-1)\,\varphi_2(x),
+\qquad
+\varphi_2(x) = \frac{1}{x}\left(\frac{\mathrm{e}^{x}-1}{x} - 1\right),
+\end{equation}
+%
+leaves a cancellation of $1$ against $1/2$ rather than against $x^{2}/2$, which
+costs one order of $x$ instead of two. Below a crossover the Taylor series
+$\sum_n x^{n}(n+1)/(n+2)!\;=\;\tfrac12 + \tfrac{x}{3} + \tfrac{x^{2}}{8}
++ \tfrac{x^{3}}{30} + \tfrac{x^{4}}{144} + \dots$ takes over; the crossover is
+placed where the series truncation meets the recurrence's rounding. The worst
+relative error over all $x$ falls from $1.8\times10^{-8}$ to
+$3.6\times10^{-14}$, and $\Bcoef$ then matches
+$e^{\bm{M}_j\dt}$ to $10^{-16}$ for every cell type. The first factor,
+$\tfrac{e^x-1}{x} = 1 + \tfrac{x}{2} + \tfrac{x^2}{6} + \dots$, needs no such
+care: \code{expm1} evaluates it to machine precision directly.
+
+\subsection{The old scheme as a special case}
+
+Setting
+%
+\begin{equation}
+\label{eq:euler-special}
+\begin{gathered}
+\Acoef_{j,r} = \Dcoef^{s}_{j} = (1-\amem)R_m,
+\qquad
+\Bcoef_{j,r} = 0, \\[0.25em]
+\Rcoef_j = -\Delta V,
+\qquad
+\Scoef_j = 0,
+\qquad
+\widetilde{\delta I^{s}} = \delta I^{s}
+\end{gathered}
+\end{equation}
+%
+turns Eq.~\eqref{eq:exact-v} back into Eq.~\eqref{eq:old-v} exactly. The
+integration scheme is therefore a \emph{choice of constants}, not a branch in
+the code: both the TensorFlow path and the fused CUDA kernel evaluate
+Eq.~\eqref{eq:exact-v} unconditionally, and the historical behaviour is
+recovered bit for bit by building the coefficients of
+Eq.~\eqref{eq:euler-special} at setup time.
+
+\subsection{Gradients}
+\label{sec:gradients}
+
+The model is trained by backpropagation through time, so the propagator is only
+as useful as its Jacobian. Differentiating Eq.~\eqref{eq:exact-v} and the state
+updates gives, for upstream gradients $\bar V, \bar I^{s}, \bar C, \bar I$ on
+the four outputs,
+
+\begin{equation}
+\label{eq:jacobian}
+\begin{aligned}
+\frac{\partial \mathcal{L}}{\partial V_j[t]} &= \amem\,\bar V, &
+\frac{\partial \mathcal{L}}{\partial \Isyn_{j,r}[t]}
+  &= \asyn\,\bar I_{r} + \Acoef_{j,r}\,\bar V, \\[0.25em]
+\frac{\partial \mathcal{L}}{\partial I^{s}_j[t]}
+  &= \beta_s\,\bar I^{s} + \Dcoef^{s}_{j}\,\bar V, &
+\frac{\partial \mathcal{L}}{\partial \Csyn_{j,r}[t]}
+  &= \asyn\,\bar C_{r} + \dt\,\asyn\,\bar I_{r}
+     + \Bcoef_{j,r}\,\bar V,
+\end{aligned}
+\end{equation}
+
+and for the incoming spike, with the two detach flags written as indicators,
+
+\begin{equation}
+\label{eq:zgrad}
+\frac{\partial \mathcal{L}}{\partial S_j[t]}
+  = \mathbb{1}_{\text{attach reset}}\,\Rcoef_j\,\bar V
+  + \mathbb{1}_{\text{attach ASC}}
+    \Bigl(\Scoef_j\,\bar V
+        + \sum_{s}\widetilde{\delta I^{s}}\,\bar I^{s}\Bigr).
+\end{equation}
+
+Every new coefficient appears in the backward pass exactly where it appears in
+the forward one, so the added cost is the same handful of multiply-adds.
+Equation~\eqref{eq:zgrad} is where the separation of $\Rcoef_j$ and $\Scoef_j$
+earns its keep: each flag gates its own term.
+
+The TensorFlow path is built from plain operations and is differentiated by
+autodiff, but the CUDA path carries a hand-written backward kernel, so both were
+checked against central finite differences of the forward step
+(\code{verify\_gradients.py}). Two inputs are excluded from that check because a
+finite difference across them measures a step function rather than the
+transition: the emitted spikes, which pass through a Heaviside with a surrogate
+gradient, and the delayed spike buffer, which feeds the event-driven recurrent
+kernel where a spike is consumed as a binary event. Both are pre-existing
+choices of the model, independent of the integrator.
+
+Over the remaining, smooth inputs --- $V_j$, $\Csyn_{j,r}$, $\Isyn_{j,r}$,
+$I^{s}_j$ and the incoming spike --- both backends and both schemes agree with
+finite differences to a worst relative discrepancy of $\gradWorst$, which is the
+float32 difference-quotient noise floor at this step size; the spike gradient of
+Eq.~\eqref{eq:zgrad}, which is exactly linear and therefore free of truncation
+error, agrees to $\gradWorstPrevZ$. The CUDA and TensorFlow gradients agree with
+each other to float32 rounding, which the test suite asserts independently.
+
+\subsection{Verification of the closed forms}
+
+Equations~\eqref{eq:coefA}--\eqref{eq:coefD} were checked against
+$e^{\bm{M}_j\dt}$ computed by scaling-and-squaring~\cite{higham2005scaling}
+(\code{scipy.linalg.expm}) for every fifth cell type. The largest discrepancy
+in any coefficient is below $\expmBound$ --- machine precision, and an
+independent confirmation of the algebra, since the two routes share no code.
+(Its last digits depend on the LAPACK build, so only the order is quoted.)
+
+% =========================================================================
+\section{Accuracy}
+\label{sec:accuracy}
+
+\subsection{An independent ground truth}
+
+Measuring the exact scheme against a reference built \emph{from} the exact
+propagator would be circular. We therefore construct the ground truth from the
+\emph{old} method: the Euler step is first-order accurate, so
+sub-stepping it at $\dt/M$ converges to the true trajectory as
+$\mathcal{O}(1/M)$, and a Richardson extrapolation~\cite{richardson1911approximate}
+%
+\begin{equation}
+\label{eq:richardson}
+V^{\mathrm{ref}} = 2\,V^{\mathrm{euler}}_{2M} - V^{\mathrm{euler}}_{M},
+\qquad M = 128,
+\end{equation}
+%
+cancels the leading error term, leaving a reference accurate to
+$\sim\!10^{-7}$ that never touches the closed form under test. The reference
+takes only Euler's \emph{integration} from the old method: it applies the
+spike events at the start of each step, as the exact scheme does
+(Section~\ref{sec:conventions}), so it measures only the integration error.
+The event convention is part of the model's definition, fixed by the fit,
+not an approximation a convergent method could arbitrate. All errors
+below are relative RMS errors in $V_j$, in units of $\Delta V$, over
+$\nCellTypes$ cell types driven by a fixed Poisson input.
+
+Figure~\ref{fig:convergence} shows the sub-stepped Euler step walking towards the
+propagator as $1/M$ and never overtaking it. The propagator is already at the
+reference's own accuracy floor at $M = 1$.
+
+\begin{figure}[t]
+  \centering
+  \widefigure[0.78\fullwidth]{figures/convergence.pdf}
+  \caption[Convergence of the sub-stepped Euler step]{%
+    \textbf{Euler converges to the propagator.}
+    Relative RMS error in $V_j$ against the Richardson reference of
+    Eq.~\eqref{eq:richardson}, as the Euler step is sub-stepped at
+    $\dt/M$ (orange circles). The square marks the scheme as implemented,
+    which additionally carries the end-of-step event timing of
+    Section~\ref{sec:previous}. The exact propagator (blue) sits at the
+    reference's own floor for $M=1$.}
+  \label{fig:convergence}
+\end{figure}
+
+\subsection{Error in the two regimes, at both precisions}
+
+Table~\ref{tab:errors} and Figure~\ref{fig:errors} separate two effects. The
+\emph{subthreshold} regime has no postsynaptic spikes, so the error is purely
+the membrane integration of the synaptic current; the \emph{spiking} regime
+adds the reset and the ASCs, whose event timing the exact scheme also
+corrects. Each is evaluated in float64, which isolates the method, and with
+the state stored in \code{float16} and the arithmetic performed in
+\code{float32} --- exactly what the production CUDA kernel
+does~\cite{micikevicius2018mixed}.
+
+\begin{table}[t]
+  \caption[Relative error of the two schemes]{%
+    Relative RMS error in $V_j$ against the Richardson reference. ``state''
+    narrows only the four recurrent state blocks; ``+ constants'' also narrows
+    the propagator coefficients, which is what the kernel really does under a
+    mixed-precision policy. The float64 entries for the exact scheme are
+    bounded by the reference, not by the scheme, so the improvement factor in
+    that column is a lower bound.}
+  \label{tab:errors}
+  \begin{widetable}
+  \begin{tabular}{llrrrr}
+    \toprule
+    & & & \multicolumn{2}{c}{\code{float16}} & \\
+    \cmidrule(lr){4-5}
+    Regime & Scheme & float64 & state & + constants & Improvement \\
+    \midrule
+    Subthreshold      & Euler            & $\eulerErrSub$  & $\eulerErrSubHalfState$ & $\eulerErrSubHalf$  & \\
+                      & exact propagator & $\exactErrSub$  & $\exactErrSubHalfState$ & $\exactErrSubHalf$  & $\gainSub\times$ \\[0.3em]
+    Spiking ($\refRate\,$Hz)
+                      & Euler            & $\eulerErrSpk$  & $\eulerErrSpkHalfState$ & $\eulerErrSpkHalf$  & \\
+                      & exact propagator & $\exactErrSpk$  & $\exactErrSpkHalfState$ & $\exactErrSpkHalf$  & $\gainSpk\times$ \\
+    \bottomrule
+  \end{tabular}
+  \end{widetable}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \widefigure[0.84\fullwidth]{figures/errors.pdf}
+  \caption[Method error versus precision error]{%
+    \textbf{The method error dominated the precision error.}
+    Under Euler, moving from float64 to \code{float16} storage changes
+    nothing: the discretisation error is some forty times larger than
+    anything the number format contributes. Only once the integrator is exact
+    does \code{float16} storage become the accuracy floor.}
+  \label{fig:errors}
+\end{figure}
+
+\textbf{The float64 columns are the substantive result. Euler's error,
+$\bm{\eulerErrSpk}$ of $\bm{\Delta V}$, is over $\bm{\eulerErrSpkPct\,\%}$ of the distance from rest to
+threshold --- a systematically wrong trajectory, not a rounding artefact.} The
+three columns read together settle the question of precision, and reverse the
+expected answer twice. \textbf{Mixed precision was never the \emph{integrator's}
+bottleneck --- under Euler, narrowing the state changes nothing, because the
+discretisation error is some forty times larger.} But once the integrator is
+exact, precision becomes the floor, and it is not the state that dominates it:
+narrowing the propagator \emph{constants} costs a further
+$\constantPenalty\times$ on top of narrowing the state. Section~\ref{sec:floor}
+returns to this, because the constants are by far the cheapest thing here to
+widen.
+
+Euler's float64 error has two sources: the current held over the step
+(Section~\ref{sec:previous}), and the spike events applied at the end of the
+step (Section~\ref{sec:timing}). They live in disjoint constants, the
+current in $\Acoef$, $\Bcoef$, $\Dcoef$ and the events in $\Rcoef$, $\Scoef$
+and the ASC increment, so each can be fixed on its own:
+%
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+remaining approximation & subthreshold & spiking \\
+\midrule
+both (Euler)                 & $\eulerErrSub$      & $\eulerErrSpk$ \\
+event timing only            & $\hybridSubEvents$  & $\hybridSpkEvents$ \\
+current hold only            & $\hybridSubCurrent$ & $\hybridSpkCurrent$ \\
+neither (exact)              & $\exactErrSub$      & $\exactErrSpk$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+%
+Without spikes the current hold is the entire error. At the imposed
+$\sim$10\,Hz output rate, the event timing is the larger of the two, and
+neither fix alone gets within two orders of magnitude of the exact step. The
+split depends on the rate: the event error scales with the number of spikes,
+the hold error with the synaptic drive.
+
+\subsection{A single postsynaptic potential}
+
+Figure~\ref{fig:psp} isolates the mechanism on one neuron
+($\tau_m = \pspTauM\,$ms) receiving a single presynaptic spike. Euler
+cannot see the current rise inside the step in which it happens, so the
+postsynaptic potential starts a millisecond late and underestimates the peak
+by $\pspUnderestimate\,\%$. The exact propagator is indistinguishable from
+the ground truth.
+
+\begin{figure}[t]
+  \centering
+  \widefigure[\fullwidth]{figures/psp.pdf}
+  \caption[Postsynaptic potential]{%
+    \textbf{One presynaptic spike, one neuron.}
+    Membrane response to a single spike on the fastest receptor basis at
+    $t = 2\,$ms. The grey trace is the sub-stepped float64 ground truth; the
+    exact propagator (blue) lies on top of it. \emph{Right:} the first steps,
+    where Euler (orange) integrates the arrival step as zero.}
+  \label{fig:psp}
+\end{figure}
+
+\subsection{Spike-level fidelity}
+
+Voltage error matters only insofar as it moves spikes. We therefore close the
+loop: neurons integrate, cross threshold, reset, adapt and block during their
+refractory period, driven by a fixed Poisson input at $\refRate\,$Hz
+($\refSpikes$ reference spikes over $800\,$ms). The metric is deliberately
+strict --- the fraction of ground-truth spikes reproduced in \emph{exactly}
+the same millisecond --- because a closed loop amplifies any voltage
+discrepancy into a different spike time, after which the trajectories
+separate.
+
+\begin{figure}[t]
+  \centering
+  \widefigure[\fullwidth]{figures/spikes.pdf}
+  \caption[Spike-level agreement with the ground truth]{%
+    \textbf{Spikes land in the right millisecond.}
+    \emph{Left:} fraction of ground-truth spikes reproduced at exactly the
+    right millisecond. \emph{Right:} rasters for the fourteen most active
+    neurons over a $160\,$ms window, with the exact propagator in float64
+    (top), the exact propagator in the production \code{float16}
+    configuration (middle) and Euler in float64 (bottom); a scheme is correct
+    where its tick aligns with the grey ground-truth bar. The ground truth here is the \emph{old}
+    method sub-stepped at $\dt/\closedSubsteps$ in float64, so it favours
+    neither scheme. It applies the spike events at the start of each step,
+    as the exact scheme does, so it measures only the integration error. Its own voltage error is about $\closedRefErr$ of
+    $\Delta V$, so the exact scheme's float64 agreement is a lower bound.}
+  \label{fig:spikes}
+\end{figure}
+
+The result (Figure~\ref{fig:spikes}) is that Euler reproduces
+$\matchEuler\,\%$ of the ground-truth spikes and the exact propagator
+$\matchExact\,\%$. In the \code{float16} configuration training uses --- state
+\emph{and} constants --- the exact scheme reproduces $\matchExactHalf\,\%$.
+Richardson extrapolation cannot supply this ground truth: once neurons spike
+on their own, runs at $M$ and $2M$ sub-steps can diverge by a whole spike,
+and a raster cannot be extrapolated. It is therefore plain sub-stepped Euler
+at $M = \closedSubsteps$, whose voltage error, first order in $1/M$, is about
+$\closedRefErr$ of $\Delta V$. That is small next to Euler's error but not
+next to the exact scheme's, so part of the exact scheme's float64 mismatch is
+the reference's own: against a reference with $M = \closedSubstepsCoarse$, the
+same run agrees on only $\matchExactCoarse\,\%$ of spikes. The float64
+agreement of the exact scheme is therefore a lower bound.
+The $\matchExactHalf\,\%$ is a strict count, and most of the remaining
+spikes are not far off: of the $\halfMissed$ ground-truth spikes the
+\code{float16} run misses, $\halfOneOff\,\%$ have a \code{float16} spike exactly
+one millisecond away, so $\halfWithinOne\,\%$ of all ground-truth spikes are
+reproduced to within $\pm 1\,$ms. That remaining gap is storage precision, not
+the integrator, and
+Section~\ref{sec:floor} shows most of it is recoverable for a fixed
+$\constantWidenMB\,$MB.
+
+It is worth stating what this does \emph{not} claim. Euler is stable and
+its mean firing rate is only $\rateErrEuler\,\%$ off, so a network trained
+under it is a perfectly self-consistent dynamical system. It is simply not
+the GLIF3 system its parameters describe. Any quantity that depends on spike
+timing --- synchrony, phase, latency, temporal codes, or the surrogate
+gradients that flow through the threshold
+crossing~\cite{bellec2020solution} --- was being computed for the wrong model.
+
+% =========================================================================
+\section{Cost}
+\label{sec:cost}
+
+\subsection{Arithmetic and memory}
+
+Equation~\eqref{eq:exact-v} replaces one scaled sum by a weighted sum: per
+neuron per step, $R$ additional fused multiply-adds, and per-basis coefficient
+arrays where there was previously one scalar $(1-\amem)R_m$. The coefficients
+are shared across the batch and so remain resident in L2. Critically,
+$\Csyn_{j,r}$ was \emph{already} read by the kernel, which has to update it
+anyway --- so the exact step introduces \textbf{no new state variables}, and
+therefore no additional memory on the backpropagation-through-time tape,
+which is what constrains this model in practice. The only new memory is
+$\kernelConstantMB\,$MB of constants at $\kernelNeurons$ neurons in
+\code{float16}, independent of batch size and sequence length.
+
+\subsection{Measured kernel time}
+
+Table~\ref{tab:bench} compares the fused forward and backward CUDA kernels
+before and after the change. Each timing chains $64$ state transitions inside
+a single \code{tf.function}, so it measures per-timestep kernel cost rather
+than dispatch overhead.
+
+\input{benchtable}
+
+In \code{float16} the fused state kernel costs $\kernelRatio\times$ its
+previous time (range $\kernelRatioMin$--$\kernelRatioMax\times$). This is the
+cost of that one kernel, not of a training step: the state transition is one
+of several kernels per timestep and the recurrent CSR products dominate. An
+end-to-end training measurement has not been performed.
+
+The overhead is not irreducible. The inner loop reads four separate
+$[N \times R]$ constant arrays at the same index; interleaving them into a
+single array of four values per $(j,r)$ would turn four strided loads into one
+\code{float4} fetch. That is a worthwhile optimisation, not a prerequisite.
+
+% =========================================================================
+\section{Consequences and open questions}
+\label{sec:discussion}
+
+\subsection{Where the accuracy floor now lies}
+\label{sec:floor}
+
+With the method error removed, \code{float16} \emph{storage} sets the floor.
+Figure~\ref{fig:precision} attributes it, block by block, over the five things
+the kernel stores: the four recurrent state blocks and the propagator
+constants.
+
+\begin{figure}[t]
+  \centering
+  \widefigure[0.92\fullwidth]{figures/precision.pdf}
+  \caption[Cost of float16 storage per stored block]{%
+    \textbf{What each stored block costs in \code{float16}.}
+    Relative RMS error in $V_j$ for the exact scheme, as each block is moved to
+    \code{float16}. The four state blocks are charged per neuron per sample;
+    the constants are shared across the batch and the sequence, so they add
+    nothing to that column. The dashed line is Euler with everything narrowed.}
+  \label{fig:precision}
+\end{figure}
+
+Two results here are worth separating, because they point the same way.
+
+Among the \emph{state} blocks the cost is counter-intuitive: $\Isyn$ and
+$\Csyn$ --- eight of the eleven words per neuron --- cost almost nothing in
+\code{float16}, while $I^{s}$, two words, costs more than both together. The
+after-spike currents carry large amplitudes and decay over hundreds of
+milliseconds, so their \code{float16} ulp is coarse and the error accumulates
+for a long time before it decays. Widening $V_j$ and $I^{s}_j$ to
+\code{float32} buys a $\precisionGain$-fold gain for $\precisionBytes\,\%$ more
+state on this block --- a far smaller fraction of the full
+backpropagation-through-time tape, which is dominated by the spike ring buffer.
+
+The \emph{constants} are the better bargain, and were the easier thing to
+overlook. Narrowing them costs $\constantPenalty\times$ on its own, more than
+every state block put together, and it is the single largest term in the
+production number of Table~\ref{tab:errors}. But unlike the state they do not
+scale: there are $\constantWords$ words per neuron, shared across every sample
+in the batch and every step of the sequence, so widening all of them to
+\code{float32} at $\kernelNeurons$ neurons costs a fixed
+$\constantWidenMB\,$MB. The obstacle is not memory but plumbing --- the fused
+operator takes one dtype for every tensor it is given, so mixed state and
+constant widths need a second type parameter on the op.
+
+We quantify both trades here and take neither: the integrator fix is
+unconditional, while the precision choices are deliberate decisions with their
+own costs, and the constants one needs a kernel signature change. On the
+evidence above the constants should be widened first.
+
+\subsection{Two defects the rewrite exposed}
+\label{sec:defects}
+
+Reworking the setup code turned up two bugs that predate the propagator and
+have nothing to do with it. Both are fixed here.
+
+\paragraph{The ASC decay went through \code{float16}.}
+$\beta_s = e^{-k^{s}\dt}$ was not computed from $k^{s}$ directly. The rate was
+cast to the compute dtype, pushed through an inverse sigmoid, stored, and
+pushed back through a sigmoid on read --- a parameterisation left over from
+when $k$ was to be trained. Under a mixed-precision policy that round trip
+happens in \code{float16} and returns $k^{s}$ with a relative error of
+$\ascKError$. The error in $\beta_s$ looks negligible, at
+$3.6\times10^{-5}$, but it is an error in a \emph{decay rate}: over three ASC
+time constants it compounds to $\ascAmplitudeError\,\%$ of the after-spike
+current's amplitude, and the slowest ASC has $\tau = 333\,$ms, so that is a
+sustained bias on the slowest adaptation in the model. It is now evaluated in
+float64 and cast once.
+
+\paragraph{A neuron-aligned constant was not following the layout.}
+The model can renumber neurons into a spatially local (Morton) order at
+runtime while keeping checkpoints in canonical order, and
+\code{\_translate\_neuron\_layout} permutes the neuron-aligned arrays when it
+does. It worked from a hand-written list of attribute names, and
+\code{t\_ref\_steps} was not on it --- so under a non-identity layout every
+neuron got somebody else's refractory period, drawn from a range of
+$\tRefMin$ to $\tRefMax$ steps. The read is live in both backends.
+
+The second is the more instructive failure: a list of names that has to be
+kept in step with a set of attributes will eventually fall out of step. The
+edge-aligned translation next to it does not have this problem, because it
+discovers its targets. The per-neuron constants are now built by a helper that
+binds and registers in one call, so the registry cannot disagree with what
+exists, and a test asserts that every constant the step reads is in it and
+survives a permutation round trip.
+
+\subsection{Reproducing earlier work}
+
+The coefficients are derived constants, not trainable parameters, and are
+deliberately excluded from the checkpoint graph, so checkpoints written before
+this change still restore and are interchangeable between the two schemes.
+What is \emph{not} interchangeable is the science: a network whose weights
+were trained under Euler was fitted to a different dynamical system, and
+its firing rates will shift when evaluated under the exact step. Earlier
+results should be reproduced with the Euler coefficients of
+Eq.~\eqref{eq:euler-special}, and new models retrained.
+
+\subsection{What remains on the grid}
+
+Spikes are still emitted and delivered only at millisecond boundaries.
+Morrison \emph{et al.}~\cite{morrison2007exact} show how to carry continuous
+spike times through the same propagator formalism, and
+Hanuschkin \emph{et al.}~\cite{hanuschkin2010general} give a general
+time-driven implementation; either would remove the remaining sub-millisecond
+quantisation. Its largest visible effect is on the after-spike currents.
+A spike is detected at the first grid point after the true crossing, but
+$\delta I^{s}$ is injected there at full amplitude. The fitted current has
+already decayed from spike initiation, so for the fastest ASC
+($k^{s} = 0.3\,\mathrm{ms}^{-1}$) its value at that grid point averages only
+$(1-e^{-k^{s}\dt})/(k^{s}\dt) \approx 86\,\%$ of $\delta I^{s}$. Carrying continuous spike times
+is a larger change, orthogonal to this one, and it becomes the natural next target now
+that the subthreshold integration is exact.
+
+\subsection{Summary}
+
+\begin{table}[h]
+  \caption[Summary]{Summary of the change.}
+  \label{tab:summary}
+  \begin{widetable}
+  \begin{tabular}{lll}
+    \toprule
+     & Euler & Exact propagator \\
+    \midrule
+    Membrane error (float64)        & $\eulerErrSpk$      & $\exactErrSpk$ \\
+    Membrane error (\code{float16}) & $\eulerErrSpkHalf$  & $\exactErrSpkHalf$ \\
+    Spikes at the right ms (float64)$^{b}$ & $\matchEuler\,\%$ ($\withinEuler\,\%$) & $\matchExact\,\%$ ($\withinExact\,\%$) \\
+    Spikes at the right ms (\code{float16})$^{b}$ & $\matchEulerHalf\,\%$ ($\withinEulerHalf\,\%$) & $\matchExactHalf\,\%$ ($\withinExactHalf\,\%$) \\
+    Membrane error (mixed)$^{a}$    & $\eulerErrSpkMixed$ & $\exactErrSpkMixed$ \\
+    Spikes at the right ms (mixed)$^{a,b}$ & $\matchEulerMixed\,\%$ ($\withinEulerMixed\,\%$) & $\matchExactMixed\,\%$ ($\withinExactMixed\,\%$) \\
+    Additional state variables      & ---                & none \\
+    Fused kernel time (\code{fp16}) & $1.00\times$       & $\kernelRatio\times$ \\
+    \bottomrule
+  \end{tabular}
+  \par\smallskip\footnotesize
+  $^{a}$\,\code{float16} only for $\Isyn$ and $\Csyn$; $V_j$, $I^{s}_j$ and the
+  propagator constants in float32, arithmetic in float32. Not available in the
+  fused operator today, which takes one dtype for every tensor, so it is
+  measured with the same per-block rounding emulation as Table~\ref{tab:errors};
+  in the all-\code{float16} case that emulation reproduces the production CUDA
+  kernel to $2\times10^{-7}$.\\
+  $^{b}$\,In brackets, the fraction reproduced to within $\pm 1\,$ms.
+  \end{widetable}
+\end{table}
+
+\vspace{1em}
+\noindent
+\begin{sloppypar}
+The implementation lives in \code{glif\_propagators.py} under
+\code{v1\_model\_utils}. The scheme is selected by the
+\code{integration\_scheme} argument of \code{create\_model}, set to
+\code{"exact"} or \code{"euler"}, or by the matching command-line flag. The
+accompanying notebook reproduces every figure and every number in this report.
+\end{sloppypar}
+
+\printbibliography[heading=bibnumbered,title={References}]
+
+\end{document}

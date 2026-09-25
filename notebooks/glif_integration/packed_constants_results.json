@@ -1,0 +1,60 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "architecture": "120",
+  "tensorflow": "2.21.0",
+  "source_sha256": {
+    "baseline": "9bd196fefbd18d39e33972c9cbaffd7345d5f7dc1ec77776930061e014b8ac87",
+    "packed": "cab179636532824cc51bd55a51a68f7208b5d6e8413ca6689852710c231d70f9"
+  },
+  "steps": 32,
+  "rows": [
+    {
+      "n": 51978,
+      "batch": 8,
+      "dtype": "float16",
+      "max_abs_difference": 0.0,
+      "baseline_forward_us": 17.87286964827217,
+      "packed_forward_us": 17.968843167182058,
+      "forward_ratio": 1.0053697878851349,
+      "baseline_backward_us": 22.53549246233888,
+      "packed_backward_us": 21.87440259149298,
+      "backward_ratio": 0.9706645030300223
+    },
+    {
+      "n": 51978,
+      "batch": 8,
+      "dtype": "float32",
+      "max_abs_difference": 1.1920928955078125e-07,
+      "baseline_forward_us": 34.79594306554645,
+      "packed_forward_us": 32.650183129590005,
+      "forward_ratio": 0.9383330426793032,
+      "baseline_backward_us": 38.948332075960934,
+      "packed_backward_us": 38.295562262646854,
+      "backward_ratio": 0.983240108663935
+    },
+    {
+      "n": 51978,
+      "batch": 32,
+      "dtype": "float16",
+      "max_abs_difference": 0.0,
+      "baseline_forward_us": 59.213023632764816,
+      "packed_forward_us": 59.373214753577486,
+      "forward_ratio": 1.0027053359376843,
+      "baseline_backward_us": 74.37126259901561,
+      "packed_backward_us": 72.09307659650221,
+      "backward_ratio": 0.9693673883849923
+    },
+    {
+      "n": 51978,
+      "batch": 32,
+      "dtype": "float32",
+      "max_abs_difference": 1.1920928955078125e-07,
+      "baseline_forward_us": 131.26640988048166,
+      "packed_forward_us": 127.24756743409671,
+      "forward_ratio": 0.9693840758649215,
+      "baseline_backward_us": 148.98775771143846,
+      "packed_backward_us": 146.80301319458522,
+      "backward_ratio": 0.9853360802900015
+    }
+  ]
+}

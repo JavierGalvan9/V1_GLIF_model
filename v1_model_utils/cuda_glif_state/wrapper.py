@@ -58,30 +58,22 @@ def _dense_state(
     prev_z, v, r, asc, psc_rise, psc, rec_inputs, *, cell
 ):
     glif_ops, _ = _load_ops()
+    # The derived float32 constants, in the order both ops take them. They get
+    # no gradient, but they are passed through the custom gradient rather than
+    # closed over: a tensor it captures is rejected when the step is retraced
+    # inside the segmented-recompute backward pass.
+    constants = (
+        cell.syn_coeffs, cell.asc_decay, cell.asc_amps, cell.decay,
+        cell.asc_factor, cell.reset_coeff, cell.asc_spike_factor,
+        cell.t_ref_steps, cell._dt,
+    )
 
     @tf.custom_gradient
-    def transition(
-        z,
-        voltage,
-        refractory,
-        adaptation,
-        rise,
-        postsynaptic,
-        inputs,
-        syn_decay,
-        psc_initial,
-        asc_decay,
-        asc_amps,
-        decay,
-        current_factor,
-        t_ref_steps,
-        dt,
-        v_reset,
-    ):
+    def transition(z, voltage, refractory, adaptation, rise, postsynaptic,
+                   inputs, v_reset, *constants):
         outputs = glif_ops.fused_glif_single_forward(
             z, voltage, refractory, adaptation, rise, postsynaptic, inputs,
-            syn_decay, psc_initial, asc_decay, asc_amps, decay, current_factor,
-            t_ref_steps, dt, v_reset,
+            *constants, v_reset,
             hard_reset=cell._hard_reset,
         )
 
@@ -103,34 +95,17 @@ def _dense_state(
                 else tf.zeros_like(z, dtype=refractory.dtype)
             )
             zg, vg, ag, rg, pg, ig = glif_ops.fused_glif_single_backward(
-                z, backward_refractory, adaptation, rise,
-                syn_decay, psc_initial, asc_decay, decay, current_factor,
-                t_ref_steps, asc_amps, dt, gv, ga, grise, gpsc,
+                z, backward_refractory, *constants, gv, ga, grise, gpsc,
                 hard_reset=cell._hard_reset,
                 detach_reset=cell._detach_reset,
                 detach_asc_reset=cell._detach_asc_reset,
             )
-            return (zg, vg, None, ag, rg, pg, ig) + (None,) * 9
+            return (zg, vg, None, ag, rg, pg, ig, None) + (None,) * len(constants)
 
         return outputs, grad
 
     return transition(
-        prev_z,
-        v,
-        r,
-        asc,
-        psc_rise,
-        psc,
-        rec_inputs,
-        tf.cast(cell.syn_decay, v.dtype),
-        tf.cast(cell.psc_initial, v.dtype),
-        tf.cast(cell.asc_decay, v.dtype),
-        tf.cast(cell.asc_amps, v.dtype),
-        tf.cast(cell.decay, v.dtype),
-        tf.cast(cell.current_factor, v.dtype),
-        cell.t_ref_steps,
-        tf.cast(cell._dt, v.dtype),
-        tf.cast(cell.v_reset, v.dtype),
+        prev_z, v, r, asc, psc_rise, psc, rec_inputs, cell.v_reset, *constants
     )
 
 
@@ -166,8 +141,8 @@ def _spike_and_shift(voltage, refractory, history, *, cell):
         voltage,
         refractory,
         history,
-        tf.cast(cell._gauss_std, voltage.dtype),
-        tf.cast(cell._dampening_factor, voltage.dtype),
+        cell._gauss_std,
+        cell._dampening_factor,
     )
 
 

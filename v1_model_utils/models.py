@@ -11,6 +11,7 @@ from .cuda_csr_external import (
     calculate_external_csr_currents,
 )
 from . import spatial_layout
+from .glif_propagators import membrane_coefficients
 from numba import njit
 
 
@@ -686,6 +687,7 @@ class V1Column(tf.keras.layers.Layer):
         noise_seed=0,
         hard_reset=False,
         current_input=False,
+        integration_scheme="exact",
         acceleration="auto",
         track_voltage_penalty=False,
         voltage_penalty_mode="range",
@@ -697,9 +699,15 @@ class V1Column(tf.keras.layers.Layer):
         lgn_row_order=None,
     ):
         super().__init__(autocast=False)
-        # Disable Keras layer autocast so tensors keep explicit dtypes:
-        # recurrent state buffers in compute_dtype, selected threshold-critical
-        # parameters in variable_dtype.
+        # Disable Keras layer autocast so tensors keep explicit dtypes. The
+        # neuron dynamics are split by precision rather than following the
+        # policy wholesale: the membrane and ASC state and every propagator
+        # constant are float32 under any policy, because float16 rounding of
+        # the decay factors and of the slowly decaying ASCs biases the
+        # simulated time constants for every sample and step. The synaptic
+        # state (psc_rise, psc), the spike buffers and the input currents are
+        # insensitive to it, so they stay in compute_dtype to keep the BPTT
+        # tape small.
         # Neuron numbering this cell was built in. Checkpoints stay canonical,
         # so the layout is what translates them; see translate_checkpointed_layout.
         self._neuron_layout = neuron_layout or spatial_layout.NeuronLayout.identity(
@@ -718,20 +726,22 @@ class V1Column(tf.keras.layers.Layer):
             lgn_input["n_inputs"]
         )
         self._lgn_row_gather = None
+        # Filled by _const; read by _translate_neuron_layout.
+        self._neuron_constants = []
         _params = dict(network["node_params"])
         # Rescale the voltages to have them near 0, as we wanted the effective step size
         # for the weights to be normalized when learning (weights are scaled similarly)
         voltage_scale = _params["V_th"] - _params["E_L"]
-        # voltage_offset = _params["E_L"] # dead write
-        # _params["V_th"] = (_params["V_th"] - voltage_offset) / voltage_scale # dead write
-        # _params["E_L"] = (_params["E_L"] - voltage_offset) / voltage_scale  # dead write
-        # _params["V_reset"] = (_params["V_reset"] - voltage_offset) / voltage_scale # dead write since E_L = V_reset
+        # Everything the neuron dynamics derive from the node parameters is
+        # evaluated in float64 and rounded once, to float32, by _const.
+        _params = {name: np.asarray(value, np.float64) for name, value in _params.items()}
         _params["asc_amps"] = (_params["asc_amps"] / voltage_scale[..., None])  # _params['asc_amps'] has shape (111, 2)
         # Define the other model variables
         self._node_type_ids = np.array(network["node_type_ids"])
-        self._dt = tf.constant(dt, self.compute_dtype)
+        self._dt = tf.constant(dt, tf.float32)
         self._recurrent_dampening = tf.constant(recurrent_dampening_factor, self.compute_dtype)
-        self._dampening_factor = tf.constant(dampening_factor, self.compute_dtype)
+        # The surrogate gradient is evaluated on the float32 membrane.
+        self._dampening_factor = tf.constant(dampening_factor, tf.float32)
         self._voltage_gradient_dampening = tf.constant(
             voltage_gradient_dampening, self.compute_dtype
         )
@@ -801,22 +811,30 @@ class V1Column(tf.keras.layers.Layer):
         # such seam, so it keeps the explicit combination.
         self._chain_current_sources = use_cuda and not current_input
         self._n_neurons = int(network["n_nodes"])
-        self._gauss_std = tf.constant(gauss_std, self.compute_dtype)
+        self._gauss_std = tf.constant(gauss_std, tf.float32)
         # Determine the membrane time decay constant
         tau = _params["C_m"] / _params["g"]
         membrane_decay = np.exp(-dt / tau)
-        current_factor = (1 - membrane_decay) / _params["g"]
 
         # Determine the synaptic dynamic parameters for each of the 4 basis receptors.
         path='synaptic_data/tau_basis.npy'
         tau_syns = np.load(path)
         self._n_syn_basis = tau_syns.size
-        syn_decay_np = np.exp(-dt / tau_syns)
-        syn_decay_np = np.tile(syn_decay_np, self._n_neurons)
-        self.syn_decay = tf.constant(syn_decay_np[None, :], dtype=self.compute_dtype) # expand the dimension for processing different receptor types
-        psc_initial_np = np.e / tau_syns
-        psc_initial_np = np.tile(psc_initial_np, self._n_neurons)
-        self.psc_initial = tf.constant(psc_initial_np[None, :], dtype=self.compute_dtype) # expand the dimension for processing different receptor types
+
+        # Membrane step propagator.  The step is always evaluated as
+        #     v' = decay * v + sum_b (A_b psc_b + B_b rise_b) + sum_j D_j asc_j
+        #          + reset_coeff * z + asc_spike_factor * z
+        #     asc' = asc_decay * asc + asc_jump * z
+        # so the integrator is a choice of constants, not a branch: "euler"
+        # reproduces the historical Euler scheme exactly, while
+        # "exact" solves the linear subthreshold system in closed form.  See
+        # glif_propagators.membrane_coefficients.
+        self._integration_scheme = integration_scheme
+        propagator = membrane_coefficients(
+            tau, _params["g"], tau_syns, _params["k"], _params["asc_amps"],
+            dt, scheme=integration_scheme,
+        )
+        print(f"    > integration_scheme={integration_scheme}")
 
         # Determine the maximum delay from the network data. Only the recurrent
         # delays live in the z ring buffer; the afferent (LGN/BKG) delays are
@@ -831,40 +849,37 @@ class V1Column(tf.keras.layers.Layer):
               f"(data max={data_max_delay} ms{f', capped by flag={max_delay}' if max_delay > 0 and max_delay < data_max_delay else ''})")
         # self.batch_size = batch_size # Batch size is now determined by the input tensors in the call() method, not fixed at initialization, to allow for flexible batching during training and inference.
 
-        def _gather(prop):
-            return tf.gather(prop, self._node_type_ids)
+        def _const(name, per_type, dtype=tf.float32):
+            """Bind a per-neuron derived constant, and register it for reordering.
 
-        def _f(_v, trainable=False, dtype=None):
-            if dtype is None:
-                dtype = self.compute_dtype
-            return tf.Variable(
-                tf.cast(_gather(_v), dtype),
-                trainable=trainable,
-                dtype=dtype,
+            Deliberately *not* a Variable: every one of these is a fixed
+            function of the node-type parameters and dt, so it carries no state
+            worth checkpointing. Keeping them out of the trackable graph is also
+            what lets checkpoints written before the propagator existed still
+            restore, since the restore path asserts that every Python variable
+            found a value and a derived constant has none to find.
+
+            Every value is computed in float64 from the node parameters and
+            rounded once, to float32 whatever the policy: rounding the decay
+            factors to float16 shifts the time constants the model simulates.
+
+            Binding and registering together is the point: these are all
+            neuron-aligned, so every one of them has to move when the neuron
+            layout does, and a hand-maintained list of names silently rots -
+            `t_ref_steps` was missing from one. `_translate_neuron_layout`
+            walks this registry instead.
+            """
+            value = tf.constant(
+                np.asarray(per_type, np.float64)[self._node_type_ids], dtype=dtype
             )
+            setattr(self, name, value)
+            self._neuron_constants.append(name)
+            return value
 
-        def inv_sigmoid(_x):
-            return tf.math.log(_x / (1 - _x))
-
-        def custom_val(_v, trainable=False):
-            _v = tf.Variable(
-                tf.cast(inv_sigmoid(_gather(_v)), self.compute_dtype),
-                trainable=trainable,
-            )
-            def _g():
-                return tf.nn.sigmoid(_v.read_value())
-
-            # return _v, _g
-            return _g
-
-        # Gather the neuron parameters for every neuron
-        # self.t_ref = _f(_params["t_ref"])  # refractory time
         # Store refractory time as integer number of simulation steps.
         # Using ceil preserves the same blocking behavior as float dynamics.
-        t_ref_per_neuron = _params["t_ref"][self._node_type_ids]
-        t_ref_steps = np.ceil(t_ref_per_neuron / dt).astype(np.int16)
-        t_ref_steps = np.maximum(t_ref_steps, 1)
-        max_ref_steps = int(np.max(t_ref_steps))
+        t_ref_steps = np.maximum(np.ceil(_params["t_ref"] / dt), 1).astype(np.int16)
+        max_ref_steps = int(t_ref_steps[self._node_type_ids].max())
         # Keep the counter narrow. Its per-timestep history is accumulated in a
         # tf.TensorArray for the fused-state backward pass, and TensorFlow has no
         # GPU kernel for TensorList operations on 8- or 16-bit integers, so that
@@ -884,37 +899,40 @@ class V1Column(tf.keras.layers.Layer):
             print(f"Warning: max refractory period is {max_ref_steps} steps, which exceeds int8 capacity. Using int16 for refractory state.")
         else:
             self._refractory_state_dtype = tf.int8
-        self.t_ref_steps = tf.constant(t_ref_steps, dtype=self._refractory_state_dtype)
+        _const("t_ref_steps", t_ref_steps, dtype=self._refractory_state_dtype)
 
-        # Keep threshold-critical membrane parameters in variable_dtype (fp32 under mixed policy)
-        # to reduce spike-timing jitter while keeping recurrent state buffers compact.
-        self.asc_amps = _f(_params["asc_amps"], trainable=False)
-        _k = tf.cast(_params['k'], self.compute_dtype)
-        # inverse sigmoid of the adaptation rate constant (1/ms)
-        # param_k, param_k_read = custom_val(_k, trainable=False)
-        param_k_read = custom_val(_k, trainable=False)
-        k = param_k_read()
-        self.asc_decay = tf.exp(-self._dt * k)
-        self.v_th = tf.constant(1.0, dtype=self.compute_dtype)
-        self.v_reset = tf.constant(0.0, dtype=self.compute_dtype)
+        # The jump a spike injects into each ASC, and the ASC decay over one
+        # step.  Both come from the propagator so that the "exact" scheme can
+        # place the jump at the spike's own grid point (where it belongs) by
+        # folding one step of decay into the amplitude.
+        _const("asc_amps", propagator["asc_jump"])
+        _const("asc_decay", np.exp(-dt * _params["k"]))
         # After per-type normalization:
         # - E_L is exactly 0
         # V_th is exactly 1
         # - V_th - E_L is exactly 1
         # E_L - V_th is exactly -1
         # Keep only the threshold offset needed for spike generation.
-        # e_l = _f(_params["E_L"])
-        # self.normalizer = self.v_th - e_l
-        # param_g = _f(_params["g"])
-        # self.gathered_g = param_g * e_l
-        # self.v_th = _f(_params["V_th"], dtype=self.compute_dtype)
-        # self.v_reset = _f(_params["V_reset"], dtype=self.compute_dtype)
-        # self.v_gap = self.v_reset - self.v_th
+        self.v_th = tf.constant(1.0, dtype=tf.float32)
+        self.v_reset = tf.constant(0.0, dtype=tf.float32)
 
-        self.decay = _f(membrane_decay, dtype=self.compute_dtype)
-        self.current_factor = _f(current_factor, dtype=self.compute_dtype)
-        # self.voltage_scale = _f(voltage_scale)
-        # self.voltage_offset = _f(voltage_offset)
+        _const("decay", membrane_decay)
+        # The four per-(neuron, basis) constants of the synaptic update and of
+        # its drive on the membrane, interleaved as
+        # [syn_decay, psc_initial, psc_factor, psc_rise_factor] and laid out
+        # (n_neurons, n_syn_basis, 4), so the CUDA kernels fetch each pair with
+        # one float4 load. The basis decay and jump are shared by all neurons,
+        # but packed beside the per-neuron membrane coefficients they are
+        # neuron-aligned all the same, and are registered like the rest.
+        _const("syn_coeffs", np.stack(np.broadcast_arrays(
+            np.exp(-dt / tau_syns), np.e / tau_syns,
+            propagator["A"], propagator["B"],
+        ), axis=-1))
+        _const("asc_factor", propagator["D"])
+        # The two effects a spike has on its own step are kept apart because
+        # detach_reset and detach_asc_reset govern them separately.
+        _const("reset_coeff", propagator["reset_coeff"])
+        _const("asc_spike_factor", propagator["asc_spike_factor"])
 
         # Find the synaptic basis representation for each synaptic type
         # path = os.path.join('GLIF_network', 'syn_id_to_syn_weights_dict.pkl')
@@ -1209,8 +1227,17 @@ class V1Column(tf.keras.layers.Layer):
         if layout.is_identity:
             return
         reorder = layout.to_runtime if to_runtime else layout.to_canonical
-        for variable in (self.asc_amps, self.decay, self.current_factor):
-            variable.assign(reorder(variable.numpy()))
+        # Neuron-aligned constants, so a layout permutation rebinds them rather
+        # than assigning through a Variable. The registry is built by _const, so
+        # adding a per-neuron constant cannot leave it behind here.
+        for name in self._neuron_constants:
+            constant = getattr(self, name)
+            setattr(self, name, tf.constant(
+                reorder(constant.numpy()), dtype=constant.dtype))
+        # Read only while the constants above are being built, but it is
+        # neuron-aligned all the same: leaving it stale would quietly mislead
+        # anything added later that gathers a per-type property through it.
+        self._node_type_ids = reorder(self._node_type_ids)
         # Index variables store neuron labels rather than neuron-aligned rows.
         # Under the CUDA backend they exist purely to keep checkpoints readable.
         for name in ("input_indices", "bkg_input_indices"):
@@ -1518,38 +1545,54 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_rec_flat
 
-    # @tf.function(jit_compile=True) does not work here because it breaks the graph structure
-    def update_psc(self, psc, psc_rise, rec_inputs):
-        new_psc_rise = psc_rise * self.syn_decay + rec_inputs * self.psc_initial
-        new_psc = psc * self.syn_decay + self._dt * self.syn_decay * psc_rise
-        return new_psc, new_psc_rise
-
     # @tf.function(jit_compile=True)  does not work here because it breaks the graph structure
     def _dense_update_impl(self, batch_size, prev_z, v, r, asc, psc_rise, psc, rec_inputs):
         """
         Compute the dense update of the neuron states for one timestep.
+
+        Mirrors the fused CUDA kernel: the synaptic state is stored in
+        compute_dtype but evolved in float32, alongside the float32 membrane
+        and ASC state, and stored back in compute_dtype.
         """
-        # Calculate the new psc variables
-        new_psc, new_psc_rise = self.update_psc(psc, psc_rise, rec_inputs)
+        basis_shape = (batch_size, self._n_neurons, self._n_syn_basis)
+        rise_b, psc_b, inputs_b = (
+            tf.reshape(tf.cast(x, tf.float32), basis_shape)
+            for x in (psc_rise, psc, rec_inputs)
+        )
+        syn_decay, psc_initial, psc_factor, psc_rise_factor = tf.unstack(
+            self.syn_coeffs, axis=-1
+        )
+        new_psc_rise = rise_b * syn_decay + inputs_b * psc_initial
+        new_psc = psc_b * syn_decay + self._dt * syn_decay * rise_b
+        new_psc_rise, new_psc = (
+            tf.cast(tf.reshape(x, tf.shape(psc)), psc.dtype)
+            for x in (new_psc_rise, new_psc)
+        )
         # Calculate the ASC variables
+        spike = tf.cast(prev_z, tf.float32)
         asc = tf.reshape(asc, (batch_size, self._n_neurons, 2))
-        asc_spike = tf.stop_gradient(prev_z) if self._detach_asc_reset else prev_z
+        asc_spike = tf.stop_gradient(spike) if self._detach_asc_reset else spike
         new_asc = self.asc_decay * asc + tf.expand_dims(asc_spike, axis=-1) * self.asc_amps
-        # new_asc = self.asc_decay * asc + tf.expand_dims(tf.stop_gradient(prev_z), axis=-1) * self.asc_amps
         new_asc = tf.reshape(new_asc, (batch_size, self._n_neurons * 2))
-        # Calculate the postsynaptic current
-        input_current = tf.reshape(psc, (batch_size, self._n_neurons, self._n_syn_basis))
-        input_current = tf.reduce_sum(input_current, -1)
-        # Add all the postsynaptic current sources
-        c1 = input_current + tf.reduce_sum(asc, axis=-1) # + self.gathered_g
-        # Compute membrane update in variable_dtype (fp32 under mixed policy) for
-        # more stable threshold crossings, then store state in compute_dtype.
-        reset = tf.stop_gradient(prev_z) if self._detach_reset else prev_z
-        new_v = self.decay * v + self.current_factor * c1 - reset
-        # Damp only the voltage self-loop. We intentionally leave
-        # current_factor * c1 untouched so recurrent/input pathways keep full credit.
-        # dampened_v = straight_through_dampen(v, self._voltage_gradient_dampening)
-        # new_v = self.decay * dampened_v + self.current_factor * c1 - tf.stop_gradient(prev_z)
+        # Drive the membrane with the step propagator.  Each current source is
+        # convolved with the membrane kernel through its own coefficient rather
+        # than held constant across the step; under the "euler" scheme the
+        # coefficients collapse to the historical current_factor.
+        dv = tf.reduce_sum(psc_factor * psc_b + psc_rise_factor * rise_b, -1)
+        dv += tf.reduce_sum(self.asc_factor * asc, axis=-1)
+        # A spike resets the membrane and injects an ASC that drives it across
+        # the same step. They ride on separate detach flags, so they stay apart.
+        reset = tf.stop_gradient(spike) if self._detach_reset else spike
+        new_v = (self.decay * v + dv + self.reset_coeff * reset
+                 + self.asc_spike_factor * asc_spike)
+        if self._hard_reset:
+            # A hard reset puts the membrane at v_reset at the spike time, and
+            # the step propagates that instead of the soft-reset value. The
+            # refractory clamp below hides this unless refractoriness ends
+            # within this step. The spike keeps the soft reset's z-gradient.
+            new_v += tf.stop_gradient(spike) * (
+                self.decay * (self.v_reset - v) - self.reset_coeff
+            )
         # Update the voltage according to the LIF equation and the refractory period
         # New r is a variable that accounts for the refractory period in which a neuron cannot spike
         prev_spike = tf.cast(prev_z, dtype=r.dtype)
@@ -1565,7 +1608,6 @@ class V1Column(tf.keras.layers.Layer):
             # Here we make a hard reset and let the voltage freely evolve but we do not let the
             # neuron spike during the refractory period
 
-        # new_v_state = tf.cast(new_v, self.compute_dtype)
         return new_v, new_r, new_asc, new_psc_rise, new_psc
 
     @property
@@ -1600,13 +1642,13 @@ class V1Column(tf.keras.layers.Layer):
         return state_size
 
     def zero_state(self, batch_size, dtype=tf.float32):
-        # Keep recurrent state buffers in compute_dtype to control VRAM.
+        # The spike and synaptic buffers follow compute_dtype to control VRAM;
+        # the membrane and ASC state are float32 under any policy (see __init__).
         # The neurons membrane voltage start the simulation at their reset value
         z0_buf = tf.zeros((batch_size, self._n_neurons * self.max_delay), self.compute_dtype)
-        v0 = tf.zeros((batch_size, self._n_neurons), self.compute_dtype)
-        # v0 = tf.ones((batch_size, self._n_neurons), self.compute_dtype) * self.v_reset
+        v0 = tf.zeros((batch_size, self._n_neurons), tf.float32)
         r0 = tf.zeros((batch_size, self._n_neurons), self._refractory_state_dtype)
-        asc = tf.zeros((batch_size, self._n_neurons * 2), self.compute_dtype)
+        asc = tf.zeros((batch_size, self._n_neurons * 2), tf.float32)
         psc_rise0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), self.compute_dtype)
         psc0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), self.compute_dtype)
         noise_step0 = tf.zeros((batch_size, 1), tf.int32)
@@ -1732,20 +1774,19 @@ class V1Column(tf.keras.layers.Layer):
             else:
                 new_z = spike_function(v_sc, self._dampening_factor)
 
-            # Generate the new spikes if the refractory period is concluded
-            # new_z = tf.cast(new_z, self.compute_dtype)
+            # Generate the new spikes if the refractory period is concluded.
+            # The surrogate sees the float32 membrane; the spikes themselves
+            # are binary and join the compute_dtype spike buffer.
             refractory_active = tf.greater(new_r, 0)
-            new_z = tf.where(refractory_active, tf.zeros_like(new_z), new_z)
+            new_z = tf.cast(
+                tf.where(refractory_active, tf.zeros_like(new_z), new_z),
+                self.compute_dtype,
+            )
 
             # Add current spikes to the buffer
             new_z_buf = tf.concat(
                 [new_z, z_buf[:, :-self._n_neurons]], axis=1
             )
-
-        # Keep model outputs in compute_dtype for mixed-precision efficiency.
-        # output_v = new_v
-        # if output_v.dtype != self.compute_dtype:
-        #     output_v = tf.cast(output_v, self.compute_dtype)
 
         # Define the model outputs and the new state of the network
         # The exposed spike representation is independent of the recurrent state
@@ -1759,10 +1800,13 @@ class V1Column(tf.keras.layers.Layer):
         # dtype.  Keep the recurrent output homogeneous and cast the exposed
         # spike sequence after the RNN has stacked timesteps.
         visible_z = tf.cast(output_z, self.compute_dtype)
-        output_v = (
+        # The float32 membrane stays in the state; the exposed voltage sequence
+        # is stacked over time, so it keeps the compute dtype of the spikes.
+        output_v = tf.cast(
             new_v
             if self._output_neuron_ids is None
-            else tf.gather(new_v, self._output_neuron_ids, axis=1)
+            else tf.gather(new_v, self._output_neuron_ids, axis=1),
+            self.compute_dtype,
         )
         outputs = (
             tf.concat((visible_z, output_v), axis=-1)
@@ -1914,6 +1958,7 @@ def create_model(
     voltage_gradient_dampening=0.5,
     detach_reset=True,
     detach_asc_reset=False,
+    integration_scheme="exact",
     lr_scale=800.0,
     train_recurrent=True,
     train_recurrent_per_type=False,
@@ -1982,6 +2027,7 @@ def create_model(
         voltage_gradient_dampening=voltage_gradient_dampening,
         detach_reset=detach_reset,
         detach_asc_reset=detach_asc_reset,
+        integration_scheme=integration_scheme,
         max_delay=max_delay,
         pseudo_gauss=pseudo_gauss,
         surrogate_gradient=surrogate_gradient,
