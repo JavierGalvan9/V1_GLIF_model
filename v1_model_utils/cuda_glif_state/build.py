@@ -61,23 +61,15 @@ def _build(stem, architecture, toolchain, compile_flags, link_flags):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--architecture", default=os.environ.get("V1_CUDA_ARCH"))
-    parser.add_argument(
-        "--stem",
-        choices=("glif_state_ops", "spike_history_ops"),
-        help="Build only one operator; by default both are built.",
-    )
     args = parser.parse_args()
     architecture = normalize_architecture(
         args.architecture or active_gpu_architecture()
     )
     toolchain = resolve_cuda_build_toolchain(architecture)
-    compile_flags = tf.sysconfig.get_compile_flags()
-    link_flags = tf.sysconfig.get_link_flags()
-    stems = (args.stem,) if args.stem else ("glif_state_ops", "spike_history_ops")
-    for stem in stems:
-        _build(
-            stem, architecture, toolchain, compile_flags, link_flags
-        )
+    _build(
+        "glif_state_ops", architecture, toolchain,
+        tf.sysconfig.get_compile_flags(), tf.sysconfig.get_link_flags(),
+    )
 
 
 if __name__ == "__main__":

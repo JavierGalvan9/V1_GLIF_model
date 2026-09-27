@@ -21,7 +21,7 @@ def _restore_global_policy():
 def _cell(
     tmp_path, *, backend, dtype, hard_reset=False, pseudo_gauss=False,
     detach_reset=True, detach_asc_reset=False, integration_scheme="exact",
-    t_ref=3, heterogeneous=False,
+    t_ref=3, heterogeneous=False, recurrent_delays=(3, 1), **column_options,
 ):
     tf.keras.mixed_precision.set_global_policy(
         "mixed_float16" if dtype == tf.float16 else "float32"
@@ -63,7 +63,7 @@ def _cell(
         "synapses": {
             "indices": np.array([[0, 0], [1, 1]], np.int32),
             "weights": np.array([0.1, 0.2], np.float32),
-            "delays": np.array([3, 1], np.float32),
+            "delays": np.array(recurrent_delays, np.float32),
             "syn_ids": np.zeros(2, np.uint8),
             "dense_shape": (8, 8),
         },
@@ -100,6 +100,7 @@ def _cell(
         detach_reset=detach_reset,
         detach_asc_reset=detach_asc_reset,
         integration_scheme=integration_scheme,
+        **column_options,
     )
 
 
@@ -126,12 +127,43 @@ def _previous_spike_gradient(cell, inputs, state, state_index):
 @pytest.mark.parametrize("hard_reset", [False, True])
 @pytest.mark.parametrize("t_ref", [3, 1])
 def test_cuda_matches_tensorflow_outputs_and_gradients(tmp_path, dtype, hard_reset, t_ref):
+    _assert_backends_match(tmp_path, dtype, hard_reset=hard_reset, t_ref=t_ref)
+
+
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("surrogate_gradient", ["triangular", "gaussian", "slayer"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"return_voltage_sequences": False, "track_voltage_penalty": True},
+        {"output_neuron_ids": np.array([1, 4, 6])},
+        {"recurrent_delays": (1, 1)},
+    ],
+    ids=["voltage-sequences", "online-voltage-penalty", "output-subset", "one-delay-slot"],
+)
+def test_fused_step_matches_tensorflow_for_every_surrogate_and_output(
+    tmp_path, dtype, surrogate_gradient, options
+):
+    """The fused op thresholds, shifts the history and exposes the voltage.
+
+    Each surrogate is evaluated inside the fused backward; the exposed voltage
+    is written by the forward only when voltage sequences are returned; the
+    online penalty sends a voltage gradient that bypasses the exposed sequence;
+    and a single delay slot leaves no older history to shift.
+    """
+    _assert_backends_match(
+        tmp_path, dtype, surrogate_gradient=surrogate_gradient, **options
+    )
+
+
+def _assert_backends_match(tmp_path, dtype, **cell_options):
     if not tf.config.list_physical_devices("GPU"):
         pytest.skip("requires CUDA")
     reference = _cell(tmp_path / "reference", backend="tensorflow", dtype=dtype,
-                      hard_reset=hard_reset, t_ref=t_ref)
+                      **cell_options)
     candidate = _cell(tmp_path / "candidate", backend="cuda", dtype=dtype,
-                      hard_reset=hard_reset, t_ref=t_ref)
+                      **cell_options)
     generator = tf.random.Generator.from_seed(713)
     inputs = generator.uniform((3, reference.input_dim), dtype=reference.compute_dtype)
     state = list(reference.zero_state(3))
@@ -316,71 +348,6 @@ def test_explicit_cuda_supports_pseudo_gaussian(tmp_path):
     cell = _cell(tmp_path, backend="cuda", dtype=tf.float32, pseudo_gauss=True)
     assert cell.resolved_acceleration == "cuda"
     assert cell._surrogate_gradient == "gaussian"
-
-
-@pytest.mark.parametrize("hard_reset", [False, True])
-def test_backward_kernel_ignores_the_refractory_state_under_soft_reset(hard_reset):
-    """The fused backward reads the refractory state only under hard reset.
-
-    The kernel uses it in one expression, to mask the voltage gradient when the
-    reset is hard. `_dense_state` relies on that: under soft reset it passes
-    zeros so the forward tensor never enters the backward graph, which stops
-    TensorFlow accumulating the per-timestep history. That history has no GPU
-    TensorList kernel for its dtype and would be staged through host memory,
-    costing about 21% of a batch-32 training step.
-
-    This pins the kernel contract that makes the substitution safe.
-    """
-    if not tf.config.list_physical_devices("GPU"):
-        pytest.skip("requires CUDA")
-    from v1_model_utils.cuda_glif_state import wrapper as glif_wrapper
-
-    glif_ops, _ = glif_wrapper._load_ops()
-    rng = np.random.default_rng(97)
-    neurons, batch, basis = 48, 4, 4
-
-    def normal(*shape):
-        return tf.constant(rng.normal(0, 1, shape).astype(np.float32))
-
-    z = tf.constant((rng.random((batch, neurons)) < 0.2).astype(np.float32))
-    def uniform(low, high, *shape):
-        return tf.constant(rng.uniform(low, high, shape).astype(np.float32))
-
-    # Op order: syn_coeffs, asc_decay, asc_amps, decay, asc_factor, reset_coeff,
-    # asc_spike_factor, t_ref_steps, dt.
-    constants = (
-        tf.stack([uniform(0.5, 0.99, neurons, basis), uniform(0.5, 2.0, neurons, basis),
-                  uniform(0.5, 2.0, neurons, basis), uniform(0.0, 0.5, neurons, basis)],
-                 axis=-1),
-        uniform(0.5, 0.99, neurons * 2), normal(neurons * 2),
-        uniform(0.8, 0.99, neurons), uniform(0.5, 2.0, neurons * 2),
-        uniform(-1.0, -0.5, neurons), uniform(-0.2, 0.2, neurons),
-        tf.constant(rng.integers(2, 5, neurons).astype(np.int8)), tf.constant(1.0),
-    )
-    gradients = (normal(batch, neurons), normal(batch, neurons * 2),
-                 normal(batch, neurons * basis), normal(batch, neurons * basis))
-
-    def backward(refractory):
-        return glif_ops.fused_glif_single_backward(
-            z, tf.cast(refractory, tf.int8), *constants, *gradients,
-            hard_reset=hard_reset, detach_reset=True, detach_asc_reset=False,
-        )
-
-    quiescent = backward(tf.zeros((batch, neurons), tf.int32))
-    refractory = backward(tf.fill((batch, neurons), tf.constant(4, tf.int32)))
-    deltas = [
-        float(tf.reduce_max(tf.abs(a - b))) for a, b in zip(quiescent, refractory)
-    ]
-    if hard_reset:
-        assert max(deltas) > 0.0, (
-            "hard reset masks the voltage gradient, so the refractory state must "
-            "still change the backward result"
-        )
-    else:
-        assert max(deltas) == 0.0, (
-            "the soft-reset backward result changed with the refractory state, so "
-            "_dense_state may no longer substitute zeros for it"
-        )
 
 
 DERIVED_COEFFICIENTS = (

@@ -1,9 +1,12 @@
 # Differentiable CUDA state transition
 
 This module is the production adapter for GLIF/PSC/ASC state evolution during
-training and ordinary Keras simulation. It fuses the dense state update and the
-spike/refractory/history update while preserving the
-legacy `V1Column` output and state interface.
+training and ordinary Keras simulation. One op, `FusedGlifStep`, performs the
+dense state update, the threshold and refractory mask, and the spike-history
+shift, so the float32 membrane is written once and never read back by a
+separate op. When the cell returns voltage sequences, the same op also writes
+the compute-dtype copy of the membrane they expose. The `V1Column` output and
+state interface is unchanged.
 
 Precision is split by state block, whatever the Keras policy: the membrane
 and after-spike currents and every propagator constant are float32, while the

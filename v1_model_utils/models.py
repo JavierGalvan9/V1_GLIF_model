@@ -1745,7 +1745,10 @@ class V1Column(tf.keras.layers.Layer):
         if self._state_backend == "cuda":
             from .cuda_glif_state import update_glif_state
 
-            new_z, transition_state = update_glif_state(
+            # One fused op also thresholds the membrane, shifts the spike
+            # history and, when voltage sequences are returned, writes the
+            # compute-dtype copy of the membrane they expose.
+            new_z, exposed_v, transition_state = update_glif_state(
                 z_buf, v, r, asc, psc_rise, psc, rec_inputs, cell=self
             )
             (
@@ -1757,13 +1760,13 @@ class V1Column(tf.keras.layers.Layer):
                 new_psc,
             ) = transition_state
         else:
+            prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
             new_v, new_r, new_asc, new_psc_rise, new_psc = self._dense_update_impl(
                 batch_size, prev_z, v, r, asc, psc_rise, psc, rec_inputs
             )
 
-        # Generate spikes from a high-fidelity membrane lane before state quantization.
-        # v_sc = (new_v - self.v_th) / self.normalizer # normalized is 1 for scaled voltage
-        if self._state_backend != "cuda":
+            # Generate spikes from a high-fidelity membrane lane before state quantization.
+            # v_sc = (new_v - self.v_th) / self.normalizer # normalized is 1 for scaled voltage
             v_sc = new_v - self.v_th
             if self._surrogate_gradient == "gaussian":
                 new_z = spike_gauss(v_sc, self._gauss_std, self._dampening_factor)
@@ -1787,6 +1790,14 @@ class V1Column(tf.keras.layers.Layer):
             new_z_buf = tf.concat(
                 [new_z, z_buf[:, :-self._n_neurons]], axis=1
             )
+            # The float32 membrane stays in the state; the exposed voltage
+            # sequence is stacked over time, so it keeps the compute dtype of
+            # the spikes.
+            exposed_v = (
+                tf.cast(new_v, self.compute_dtype)
+                if self._return_voltage_sequences
+                else None
+            )
 
         # Define the model outputs and the new state of the network
         # The exposed spike representation is independent of the recurrent state
@@ -1800,19 +1811,15 @@ class V1Column(tf.keras.layers.Layer):
         # dtype.  Keep the recurrent output homogeneous and cast the exposed
         # spike sequence after the RNN has stacked timesteps.
         visible_z = tf.cast(output_z, self.compute_dtype)
-        # The float32 membrane stays in the state; the exposed voltage sequence
-        # is stacked over time, so it keeps the compute dtype of the spikes.
-        output_v = tf.cast(
-            new_v
-            if self._output_neuron_ids is None
-            else tf.gather(new_v, self._output_neuron_ids, axis=1),
-            self.compute_dtype,
-        )
-        outputs = (
-            tf.concat((visible_z, output_v), axis=-1)
-            if self._return_voltage_sequences
-            else visible_z
-        )
+        if self._return_voltage_sequences:
+            output_v = (
+                exposed_v
+                if self._output_neuron_ids is None
+                else tf.gather(exposed_v, self._output_neuron_ids, axis=1)
+            )
+            outputs = tf.concat((visible_z, output_v), axis=-1)
+        else:
+            outputs = visible_z
         new_noise_step = noise_step + 1
         new_state = (new_z_buf, new_v, new_r, new_asc, new_psc_rise, new_psc, new_noise_step)
         if self._lgn_delay_buffer_width:
