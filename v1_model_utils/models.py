@@ -14,6 +14,7 @@ from .cuda_csr_external import (
 )
 from . import spatial_layout
 from .glif_propagators import membrane_coefficients
+from .tf_utils import replica_local_constant
 from numba import njit
 
 
@@ -659,6 +660,21 @@ class ClipConstraint(tf.keras.constraints.Constraint):
 
 
 class V1Column(tf.keras.layers.Layer):
+    @tf.__internal__.tracking.no_automatic_dependency_tracking
+    def _bind_constant(self, name, value, dtype=None):
+        """Bind a derived constant that every replica reads from its own GPU.
+
+        Everything bound here is a fixed function of the network files and the
+        flags, rebuilt identically - in runtime neuron order - on every
+        construction. It is therefore kept out of the checkpoint (which also
+        keeps every checkpoint written before it existed restorable) and out
+        of the layout translation. See ``tf_utils.replica_local_constant`` for
+        why a variable rather than a ``tf.constant``.
+        """
+        value = replica_local_constant(value, dtype=dtype, name=name)
+        setattr(self, name, value)
+        return value
+
     def __init__(
         self,
         network,
@@ -728,7 +744,7 @@ class V1Column(tf.keras.layers.Layer):
             lgn_input["n_inputs"]
         )
         self._lgn_row_gather = None
-        # Filled by _const; read by _translate_neuron_layout.
+        # Names of the per-neuron constants _const binds.
         self._neuron_constants = []
         _params = dict(network["node_params"])
         # Rescale the voltages to have them near 0, as we wanted the effective step size
@@ -740,12 +756,14 @@ class V1Column(tf.keras.layers.Layer):
         _params["asc_amps"] = (_params["asc_amps"] / voltage_scale[..., None])  # _params['asc_amps'] has shape (111, 2)
         # Define the other model variables
         self._node_type_ids = np.array(network["node_type_ids"])
-        self._dt = tf.constant(dt, tf.float32)
-        self._recurrent_dampening = tf.constant(recurrent_dampening_factor, self.compute_dtype)
+        self._bind_constant("_dt", dt, tf.float32)
+        self._bind_constant(
+            "_recurrent_dampening", recurrent_dampening_factor, self.compute_dtype
+        )
         # The surrogate gradient is evaluated on the float32 membrane.
-        self._dampening_factor = tf.constant(dampening_factor, tf.float32)
-        self._voltage_gradient_dampening = tf.constant(
-            voltage_gradient_dampening, self.compute_dtype
+        self._bind_constant("_dampening_factor", dampening_factor, tf.float32)
+        self._bind_constant(
+            "_voltage_gradient_dampening", voltage_gradient_dampening, self.compute_dtype
         )
         self._detach_reset = bool(detach_reset)
         self._detach_asc_reset = bool(detach_asc_reset)
@@ -753,7 +771,7 @@ class V1Column(tf.keras.layers.Layer):
             surrogate_gradient, pseudo_gauss
         )
         self._pseudo_gauss = self._surrogate_gradient == "gaussian"
-        self._lr_scale = tf.constant(lr_scale, dtype=self.compute_dtype)
+        self._bind_constant("_lr_scale", lr_scale, self.compute_dtype)
         self._scales_recurrent_inputs = float(lr_scale) != 1.0
         # self._spike_gradient = spike_gradient
         # Updated by the training loop before each logical forward call.
@@ -781,11 +799,9 @@ class V1Column(tf.keras.layers.Layer):
             raise ValueError(
                 "output_spike_dtype must be a floating dtype or tf.uint8"
             )
-        self._output_neuron_ids = (
-            None
-            if output_neuron_ids is None
-            else tf.convert_to_tensor(output_neuron_ids, dtype=tf.int32)
-        )
+        self._output_neuron_ids = None
+        if output_neuron_ids is not None:
+            self._bind_constant("_output_neuron_ids", output_neuron_ids, tf.int64)
         if acceleration not in ("auto", "cuda", "tensorflow"):
             raise ValueError(
                 "acceleration must be 'auto', 'cuda', or 'tensorflow', got "
@@ -813,7 +829,7 @@ class V1Column(tf.keras.layers.Layer):
         # such seam, so it keeps the explicit combination.
         self._chain_current_sources = use_cuda and not current_input
         self._n_neurons = int(network["n_nodes"])
-        self._gauss_std = tf.constant(gauss_std, tf.float32)
+        self._bind_constant("_gauss_std", gauss_std, tf.float32)
         # Determine the membrane time decay constant
         tau = _params["C_m"] / _params["g"]
         membrane_decay = np.exp(-dt / tau)
@@ -852,29 +868,23 @@ class V1Column(tf.keras.layers.Layer):
         # self.batch_size = batch_size # Batch size is now determined by the input tensors in the call() method, not fixed at initialization, to allow for flexible batching during training and inference.
 
         def _const(name, per_type, dtype=tf.float32):
-            """Bind a per-neuron derived constant, and register it for reordering.
-
-            Deliberately *not* a Variable: every one of these is a fixed
-            function of the node-type parameters and dt, so it carries no state
-            worth checkpointing. Keeping them out of the trackable graph is also
-            what lets checkpoints written before the propagator existed still
-            restore, since the restore path asserts that every Python variable
-            found a value and a derived constant has none to find.
+            """Bind a per-neuron derived constant, expanded from its node type.
 
             Every value is computed in float64 from the node parameters and
             rounded once, to float32 whatever the policy: rounding the decay
             factors to float16 shifts the time constants the model simulates.
 
-            Binding and registering together is the point: these are all
-            neuron-aligned, so every one of them has to move when the neuron
-            layout does, and a hand-maintained list of names silently rots -
-            `t_ref_steps` was missing from one. `_translate_neuron_layout`
-            walks this registry instead.
+            `_node_type_ids` is already in runtime neuron order - the network
+            is relabelled before the column is built - so these are built in
+            runtime order and must never be permuted again. They are not
+            checkpointed, so a restore has nothing canonical to translate:
+            permuting them there gave every neuron another neuron's
+            coefficients. `_neuron_constants` records the names so tests can
+            check each of them.
             """
-            value = tf.constant(
-                np.asarray(per_type, np.float64)[self._node_type_ids], dtype=dtype
+            value = self._bind_constant(
+                name, np.asarray(per_type, np.float64)[self._node_type_ids], dtype
             )
-            setattr(self, name, value)
             self._neuron_constants.append(name)
             return value
 
@@ -915,8 +925,8 @@ class V1Column(tf.keras.layers.Layer):
         # - V_th - E_L is exactly 1
         # E_L - V_th is exactly -1
         # Keep only the threshold offset needed for spike generation.
-        self.v_th = tf.constant(1.0, dtype=tf.float32)
-        self.v_reset = tf.constant(0.0, dtype=tf.float32)
+        self._bind_constant("v_th", 1.0, tf.float32)
+        self._bind_constant("v_reset", 0.0, tf.float32)
 
         _const("decay", membrane_decay)
         # The four per-(neuron, basis) constants of the synaptic update and of
@@ -949,7 +959,7 @@ class V1Column(tf.keras.layers.Layer):
         basis_dtype = (
             tf.float32 if self._synaptic_current_backend == "cuda" else self.compute_dtype
         )
-        self.synaptic_basis_weights = tf.constant(synaptic_basis_weights, dtype=basis_dtype)
+        self._bind_constant("synaptic_basis_weights", synaptic_basis_weights, basis_dtype)
 
         ### Network recurrent connectivity ###
         indices = np.array(network["synapses"]["indices"])
@@ -984,11 +994,12 @@ class V1Column(tf.keras.layers.Layer):
             )
         # add dimension for the weights factors - TensorShape([23525415, 1])
         # weights = tf.expand_dims(weights, axis=1)
-        # Set the sign of the connections (exc or inh)
-        # recurrent_weight_positive = tf.Variable(
-        #     weights >= 0.0, name="recurrent_weights_sign", trainable=False)
-        # recurrent_weight_positive = tf.constant(weights >= 0, dtype=tf.int8)
-        recurrent_weight_positive = tf.constant(weights >= 0, dtype=tf.bool)
+        # Set the sign of the connections (exc or inh). The constraint runs in
+        # every replica after each update; it does not track its condition, so
+        # the mask stays out of the checkpoint.
+        recurrent_weight_positive = replica_local_constant(
+            weights >= 0, name="recurrent_weight_positive"
+        )
 
         # if training the recurrent connection per type, turn off recurrent training
         # of individual connections
@@ -1029,7 +1040,7 @@ class V1Column(tf.keras.layers.Layer):
         #     self.per_type_training = False
 
         if self._synaptic_current_backend == "tensorflow":
-            self.syn_ids = tf.constant(syn_ids, dtype=tf.int64)
+            self._bind_constant("syn_ids", syn_ids, tf.int64)
         # self.recurrent_weights_factors = tf.gather(self.synaptic_basis_weights, self.syn_ids, axis=0) # TensorShape([23525415, 5])
         print(f"    > # Recurrent synapses: {len(indices)}")
 
@@ -1039,8 +1050,8 @@ class V1Column(tf.keras.layers.Layer):
         self.input_dim = lgn_input["n_inputs"]
         if not self._lgn_row_order.is_identity:
             # Runtime row r holds the spikes of canonical row new_to_old[r].
-            self._lgn_row_gather = tf.constant(
-                self._lgn_row_order.new_to_old, dtype=tf.int32
+            self._bind_constant(
+                "_lgn_row_gather", self._lgn_row_order.new_to_old, tf.int64
             )
         self.lgn_input_dense_shape = (self._n_neurons, self.input_dim,)
         input_indices = np.array(lgn_input["indices"])
@@ -1073,10 +1084,9 @@ class V1Column(tf.keras.layers.Layer):
             )
 
         # Define the Tensorflow variables
-        # input_weight_positive = tf.Variable(
-        #     input_weights >= 0.0, name="input_weights_sign", trainable=False)
-        # input_weight_positive = tf.constant(input_weights >= 0, dtype=tf.int8)
-        input_weight_positive = tf.constant(input_weights >= 0, dtype=tf.bool)
+        input_weight_positive = replica_local_constant(
+            input_weights >= 0, name="input_weight_positive"
+        )
         input_values = input_weights * input_weight_scale / lr_scale
         self.input_weight_values = self.add_weight(
             shape=input_values.shape,
@@ -1096,7 +1106,7 @@ class V1Column(tf.keras.layers.Layer):
                 needs_activity_backward=self._compute_lgn_activity_gradient,
             )
         else:
-            self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64)
+            self._bind_constant("input_syn_ids", input_syn_ids, tf.int64)
         if self._synaptic_current_backend == "tensorflow" and not self._current_input:
             self.pre_input_ind_table = make_pre_ind_table(input_indices, n_source_neurons=self.lgn_input_dense_shape[1])
 
@@ -1104,7 +1114,7 @@ class V1Column(tf.keras.layers.Layer):
         del input_indices, input_weights, input_syn_ids, input_weight_positive #, input_delays
 
         ### BKG input connectivity ###
-        self.bkg_spike_prob = tf.constant(bkg_firing_rate * 0.001, dtype=self.compute_dtype)
+        self._bind_constant("bkg_spike_prob", bkg_firing_rate * 0.001, self.compute_dtype)
         self.bkg_input_dense_shape = (self._n_neurons, bkg_input["n_inputs"],)
         bkg_input_indices = np.array(bkg_input['indices'])
         bkg_input_weights = np.array(bkg_input['weights'])
@@ -1145,10 +1155,9 @@ class V1Column(tf.keras.layers.Layer):
             )
 
         # Define Tensorflow variables
-        # bkg_input_weight_positive = tf.Variable(
-        #     bkg_input_weights >= 0.0, name="bkg_input_weights_sign", trainable=False)
-        # bkg_input_weight_positive = tf.constant(bkg_input_weights >= 0, dtype=tf.int8)
-        bkg_input_weight_positive = tf.constant(bkg_input_weights >= 0, dtype=tf.bool)
+        bkg_input_weight_positive = replica_local_constant(
+            bkg_input_weights >= 0, name="bkg_input_weight_positive"
+        )
         bkg_values = bkg_input_weights * input_weight_scale / lr_scale
         self.bkg_input_weights = self.add_weight(
             shape=bkg_values.shape,
@@ -1160,7 +1169,7 @@ class V1Column(tf.keras.layers.Layer):
         )
 
         if self._synaptic_current_backend == "tensorflow":
-            self.bkg_input_syn_ids = tf.constant(bkg_input_syn_ids, dtype=tf.int64)
+            self._bind_constant("bkg_input_syn_ids", bkg_input_syn_ids, tf.int64)
         # self.bkg_input_weights_factors = tf.gather(self.synaptic_basis_weights, bkg_input_syn_ids, axis=0)
 
         print(f"    > # BKG input synapses {len(bkg_input_indices)}")
@@ -1236,18 +1245,10 @@ class V1Column(tf.keras.layers.Layer):
         layout = self._neuron_layout
         if layout.is_identity:
             return
-        reorder = layout.to_runtime if to_runtime else layout.to_canonical
-        # Neuron-aligned constants, so a layout permutation rebinds them rather
-        # than assigning through a Variable. The registry is built by _const, so
-        # adding a per-neuron constant cannot leave it behind here.
-        for name in self._neuron_constants:
-            constant = getattr(self, name)
-            setattr(self, name, tf.constant(
-                reorder(constant.numpy()), dtype=constant.dtype))
-        # Read only while the constants above are being built, but it is
-        # neuron-aligned all the same: leaving it stale would quietly mislead
-        # anything added later that gathers a per-type property through it.
-        self._node_type_ids = reorder(self._node_type_ids)
+        # Only what the checkpoint stores is translated. The per-neuron
+        # constants (_const) and _node_type_ids are rebuilt in runtime order on
+        # every construction and never saved, so they stay put; permuting them
+        # on restore handed each neuron another neuron's coefficients.
         # Index variables store neuron labels rather than neuron-aligned rows.
         # Under the CUDA backend they exist purely to keep checkpoints readable.
         for name in ("input_indices", "bkg_input_indices"):

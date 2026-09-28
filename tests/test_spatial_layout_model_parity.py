@@ -187,6 +187,39 @@ def test_checkpoint_translation_round_trips_weights_and_optimizer_slots():
         )
 
 
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+def test_a_restore_keeps_each_neuron_its_own_coefficients():
+    """Restoring into a relabelled model must not permute the derived constants.
+
+    Production relabels the network before building the column, so the
+    per-neuron constants are born in runtime order, and a restore only
+    translates what the checkpoint stored. Every neuron of one type must
+    therefore still carry that type's coefficients after the restore half of
+    the translation.
+    """
+    network, lgn_input, bkg_input = _load()
+    layout = spatial_layout.build_layout(network, spatial_layout.MORTON)
+    network, lgn_input, bkg_input, edge_orders = _prepare(
+        network, lgn_input, bkg_input, layout
+    )
+    cell = _cell(network, lgn_input, bkg_input, layout, "cuda", edge_orders)
+    types = np.asarray(network["node_type_ids"])
+
+    def mismatched():
+        return sorted(
+            name for name in cell._neuron_constants
+            for value in [getattr(cell, name).numpy()]
+            if any(
+                len(np.unique(value[types == node_type], axis=0)) != 1
+                for node_type in np.unique(types)
+            )
+        )
+
+    assert not mismatched()
+    cell.translate_checkpointed_layout(to_runtime=True)
+    assert not mismatched(), "a restore gave neurons another type's coefficients"
+
+
 def test_ambiguous_optimizer_slot_lengths_are_refused():
     """Length matching must not silently guess when two populations collide."""
     if not cuda_csr_recurrent.DIRECT_CSR:

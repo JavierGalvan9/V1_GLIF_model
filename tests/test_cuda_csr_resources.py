@@ -6,6 +6,7 @@ from v1_model_utils.cuda_csr_resources import resource_mode_enabled
 from v1_model_utils.cuda_csr_external import (
     build_csr_connectivity as build_external_connectivity,
     calculate_external_csr_currents,
+    uses_bkg_gather,
 )
 from v1_model_utils.cuda_csr_recurrent import (
     DIRECT_CSR,
@@ -158,6 +159,66 @@ def test_resource_external_backward_modes_match_tensor_backend(
         )
     else:
         assert actual[1][1] is expected[1][1] is None
+
+
+@pytest.mark.skipif(
+    len(tf.config.list_physical_devices("GPU")) != 1,
+    reason="resource workers require exactly one visible CUDA GPU",
+)
+@pytest.mark.parametrize("batch_size", [2, 32])
+@pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
+def test_resource_bkg_forward_takes_the_gather_like_the_tensor_backend(
+    monkeypatch, batch_size, dtype
+):
+    """Replicated training must run the same BKG forward as one GPU.
+
+    The background input is dense - exactly four edges into every neuron from
+    100 sources - and both backends replace the atomic scatter with a gather
+    over that fixed fan-in. The gather is deterministic, so identical values
+    in half precision show that both took it; the scatter's atomics would not
+    reproduce them bit for bit.
+    """
+    rng = np.random.default_rng(2026)
+    n_pre, n_post = 100, 64
+    posts = np.repeat(np.arange(n_post), 4)
+    pres = np.concatenate(
+        [rng.choice(n_pre, size=4, replace=False) for _ in range(n_post)]
+    )
+    order = np.lexsort((posts, pres))
+    indices = np.stack([posts, pres], axis=1)[order].astype(np.int64)
+    types = rng.integers(0, 3, size=len(indices)).astype(np.int64)
+    activity = tf.constant(rng.poisson(0.3, size=(batch_size, n_pre)), dtype)
+    basis = tf.constant(rng.normal(size=(3, 4)), dtype)
+    initial = tf.constant(rng.normal(size=(batch_size * n_post, 4)), dtype)
+    upstream = tf.constant(rng.normal(size=(batch_size * n_post, 4)), dtype)
+    weight_values = rng.normal(size=len(indices)).astype(np.float32)
+
+    def evaluate():
+        connectivity = build_external_csr(
+            indices, types, n_pre, n_post, sparse_activity=False
+        )
+        assert uses_bkg_gather(connectivity, basis)
+        weights = tf.Variable(weight_values)
+        with tf.GradientTape() as tape:
+            tape.watch(initial)
+            output = calculate_external_csr_currents(
+                activity, weights, basis, connectivity, initial=initial,
+                compute_activity_gradient=False, compute_weight_gradient=True,
+            )
+            loss = tf.reduce_sum(tf.cast(output * upstream, tf.float32))
+        return output, tape.gradient(loss, (initial, weights))
+
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", "0")
+    expected = evaluate()
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", "1")
+    actual = evaluate()
+
+    np.testing.assert_array_equal(actual[0], expected[0])
+    np.testing.assert_array_equal(actual[1][0], expected[1][0])
+    tolerance = 2e-3 if dtype == tf.float16 else 2e-5
+    np.testing.assert_allclose(
+        actual[1][1], expected[1][1], rtol=tolerance, atol=tolerance
+    )
 
 
 @pytest.mark.skipif(

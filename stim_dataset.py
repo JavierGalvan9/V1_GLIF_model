@@ -94,6 +94,124 @@ def make_drifting_grating_stimulus(row_size=80, col_size=120, moving_flag=True, 
         return tf.tile(data[0][tf.newaxis, ...], (image_duration, 1, 1))
 
 
+def _grating_sample_seeds(base_seed, sample_index):
+    """Orientation, phase and spike seeds of one sample of a seeded grating stream."""
+    sample_seed = _fold_in_seed(base_seed, sample_index)
+    return tuple(_fold_in_seed(sample_seed, part) for part in range(3))
+
+
+def _random_angle(seed, dtype):
+    """An angle in [0, 360) degrees; stateless when seeded."""
+    if seed is None:
+        return tf.random.uniform(shape=(), minval=0, maxval=360, dtype=dtype)
+    return tf.random.stateless_uniform(
+        shape=(), seed=seed, minval=0, maxval=360, dtype=dtype
+    )
+
+
+class DriftingGratingLGN:
+    """LGN response to a drifting grating: movie, spatial and temporal filters, spikes.
+
+    One definition of a sample, shared by the host generator
+    (``generate_drifting_grating_tuning``) and by training, which runs
+    ``batch_spikes`` on every replica's own GPU. Built under a distribution
+    strategy's scope, the LGN filters are replica-local, so no replica reads
+    another GPU's copy.
+    """
+
+    def __init__(self, seq_len, pre_delay, post_delay, n_input=17400,
+                 data_dir='GLIF_network_nll', temporal_f=2, cpd=0.04, contrast=0.8,
+                 row_size=80, col_size=120, rotation='cw', billeh_phase=False,
+                 bmtk_compat=True, dtype=tf.float32):
+        self.lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input,
+                                  dtype=dtype, data_dir=data_dir)
+        self.seq_len = seq_len
+        self.pre_delay = pre_delay
+        self.post_delay = post_delay
+        # seq_len = pre_delay + duration + post_delay
+        self.duration = seq_len - pre_delay - post_delay
+        self.n_input = n_input
+        self.temporal_f = temporal_f
+        self.cpd = cpd
+        self.contrast = contrast
+        self.row_size = row_size
+        self.col_size = col_size
+        self.rotation = rotation
+        self.billeh_phase = billeh_phase
+        self.bmtk_compat = bmtk_compat
+        self.dtype = dtype
+
+    def firing_rates(self, theta, phase):
+        """LGN firing rates in Hz, [seq_len, n_input], for one grating."""
+        mov_theta = theta if self.rotation == "cw" else -theta  # flip the sign for ccw
+        if self.billeh_phase:
+            mov_theta += 180
+        # Ensure theta is a Tensor to avoid tf.function retracing on Python scalars.
+        mov_theta = tf.cast(mov_theta, self.dtype)
+        movie = make_drifting_grating_stimulus(
+            row_size=self.row_size, col_size=self.col_size, moving_flag=True,
+            image_duration=self.duration, cpd=self.cpd, temporal_f=self.temporal_f,
+            theta=mov_theta, phase=phase, contrast=self.contrast, dtype=self.dtype)
+        # Add an empty gray screen period before and after the movie
+        videos = movies_concat(
+            tf.expand_dims(movie, axis=-1), self.pre_delay, self.post_delay, dtype=self.dtype
+        )
+        spatial = self.lgn.spatial_response(videos, self.bmtk_compat)
+        return self.lgn.firing_rates_from_spatial(*spatial)
+
+    def spikes(self, theta, phase, spike_seed=None, current_input=False):
+        """LGN spikes (or the scaled spike probability for current input)."""
+        # Probability of having a spike before dt = 1 ms
+        probability = 1 - tf.exp(-self.firing_rates(theta, phase) / 1000.)
+        if current_input:
+            return probability * 1.3
+        if spike_seed is None:
+            uniform = tf.random.uniform(tf.shape(probability), dtype=self.dtype)
+        else:
+            uniform = tf.random.stateless_uniform(
+                tf.shape(probability), seed=spike_seed, dtype=self.dtype
+            )
+        return uniform < probability
+
+    def batch_spikes(self, theta, phase, spike_seeds):
+        """Spikes [batch, seq_len, n_input] for a batch of seeded gratings.
+
+        One sample at a time, so the filtering intermediates - about 0.5 GB
+        per sample in float16 - never exist for the whole batch at once.
+        """
+        return tf.map_fn(
+            lambda sample: self.spikes(*sample),
+            (theta[:, 0], phase, spike_seeds),
+            fn_output_signature=tf.TensorSpec((self.seq_len, self.n_input), tf.bool),
+            parallel_iterations=1,
+        )
+
+
+def generate_drifting_grating_parameters(seed, dtype=tf.float32):
+    """The seeded random stream of ``generate_drifting_grating_tuning``, minus the LGN.
+
+    Yields each sample's orientation [1], phase and spike seed [2], derived
+    exactly as the generator derives them, so ``DriftingGratingLGN.batch_spikes``
+    reproduces the generator's samples wherever it runs (stateless random ops
+    give the same values on the host and on the GPU). Pure stateless ops, so
+    the whole stream runs inside tf.data with no Python generator.
+    """
+    if seed is None:
+        raise ValueError("the grating parameter stream requires a seed")
+    base_seed = _stateless_seed_pair(seed, salt=1001)
+
+    def sample(index):
+        orientation_seed, phase_seed, spike_seed = _grating_sample_seeds(base_seed, index)
+        return (tf.reshape(_random_angle(orientation_seed, dtype), (1,)),
+                _random_angle(phase_seed, dtype), spike_seed)
+
+    data_options = tf.data.Options()
+    data_options.deterministic = True
+    return (tf.data.Dataset.range(np.iinfo(np.int64).max)
+            .map(sample, num_parallel_calls=tf.data.AUTOTUNE)
+            .with_options(data_options))
+
+
 def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8,
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,
@@ -105,11 +223,12 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
 
     If `seed` is provided, orientation/phase/spike sampling is stateless and reproducible.
     """
-
-    lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input, dtype=dtype, data_dir=data_dir)
-
-    # seq_len = pre_delay + duration + post_delay
-    duration =  seq_len - pre_delay - post_delay
+    grating = DriftingGratingLGN(
+        seq_len, pre_delay, post_delay, n_input=n_input, data_dir=data_dir,
+        temporal_f=temporal_f, cpd=cpd, contrast=contrast, row_size=row_size,
+        col_size=col_size, rotation=rotation, billeh_phase=billeh_phase,
+        bmtk_compat=bmtk_compat, dtype=dtype)
+    duration = grating.duration
     base_seed = _stateless_seed_pair(seed, salt=1001)
 
     def _g():
@@ -117,87 +236,24 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
             theta = -45  # to make the first one 0
         sample_idx = 0
         while True:
-            phase_seed = None
-            orientation_seed = None
-            spike_seed = None
+            orientation_seed = phase_seed = spike_seed = None
             if base_seed is not None:
-                sample_seed = _fold_in_seed(base_seed, sample_idx)
-                orientation_seed = _fold_in_seed(sample_seed, 0)
-                phase_seed = _fold_in_seed(sample_seed, 1)
-                spike_seed = _fold_in_seed(sample_seed, 2)
-
+                orientation_seed, phase_seed, spike_seed = _grating_sample_seeds(
+                    base_seed, sample_idx
+                )
             if orientation is None:
-                # generate randdomly.
                 if regular:
                     theta = (theta + 45) % 360
                 else:
-                    if orientation_seed is None:
-                        theta = tf.random.uniform(shape=(), minval=0, maxval=360, dtype=dtype)
-                    else:
-                        theta = tf.random.stateless_uniform(
-                            shape=(),
-                            seed=orientation_seed,
-                            minval=0,
-                            maxval=360,
-                            dtype=dtype,
-                        )
+                    theta = _random_angle(orientation_seed, dtype)
             else:
                 theta = orientation
-
-            mov_theta = theta if rotation == "cw" else -theta  # flip the sign for ccw
-
-            if billeh_phase:
-                mov_theta += 180
-            # Ensure theta is a Tensor to avoid tf.function retracing on Python scalars.
-            mov_theta = tf.cast(mov_theta, dtype)
-
-            # Generate a random phase
-            if phase_seed is None:
-                phase = tf.random.uniform(shape=(), minval=0, maxval=360, dtype=dtype)
-            else:
-                phase = tf.random.stateless_uniform(
-                    shape=(), seed=tf.cast(phase_seed, tf.int32), minval=0, maxval=360, dtype=dtype
-                )
-
-            movie = make_drifting_grating_stimulus(row_size=row_size, col_size=col_size, moving_flag=True,
-                                                image_duration=duration, cpd=cpd, temporal_f=temporal_f, theta=mov_theta,
-                                                phase=phase, contrast=contrast, dtype=dtype)
-            movie = tf.expand_dims(movie, axis=-1)
-            # Add an empty gray screen period before and after the movie
-            videos = movies_concat(movie, pre_delay, post_delay, dtype=dtype)
-            del movie
-            # process spatial filters
-            spatial = lgn.spatial_response(videos, bmtk_compat)
-            del videos
-            # process temporal filters and get firing rates
-            firing_rates = lgn.firing_rates_from_spatial(*spatial)
+            phase = _random_angle(phase_seed, dtype)
             if return_firing_rates:
-                # yield tf.constant(firing_rates, dtype=dtype, shape=(seq_len, n_input))
-                yield firing_rates
-
+                yield grating.firing_rates(theta, phase)
             else:
-                del spatial
-                # sample rate
-                # assuming dt = 1 ms
-                _p = 1 - tf.exp(-firing_rates / 1000.) # probability of having a spike before dt = 1 ms
-                del firing_rates
-                # _z = tf.cast(fixed_noise < _p, dtype)
-                if current_input:
-                    _z = _p * 1.3
-                else:
-                    if spike_seed is None:
-                        _z = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
-                    else:
-                        _z = tf.random.stateless_uniform(
-                            tf.shape(_p), seed=spike_seed, dtype=dtype
-                        ) < _p
-                del _p
-
-                # downsample
-                # _z = tf.gather(_z, tf.range(0,tf.shape(_z)[0],dt), axis=0)
-
+                _z = grating.spikes(theta, phase, spike_seed, current_input)
                 yield _z, tf.constant(theta, dtype=dtype, shape=(1,)), tf.constant(contrast, dtype=dtype, shape=(1,)), tf.constant(duration, dtype=dtype, shape=(1,))
-                # yield _z, np.array([theta], dtype=np.float32)
             sample_idx += 1
 
     if return_firing_rates:

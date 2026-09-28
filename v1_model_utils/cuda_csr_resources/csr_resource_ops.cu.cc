@@ -8,26 +8,20 @@
 
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
-// Ahead of the macro block below, so the operator sources' own includes of these
-// headers are no-ops rather than TensorFlow headers read with `uint32` redefined.
+// Ahead of the included operator sources, whose own includes are then no-ops
+// inside the namespace below.
 #include "tensorflow/core/framework/resource_mgr.h"
 #include "tensorflow/core/framework/resource_var.h"
 #include "tensorflow/core/util/gpu_kernel_helper.h"
 
-// MultiWorkerMirroredStrategy cannot broadcast uint8/uint32 variables in
-// TensorFlow 2.15.  The network values fit int32, so compile this isolated
-// kernel with a consistent signed 32-bit metadata representation.
-#define uint8 int32
-#define uint32 int32
+// The resource stores the metadata in the tensor backend's own widths (uint32
+// indices, uint8 synapse types), so both libraries compile the kernels from
+// these sources unchanged.
 #define V1_KERNEL_IMPLEMENTATION_ONLY
 #include "../cuda_csr_recurrent/csr_recurrent_ops.cu.cc"
 #undef V1_KERNEL_IMPLEMENTATION_ONLY
-#undef uint32
-#undef uint8
 
 namespace external_resource_kernel {
-#define uint8 int32
-#define uint32 int32
 #define AsFloat ExternalAsFloat
 #define BasisProjection ExternalBasisProjection
 #define V1_KERNEL_IMPLEMENTATION_ONLY
@@ -35,24 +29,24 @@ namespace external_resource_kernel {
 #undef V1_KERNEL_IMPLEMENTATION_ONLY
 #undef BasisProjection
 #undef AsFloat
-#undef uint32
-#undef uint8
 }  // namespace external_resource_kernel
 
 class V1CsrResource : public ResourceBase {
  public:
-  V1CsrResource(const Tensor& post_ids, const Tensor& synapse_types,
-                const Tensor& row_splits, const Tensor& edge_ids,
-                const Tensor& nonempty_rows, const Tensor& pair_ids,
-                const Tensor& pair_posts, const Tensor& pair_types)
-      : post_ids(post_ids),
-        synapse_types(synapse_types),
-        row_splits(row_splits),
-        edge_ids(edge_ids),
-        nonempty_rows(nonempty_rows),
-        pair_ids(pair_ids),
-        pair_posts(pair_posts),
-        pair_types(pair_types) {}
+  // Built from the inputs of InitializeV1CsrResource, in registration order.
+  explicit V1CsrResource(OpKernelContext* context)
+      : post_ids(context->input(0)),
+        synapse_types(context->input(1)),
+        row_splits(context->input(2)),
+        edge_ids(context->input(3)),
+        nonempty_rows(context->input(4)),
+        pair_ids(context->input(5)),
+        pair_posts(context->input(6)),
+        pair_types(context->input(7)),
+        incoming_row_splits(context->input(8)),
+        incoming_pre_ids(context->input(9)),
+        incoming_edge_ids(context->input(10)),
+        incoming_types(context->input(11)) {}
 
   string DebugString() const override { return "V1CsrResource"; }
 
@@ -64,24 +58,27 @@ class V1CsrResource : public ResourceBase {
   Tensor pair_ids;
   Tensor pair_posts;
   Tensor pair_types;
+  // Fixed-four incoming CSR of the BKG forward gather; empty when absent.
+  Tensor incoming_row_splits;
+  Tensor incoming_pre_ids;
+  Tensor incoming_edge_ids;
+  Tensor incoming_types;
 };
 
-Status ValidateMetadata(const Tensor& post_ids, const Tensor& synapse_types,
-                        const Tensor& row_splits, const Tensor& edge_ids,
-                        const Tensor& nonempty_rows, const Tensor& pair_ids,
-                        const Tensor& pair_posts, const Tensor& pair_types) {
-  if (!TensorShapeUtils::IsVector(post_ids.shape()) ||
-      !TensorShapeUtils::IsVector(synapse_types.shape()) ||
-      !TensorShapeUtils::IsVector(row_splits.shape()) ||
-      !TensorShapeUtils::IsVector(edge_ids.shape()) ||
-      !TensorShapeUtils::IsVector(nonempty_rows.shape()) ||
-      !TensorShapeUtils::IsVector(pair_ids.shape()) ||
-      !TensorShapeUtils::IsVector(pair_posts.shape()) ||
-      !TensorShapeUtils::IsVector(pair_types.shape())) {
-    return errors::InvalidArgument("CSR metadata tensors must be rank one");
+Status ValidateMetadata(const V1CsrResource& resource) {
+  for (const Tensor* tensor :
+       {&resource.post_ids, &resource.synapse_types, &resource.row_splits,
+        &resource.edge_ids, &resource.nonempty_rows, &resource.pair_ids,
+        &resource.pair_posts, &resource.pair_types,
+        &resource.incoming_row_splits, &resource.incoming_pre_ids,
+        &resource.incoming_edge_ids, &resource.incoming_types}) {
+    if (!TensorShapeUtils::IsVector(tensor->shape())) {
+      return errors::InvalidArgument("CSR metadata tensors must be rank one");
+    }
   }
-  if (post_ids.NumElements() != synapse_types.NumElements() ||
-      post_ids.NumElements() != edge_ids.NumElements()) {
+  const int64_t n_edges = resource.post_ids.NumElements();
+  if (resource.synapse_types.NumElements() != n_edges ||
+      resource.edge_ids.NumElements() != n_edges) {
     return errors::InvalidArgument(
         "post_ids, synapse_types, and edge_ids must have equal lengths");
   }
@@ -89,21 +86,37 @@ Status ValidateMetadata(const Tensor& post_ids, const Tensor& synapse_types,
   // connectivity declared without a backward (the LGN and BKG inputs) uploads
   // it empty, so accept that and let the backward ops reject a missing
   // projection if one is ever requested.
-  if (pair_ids.NumElements() != 0 &&
-      pair_ids.NumElements() != post_ids.NumElements()) {
+  if (resource.pair_ids.NumElements() != 0 &&
+      resource.pair_ids.NumElements() != n_edges) {
     return errors::InvalidArgument(
         "pair_ids must be empty or match the edge count");
   }
-  if (row_splits.NumElements() < 2) {
+  if (resource.row_splits.NumElements() < 2) {
     return errors::InvalidArgument("row_splits must contain at least two values");
   }
-  if (nonempty_rows.NumElements() >= row_splits.NumElements()) {
+  if (resource.nonempty_rows.NumElements() >= resource.row_splits.NumElements()) {
     return errors::InvalidArgument(
         "nonempty_rows cannot exceed the number of CSR rows");
   }
-  if (pair_posts.NumElements() != pair_types.NumElements()) {
+  if (resource.pair_posts.NumElements() != resource.pair_types.NumElements()) {
     return errors::InvalidArgument(
         "pair_posts and pair_types must have equal lengths");
+  }
+  // The incoming CSR is all or nothing, and when present lists every edge
+  // once, four per post.
+  const int64_t incoming_rows = resource.incoming_row_splits.NumElements();
+  const bool has_incoming = incoming_rows != 0;
+  for (const Tensor* tensor :
+       {&resource.incoming_pre_ids, &resource.incoming_edge_ids,
+        &resource.incoming_types}) {
+    if (tensor->NumElements() != (has_incoming ? n_edges : 0)) {
+      return errors::InvalidArgument(
+          "incoming CSR metadata must be empty or list every edge once");
+    }
+  }
+  if (has_incoming && n_edges != 4 * (incoming_rows - 1)) {
+    return errors::InvalidArgument(
+        "incoming CSR metadata requires exactly four edges per post");
   }
   return OkStatus();
 }
@@ -148,16 +161,13 @@ class InitializeV1CsrResourceOp : public OpKernel {
   }
 
   void Compute(OpKernelContext* context) override {
-    OP_REQUIRES_OK(context,
-                   ValidateMetadata(context->input(0), context->input(1),
-                                    context->input(2), context->input(3),
-                                    context->input(4), context->input(5),
-                                    context->input(6), context->input(7)));
-    V1CsrResource* resource = new V1CsrResource(
-        context->input(0), context->input(1), context->input(2),
-        context->input(3), context->input(4), context->input(5),
-        context->input(6), context->input(7));
-    Status status = context->resource_manager()->Create(
+    V1CsrResource* resource = new V1CsrResource(context);
+    Status status = ValidateMetadata(*resource);
+    if (!status.ok()) {
+      resource->Unref();
+      OP_REQUIRES_OK(context, status);
+    }
+    status = context->resource_manager()->Create(
         "distributed_connectivity", resource_name_, resource);
     if (!status.ok()) {
       resource->Unref();
@@ -245,6 +255,68 @@ class V1CsrForwardResourceOp : public OpKernel {
   int n_post_;
   string resource_name_;
   bool aggregate_runs_ = true;
+};
+
+template <typename T>
+class BkgCsrForwardResourceOp : public OpKernel {
+ public:
+  explicit BkgCsrForwardResourceOp(OpKernelConstruction* context)
+      : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("resource_name", &resource_name_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    V1CsrResource* resource = nullptr;
+    OP_REQUIRES_OK(context, context->resource_manager()->Lookup(
+                                "distributed_connectivity",
+                                DeviceResourceName(context, resource_name_),
+                                &resource));
+    core::ScopedUnref resource_unref(resource);
+    const Tensor& activity = context->input(0);
+    const Tensor& weights = context->input(1);
+    const Tensor& basis = context->input(2);
+    const Tensor& initial = context->input(3);
+    OP_REQUIRES_OK(context, ValidateRuntimeInputs(
+                                *resource, activity, weights, basis, n_post_,
+                                resource->post_ids.NumElements()));
+    OP_REQUIRES(context, basis.dim_size(1) == 4,
+                errors::InvalidArgument("basis must have four columns"));
+    OP_REQUIRES(context,
+                resource->incoming_row_splits.NumElements() == n_post_ + 1,
+                errors::InvalidArgument(
+                    "resource carries no fixed-four incoming CSR for n_post"));
+    const int64_t count = activity.dim_size(0) * n_post_;
+    const TensorShape shape({count, 4});
+    OP_REQUIRES(context,
+                initial.NumElements() == 0 || initial.shape() == shape,
+                errors::InvalidArgument("initial must be empty or match output"));
+    Tensor* output;
+    // Every element is written, so the output takes over `initial` in place
+    // when it can and is never cleared first.
+    OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(
+                                {3}, 0, shape, &output));
+    if (count == 0) return;
+    auto device = context->eigen_device<GPUDevice>();
+    OP_REQUIRES_OK(
+        context,
+        GpuLaunchKernel(
+            external_resource_kernel::BkgGatherKernel<T>,
+            dim3((n_post_ + 127) / 128, activity.dim_size(0)), 128, 0,
+            device.stream(), static_cast<int>(activity.dim_size(1)), n_post_,
+            activity.flat<T>().data(), weights.flat<float>().data(),
+            resource->incoming_row_splits.flat<uint32>().data(),
+            resource->incoming_pre_ids.flat<uint32>().data(),
+            resource->incoming_edge_ids.flat<uint32>().data(),
+            resource->incoming_types.flat<uint8>().data(),
+            basis.flat<float>().data(),
+            initial.NumElements() ? initial.flat<T>().data() : nullptr,
+            output->flat<T>().data()));
+  }
+
+ private:
+  int n_post_;
+  string resource_name_;
 };
 
 template <typename T, typename W, bool kAccumulate = false>
@@ -494,6 +566,11 @@ class ExternalCsrActivityBackwardResourceOp : public OpKernel {
       V1CsrBackwardResourceOp<T, float, true>);
       
 #define REGISTER_EXTERNAL_RESOURCE_TYPE(T)                               \
+  REGISTER_KERNEL_BUILDER(                                               \
+      Name("BkgCsrForwardResource")                                     \
+          .Device(DEVICE_GPU)                                            \
+          .TypeConstraint<T>("T"),                                     \
+      BkgCsrForwardResourceOp<T>);                                       \
   REGISTER_KERNEL_BUILDER(                                               \
       Name("ExternalCsrWeightBackwardResource")                         \
           .Device(DEVICE_GPU)                                            \

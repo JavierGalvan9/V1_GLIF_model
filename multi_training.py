@@ -20,6 +20,7 @@ from v1_model_utils.training_bootstrap import TRAINING_LAUNCH_PLAN
 import absl
 import socket
 # import re
+import concurrent.futures
 import copy
 import json
 import numpy as np
@@ -1285,31 +1286,55 @@ def main(_):
         return model_spikes, step_values
 
     ### LGN INPUT ###
-    # Define the function that generates the dataset for our task
-    def get_gratings_dataset_fn(regular=False):
+    # The host pipeline only draws each grating's orientation, phase and spike
+    # seed; every replica filters its own stimuli on its own GPU. Filtering them
+    # all in one Python generator put every replica's LGN work on GPU 0.
+    def get_gratings_dataset_fn():
         def _f(input_context):
             batch_size = input_context.get_per_replica_batch_size(
                 global_grating_batch_size
             )
             pipeline_seed = flags.seed + flags.run_session + 10000 + int(input_context.input_pipeline_id)
-            _data_set = (stim_dataset.generate_drifting_grating_tuning(
-                seq_len=flags.seq_len,
-                pre_delay=delays[0],
-                post_delay=delays[1],
-                n_input=flags.n_input,
-                data_dir=flags.data_dir,
-                regular=regular,
-                bmtk_compat=flags.bmtk_compat_lgn,
-                rotation=flags.rotation,
-                dtype=dtype,
-                seed=pipeline_seed,
-            )
+            return (
+                stim_dataset.generate_drifting_grating_parameters(pipeline_seed, dtype=dtype)
                 .batch(batch_size)
                 .prefetch(tf.data.AUTOTUNE)
             )
-
-            return _data_set
         return _f
+
+    # One generator per replica GPU, with its LGN filters on that GPU, called
+    # under that GPU's device scope. A tf.function returning strategy.run
+    # results hands every replica's output back on GPU:0, which sent each
+    # replica's 139 MB batch to GPU:0 and back every step; and a mirrored
+    # variable read outside replica context resolves to GPU:0's copy.
+    grating_generators = []
+    for device in strategy.extended.worker_devices:
+        with tf.device(device):
+            grating_lgn = stim_dataset.DriftingGratingLGN(
+                flags.seq_len,
+                delays[0],
+                delays[1],
+                n_input=flags.n_input,
+                data_dir=flags.data_dir,
+                rotation=flags.rotation,
+                bmtk_compat=flags.bmtk_compat_lgn,
+                dtype=dtype,
+            )
+        grating_generators.append((device, tf.function(grating_lgn.batch_spikes)))
+
+    def distributed_generate_gratings(orientation, phase, spike_seeds):
+        """LGN spikes for every replica, each generated and left on its own GPU."""
+        per_replica_inputs = zip(
+            *(strategy.experimental_local_results(value)
+              for value in (orientation, phase, spike_seeds))
+        )
+        batches = []
+        for (device, generate), inputs in zip(grating_generators, per_replica_inputs):
+            with tf.device(device):
+                batches.append(generate(*inputs))
+        return strategy.experimental_distribute_values_from_function(
+            lambda context: batches[context.replica_id_in_sync_group]
+        )
 
     def get_gray_dataset_fn():
         def _f(input_context):
@@ -1841,6 +1866,21 @@ def main(_):
     # Load the dataset iterator
     it = iter(train_data_set)
 
+    def next_gratings():
+        """The next step's LGN spikes on every replica, and their orientations."""
+        y, phase, spike_seeds = next(it)
+        return distributed_generate_gratings(y, phase, spike_seeds), y  # x dtype tf.bool
+
+    # Step k+1's gratings are generated on a background thread while step k
+    # trains. Each GPU runs both on its one compute stream, so the generation
+    # kernels fill the step's launch gaps instead of queueing after it. The
+    # first batch is made here, so the generator is traced on this thread; from
+    # then on only the background thread reads `it`, keeping the sample order.
+    # A batch still pending when training returns is joined at interpreter exit.
+    grating_generator = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    next_batch = concurrent.futures.Future()
+    next_batch.set_result(next_gratings())
+
     for epoch in range(n_prev_epochs, n_prev_epochs + flags.n_epochs):
         if not flags.benchmark_output:
             callbacks.on_epoch_start()
@@ -1859,8 +1899,15 @@ def main(_):
             if flags.reset_every_step:
                 gray_state = distributed_generate_gray_state()
 
-            # Generate LGN spikes
-            x, y, _, _ = next(it)  # x dtype tf.bool
+            # The benchmark times the whole iteration, including any wait for
+            # the stimulus generation overlapping the previous step.
+            if flags.benchmark_output and step == flags.benchmark_warmup_steps:
+                tf.config.experimental.reset_memory_stats("GPU:0")
+            start_time = time() if flags.benchmark_output and step >= flags.benchmark_warmup_steps else None
+
+            # LGN spikes for this step; y is the grating orientation
+            x, y = next_batch.result()
+            next_batch = grating_generator.submit(next_gratings)
             x_spontaneous = distributed_sample_probability_batch(
                 spontaneous_prob_base,
                 gray_batch_size,
@@ -1889,9 +1936,6 @@ def main(_):
                 #     model_spikes, step_values = distributed_split_train_step(x_chunk, y, gray_state, x_spont_chunk, trim=chunknum==1)
                 # # distributed_train_step(x, y, w, trim=chunknum==1)
                 # model_spikes, step_values = distributed_split_train_step(x, y, gray_state, x_spontaneous, trim=chunknum==1)
-                if flags.benchmark_output and step == flags.benchmark_warmup_steps:
-                    tf.config.experimental.reset_memory_stats("GPU:0")
-                start_time = time() if flags.benchmark_output and step >= flags.benchmark_warmup_steps else None
                 if profile_this_step:
                     options = tf.profiler.experimental.ProfilerOptions(
                         host_tracer_level=2,

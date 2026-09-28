@@ -414,19 +414,61 @@ DERIVED_COEFFICIENTS = (
 )
 
 
-def test_membrane_coefficients_stay_out_of_the_checkpoint(tmp_path):
-    """They are derived from the node parameters, so they are not state.
+def test_derived_constants_are_untracked_variables(tmp_path):
+    """Every tensor the cell holds is a variable, and none of them is saved.
 
-    Keeping them untracked is also what lets a checkpoint written before the
-    propagator existed still restore: the restore path asserts that every Python
-    variable found a value, and a derived constant has none to find.
+    An eager constant lives on one GPU, so a replica on another re-reads it
+    across devices on every timestep; a variable created under the strategy
+    scope is mirrored instead. They are derived from the node parameters, so
+    they are not state, and keeping them out of the checkpoint is also what
+    lets a checkpoint written before they existed still restore: the restore
+    path asserts that every tracked variable found a value. Keras 3 leaves raw
+    tf.Variables out of ``cell.variables``, so the checkpoint keys are the
+    check.
     """
     cell = _cell(tmp_path, backend="tensorflow", dtype=tf.float32)
-    leaked = [
-        variable.name for variable in cell.variables
-        if any(name in variable.name for name in DERIVED_COEFFICIENTS)
+    eager = sorted(
+        name for name, value in vars(cell).items() if isinstance(value, tf.Tensor)
+    )
+    assert not eager, f"eager tensors bound on the cell: {eager}"
+
+    path = tf.train.Checkpoint(model=cell).save(str(tmp_path / "checkpoint"))
+    keys = [key for key, _ in tf.train.list_variables(path)]
+    derived = set(DERIVED_COEFFICIENTS) | set(cell._neuron_constants) | {
+        "v_th", "v_reset", "synaptic_basis_weights", "_dt", "_gauss_std",
+        "_dampening_factor", "bkg_spike_prob",
+    }
+    leaked = sorted(
+        name for name in derived
+        if any(f"/{name}/.ATTRIBUTES" in key for key in keys)
+    )
+    assert not leaked, f"derived constants in the checkpoint: {leaked}"
+
+
+@pytest.mark.skipif(
+    len(tf.config.list_physical_devices("GPU")) < 2, reason="two GPUs required"
+)
+def test_every_replica_reads_the_cell_constants_from_its_own_gpu(tmp_path):
+    """Under a two-replica strategy each derived constant has a copy per GPU.
+
+    An eager constant would live on GPU:0 only, and the other replica would
+    fetch it across devices on every timestep of the time loop.
+    """
+    devices = [device.name for device in tf.config.list_logical_devices("GPU")[:2]]
+    strategy = tf.distribute.MirroredStrategy(devices)
+    with strategy.scope():
+        cell = _cell(tmp_path, backend="tensorflow", dtype=tf.float32)
+    names = list(cell._neuron_constants) + [
+        "v_th", "v_reset", "synaptic_basis_weights", "_dt", "_gauss_std",
+        "_dampening_factor", "bkg_spike_prob",
     ]
-    assert not leaked
+    masks = {
+        f"{name}.constraint": getattr(cell, name).constraint.condition
+        for name in ("recurrent_weight_values", "input_weight_values", "bkg_input_weights")
+    }
+    for name, value in [(name, getattr(cell, name)) for name in names] + list(masks.items()):
+        placed = {component.device for component in strategy.experimental_local_results(value)}
+        assert len(placed) == 2, f"{name} is not replica-local: {placed}"
 
 
 @pytest.mark.parametrize("written,restored", [("euler", "exact"), ("exact", "euler")])
@@ -500,48 +542,40 @@ def _permuted_layout(n_nodes, seed=3):
     )
 
 
-def test_every_per_neuron_constant_follows_a_layout_permutation(tmp_path):
-    """A neuron-aligned constant that does not move is attached to the wrong cell.
+def test_layout_translation_leaves_the_per_neuron_constants_in_place(tmp_path):
+    """The constants are rebuilt in runtime order, so no translation moves them.
 
-    The translation used to work from a hand-written list of names, and
-    `t_ref_steps` was missing from it, so a permuted layout gave every neuron
-    somebody else's refractory period. `_const` now registers each constant as
-    it builds it; this checks the registry actually covers them and that a
-    round trip is the identity.
+    The network is relabelled before the column is built, and the constants
+    are never checkpointed, so a restore has nothing canonical to bring back.
+    Translating them on restore - as the registry once did - gave every
+    neuron another neuron's coefficients.
     """
     cell = _cell(tmp_path, backend="tensorflow", dtype=tf.float32,
                  heterogeneous=True)
-    n = cell._n_neurons
-    cell._neuron_layout = _permuted_layout(n)
+    cell._neuron_layout = _permuted_layout(cell._n_neurons)
 
     # Everything per-neuron the step reads must be registered.
     reads = {"decay", "syn_coeffs", "asc_factor", "reset_coeff",
              "asc_spike_factor", "asc_decay", "asc_amps", "t_ref_steps"}
     missing = reads - set(cell._neuron_constants)
-    assert not missing, f"not registered for reordering: {sorted(missing)}"
+    assert not missing, f"not registered: {sorted(missing)}"
 
     before = {name: getattr(cell, name).numpy().copy()
               for name in cell._neuron_constants}
     type_ids_before = np.asarray(cell._node_type_ids).copy()
-    cell._translate_neuron_layout(to_runtime=True)
-    moved = {name: getattr(cell, name).numpy().copy()
-             for name in cell._neuron_constants}
-    cell._translate_neuron_layout(to_runtime=False)
-
     order = cell._neuron_layout.new_to_old
-    # With two cell types a constant that stayed put now differs from where it
-    # should have moved, so the checks below have teeth.
+    # With two cell types a permuted constant differs from the original, so
+    # the equality checks below would notice one being moved.
     for name in reads:
         assert not np.array_equal(before[name], before[name][order]), name
-    # node_type_ids is neuron-aligned too, and must not be left stale.
-    np.testing.assert_array_equal(cell._node_type_ids, type_ids_before)
-    for name, original in before.items():
-        np.testing.assert_array_equal(
-            moved[name], original[order],
-            err_msg=f"{name} did not follow the permutation")
-        np.testing.assert_array_equal(
-            getattr(cell, name).numpy(), original,
-            err_msg=f"{name} did not survive the round trip")
+
+    for to_runtime in (True, False):
+        cell._translate_neuron_layout(to_runtime=to_runtime)
+        np.testing.assert_array_equal(cell._node_type_ids, type_ids_before)
+        for name, original in before.items():
+            np.testing.assert_array_equal(
+                getattr(cell, name).numpy(), original,
+                err_msg=f"{name} moved when translating to_runtime={to_runtime}")
 
 
 @pytest.mark.parametrize("backend", ["tensorflow", "cuda"])

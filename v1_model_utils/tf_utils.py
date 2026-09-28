@@ -178,6 +178,35 @@ def stateless_fold_in(seed, data):
     return fold_in_fn(seed, data)
 
 
+def replica_local_constant(value, dtype=None, name=None):
+    """A constant that every replica reads from its own GPU.
+
+    An eager ``tf.constant`` lives on one device, and a replica on another GPU
+    that reads it inside a loop fetches it again on every iteration: the GLIF
+    cell's per-neuron constants cost each extra replica 31 GB of peer-to-peer
+    copies per step at 203,816 neurons. Created under a distribution strategy's
+    scope, a variable is mirrored with one copy per GPU, and a replica's read
+    resolves to its own copy. Outside any scope it is an ordinary variable on
+    the default device, exactly where the constant would have been.
+
+    It is non-trainable, so no tape and no ``tf.custom_gradient`` ever asks for
+    its gradient. Callers that hold it on a trackable object must keep it out
+    of the checkpoint, since it is derived rather than learned.
+
+    TensorFlow keeps int32 variables in host memory, which would reintroduce a
+    copy per read, so int32 is refused: store indices as int64.
+    """
+    if not tf.is_tensor(value):
+        value = tf.constant(value, dtype=dtype)
+    elif dtype is not None:
+        value = tf.cast(value, dtype)
+    if value.dtype == tf.int32:
+        raise ValueError(
+            f"{name or 'constant'}: int32 variables live in host memory; use int64."
+        )
+    return tf.Variable(value, trainable=False, name=name)
+
+
 def configure_run_paths(
     flags,
     task_name=None,
@@ -646,6 +675,7 @@ def restore_evaluation_checkpoint(
     logdir,
     current_epoch=0,
     result_name="OSI/DSI",
+    runtime_cast_ignored_variables=(),
 ):
     """Restore a model checkpoint for evaluation-style scripts."""
     checkpoint_directory, checkpoint_source = resolve_checkpoint_directory(flags)
@@ -680,6 +710,7 @@ def restore_evaluation_checkpoint(
                 checkpoint_directory=checkpoint_directory,
                 checkpoint_dtype_name=checkpoint_model_dtype,
                 target_dtype_name=flags.dtype,
+                ignored_target_variable_names=runtime_cast_ignored_variables,
             )
             print('Checkpoint restored via in-memory dtype conversion (no checkpoint re-save).')
         else:
@@ -697,8 +728,8 @@ def restore_evaluation_checkpoint(
         print(f'{result_name} results for epoch {current_epoch} will be saved in: {logdir}\n')
     else:
         raise FileNotFoundError(
-            f"No checkpoint could be restored. Reason: "
-            f"No valid checkpoint found. Point --restore_from at a "
+            "No checkpoint could be restored. Reason: "
+            "No valid checkpoint found. Point --restore_from at a "
             "directory that still holds its ckpt-*.index/.data files."
         )
 
@@ -751,9 +782,21 @@ def restore_model_with_runtime_dtype_cast(
     checkpoint_directory,
     checkpoint_dtype_name,
     target_dtype_name,
+    ignored_target_variable_names=(),
 ):
-    def _canonical_name(var_name):
-        return var_name.split(':', 1)[0]
+    ignored_target_variable_names = set(ignored_target_variable_names)
+
+    def _variables_by_name(variables):
+        """Index Keras variables by path, disambiguating raw TF variable names."""
+        indexed = {}
+        occurrences = {}
+        for variable in variables:
+            name = getattr(variable, 'path', None) or variable.name.split(':', 1)[0]
+            occurrence = occurrences.get(name, 0)
+            occurrences[name] = occurrence + 1
+            key = name if occurrence == 0 else f'{name}#{occurrence}'
+            indexed[key] = variable
+        return indexed
 
     _, source_dtype = configure_policy_and_dtype(checkpoint_dtype_name)
     source_model = build_model_fn(source_dtype)
@@ -761,14 +804,16 @@ def restore_model_with_runtime_dtype_cast(
     restore_and_rebase(source_checkpoint, checkpoint_directory, source_model)
 
     try:
-        source_vars_by_name = {_canonical_name(var.name): var for var in source_model.variables}
-        target_vars_by_name = {_canonical_name(var.name): var for var in target_model.variables}
+        source_vars_by_name = _variables_by_name(source_model.variables)
+        target_vars_by_name = _variables_by_name(target_model.variables)
 
         missing_in_source = []
         shape_mismatches = []
         assigned_count = 0
 
         for target_name, target_var in target_vars_by_name.items():
+            if target_name in ignored_target_variable_names:
+                continue
             source_var = source_vars_by_name.get(target_name)
             if source_var is None and target_name.endswith("sparse_recurrent_weights_compute"):
                 base_name = target_name.replace("_compute", "")
@@ -782,7 +827,7 @@ def restore_model_with_runtime_dtype_cast(
                 shape_mismatches.append(f'{target_name} ({source_var.shape} != {target_var.shape})')
                 continue
 
-            target_var.assign(tf.cast(source_var.read_value(), target_var.dtype))
+            target_var.assign(tf.cast(tf.convert_to_tensor(source_var), target_var.dtype))
             assigned_count += 1
 
         if shape_mismatches:
@@ -799,7 +844,10 @@ def restore_model_with_runtime_dtype_cast(
                 f'Examples: {preview}'
             )
 
-        extra_in_source = sorted(set(source_vars_by_name) - set(target_vars_by_name))
+        extra_in_source = sorted(
+            set(source_vars_by_name) - set(target_vars_by_name)
+            - ignored_target_variable_names
+        )
         if extra_in_source:
             preview = ', '.join(extra_in_source[:5])
             print(

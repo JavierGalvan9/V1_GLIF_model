@@ -6,6 +6,7 @@ from .wrapper import (
     build_csr_connectivity,
     calculate_external_csr_currents,
     kernel_variant,
+    uses_bkg_gather,
 )
 
 __all__ = (
@@ -14,4 +15,5 @@ __all__ = (
     "build_csr_connectivity",
     "calculate_external_csr_currents",
     "kernel_variant",
+    "uses_bkg_gather",
 )

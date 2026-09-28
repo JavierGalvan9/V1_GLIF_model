@@ -34,8 +34,8 @@ def resource_mode_enabled():
     visible: ``create_distribution_strategy`` sets ``V1_CSR_RESOURCE_MODE``
     when it builds a multi-replica strategy, and the one-process-per-GPU
     launcher sets ``V1_DISTRIBUTED_WORKER``. A single replica keeps the plain
-    tensor path, whose background-input forward carries a specialization the
-    resource operators do not implement.
+    tensor path; both backends run the same kernels, including the
+    background-input forward gather.
     """
     override = os.environ.get("V1_CSR_RESOURCE_MODE")
     if override is not None:
@@ -73,16 +73,30 @@ def load_ops():
     return _OPS
 
 
-_METADATA_FIELDS = (
-    "post_ids",
-    "synapse_types",
-    "row_splits",
-    "edge_ids",
-    "nonempty_rows",
-    "pair_ids",
-    "pair_posts",
-    "pair_types",
-)
+# Resource fields and their dtypes, in InitializeV1CsrResource input order: the
+# tensor backend's own widths, so both backends run identical kernels.
+_METADATA_FIELDS = {
+    "post_ids": tf.uint32,
+    "synapse_types": tf.uint8,
+    "row_splits": tf.uint32,
+    "edge_ids": tf.uint32,
+    "nonempty_rows": tf.uint32,
+    "pair_ids": tf.uint32,
+    "pair_posts": tf.uint32,
+    "pair_types": tf.uint8,
+    # The BKG forward gather's incoming CSR; absent from every other source.
+    "incoming_row_splits": tf.uint32,
+    "incoming_pre_ids": tf.uint32,
+    "incoming_edge_ids": tf.uint32,
+    "incoming_types": tf.uint8,
+}
+
+
+def _metadata_value(metadata, field):
+    """A resource field in its dtype; one the connectivity lacks is uploaded empty."""
+    dtype = _METADATA_FIELDS[field]
+    value = getattr(metadata, field, None)
+    return tf.zeros((0,), dtype) if value is None else tf.cast(value, dtype)
 
 
 def _device_suffix(device_name):
@@ -122,10 +136,7 @@ def initialize_resource(metadata):
     name = f"v1_csr_{uuid.uuid4().hex}"
     for device in devices:
         with tf.device(device):
-            values = [
-                tf.cast(getattr(metadata, field), tf.int32)
-                for field in _METADATA_FIELDS
-            ]
+            values = [_metadata_value(metadata, field) for field in _METADATA_FIELDS]
             initialized = load_ops().initialize_v1_csr_resource(
                 *values,
                 resource_name=f"{name}_gpu{_device_suffix(device)}",

@@ -105,10 +105,13 @@ def _compact_pairs(post_ids, synapse_types, needed=True):
 def _bkg_incoming_metadata(
     post_ids, synapse_types, row_splits, n_pre, n_post, weights_csr_ordered
 ):
-    """Build the fixed-four incoming CSR used by the BKG forward fast path."""
+    """Build the fixed-four incoming CSR used by the BKG forward fast path.
+
+    Both backends use it: the tensor operators read it from these tensors, and
+    resource mode stores it in each GPU's resource.
+    """
     if (
-        resource_mode_enabled()
-        or not weights_csr_ordered
+        not weights_csr_ordered
         or n_pre != 100
         or len(post_ids) != 4 * n_post
     ):
@@ -128,6 +131,15 @@ def _bkg_incoming_metadata(
         "incoming_edge_ids": tf.constant(incoming_order, tf.uint32),
         "incoming_types": tf.constant(synapse_types[incoming_order], tf.uint8),
     }
+
+
+def uses_bkg_gather(connectivity, basis):
+    """Whether the forward takes the fixed-four incoming gather.
+
+    The one gate for both backends, so the tensor and resource paths cannot
+    select different kernels for the same connectivity.
+    """
+    return connectivity.incoming_row_splits is not None and basis.shape[-1] == 4
 
 
 def kernel_variant(n_basis, batch_size):
@@ -317,10 +329,7 @@ def calculate_external_csr_currents(
         pair_posts,
         pair_types,
     ):
-        if (
-            connectivity.incoming_row_splits is not None
-            and basis_values.shape[-1] == 4
-        ):
+        if uses_bkg_gather(connectivity, basis_values):
             currents = external_ops.bkg_csr_forward(
                 values,
                 master_weights,
@@ -422,15 +431,25 @@ def _calculate_resource_currents(
 
     @tf.custom_gradient
     def fused(values, master_weights, basis_values, initial_values):
-        currents = ops.v1_csr_forward_resource(
-            values,
-            master_weights,
-            basis_values,
-            initial_values,
-            n_post=connectivity.n_post,
-            resource_name=connectivity.resource_name,
-            aggregate_runs=connectivity.repeats_targets,
-        )
+        if uses_bkg_gather(connectivity, basis_values):
+            currents = ops.bkg_csr_forward_resource(
+                values,
+                master_weights,
+                basis_values,
+                initial_values,
+                n_post=connectivity.n_post,
+                resource_name=connectivity.resource_name,
+            )
+        else:
+            currents = ops.v1_csr_forward_resource(
+                values,
+                master_weights,
+                basis_values,
+                initial_values,
+                n_post=connectivity.n_post,
+                resource_name=connectivity.resource_name,
+                aggregate_runs=connectivity.repeats_targets,
+            )
 
         def grad(upstream):
             if compute_activity_gradient:

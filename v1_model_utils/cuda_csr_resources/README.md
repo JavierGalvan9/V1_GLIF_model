@@ -20,12 +20,13 @@ visible: `tf_utils.create_distribution_strategy` sets `V1_CSR_RESOURCE_MODE=1`
 when it builds a multi-replica strategy, and the one-process-per-GPU launcher
 sets `V1_DISTRIBUTED_WORKER`. `V1_CSR_RESOURCE_MODE` forces either backend for
 tests and benchmarks. Single-replica training keeps the tensor-backed
-operators, whose background-input forward carries a gather specialization this
-library does not implement - worth about 3% of a step at batch 32.
+operators.
 
 The library provides recurrent forward/backward (including the in-place
-accumulating backward, see `cuda_csr_recurrent/README.md`) and the external
-weight-only and activity backward operations. Two contracts are shared with the tensor
+accumulating backward, see `cuda_csr_recurrent/README.md`), the background
+input's fixed-four forward gather (`BkgCsrForwardResource`, reading the
+incoming CSR stored in the resource), and the external weight-only and
+activity backward operations. Two contracts are shared with the tensor
 backend and must not drift:
 
 - **Compile flags.** `csr_resource_ops.cu.cc` `#include`s the recurrent and
@@ -38,9 +39,9 @@ backend and must not drift:
   event-driven weight gradient for the external inputs.
 - **Operator interface.** Like the tensor backend, the forward finds its
   active rows on the device (there is no `active_indices` input) and every
-  operator takes the synaptic basis in FP32. Note that the included sources
-  see `uint32` redefined as `int32`, so kernel code that shifts or masks packed
-  words must use `unsigned int`.
+  operator takes the synaptic basis in FP32. The resource stores the metadata
+  in the same widths the tensor operators take (uint32 indices, uint8 synapse
+  types), so the included kernel sources compile unchanged.
 
 A connectivity declared without a backward (`needs_backward=False`, the LGN and
 BKG inputs) uploads an empty pair projection. Initialization accepts that; the

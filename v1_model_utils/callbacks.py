@@ -3,10 +3,11 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import datetime as dt
-import subprocess
+import functools
 from time import time
 import pickle as pkl
 from numba import njit
+import pynvml
 from matplotlib import pyplot as plt
 import matplotlib.ticker as ticker
 import seaborn as sns
@@ -50,6 +51,43 @@ else:
     print("LaTeX not found. Using MathText for rendering.")
 plt.rcParams['text.usetex'] = False  # use_tex
 
+# Display names and colorblind-friendly colors of the loss components in the
+# loss-curve figures, shared with animations/.
+LOSS_DISPLAY_NAMES = {
+    "val_rate_loss": "Rate Loss",
+    "val_voltage_loss": "Voltage Reg.",
+    "val_regularizer_loss": "Weight Reg.",
+    "val_osi_dsi_loss": "OSI/DSI Loss",
+    "val_sync_loss": "Sync. Loss",
+    "val_loss": "Total Loss",
+}
+LOSS_COLORS = {
+    "val_rate_loss": "#0077BB",  # Blue
+    "val_voltage_loss": "#33BBEE",  # Cyan
+    "val_regularizer_loss": "#009988",  # Teal
+    "val_osi_dsi_loss": "#EE7733",  # Orange
+    "val_sync_loss": "#CC3311",  # Red
+}
+
+
+@functools.cache
+def _nvml_device_count():
+    pynvml.nvmlInit()
+    return pynvml.nvmlDeviceGetCount()
+
+
+def device_memory_gib(gpu_id):
+    """Whole-device (used, free, total) memory in GiB, as nvidia-smi reports it.
+
+    NVML is what nvidia-smi reads, and indexes GPUs the same way, without a
+    subprocess: nvidia-smi took 0.12 s per call on a 10-GPU node, once per GPU
+    per training step. Returns None for an index this process cannot see.
+    """
+    if gpu_id >= _nvml_device_count():
+        return None
+    info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(gpu_id))
+    return tuple(value / 1024**3 for value in (info.used, info.free, info.total))
+
 
 def printgpu(gpu_id=0):
     if tf.config.list_physical_devices('GPU'):
@@ -59,50 +97,22 @@ def printgpu(gpu_id=0):
         peak = meminfo['peak'] / 1024**3
         print(
             f'    TensorFlow GPU {gpu_id} Memory Usage: {current:.2f} GiB, Peak Usage: {peak:.2f} GiB')
-        # Check GPU memory using nvidia-smi
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total',
-                '--format=csv,nounits,noheader'],
-            stdout=subprocess.PIPE, encoding='utf-8'
-        )  # MiB
-        # Split output into lines for each GPU
-        gpu_memory_info = result.stdout.strip().split('\n')
-        if gpu_id is not None:
-            # Display memory info for a specific GPU
-            if gpu_id < len(gpu_memory_info):
-                used, free, total = [
-                    float(x)/1024 for x in gpu_memory_info[gpu_id].split(',')]
-                print(
-                    f"    Total GPU {gpu_id} Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
-            else:
-                print(
-                    f"    Invalid GPU ID: {gpu_id}. Available GPUs: {len(gpu_memory_info)}")
+        memory = device_memory_gib(gpu_id)
+        if memory is None:
+            print(f"    Invalid GPU ID: {gpu_id}. Available GPUs: {_nvml_device_count()}")
         else:
-            # Display memory info for all GPUs
-            for i, info in enumerate(gpu_memory_info):
-                used, free, total = [float(x)/1024 for x in info.split(',')]
-                print(
-                    f"    Total GPU {gpu_id} Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
+            used, free, total = memory
+            print(
+                f"    Total GPU {gpu_id} Memory Usage: Used: {used:.2f} GiB, Free: {free:.2f} GiB, Total: {total:.2f} GiB")
 
 
 def get_gpu_memory(gpu_id=0):
-    """Returns GPU memory usage in GiB using only nvidia-smi."""
+    """Returns the whole-device GPU memory in use, in GiB (0.0 if unavailable)."""
     try:
-        # Get GPU memory info using nvidia-smi
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=memory.used',
-                '--format=csv,nounits,noheader'],
-            stdout=subprocess.PIPE, encoding='utf-8'
-        )
-        gpu_memory_info = result.stdout.strip().split('\n')
-        if gpu_id < len(gpu_memory_info):
-            # Convert MiB to GiB
-            used_memory = float(gpu_memory_info[gpu_id]) / 1024
-            return used_memory
-        else:
-            return 0.0
-    except Exception:
+        memory = device_memory_gib(gpu_id)
+    except pynvml.NVMLError:
         return 0.0
+    return 0.0 if memory is None else memory[0]
 
 
 def compose_str(metrics_values):
@@ -1572,15 +1582,7 @@ class Callbacks:
         ]
         component_labels = [label for label in labels if label != "val_loss"]
 
-        # Create descriptive names for the labels
-        label_display_names = {
-            "val_rate_loss": "Rate Loss",
-            "val_voltage_loss": "Voltage Reg.",
-            "val_regularizer_loss": "Weight Reg.",
-            "val_osi_dsi_loss": "OSI/DSI Loss",
-            "val_sync_loss": "Sync. Loss",
-            "val_loss": "Total Loss",
-        }
+        label_display_names = LOSS_DISPLAY_NAMES
 
         # Create directory for loss curves
         images_dir = os.path.join(self.logdir, 'Loss_curves')
@@ -1624,14 +1626,7 @@ class Callbacks:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
         plt.subplots_adjust(hspace=0.08)
 
-        # Use a professional colorblind-friendly palette
-        colors = {
-            "val_rate_loss": "#0077BB",  # Blue
-            "val_voltage_loss": "#33BBEE",  # Cyan
-            "val_regularizer_loss": "#009988",  # Teal
-            "val_osi_dsi_loss": "#EE7733",  # Orange
-            "val_sync_loss": "#CC3311",  # Red
-        }
+        colors = LOSS_COLORS
 
         # --- TOP SUBPLOT: STACKED AREA CHART ---
         valid_component_labels = [

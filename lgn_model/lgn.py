@@ -7,6 +7,7 @@ import pandas as pd
 import h5py
 import tensorflow as tf
 import matplotlib.pyplot as plt
+from v1_model_utils.tf_utils import replica_local_constant
 # import pdb
 
 try:
@@ -468,21 +469,24 @@ class LGN(object):
             spatial_range_indices = [np.asarray(a, dtype=np.int32) for a in loaded['spatial_range_indices']]
             sorted_neuron_ids_indices = np.asarray(loaded['sorted_neuron_ids_indices'], dtype=np.int32)
 
-        # Preprocess data tensors outside the loop if they don't change
+        # Preprocess data tensors outside the loop if they don't change. What
+        # spatial_response and firing_rates_from_spatial read is replica-local
+        # (see tf_utils.replica_local_constant): built under a distribution
+        # strategy, every replica filters its own stimuli from its own GPU.
         self.x = tf.constant(x, dtype=dtype)
         self.y = tf.constant(y, dtype=dtype)
         self.non_dominant_x = tf.constant(non_dominant_x, dtype=dtype)
         self.non_dominant_y = tf.constant(non_dominant_y, dtype=dtype)
-        self.amplitude = tf.constant(amplitude, dtype=dtype)
+        self.amplitude = replica_local_constant(amplitude, dtype)
         self.non_dom_amplitude = tf.constant(non_dom_amplitude, dtype=dtype)
         self.is_composite = tf.constant(is_composite, dtype=dtype)
-        self.spontaneous_firing_rates = tf.constant(spontaneous_firing_rates, dtype=dtype)
+        self.spontaneous_firing_rates = replica_local_constant(spontaneous_firing_rates, dtype)
 
-        self.dom_temporal_kernels = tf.convert_to_tensor(dom_temporal_kernels, dtype=dtype)
+        self.dom_temporal_kernels = replica_local_constant(dom_temporal_kernels, dtype)
         self.non_dom_temporal_kernels = tf.convert_to_tensor(non_dom_temporal_kernels, dtype=dtype)
         self.gaussian_filters = [tf.convert_to_tensor(gf, dtype=dtype) for gf in gaussian_filters]
         self.spatial_range_indices = spatial_range_indices
-        self.sorted_neuron_ids_indices = tf.convert_to_tensor(sorted_neuron_ids_indices, dtype=tf.int32)
+        self.sorted_neuron_ids_indices = replica_local_constant(sorted_neuron_ids_indices, tf.int64)
 
         self.vertical_filters = []
         self.horizontal_filters = []
@@ -503,7 +507,9 @@ class LGN(object):
                 strides=1,
                 padding='SAME',
             )
-            self.edge_reciprocals.append(tf.math.reciprocal(edge_fraction))
+            self.edge_reciprocals.append(
+                replica_local_constant(tf.math.reciprocal(edge_fraction))
+            )
 
         max_vertical = max(value.shape[0] for value in self.vertical_filters)
         max_horizontal = max(value.shape[1] for value in self.horizontal_filters)
@@ -530,19 +536,21 @@ class LGN(object):
             ],
             axis=2,
         )
-        self.packed_vertical_filters = tf.constant(packed_vertical, dtype=dtype)
-        self.packed_horizontal_filters = tf.constant(packed_horizontal, dtype=dtype)
+        self.packed_vertical_filters = replica_local_constant(packed_vertical, dtype)
+        self.packed_horizontal_filters = replica_local_constant(packed_horizontal, dtype)
 
         composite_mask = is_composite.astype(bool)
         composite_ids = np.flatnonzero(composite_mask).astype(np.int32)
         self.n_composite = composite_ids.size
-        self.composite_ids = tf.constant(composite_ids)
-        self.composite_non_dom_kernels = tf.gather(
-            self.non_dom_temporal_kernels, self.composite_ids, axis=1
+        self.composite_ids = replica_local_constant(composite_ids, tf.int64)
+        self.composite_non_dom_kernels = replica_local_constant(
+            tf.gather(self.non_dom_temporal_kernels, composite_ids, axis=1)
         )
-        self.composite_non_dom_amplitude = tf.gather(self.non_dom_amplitude, self.composite_ids)
-        self.composite_spontaneous_rates = tf.gather(
-            self.spontaneous_firing_rates, self.composite_ids
+        self.composite_non_dom_amplitude = replica_local_constant(
+            tf.gather(self.non_dom_amplitude, composite_ids)
+        )
+        self.composite_spontaneous_rates = replica_local_constant(
+            tf.gather(self.spontaneous_firing_rates, composite_ids)
         )
 
         self.dominant_sample_indices = []
@@ -558,16 +566,22 @@ class LGN(object):
             non_dominant_indices, non_dominant_weights = _bilinear_metadata(
                 non_dominant_x[selected_ids], non_dominant_y[selected_ids], col_size
             )
-            self.dominant_sample_indices.append(tf.constant(dominant_indices))
-            self.dominant_sample_weights.append(tf.constant(dominant_weights, dtype=dtype))
-            self.non_dominant_sample_indices.append(tf.constant(non_dominant_indices))
+            self.dominant_sample_indices.append(
+                replica_local_constant(dominant_indices, tf.int64)
+            )
+            self.dominant_sample_weights.append(
+                replica_local_constant(dominant_weights, dtype)
+            )
+            self.non_dominant_sample_indices.append(
+                replica_local_constant(non_dominant_indices, tf.int64)
+            )
             self.non_dominant_sample_weights.append(
-                tf.constant(non_dominant_weights, dtype=dtype)
+                replica_local_constant(non_dominant_weights, dtype)
             )
             grouped_composite_ids.append(selected_ids)
         grouped_composite_ids = np.concatenate(grouped_composite_ids)
-        self.composite_sort_indices = tf.constant(
-            np.argsort(grouped_composite_ids).astype(np.int32)
+        self.composite_sort_indices = replica_local_constant(
+            np.argsort(grouped_composite_ids), tf.int64
         )
 
     @tf.function
@@ -638,7 +652,8 @@ class LGN(object):
             tf.scatter_nd(
                 self.composite_ids[:, None],
                 tf.transpose(composite_firing_rates),
-                (tf.shape(all_spatial_responses)[1], tf.shape(all_spatial_responses)[0]),
+                (tf.shape(all_spatial_responses, out_type=tf.int64)[1],
+                 tf.shape(all_spatial_responses, out_type=tf.int64)[0]),
             )
         )
         return dom_firing_rates + non_dom_firing_rates

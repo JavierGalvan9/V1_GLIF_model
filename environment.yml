@@ -34,5 +34,7 @@ dependencies:
       - lz4==4.4.5
       - bmtk==1.2.0
       - tensorboard-plugin-profile==2.23.1
+      # NVML bindings: per-step GPU memory readout without spawning nvidia-smi.
+      - nvidia-ml-py==13.615.71
       - pytest==9.1.1
       - ruff==0.15.8
