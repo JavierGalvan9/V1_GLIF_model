@@ -1,6 +1,9 @@
 #if GOOGLE_CUDA
 #define EIGEN_USE_GPU
 
+#include <cub/device/device_select.cuh>
+#include <cub/iterator/counting_input_iterator.cuh>
+#include <cub/iterator/transform_input_iterator.cuh>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -8,83 +11,51 @@
 
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
+#include "tensorflow/core/framework/resource_mgr.h"
+#include "tensorflow/core/framework/resource_var.h"
 #include "tensorflow/core/util/gpu_kernel_helper.h"
 
 using namespace tensorflow;
 using GPUDevice = Eigen::GpuDevice;
 
-#ifndef V1_OPT_LARGE_PAIR_MODE
-#define V1_OPT_LARGE_PAIR_MODE 2
-#endif
-#ifndef V1_OPT_DIRECT64_WARPS
-#define V1_OPT_DIRECT64_WARPS 2
-#endif
-#ifndef V1_OPT_BACKWARD_THREADS
-#define V1_OPT_BACKWARD_THREADS 128
-#endif
-#ifndef V1_OPT_BATCH512_TILE
-#define V1_OPT_BATCH512_TILE 32
-#endif
-#ifndef V1_OPT_BATCH512_THREADS
-#define V1_OPT_BATCH512_THREADS 128
-#endif
-#ifndef V1_THREADS
-#define V1_THREADS 128
-#endif
-#ifndef V1_BATCH32_TILE
-#define V1_BATCH32_TILE 4
-#endif
-#ifndef V1_WARP_REDUCTION
-#define V1_WARP_REDUCTION 0
-#endif
-#ifndef V1_HALF2_PROJECTION
-#define V1_HALF2_PROJECTION 0
-#endif
-#ifndef V1_WARP_PER_ROW
-#define V1_WARP_PER_ROW 0
-#endif
-#ifndef V1_LARGE_BACKWARD_TILE
-#define V1_LARGE_BACKWARD_TILE 32
-#endif
-#ifndef V1_PREPROJECT
-#define V1_PREPROJECT 0
-#endif
-#ifndef V1_PAIR_PREPROJECT
-#define V1_PAIR_PREPROJECT 0
-#endif
 #ifndef V1_FORWARD_THREADS
 #define V1_FORWARD_THREADS 128
-#endif
-#ifndef V1_FORWARD_HALF2_ATOMICS
-#define V1_FORWARD_HALF2_ATOMICS 0
 #endif
 #ifndef V1_FORWARD_FLOAT_ACCUM
 #define V1_FORWARD_FLOAT_ACCUM 0
 #endif
-#ifndef V1_FORWARD_GROUPED
-#define V1_FORWARD_GROUPED 0
-#endif
 #ifndef V1_DIRECT_CSR
 #define V1_DIRECT_CSR 0
-#endif
-// Enables the packed batch-lane backward specialization. It uses no tensor
-// cores -- only vector loads and warp shuffles -- but it is qualified on SM120
-// only, so older architectures keep the batch-lane path until measured.
-#ifndef V1_PACKED_BACKWARD
-#define V1_PACKED_BACKWARD 0
 #endif
 
 // With direct-CSR weights the caller keeps `weights` and `weight_grad` in CSR
 // edge order, so the CSR position is the weight index and the effectively
 // random `edge_ids[csr]` gather disappears from every inner loop. The choice is
-// global: forward and backward, and every batch specialization, must agree.
+// global: forward and backward must agree.
 #if V1_DIRECT_CSR
 #define V1_EDGE_INDEX(csr) (csr)
 #else
 #define V1_EDGE_INDEX(csr) (edge_ids[csr])
 #endif
 
-constexpr int kThreads = V1_THREADS;
+#include "event_weight_grad.cuh"
+
+// The forward's device-built active-row queue packs one (batch, presynaptic
+// row) entry as `batch << kQueueRowBits | row`. 611,448 rows on the
+// 203,816-neuron network needs 20 bits; 21 leaves room to 2,097,152 rows and
+// 11 bits of batch. The entries are plain `unsigned int`, not `uint32`: the
+// resource library compiles this file with `uint32` redefined as a signed type,
+// and a signed shift would corrupt batch indices of 1024 and above.
+constexpr int kQueueRowBits = 21;
+constexpr int64_t kQueueMaxRows = int64_t{1} << kQueueRowBits;
+constexpr int64_t kQueueMaxBatch = int64_t{1} << (32 - kQueueRowBits);
+// Backward row kernel: one CSR row per warp, four warps per block.
+constexpr int kBackwardRowsPerBlock = 4;
+
+// A synapse type's four FP32 basis values in one vector load.
+__device__ __forceinline__ ::float4 LoadBasis4(const float* basis, int type) {
+  return *reinterpret_cast<const ::float4*>(basis + type * 4);
+}
 
 template <typename T>
 __device__ __forceinline__ float AsFloat(T value) {
@@ -111,138 +82,223 @@ __device__ __forceinline__ void AtomicAddValue<Eigen::half>(
   atomicAdd(reinterpret_cast<__half*>(address), __float2half(value));
 }
 
-template <typename T, int kBasis>
-struct BasisProjection {
-  __device__ __forceinline__ static float Apply(const T* upstream,
-                                                 const T* basis, int type,
-                                                 int n_basis) {
-    float result = 0.0f;
-#pragma unroll
-    for (int receptor = 0; receptor < kBasis; ++receptor) {
-      result += AsFloat(upstream[receptor]) *
-                AsFloat(basis[type * kBasis + receptor]);
-    }
-    return result;
+// Two adjacent receptors in one atomic where the element type allows it.
+template <typename O>
+__device__ __forceinline__ void AtomicAddPair(O* address, float first, float second) {
+  if constexpr (std::is_same<O, Eigen::half>::value) {
+    atomicAdd(reinterpret_cast<__half2*>(address), __floats2half2_rn(first, second));
+  } else {
+    atomicAdd(address, first);
+    atomicAdd(address + 1, second);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Forward
+// ---------------------------------------------------------------------------
+
+// The device-built list of active (batch, presynaptic row) slots the scatter
+// forward visits, as an ordered stream compaction: `tf.where` computed the same
+// list, but it copies the count to the host to size its output and blocks every
+// forward on that round trip. Here the queue is sized for every slot and the
+// count stays on the device. The order is the row-major slot order, which is
+// what makes concurrent blocks scatter into the same few samples' currents and,
+// with the Morton layout, into neighbouring postsynaptic neurons.
+struct PackActiveSlot {
+  int64_t n_pre;
+  __host__ __device__ unsigned int operator()(int64_t index) const {
+    return static_cast<unsigned int>(((index / n_pre) << kQueueRowBits) | (index % n_pre));
   }
 };
 
 template <typename T>
-struct BasisProjection<T, 0> {
-  __device__ __forceinline__ static float Apply(const T* upstream,
-                                                 const T* basis, int type,
-                                                 int n_basis) {
-    float result = 0.0f;
-    for (int receptor = 0; receptor < n_basis; ++receptor) {
-      result += AsFloat(upstream[receptor]) *
-                AsFloat(basis[type * n_basis + receptor]);
+struct SlotIsActive {
+  const T* spikes;
+  __host__ __device__ bool operator()(int64_t index) const {
+    return static_cast<float>(spikes[index]) != 0.0f;
+  }
+};
+
+template <typename T>
+Status BuildActiveQueue(OpKernelContext* context, const T* spikes, int64_t slots,
+                        int64_t n_pre, unsigned int* queue, unsigned int* queue_count) {
+  const cub::CountingInputIterator<int64_t> indices(0);
+  const cub::TransformInputIterator<unsigned int, PackActiveSlot,
+                                    cub::CountingInputIterator<int64_t>>
+      packed(indices, PackActiveSlot{n_pre});
+  const cub::TransformInputIterator<bool, SlotIsActive<T>,
+                                    cub::CountingInputIterator<int64_t>>
+      active(indices, SlotIsActive<T>{spikes});
+  auto stream = context->eigen_device<GPUDevice>().stream();
+  size_t scratch_bytes = 0;
+  cub::DeviceSelect::Flagged(nullptr, scratch_bytes, packed, active, queue, queue_count,
+                             slots, stream);
+  Tensor scratch;
+  TF_RETURN_IF_ERROR(context->allocate_temp(
+      DT_INT8, TensorShape({static_cast<int64_t>(scratch_bytes)}), &scratch));
+  if (cub::DeviceSelect::Flagged(scratch.flat<int8>().data(), scratch_bytes, packed, active,
+                                 queue, queue_count, slots, stream) != cudaSuccess) {
+    return errors::Internal("building the active-row queue failed");
+  }
+  return OkStatus();
+}
+
+// Sums each of `values` over the lanes of this lane's run (the lanes `group`
+// names, which are contiguous) that sit at or above it: a segmented
+// Hillis-Steele suffix scan, so the run's lowest lane ends up holding the run's
+// totals. Membership of `lane + offset` is tested once per step for all values.
+template <int kValues>
+__device__ __forceinline__ void RunSuffixSums(float (&values)[kValues], unsigned int group,
+                                              int lane) {
+#pragma unroll
+  for (int offset = 1; offset < 32; offset <<= 1) {
+    const int source = lane + offset;
+    const bool take = source < 32 && ((group >> source) & 1u);
+#pragma unroll
+    for (int index = 0; index < kValues; ++index) {
+      const float other = __shfl_down_sync(0xffffffffu, values[index], offset);
+      if (take) values[index] += other;
     }
-    return result;
   }
-};
+}
 
-#if V1_HALF2_PROJECTION
-template <>
-struct BasisProjection<Eigen::half, 4> {
-  __device__ __forceinline__ static float Apply(const Eigen::half* upstream,
-                                                 const Eigen::half* basis,
-                                                 int type, int n_basis) {
-    const __half2 upstream01 = *reinterpret_cast<const __half2*>(upstream);
-    const __half2 upstream23 = *reinterpret_cast<const __half2*>(upstream + 2);
-    const Eigen::half* type_basis = basis + type * 4;
-    const __half2 basis01 = *reinterpret_cast<const __half2*>(type_basis);
-    const __half2 basis23 = *reinterpret_cast<const __half2*>(type_basis + 2);
-    const float2 u01 = __half22float2(upstream01);
-    const float2 u23 = __half22float2(upstream23);
-    const float2 b01 = __half22float2(basis01);
-    const float2 b23 = __half22float2(basis23);
-    return fmaf(u01.x, b01.x,
-                fmaf(u01.y, b01.y,
-                     fmaf(u23.x, b23.x, u23.y * b23.y)));
-  }
-};
-#endif
-
-template <typename T, typename W, typename O, int kBasis, int kBatch>
+// Scatter forward over the ordered device-built queue. A fixed grid consumes a
+// queue whose length only the device knows, each block taking the next slots
+// from an atomic ticket, so consumption follows queue order: the atomics at any
+// moment land in a few samples' currents and stay in L2. (A static stride over
+// the same ordered queue lets blocks drift apart; once the currents outgrow L2
+// it measured 1.5x slower at batch 128 and 3.2x at 512 on the 203,816-neuron
+// network, for at most 0.02 ms gained at batch <= 32.)
+// The ticket also balances the heavy-tailed row lengths. A ticket covers
+// `slots_per_ticket` consecutive slots, about 1,024 edges of work: one long LGN
+// row (~5,500 edges), or seven short recurrent ones (~140), which keeps the
+// ticket from becoming the bottleneck when rows are short and numerous. Each
+// slot takes the whole block, so concurrent atomics stay on neighbouring
+// targets; giving each warp its own slot measured 1.4-2x slower.
+//
+// With kAggregate, contributions from edges of the same row that land on the
+// same postsynaptic neuron are summed in FP32 registers and committed by a
+// single lane: fewer atomics, and the sum happens in FP32 rather than through
+// repeated narrow read-modify-writes, so it is also more accurate. LGN rows
+// average 1.42 edges per target (one per synapse type), which is where this
+// pays. Recurrent rows never repeat a target (the connectivity says so, see
+// csr_order.repeats_targets), so they take a plain one-thread-per-edge scatter
+// with no warp collectives.
+//
+// Aggregation relies on the CSR invariant that postsynaptic ids ascend within a
+// row, so a run occupies consecutive lanes. Its loop is warp-uniform (every
+// lane of a warp shares `base`) because __match_any_sync requires all named
+// lanes to arrive together. kBasis == 4 unrolls the receptors; 0 loops over
+// `n_basis`.
+template <typename T, typename W, typename O, int kBasis, bool kAggregate>
 __global__ void ForwardKernel(
-    int64_t n_active, int64_t n_pre, int n_post, int n_basis,
-    const T* spikes, const int64_t* active, const W* weights,
-    const uint32* post_ids, const uint8* synapse_types,
-    const uint32* row_splits, const uint32* edge_ids, const T* basis,
+    int64_t n_pre, int n_post, int n_basis, const T* spikes,
+    const unsigned int* queue, const unsigned int* queue_count, unsigned int* ticket,
+    unsigned int slots_per_ticket,
+    const W* weights, const uint32* post_ids, const uint8* synapse_types,
+    const uint32* row_splits, const uint32* edge_ids, const float* basis,
     O* currents) {
-  const int64_t active_id = blockIdx.x;
-  if (active_id >= n_active) return;
-  const int64_t batch = active[2 * active_id];
-  if (kBatch != 0 && batch >= kBatch) return;
-  const int64_t pre = active[2 * active_id + 1];
-  const float spike = AsFloat(spikes[batch * n_pre + pre]);
-  const uint32 start = row_splits[pre];
-  const uint32 end = row_splits[pre + 1];
-  for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
-    const uint32 edge = V1_EDGE_INDEX(csr);
-    const uint32 post = post_ids[csr];
-    const uint32 type = synapse_types[csr];
-    const float weighted_spike = spike * AsFloat(weights[edge]);
-    O* output = currents +
-                (batch * static_cast<int64_t>(n_post) + post) * n_basis;
-    if (kBasis == 4) {
-#if V1_FORWARD_HALF2_ATOMICS
-      if constexpr (std::is_same<T, Eigen::half>::value) {
-        const Eigen::half* type_basis = basis + type * 4;
-        const float2 basis01 = __half22float2(
-            *reinterpret_cast<const __half2*>(type_basis));
-        const float2 basis23 = __half22float2(
-            *reinterpret_cast<const __half2*>(type_basis + 2));
-        if constexpr (std::is_same<O, Eigen::half>::value) {
-          atomicAdd(reinterpret_cast<__half2*>(output),
-                    __floats2half2_rn(weighted_spike * basis01.x,
-                                      weighted_spike * basis01.y));
-          atomicAdd(reinterpret_cast<__half2*>(output + 2),
-                    __floats2half2_rn(weighted_spike * basis23.x,
-                                      weighted_spike * basis23.y));
-        } else {
-          atomicAdd(output, weighted_spike * basis01.x);
-          atomicAdd(output + 1, weighted_spike * basis01.y);
-          atomicAdd(output + 2, weighted_spike * basis23.x);
-          atomicAdd(output + 3, weighted_spike * basis23.y);
-        }
-      } else {
-#pragma unroll
-        for (int receptor = 0; receptor < 4; ++receptor) {
-          AtomicAddValue(output + receptor,
-                         weighted_spike * AsFloat(basis[type * 4 + receptor]));
-        }
-      }
-#else
-#pragma unroll
-      for (int receptor = 0; receptor < 4; ++receptor) {
-        AtomicAddValue(output + receptor,
-                       weighted_spike * AsFloat(basis[type * 4 + receptor]));
-      }
-#endif
-    } else {
-      if constexpr (std::is_same<T, Eigen::half>::value &&
-                    std::is_same<O, Eigen::half>::value) {
-        if ((n_basis & 1) == 0) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int warps = blockDim.x >> 5;
+  const unsigned int total = *queue_count;
+  const int basis_width = kBasis == 4 ? 4 : n_basis;
+  __shared__ unsigned int next_slot;
+
+  for (;;) {
+    if (threadIdx.x == 0) next_slot = atomicAdd(ticket, slots_per_ticket);
+    __syncthreads();
+    const unsigned int first_slot = next_slot;
+    __syncthreads();   // every thread has read it before thread 0 overwrites it
+    if (first_slot >= total) break;
+    const unsigned int last_slot = min(first_slot + slots_per_ticket, total);
+  for (unsigned int active_id = first_slot; active_id < last_slot; ++active_id) {
+    const unsigned int packed = queue[active_id];
+    const int64_t batch = packed >> kQueueRowBits;
+    const int64_t pre = packed & ((1u << kQueueRowBits) - 1);
+    const float spike = AsFloat(spikes[batch * n_pre + pre]);
+    const uint32 start = row_splits[pre];
+    const uint32 end = row_splits[pre + 1];
+
+    if constexpr (!kAggregate) {
+      for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
+        const float weighted = spike * AsFloat(weights[V1_EDGE_INDEX(csr)]);
+        const int type = synapse_types[csr];
+        O* output =
+            currents + (batch * static_cast<int64_t>(n_post) + post_ids[csr]) * basis_width;
+        if constexpr (kBasis == 4) {
+          const ::float4 bv = LoadBasis4(basis, type);
+          AtomicAddPair(output, weighted * bv.x, weighted * bv.y);
+          AtomicAddPair(output + 2, weighted * bv.z, weighted * bv.w);
+        } else if ((n_basis & 1) == 0) {
           for (int receptor = 0; receptor < n_basis; receptor += 2) {
-            const float2 pair = __half22float2(*reinterpret_cast<const __half2*>(
-                basis + type * n_basis + receptor));
-            atomicAdd(reinterpret_cast<__half2*>(output + receptor),
-                      __floats2half2_rn(weighted_spike * pair.x,
-                                        weighted_spike * pair.y));
+            AtomicAddPair(output + receptor, weighted * basis[type * n_basis + receptor],
+                          weighted * basis[type * n_basis + receptor + 1]);
           }
         } else {
           for (int receptor = 0; receptor < n_basis; ++receptor) {
-            AtomicAddValue(output + receptor, weighted_spike *
-                           AsFloat(basis[type * n_basis + receptor]));
+            AtomicAddValue(output + receptor, weighted * basis[type * n_basis + receptor]);
           }
         }
+      }
+      continue;
+    }
+
+    for (uint32 base = start + warp * 32; base < end; base += warps * 32) {
+      const uint32 csr = base + lane;
+      const bool valid = csr < end;
+      // Invalid lanes take a post no real edge can have, so they form their own
+      // singleton run and never merge with a live one.
+      const unsigned int post = valid ? post_ids[csr] : 0xffffffffu;
+      const float weighted = valid ? spike * AsFloat(weights[V1_EDGE_INDEX(csr)]) : 0.0f;
+      const int type = valid ? synapse_types[csr] : 0;
+      const unsigned int group = __match_any_sync(0xffffffffu, post);
+      // When every run in the warp is a singleton the scan cannot move anything,
+      // and one vote is far cheaper than the shuffles.
+      const bool any_run = !__all_sync(0xffffffffu, __popc(group) == 1);
+      const bool leader = valid && lane == __ffs(group) - 1;
+      O* output = currents + (batch * static_cast<int64_t>(n_post) + post) * basis_width;
+      if constexpr (kBasis == 4) {
+        const ::float4 bv = LoadBasis4(basis, type);
+        float value[4] = {weighted * bv.x, weighted * bv.y, weighted * bv.z, weighted * bv.w};
+        if (any_run) RunSuffixSums(value, group, lane);
+        if (leader) {
+          AtomicAddPair(output, value[0], value[1]);
+          AtomicAddPair(output + 2, value[2], value[3]);
+        }
       } else {
-        for (int receptor = 0; receptor < n_basis; ++receptor) {
-          AtomicAddValue(output + receptor, weighted_spike *
-                         AsFloat(basis[type * n_basis + receptor]));
+        // A half2 atomic needs a 4-byte aligned address, which every receptor
+        // pair has only when the row width is even.
+        const bool paired = (n_basis & 1) == 0;
+        for (int receptor = 0; receptor < n_basis; receptor += paired ? 2 : 1) {
+          float value[2] = {weighted * basis[type * n_basis + receptor],
+                            paired ? weighted * basis[type * n_basis + receptor + 1] : 0.0f};
+          if (any_run) RunSuffixSums(value, group, lane);
+          if (!leader) continue;
+          if (paired) {
+            AtomicAddPair(output + receptor, value[0], value[1]);
+          } else {
+            AtomicAddValue(output + receptor, value[0]);
+          }
         }
       }
     }
+  }
+  }
+}
+
+// The inverse of CastForwardOutputKernel. With V1_FORWARD_FLOAT_ACCUM the
+// scatter lands in an fp32 side buffer, so that buffer -- not `output` -- is
+// what the kernel accumulates onto. `output` has already been seeded by the op
+// with the `initial` tensor (the LGN -> BKG -> recurrent accumulator chain) or
+// with zeros, so the fp32 buffer must start from it. Memsetting it to zero
+// instead silently drops `initial`.
+template <typename T>
+__global__ void SeedForwardAccumKernel(int64_t elements, const T* input,
+                                       float* output) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    output[index] = AsFloat(input[index]);
   }
 }
 
@@ -255,375 +311,227 @@ __global__ void CastForwardOutputKernel(int64_t elements, const float* input,
   }
 }
 
-template <typename T, typename W, int kBasis, int kBatch>
-__global__ void ForwardGroupedStaticBatchKernel(
-    int64_t n_active_rows, int64_t n_pre, int n_post, int n_basis,
-    const T* spikes, const int64_t* active_rows, const W* weights,
-    const uint32* post_ids, const uint8* synapse_types,
-    const uint32* row_splits, const uint32* edge_ids, const T* basis,
-    T* currents) {
-  const int64_t row_id = blockIdx.x;
-  if (row_id >= n_active_rows) return;
-  const uint32 pre = static_cast<uint32>(active_rows[2 * row_id + 1]);
-  constexpr int kMasks = (kBatch + 31) / 32;
-  __shared__ uint32 batch_masks[kMasks];
-  if (threadIdx.x < 32) {
-    for (int mask_id = 0; mask_id < kMasks; ++mask_id) {
-      const int batch = mask_id * 32 + threadIdx.x;
-      const bool active = batch < kBatch &&
-                          AsFloat(spikes[batch * n_pre + pre]) != 0.0f;
-      const uint32 mask = __ballot_sync(0xffffffff, active);
-      if (threadIdx.x == 0) batch_masks[mask_id] = mask;
-    }
+template <typename T, typename W, int kBasis>
+Status LaunchForward(OpKernelContext* context, const Tensor& spikes,
+                     const Tensor& weights, const Tensor& post_ids,
+                     const Tensor& synapse_types, const Tensor& row_splits,
+                     const Tensor& edge_ids, const Tensor& basis, int n_post,
+                     bool aggregate_runs, Tensor* output) {
+  const int64_t batch = spikes.dim_size(0);
+  const int64_t n_pre = spikes.dim_size(1);
+  if (n_pre > kQueueMaxRows || batch > kQueueMaxBatch) {
+    return errors::InvalidArgument(
+        "the active-row queue packs a row into ", kQueueRowBits, " bits and a batch "
+        "index into the remaining ", 32 - kQueueRowBits, "; got ", n_pre, " rows and a "
+        "batch of ", batch);
   }
-  __syncthreads();
-  for (uint32 csr = row_splits[pre] + threadIdx.x;
-       csr < row_splits[pre + 1]; csr += blockDim.x) {
-    const uint32 edge = V1_EDGE_INDEX(csr);
-    const uint32 post = post_ids[csr];
-    const uint32 type = synapse_types[csr];
-    const float weight = AsFloat(weights[edge]);
-    for (int mask_id = 0; mask_id < kMasks; ++mask_id) {
-      uint32 remaining = batch_masks[mask_id];
-      while (remaining != 0) {
-      const int batch = mask_id * 32 + __ffs(remaining) - 1;
-      remaining &= remaining - 1;
-      const float weighted_spike =
-          AsFloat(spikes[batch * n_pre + pre]) * weight;
-      T* output = currents +
-                  (batch * static_cast<int64_t>(n_post) + post) * n_basis;
-      if constexpr (std::is_same<T, Eigen::half>::value) {
-        const Eigen::half* type_basis = basis + type * 4;
-        const float2 basis01 = __half22float2(
-            *reinterpret_cast<const __half2*>(type_basis));
-        const float2 basis23 = __half22float2(
-            *reinterpret_cast<const __half2*>(type_basis + 2));
-        atomicAdd(reinterpret_cast<__half2*>(output),
-                  __floats2half2_rn(weighted_spike * basis01.x,
-                                    weighted_spike * basis01.y));
-        atomicAdd(reinterpret_cast<__half2*>(output + 2),
-                  __floats2half2_rn(weighted_spike * basis23.x,
-                                    weighted_spike * basis23.y));
-      } else {
+  const int64_t slots = spikes.NumElements();
+  if (slots == 0) return OkStatus();
+  const int n_basis = basis.dim_size(1);
+  auto device = context->eigen_device<GPUDevice>();
+  // One slot per (batch, row): 78 MiB at batch 32 on the 203,816-neuron
+  // network, and a temp, so it lives only for the op.
+  Tensor queue_tensor;
+  unsigned int* queue;
+  TF_RETURN_IF_ERROR(AllocateQueueWords(context, slots + 2, &queue_tensor, &queue));
+  unsigned int* queue_count = queue + slots;   // then the consumers' ticket
+  cudaMemsetAsync(queue_count, 0, 2 * sizeof(unsigned int), device.stream());
+  TF_RETURN_IF_ERROR(BuildActiveQueue<T>(context, spikes.flat<T>().data(), slots, n_pre,
+                                         queue, queue_count));
+  // About 1,024 edges of work per ticket; see ForwardKernel.
+  const int64_t mean_edges = std::max<int64_t>(1, post_ids.NumElements() / n_pre);
+  const unsigned int slots_per_ticket =
+      static_cast<unsigned int>(std::clamp<int64_t>(1024 / mean_edges, 1, 8));
+#define LAUNCH_FORWARD_WITH(OUTPUT_TYPE, OUTPUT_PTR, AGGREGATE)                \
+  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                          \
+      ForwardKernel<T, W, OUTPUT_TYPE, kBasis, AGGREGATE>, kEventBlocks,       \
+      V1_FORWARD_THREADS, 0, device.stream(), n_pre, n_post, n_basis,          \
+      spikes.flat<T>().data(), queue, queue_count, queue_count + 1,            \
+      slots_per_ticket,                                                        \
+      weights.flat<W>().data(),                                                \
+      post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(),      \
+      row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(),        \
+      basis.flat<float>().data(), OUTPUT_PTR))
+#define LAUNCH_FORWARD(OUTPUT_TYPE, OUTPUT_PTR)                                 \
+  if (aggregate_runs) {                                                        \
+    LAUNCH_FORWARD_WITH(OUTPUT_TYPE, OUTPUT_PTR, true);                        \
+  } else {                                                                     \
+    LAUNCH_FORWARD_WITH(OUTPUT_TYPE, OUTPUT_PTR, false);                       \
+  }
+#if V1_FORWARD_FLOAT_ACCUM
+  Tensor accumulation;
+  TF_RETURN_IF_ERROR(context->allocate_temp(DT_FLOAT, output->shape(), &accumulation));
+  constexpr int kElementThreads = 256;
+  const int64_t elements = output->NumElements();
+  const int element_blocks =
+      static_cast<int>((elements + kElementThreads - 1) / kElementThreads);
+  TF_RETURN_IF_ERROR(GpuLaunchKernel(
+      SeedForwardAccumKernel<T>, element_blocks, kElementThreads, 0, device.stream(),
+      elements, output->flat<T>().data(), accumulation.flat<float>().data()));
+  LAUNCH_FORWARD(float, accumulation.flat<float>().data());
+  TF_RETURN_IF_ERROR(GpuLaunchKernel(
+      CastForwardOutputKernel<T>, element_blocks, kElementThreads, 0, device.stream(),
+      elements, accumulation.flat<float>().data(), output->flat<T>().data()));
+#else
+  LAUNCH_FORWARD(T, output->flat<T>().data());
+#endif
+#undef LAUNCH_FORWARD
+#undef LAUNCH_FORWARD_WITH
+  return OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Backward
+//
+// The spike gradient is an SpMM over the compact (postsynaptic neuron, synapse
+// type) pairs: each distinct pair is projected onto the basis once instead of
+// once per edge (1,675,972 pairs for 84,145,692 edges on the 203,816-neuron
+// network), and a row kernel sums projection * weight over each row's edges.
+// The weight gradient is the event-driven SDDMM in event_weight_grad.cuh.
+//
+// The batch is processed in slices of kSlice = min(32, next power of two)
+// samples, the projection is laid out [pair, batch_stride] with batch_stride a
+// whole number of slices, and one grid row of the SpMM runs per slice. Padding
+// samples project to zero and are never written back.
+// ---------------------------------------------------------------------------
+
+// Largest finite |current_grad|, as raw float bits in a uint32. Non-negative
+// floats order identically to their bit patterns, so an integer atomicMax is a
+// float max. Non-finite entries are skipped on purpose: the backward
+// legitimately propagates NaNs from `current_grad`, and letting one NaN poison
+// the scale would turn every spike gradient into a NaN instead of only the
+// affected ones.
+template <typename T>
+__global__ void AbsMaxFiniteKernel(int64_t elements, const T* values,
+                                   unsigned int* result) {
+  float local = 0.0f;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const float value = fabsf(AsFloat(values[index]));
+    if (isfinite(value) && value > local) local = value;
+  }
 #pragma unroll
-        for (int receptor = 0; receptor < 4; ++receptor) {
-          AtomicAddValue(output + receptor,
-                         weighted_spike * AsFloat(basis[type * 4 + receptor]));
-        }
-      }
-      }
-    }
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    local = fmaxf(local, __shfl_xor_sync(0xffffffff, local, mask));
+  }
+  if ((threadIdx.x & 31) == 0 && local > 0.0f) {
+    atomicMax(result, __float_as_uint(local));
   }
 }
 
-template <typename T, typename W, int kBasis, int kTile>
-__global__ void BackwardRuntimeBatchKernel(
-    int64_t batch_size, int64_t n_pre, int n_post, int n_basis, const T* spikes,
-    const T* current_grad, const W* weights, const uint32* post_ids,
-    const uint8* synapse_types, const uint32* row_splits,
-    const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const T* basis, const T* dampening, T* spike_grad,
-    float* weight_grad) {
-  __shared__ float reduction[kTile][kThreads];
-  const int64_t tile_id = blockIdx.x / n_rows;
-  const int64_t row_id = blockIdx.x - tile_id * n_rows;
-  if (row_id >= n_rows) return;
-  const int64_t first_batch = tile_id * kTile;
-  const uint32 pre = nonempty_rows[row_id];
-  float local_spike_grad[kTile] = {};
-    const uint32 start = row_splits[pre];
-    const uint32 end = row_splits[pre + 1];
-    for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
-      const uint32 edge = V1_EDGE_INDEX(csr);
-      const uint32 post = post_ids[csr];
-      const uint32 type = synapse_types[csr];
-    float tile_weight_grad = 0.0f;
-#pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      const int64_t batch = first_batch + offset;
-      if (batch < batch_size) {
-        const T* upstream = current_grad +
-                            (batch * static_cast<int64_t>(n_post) + post) *
-                                n_basis;
-        const float projected = BasisProjection<T, kBasis>::Apply(
-            upstream, basis, type, n_basis);
-        local_spike_grad[offset] += projected * AsFloat(weights[edge]);
-        tile_weight_grad += projected * AsFloat(spikes[batch * n_pre + pre]);
-      }
+// Turn that bound into a power-of-two scale that puts the largest projection
+// near 8192, three binades below fp16's 65504 ceiling.
+//
+// With FP16 spikes the pair projection is stored as FP16, which halves the row
+// kernel's hottest gather and makes the 16-byte packed load possible. The
+// values are an fp16 upstream gradient dotted with the basis, so unscaled they
+// sit near fp16's 6e-5 flush-to-zero floor; the scale removes that underflow. A
+// power of two is exact in both directions, so the only error introduced is
+// mantissa rounding, and the spike gradient is linear in the projection, so
+// the row kernel undoes the scale once after its FP32 accumulation.
+//
+// |projected| <= max|current_grad| * max_type sum_r |basis[type][r]|, so the
+// bound is exact and one pass over `current_grad` suffices -- the projection
+// itself never has to be measured.
+__global__ void ProjectionScaleKernel(const unsigned int* max_bits, const float* basis,
+                                      int n_types, int n_basis, float* scale_out) {
+  // One warp: each lane takes every 32nd synapse type, then a max-reduce.
+  // Row sums keep their receptor order and max is order-independent, so the
+  // scale is bit-identical to a serial loop -- which, as one thread doing 360
+  // dependent global loads, cost ~18 us per call.
+  float basis_l1 = 0.0f;
+  for (int type = threadIdx.x; type < n_types; type += 32) {
+    float row = 0.0f;
+    for (int receptor = 0; receptor < n_basis; ++receptor) {
+      row += fabsf(basis[type * n_basis + receptor]);
     }
-    if (tile_weight_grad != 0.0f) {
-      if (batch_size <= kTile) {
-        weight_grad[edge] = tile_weight_grad;
-      } else {
-        atomicAdd(weight_grad + edge, tile_weight_grad);
-      }
-    }
+    basis_l1 = fmaxf(basis_l1, row);
   }
 #pragma unroll
-  for (int offset = 0; offset < kTile; ++offset) {
-    reduction[offset][threadIdx.x] = local_spike_grad[offset];
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    basis_l1 = fmaxf(basis_l1, __shfl_xor_sync(0xffffffffu, basis_l1, offset));
   }
-  __syncthreads();
-  for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-#pragma unroll
-      for (int offset = 0; offset < kTile; ++offset) {
-        reduction[offset][threadIdx.x] +=
-            reduction[offset][threadIdx.x + stride];
-      }
-    }
-    __syncthreads();
+  if (threadIdx.x != 0) return;
+  const float bound = __uint_as_float(*max_bits) * basis_l1;
+  float scale = 1.0f;
+  if (isfinite(bound) && bound > 0.0f) {
+    scale = exp2f(floorf(log2f(8192.0f / bound)));
+    if (!isfinite(scale) || scale <= 0.0f) scale = 1.0f;
   }
-  if (threadIdx.x == 0) {
-#pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      const int64_t batch = first_batch + offset;
-      if (batch < batch_size) {
-        spike_grad[batch * n_pre + pre] =
-            FromFloat<T>(reduction[offset][0] * AsFloat(*dampening));
-      }
-    }
-  }
-}
-
-template <typename T, typename W, int kBasis, int kBatch, int kTile>
-__global__ void BackwardStaticBatchKernel(
-    int64_t n_pre, int n_post, int n_basis, const T* spikes,
-    const T* current_grad, const W* weights, const uint32* post_ids,
-    const uint8* synapse_types, const uint32* row_splits,
-    const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const T* basis, const T* dampening, T* spike_grad,
-    float* weight_grad) {
-  static_assert(kBatch % kTile == 0, "batch tiles must divide the batch");
-#if V1_WARP_REDUCTION
-  constexpr int kWarps = (kThreads + 31) / 32;
-  __shared__ float reduction[kTile][kWarps];
-#else
-  __shared__ float reduction[kTile][kThreads];
-#endif
-  const int64_t tile_id = blockIdx.x / n_rows;
-  const int64_t row_id = blockIdx.x - tile_id * n_rows;
-  if (row_id >= n_rows) return;
-  const int first_batch = static_cast<int>(tile_id) * kTile;
-  const uint32 pre = nonempty_rows[row_id];
-  float local_spike_grad[kTile] = {};
-  const uint32 start = row_splits[pre];
-  const uint32 end = row_splits[pre + 1];
-  for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
-    const uint32 edge = V1_EDGE_INDEX(csr);
-    const uint32 post = post_ids[csr];
-    const uint32 type = synapse_types[csr];
-    float tile_weight_grad = 0.0f;
-#pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      const int batch = first_batch + offset;
-      const T* upstream = current_grad +
-                          (batch * static_cast<int64_t>(n_post) + post) *
-                              n_basis;
-      const float projected = BasisProjection<T, kBasis>::Apply(
-          upstream, basis, type, n_basis);
-      local_spike_grad[offset] += projected * AsFloat(weights[edge]);
-      tile_weight_grad += projected * AsFloat(spikes[batch * n_pre + pre]);
-    }
-    if (tile_weight_grad != 0.0f) {
-      if (kBatch <= kTile) {
-        weight_grad[edge] = tile_weight_grad;
-      } else {
-        atomicAdd(weight_grad + edge, tile_weight_grad);
-      }
-    }
-  }
-#if V1_WARP_REDUCTION
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-#pragma unroll
-  for (int offset = 0; offset < kTile; ++offset) {
-    float value = local_spike_grad[offset];
-#pragma unroll
-    for (int delta = 16; delta > 0; delta >>= 1) {
-      value += __shfl_down_sync(0xffffffff, value, delta);
-    }
-    if (lane == 0) reduction[offset][warp] = value;
-  }
-  __syncthreads();
-  if (warp == 0) {
-#pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      float value = lane < kWarps ? reduction[offset][lane] : 0.0f;
-#pragma unroll
-      for (int delta = 16; delta > 0; delta >>= 1) {
-        value += __shfl_down_sync(0xffffffff, value, delta);
-      }
-      if (lane == 0) {
-        const int batch = first_batch + offset;
-        spike_grad[batch * n_pre + pre] =
-            FromFloat<T>(value * AsFloat(*dampening));
-      }
-    }
-  }
-#else
-#pragma unroll
-  for (int offset = 0; offset < kTile; ++offset) {
-    reduction[offset][threadIdx.x] = local_spike_grad[offset];
-  }
-  __syncthreads();
-  for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-#pragma unroll
-      for (int offset = 0; offset < kTile; ++offset) {
-        reduction[offset][threadIdx.x] += reduction[offset][threadIdx.x + stride];
-      }
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) {
-#pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      const int batch = first_batch + offset;
-      spike_grad[batch * n_pre + pre] =
-          FromFloat<T>(reduction[offset][0] * AsFloat(*dampening));
-    }
-  }
-#endif
-}
-
-template <typename T, typename W, int kBasis, int kBatch, int kTile,
-          int kBlockThreads>
-__global__ void BackwardWarpPerRowStaticBatchKernel(
-    int64_t n_pre, int n_post, int n_basis, const T* spikes,
-    const T* current_grad, const W* weights, const uint32* post_ids,
-    const uint8* synapse_types, const uint32* row_splits,
-    const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const T* basis, const float* preprojected, int n_types,
-    const uint32* pair_ids, int64_t n_pairs,
-    const T* dampening, T* spike_grad,
-    float* weight_grad) {
-  static_assert(kBatch % kTile == 0, "batch tiles must divide the batch");
-  constexpr int kWarps = kBlockThreads / 32;
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int64_t work_id = static_cast<int64_t>(blockIdx.x) * kWarps + warp;
-  const int64_t tile_id = work_id / n_rows;
-  const int64_t row_id = work_id - tile_id * n_rows;
-  if (tile_id >= kBatch / kTile) return;
-  if (row_id >= n_rows) return;
-  const int first_batch = static_cast<int>(tile_id) * kTile;
-  const uint32 pre = nonempty_rows[row_id];
-  float local_spike_grad[kTile] = {};
-  const uint32 start = row_splits[pre];
-  const uint32 end = row_splits[pre + 1];
-  for (uint32 csr = start + lane; csr < end; csr += 32) {
-    const uint32 edge = V1_EDGE_INDEX(csr);
-    const uint32 post = post_ids[csr];
-    const uint32 type = synapse_types[csr];
-    float edge_weight_grad = 0.0f;
-#pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      const int batch = first_batch + offset;
-#if V1_PAIR_PREPROJECT
-      const float projected = preprojected[
-          batch * n_pairs + pair_ids[csr]];
-#elif V1_PREPROJECT
-      const float projected = preprojected[
-          (batch * static_cast<int64_t>(n_post) + post) * n_types + type];
-#else
-      const T* upstream = current_grad +
-                          (batch * static_cast<int64_t>(n_post) + post) * n_basis;
-      const float projected = BasisProjection<T, kBasis>::Apply(
-          upstream, basis, type, n_basis);
-#endif
-      local_spike_grad[offset] += projected * AsFloat(weights[edge]);
-      edge_weight_grad += projected * AsFloat(spikes[batch * n_pre + pre]);
-    }
-    if constexpr (kBatch == kTile) {
-      weight_grad[edge] = edge_weight_grad;
-    } else {
-      atomicAdd(weight_grad + edge, edge_weight_grad);
-    }
-  }
-#pragma unroll
-  for (int offset = 0; offset < kTile; ++offset) {
-    float value = local_spike_grad[offset];
-#pragma unroll
-    for (int delta = 16; delta > 0; delta >>= 1) {
-      value += __shfl_down_sync(0xffffffff, value, delta);
-    }
-    if (lane == 0) {
-      const int batch = first_batch + offset;
-      spike_grad[batch * n_pre + pre] =
-          FromFloat<T>(value * AsFloat(*dampening));
-    }
-  }
+  scale_out[0] = scale;
+  scale_out[1] = 1.0f / scale;
 }
 
 template <typename T, int kBasis>
-__global__ void PreprojectBatch32Kernel(int64_t elements, int n_post,
-                                        int n_basis, int n_types,
-                                        const T* current_grad, const T* basis,
-                                        float* projected) {
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
-    const int type = index % n_types;
-    const int64_t row = index / n_types;
-    projected[index] = BasisProjection<T, kBasis>::Apply(
-        current_grad + row * n_basis, basis, type, n_basis);
+__device__ __forceinline__ float BasisProjection(const T* upstream, const float* basis,
+                                                 int type, int n_basis) {
+  const int width = kBasis == 0 ? n_basis : kBasis;
+  float result = 0.0f;
+#pragma unroll
+  for (int receptor = 0; receptor < (kBasis == 0 ? n_basis : kBasis); ++receptor) {
+    result += AsFloat(upstream[receptor]) * basis[type * width + receptor];
   }
+  return result;
 }
 
-// Compact projection, emitted as [pair, batch] so that one warp reading a
-// pair's whole batch line touches a single 128-byte line.
+__device__ __forceinline__ float ProjToFloat(float value) { return value; }
+__device__ __forceinline__ float ProjToFloat(__half value) { return __half2float(value); }
+
+__device__ __forceinline__ void ProjStore(float* address, float value) { *address = value; }
+__device__ __forceinline__ void ProjStore(__half* address, float value) {
+  *address = __float2half(value);
+}
+
+// Compact projection for one batch slice, emitted as [pair, batch_stride] so
+// that a warp reading one pair's slice line touches a single cache line.
 //
-// That output order is what the backward row kernels want, but writing it
-// directly makes consecutive threads take consecutive batch samples of one
-// pair, whose current gradients are `n_post * n_basis` apart -- 1.6 MiB on the
-// 203,816-neuron network. Each lane then pulls its own 32-byte sector for the
-// 8 bytes it needs, and a warp fetches 1 KiB to use 256 B.
-//
-// Pairs are sorted by (postsynaptic neuron, synapse type) and average 8.2 types
-// per neuron, so thirty-two consecutive pairs touch about four distinct
-// neurons. Reading pair-contiguous, transposing through shared memory and
-// writing batch-contiguous coalesces both halves. The padding keeps the
-// transpose read conflict-free: a 34-float row is 34 banks, and 34 is even but
-// coprime to 32 in the stride that matters here -- consecutive lanes land on
-// banks (34 * lane) % 32 = (2 * lane) % 32, so the row is read in two
-// conflict-free halves rather than one 32-way conflict.
-template <typename T, int kBasis, int kBatch, int kPairsPerTile>
+// Writing that layout directly makes consecutive threads take consecutive batch
+// samples of one pair, whose current gradients are `n_post * n_basis` apart --
+// 1.6 MiB on the 203,816-neuron network -- so a warp fetches 1 KiB to use
+// 256 B. Pairs are sorted by (postsynaptic neuron, synapse type), so thirty-two
+// consecutive pairs touch about four neurons: reading pair-contiguous and
+// transposing through shared memory coalesces both halves. The 34-float row
+// keeps the transposed read to two conflict-free halves.
+template <typename T, typename P, int kBasis, int kSlice, int kPairsPerTile>
 __global__ void PreprojectPairsTiledKernel(
-    int n_post, int n_basis, int64_t n_pairs, const T* current_grad,
-    const T* basis, const uint32* pair_posts, const uint8* pair_types,
-    float* projected) {
-  constexpr int kTileElements = kPairsPerTile * kBatch;
-  __shared__ float tile[kBatch][kPairsPerTile + 2];
+    int n_post, int n_basis, int64_t n_pairs, int64_t batch, int64_t batch_stride,
+    const T* current_grad, const float* basis, const uint32* pair_posts,
+    const uint8* pair_types, P* projected, const float* scale) {
+  const float factor = scale == nullptr ? 1.0f : scale[0];
+  constexpr int kTileElements = kPairsPerTile * kSlice;
+  __shared__ float tile[kSlice][kPairsPerTile + 2];
   const int64_t pair_base = static_cast<int64_t>(blockIdx.x) * kPairsPerTile;
+  const int64_t batch_base = static_cast<int64_t>(blockIdx.y) * kSlice;
   for (int index = threadIdx.x; index < kTileElements; index += blockDim.x) {
     const int column = index % kPairsPerTile;
-    const int batch = index / kPairsPerTile;
+    const int sample = index / kPairsPerTile;
     const int64_t pair = pair_base + column;
+    const int64_t b = batch_base + sample;
     float value = 0.0f;
-    if (pair < n_pairs) {
-      value = BasisProjection<T, kBasis>::Apply(
-          current_grad + (static_cast<int64_t>(batch) * n_post +
-                          pair_posts[pair]) * n_basis,
-          basis, pair_types[pair], n_basis);
+    if (pair < n_pairs && b < batch) {
+      value = BasisProjection<T, kBasis>(
+          current_grad + (b * n_post + pair_posts[pair]) * n_basis, basis,
+          pair_types[pair], n_basis);
     }
-    tile[batch][column] = value;
+    tile[sample][column] = value;
   }
   __syncthreads();
   for (int index = threadIdx.x; index < kTileElements; index += blockDim.x) {
-    const int batch = index % kBatch;
-    const int column = index / kBatch;
+    const int sample = index % kSlice;
+    const int column = index / kSlice;
     const int64_t pair = pair_base + column;
-    if (pair < n_pairs) projected[pair * kBatch + batch] = tile[batch][column];
+    if (pair < n_pairs) {
+      ProjStore(projected + pair * batch_stride + batch_base + sample,
+                tile[sample][column] * factor);
+    }
   }
 }
 
-// Cache policy for the backward row kernel's operands.
-//
-// The projection is re-read once per edge sharing a pair (50.2 times on the
-// 203,816-neuron network) and is the only array with reuse. `pair_ids`,
-// `weights` and the `weight_grad` output are each touched exactly once per
-// edge, so evict-first hints keep their roughly 1 GiB of single-use traffic
-// from displacing the projection in L2.
+// Cache policy for the row kernel's operands. The projection is re-read once
+// per edge sharing a pair (50.2 times on the 203,816-neuron network) and is the
+// only array with reuse. `pair_ids` and `weights` are each touched once per
+// edge, so evict-first hints keep that single-use traffic from displacing the
+// projection in L2.
 __device__ __forceinline__ uint32 LoadEdgeIndex(const uint32* address) {
   return __ldcs(address);
 }
@@ -634,170 +542,88 @@ __device__ __forceinline__ float LoadEdgeWeight(const W* address) {
   return AsFloat(*address);
 }
 
-__device__ __forceinline__ void StoreEdgeGrad(float* address, float value) {
-  __stcs(address, value);
-}
-
-// Reduce `partial[0 .. 2 * kHalf)` across the lane pair (lane, lane ^ kMask)
-// into `partial[0 .. kHalf)`, then recurse. One shuffle and one add per
-// surviving value, so a whole tile costs about one shuffle per edge -- against
-// a shared-memory round trip per tile for a tensor-core reduction.
-//
-// Each round drops the lane bit it reduced over into the surviving value's
-// index, so after the recursion lane l holds the value for index
-// bit-reverse(l). `ReverseBits` undoes that when the results are stored.
-template <int kHalf, int kMask>
-__device__ __forceinline__ void ButterflyReduce(float* partial, int lane) {
-  const bool upper = (lane & kMask) != 0;
-#pragma unroll
-  for (int index = 0; index < kHalf; ++index) {
-    const float keep = upper ? partial[kHalf + index] : partial[index];
-    const float send = upper ? partial[index] : partial[kHalf + index];
-    partial[index] = keep + __shfl_xor_sync(0xffffffff, send, kMask);
-  }
-  if constexpr (kHalf > 1) ButterflyReduce<kHalf / 2, kMask * 2>(partial, lane);
-}
-
-template <int kBits>
-__device__ __forceinline__ int ReverseBits(int value) {
-  int result = 0;
-#pragma unroll
-  for (int bit = 0; bit < kBits; ++bit) {
-    result |= ((value >> bit) & 1) << (kBits - 1 - bit);
-  }
-  return result;
-}
-
-// One lane's slice of a pair's projected batch line. A 16-byte load is the
-// widest a lane can issue, so it carries four FP32 batch samples.
-template <int kPack>
-struct PackedProjection {
-  __device__ __forceinline__ static void Load(const float* source, float* out);
-};
-
-template <>
-struct PackedProjection<1> {
-  __device__ __forceinline__ static void Load(const float* source, float* out) {
-    out[0] = *source;
-  }
-};
-
-template <>
-struct PackedProjection<2> {
-  __device__ __forceinline__ static void Load(const float* source, float* out) {
+// One lane's kPack consecutive samples of a pair's projected slice line, in
+// one vector load: 16 B carries four FP32 or eight FP16 samples.
+template <typename P, int kPack>
+__device__ __forceinline__ void LoadProjection(const P* source, float* out) {
+  if constexpr (std::is_same<P, float>::value && kPack == 4) {
+    const ::float4 raw = *reinterpret_cast<const ::float4*>(source);
+    out[0] = raw.x; out[1] = raw.y; out[2] = raw.z; out[3] = raw.w;
+  } else if constexpr (std::is_same<P, float>::value && kPack == 2) {
     const ::float2 raw = *reinterpret_cast<const ::float2*>(source);
     out[0] = raw.x; out[1] = raw.y;
+  } else if constexpr (std::is_same<P, __half>::value && (kPack == 8 || kPack == 4)) {
+    using Vector = typename std::conditional<kPack == 8, ::uint4, ::uint2>::type;
+    const Vector raw = *reinterpret_cast<const Vector*>(source);
+    const __half* packed = reinterpret_cast<const __half*>(&raw);
+#pragma unroll
+    for (int index = 0; index < kPack; ++index) out[index] = __half2float(packed[index]);
+  } else {
+#pragma unroll
+    for (int index = 0; index < kPack; ++index) out[index] = ProjToFloat(source[index]);
   }
-};
+}
 
-template <>
-struct PackedProjection<4> {
-  __device__ __forceinline__ static void Load(const float* source, float* out) {
-    const ::float4 raw = *reinterpret_cast<const ::float4*>(source);
-    out[0] = raw.x;
-    out[1] = raw.y;
-    out[2] = raw.z;
-    out[3] = raw.w;
-  }
-};
-
-// FP16 batch-32 specialization: one CSR row per two-warp block, packed batch
-// lanes, butterfly weight-gradient reduction.
+// Spike gradient for one batch slice: one CSR row per warp, kRows warps per
+// block, no shared memory and no barrier, so a 32 * kRows block reaches full
+// occupancy.
 //
-// Giving a lane `kPack` consecutive batch samples shrinks an edge from 32 lanes
-// to `32 / kPack`, so a warp splits into that many independent edge slots and
-// one load instruction serves all of them. At kPack = 4 a 32-edge tile issues
-// eight projection loads instead of thirty-two, and the descriptors
-// (`pair_ids`, `weights`) are read once cooperatively and broadcast with
-// `__shfl_sync` rather than re-read at one address by all 32 lanes. The bytes
-// moved are unchanged; the instruction count is not.
+// A lane holds kPack consecutive samples, so an edge needs kSlice / kPack
+// lanes, a warp splits into that many independent edge slots, and one load
+// serves all of them. The descriptors (`pair_ids`, `weights`) are read once per
+// 32-edge tile cooperatively and broadcast with `__shfl_sync`. Out-of-range
+// lanes point at `sentinel_pair`, an all-zero projection row, so the hot loop
+// loads unconditionally instead of branching and zero-filling.
 //
-// The block holds 256 B of shared memory, so an SM runs its full 24 blocks.
-// Both outputs keep FP32 arithmetic: the spike gradient accumulates the FP32
-// projected value, and the butterfly sums the weight gradient in FP32.
-template <typename W, int kBatch, int kPack, int kWarps, int kTile, bool kAccumulate = false>
-__global__ __launch_bounds__(32 * kWarps) void BackwardPackedRowKernel(
-    int64_t n_pre, const Eigen::half* spikes, const float* projected,
-    const W* weights, const uint32* pair_ids, const uint32* edge_ids,
-    const uint32* row_splits, const uint32* nonempty_rows, int64_t n_rows,
-    const Eigen::half* dampening, Eigen::half* spike_grad,
-    float* weight_grad) {
-  constexpr int kLanesPerEdge = kBatch / kPack;
+// The result goes to a [pre, batch_stride] scratch buffer, one contiguous line
+// per row, and TransposeSpikeGradKernel restores [batch, pre].
+template <typename T, typename W, typename P, int kSlice, int kPack, int kRows,
+          bool kMultiSlice>
+__global__ __launch_bounds__(32 * kRows) void BackwardRowPerWarpKernel(
+    const P* projected, int64_t runtime_stride, const W* weights, const uint32* pair_ids,
+    const uint32* edge_ids, const uint32* row_splits, const uint32* nonempty_rows,
+    int64_t n_rows, const T* dampening, T* spike_grad_t, const float* inverse_scale,
+    uint32 sentinel_pair) {
+  constexpr int kTile = 32;
+  constexpr int kLanesPerEdge = kSlice / kPack;
   constexpr int kSlots = 32 / kLanesPerEdge;
   constexpr int kPerSlot = kTile / kSlots;
-  constexpr int kIndexBits = kPerSlot == 8 ? 3 : (kPerSlot == 4 ? 2 : (kPerSlot == 2 ? 1 : 0));
-  static_assert(kTile == kSlots * kPerSlot, "tile must divide into edge slots");
-  static_assert(kPerSlot == (1 << kIndexBits), "slot depth must be a power of two");
+  // One slice (batch <= 32) keeps the stride a compile-time constant, so the hot
+  // loop's address arithmetic stays a shift.
+  const int64_t batch_stride = kMultiSlice ? runtime_stride : kSlice;
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
   const int slot = lane / kLanesPerEdge;
-  const int sub = lane % kLanesPerEdge;   // batch samples sub * kPack ... + kPack
-  const int64_t row_id = blockIdx.x;
+  const int sub = lane % kLanesPerEdge;
+  const int64_t row_id = static_cast<int64_t>(blockIdx.x) * kRows + (threadIdx.x >> 5);
   if (row_id >= n_rows) return;
-
-  __shared__ float spike_partials[kWarps][32];
-
+  const int64_t sample_base =
+      (kMultiSlice ? static_cast<int64_t>(blockIdx.y) * kSlice : 0) + sub * kPack;
   const uint32 pre = nonempty_rows[row_id];
-  const uint32 start = row_splits[pre];
   const uint32 end = row_splits[pre + 1];
-  float spike[kPack];
-  float grad[kPack];
-#pragma unroll
-  for (int sample = 0; sample < kPack; ++sample) {
-    spike[sample] = AsFloat(
-        spikes[static_cast<int64_t>(sub * kPack + sample) * n_pre + pre]);
-    grad[sample] = 0.0f;
-  }
-  const int target = ReverseBits<kIndexBits>(sub & (kPerSlot - 1));
-
-  for (uint32 base = start + warp * kTile; base < end; base += kWarps * kTile) {
-    // One coalesced load of the tile's edge descriptors, broadcast to the batch
-    // lanes below instead of re-read by each of them.
+  float grad[kPack] = {};
+  for (uint32 base = row_splits[pre]; base < end; base += kTile) {
     const uint32 edge_lane = base + lane;
-    const bool own = lane < kTile && edge_lane < end;
-    const uint32 my_pair = own ? LoadEdgeIndex(pair_ids + edge_lane) : 0u;
+    const bool own = edge_lane < end;
+    const uint32 my_pair = own ? LoadEdgeIndex(pair_ids + edge_lane) : sentinel_pair;
     const float my_weight =
         own ? LoadEdgeWeight<W>(weights + V1_EDGE_INDEX(edge_lane)) : 0.0f;
-    float partial[kPerSlot];
 #pragma unroll
     for (int step = 0; step < kPerSlot; ++step) {
       const int column = kSlots * step + slot;
       const uint32 pair = __shfl_sync(0xffffffff, my_pair, column);
       const float weight = __shfl_sync(0xffffffff, my_weight, column);
       float value[kPack];
-      if (base + column < end) {
-        PackedProjection<kPack>::Load(
-            projected + static_cast<int64_t>(pair) * kBatch + sub * kPack, value);
-      } else {
+      LoadProjection<P, kPack>(projected + static_cast<int64_t>(pair) * batch_stride +
+                                   sample_base, value);
 #pragma unroll
-        for (int sample = 0; sample < kPack; ++sample) value[sample] = 0.0f;
-      }
-      float sum = 0.0f;
-#pragma unroll
-      for (int sample = 0; sample < kPack; ++sample) {
-        grad[sample] += value[sample] * weight;
-        sum += value[sample] * spike[sample];
-      }
-      partial[step] = sum;
-    }
-    // Compact the slot's `kPerSlot` values down its lanes, then fold the lanes
-    // left holding duplicates of the same edge.
-    if constexpr (kPerSlot > 1) ButterflyReduce<kPerSlot / 2, 1>(partial, lane);
-#pragma unroll
-    for (int mask = kPerSlot; mask < kLanesPerEdge; mask <<= 1) {
-      partial[0] += __shfl_xor_sync(0xffffffff, partial[0], mask);
-    }
-    const uint32 edge = base + kSlots * target + slot;
-    if (sub < kPerSlot && edge < end) {
-      if constexpr (kAccumulate) {
-        weight_grad[V1_EDGE_INDEX(edge)] += partial[0];
-      } else {
-        StoreEdgeGrad(weight_grad + V1_EDGE_INDEX(edge), partial[0]);
-      }
+      for (int sample = 0; sample < kPack; ++sample) grad[sample] += value[sample] * weight;
     }
   }
 
-  // Every slot accumulated the same batch samples from a different edge subset.
+  // Fold the slots, which each accumulated the same samples from a different
+  // edge subset. Afterwards every lane sharing `sub` holds the total, so the
+  // kLanesPerEdge lowest lanes cover the slice between them and store it
+  // without a shared-memory round trip.
 #pragma unroll
   for (int mask = kLanesPerEdge; mask < 32; mask <<= 1) {
 #pragma unroll
@@ -806,483 +632,139 @@ __global__ __launch_bounds__(32 * kWarps) void BackwardPackedRowKernel(
     }
   }
   if (lane < kLanesPerEdge) {
+    const float factor =
+        (inverse_scale == nullptr ? 1.0f : inverse_scale[1]) * AsFloat(*dampening);
 #pragma unroll
     for (int sample = 0; sample < kPack; ++sample) {
-      spike_partials[warp][sub * kPack + sample] = grad[sample];
-    }
-  }
-  __syncthreads();
-  if (warp == 0 && lane < kBatch) {
-    float total = 0.0f;
-#pragma unroll
-    for (int source = 0; source < kWarps; ++source) {
-      total += spike_partials[source][lane];
-    }
-    spike_grad[static_cast<int64_t>(lane) * n_pre + pre] =
-        FromFloat<Eigen::half>(total * AsFloat(*dampening));
-  }
-}
-
-
-// Large power-of-two batches retain the warp-native 32-sample layout.  The
-// projection is tile-major, and each (row, batch-tile) block writes a disjoint
-// spike-gradient slice while accumulating into the one edge-gradient output.
-template <typename T, int kBasis, int kBatch, int kPairsPerTile>
-__global__ void PreprojectPairsBatchTilesKernel(
-    int n_post, int n_basis, int64_t n_pairs, const T* current_grad,
-    const T* basis, const uint32* pair_posts, const uint8* pair_types,
-    float* projected) {
-  constexpr int kBatchTile = 32;
-  constexpr int kTileElements = kPairsPerTile * kBatchTile;
-  __shared__ float tile[kBatchTile][kPairsPerTile + 2];
-  const int batch_base = static_cast<int>(blockIdx.y) * kBatchTile;
-  const int64_t pair_base = static_cast<int64_t>(blockIdx.x) * kPairsPerTile;
-  for (int index = threadIdx.x; index < kTileElements; index += blockDim.x) {
-    const int column = index % kPairsPerTile;
-    const int local_batch = index / kPairsPerTile;
-    const int batch = batch_base + local_batch;
-    const int64_t pair = pair_base + column;
-    float value = 0.0f;
-    if (pair < n_pairs) {
-      value = BasisProjection<T, kBasis>::Apply(
-          current_grad + (static_cast<int64_t>(batch) * n_post +
-                          pair_posts[pair]) * n_basis,
-          basis, pair_types[pair], n_basis);
-    }
-    tile[local_batch][column] = value;
-  }
-  __syncthreads();
-  for (int index = threadIdx.x; index < kTileElements; index += blockDim.x) {
-    const int local_batch = index % kBatchTile;
-    const int column = index / kBatchTile;
-    const int64_t pair = pair_base + column;
-    if (pair < n_pairs) {
-      const int64_t tile_id = blockIdx.y;
-      projected[(tile_id * n_pairs + pair) * kBatchTile + local_batch] =
-          tile[local_batch][column];
+      spike_grad_t[static_cast<int64_t>(pre) * batch_stride + sample_base + sample] =
+          FromFloat<T>(grad[sample] * factor);
     }
   }
 }
 
-template <typename W, int kBatch, int kPack, int kWarps, int kTile>
-__global__ __launch_bounds__(32 * kWarps) void BackwardPackedBatchTilesKernel(
-    int64_t n_pre, int64_t n_pairs, const Eigen::half* spikes,
-    const float* projected, const W* weights, const uint32* pair_ids,
-    const uint32* edge_ids, const uint32* row_splits,
-    const uint32* nonempty_rows, int64_t n_rows,
-    const Eigen::half* dampening, Eigen::half* spike_grad,
-    float* weight_grad) {
-  constexpr int kBatchTile = 32;
-  constexpr int kLanesPerEdge = kBatchTile / kPack;
-  constexpr int kSlots = 32 / kLanesPerEdge;
-  constexpr int kPerSlot = kTile / kSlots;
-  constexpr int kIndexBits = kPerSlot == 8 ? 3 : (kPerSlot == 4 ? 2 :
-                              (kPerSlot == 2 ? 1 : 0));
+// [pre, batch_stride] -> [batch, pre], one 32-row by kSlice-sample tile per
+// block. Each read pass takes one row's slice line, each write pass 32
+// consecutive rows of one sample, so both halves are coalesced; the odd row
+// stride kSlice + 1 keeps the transposed read conflict-free. Rows without edges
+// were never written by the row kernel, so they are emitted as zeros here,
+// which is what lets the op skip clearing its output.
+template <typename T, int kSlice>
+__global__ void TransposeSpikeGradKernel(int64_t n_pre, int64_t batch, int64_t batch_stride,
+                                         const T* source, T* destination,
+                                         const uint32* row_splits) {
+  __shared__ float tile[32][kSlice + 1];
+  const int64_t pre_base = static_cast<int64_t>(blockIdx.x) * 32;
+  const int64_t batch_base = static_cast<int64_t>(blockIdx.y) * kSlice;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int slot = lane / kLanesPerEdge;
-  const int sub = lane % kLanesPerEdge;
-  const int64_t row_id = blockIdx.x;
-  if (row_id >= n_rows) return;
-  const int tile_id = static_cast<int>(blockIdx.y);
-  const int batch_base = tile_id * kBatchTile;
-
-  __shared__ float spike_partials[kWarps][kBatchTile];
-  const uint32 pre = nonempty_rows[row_id];
-  const uint32 start = row_splits[pre];
-  const uint32 end = row_splits[pre + 1];
-  float spike[kPack];
-  float grad[kPack];
-#pragma unroll
-  for (int sample = 0; sample < kPack; ++sample) {
-    const int batch = batch_base + sub * kPack + sample;
-    spike[sample] = AsFloat(spikes[static_cast<int64_t>(batch) * n_pre + pre]);
-    grad[sample] = 0.0f;
-  }
-  const int target = ReverseBits<kIndexBits>(sub & (kPerSlot - 1));
-  const float* tile_projected =
-      projected + static_cast<int64_t>(tile_id) * n_pairs * kBatchTile;
-
-  for (uint32 base = start + warp * kTile; base < end;
-       base += kWarps * kTile) {
-    const uint32 edge_lane = base + lane;
-    const bool own = lane < kTile && edge_lane < end;
-    const uint32 my_pair = own ? LoadEdgeIndex(pair_ids + edge_lane) : 0u;
-    const float my_weight =
-        own ? LoadEdgeWeight<W>(weights + V1_EDGE_INDEX(edge_lane)) : 0.0f;
-    float partial[kPerSlot];
-#pragma unroll
-    for (int step = 0; step < kPerSlot; ++step) {
-      const int column = kSlots * step + slot;
-      const uint32 pair = __shfl_sync(0xffffffff, my_pair, column);
-      const float weight = __shfl_sync(0xffffffff, my_weight, column);
-      float value[kPack];
-      if (base + column < end) {
-        PackedProjection<kPack>::Load(
-            tile_projected + static_cast<int64_t>(pair) * kBatchTile +
-                sub * kPack,
-            value);
-      } else {
-#pragma unroll
-        for (int sample = 0; sample < kPack; ++sample) value[sample] = 0.0f;
-      }
-      float sum = 0.0f;
-#pragma unroll
-      for (int sample = 0; sample < kPack; ++sample) {
-        grad[sample] += value[sample] * weight;
-        sum += value[sample] * spike[sample];
-      }
-      partial[step] = sum;
-    }
-    if constexpr (kPerSlot > 1) ButterflyReduce<kPerSlot / 2, 1>(partial, lane);
-#pragma unroll
-    for (int mask = kPerSlot; mask < kLanesPerEdge; mask <<= 1) {
-      partial[0] += __shfl_xor_sync(0xffffffff, partial[0], mask);
-    }
-    const uint32 edge = base + kSlots * target + slot;
-    if (sub < kPerSlot && edge < end) {
-      atomicAdd(weight_grad + V1_EDGE_INDEX(edge), partial[0]);
-    }
-  }
-#pragma unroll
-  for (int mask = kLanesPerEdge; mask < 32; mask <<= 1) {
-#pragma unroll
-    for (int sample = 0; sample < kPack; ++sample) {
-      grad[sample] += __shfl_xor_sync(0xffffffff, grad[sample], mask);
-    }
-  }
-  if (lane < kLanesPerEdge) {
-#pragma unroll
-    for (int sample = 0; sample < kPack; ++sample) {
-      spike_partials[warp][sub * kPack + sample] = grad[sample];
+  const int warps = blockDim.x >> 5;
+  for (int index = warp; index < 32; index += warps) {
+    const int64_t pre = pre_base + index;
+    if (lane < kSlice) {
+      const bool written = pre < n_pre && row_splits[pre + 1] != row_splits[pre];
+      tile[index][lane] =
+          written ? AsFloat(source[pre * batch_stride + batch_base + lane]) : 0.0f;
     }
   }
   __syncthreads();
-  if (warp == 0) {
-    float total = 0.0f;
-#pragma unroll
-    for (int source = 0; source < kWarps; ++source) {
-      total += spike_partials[source][lane];
-    }
-    const int batch = batch_base + lane;
-    spike_grad[static_cast<int64_t>(batch) * n_pre + pre] =
-        FromFloat<Eigen::half>(total * AsFloat(*dampening));
-  }
-}
-
-// Batch 64 can keep both 32-sample tiles live without excessive register
-// pressure.  One row block traverses edge descriptors once, combines both
-// tiles' weight contribution, and direct-stores every edge exactly once.
-template <typename W, int kBatch, int kPack, int kWarps, int kTile>
-__global__ __launch_bounds__(32 * kWarps) void BackwardPackedBatch64DirectKernel(
-    int64_t n_pre, int64_t n_pairs, const Eigen::half* spikes,
-    const float* projected, const W* weights, const uint32* pair_ids,
-    const uint32* edge_ids, const uint32* row_splits,
-    const uint32* nonempty_rows, int64_t n_rows,
-    const Eigen::half* dampening, Eigen::half* spike_grad,
-    float* weight_grad) {
-  constexpr int kBatchTile = 32;
-  constexpr int kTiles = kBatch / kBatchTile;
-  constexpr int kLanesPerEdge = kBatchTile / kPack;
-  constexpr int kSlots = 32 / kLanesPerEdge;
-  constexpr int kPerSlot = kTile / kSlots;
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int slot = lane / kLanesPerEdge;
-  const int sub = lane % kLanesPerEdge;
-  const int64_t row_id = blockIdx.x;
-  if (row_id >= n_rows) return;
-  __shared__ float spike_partials[kWarps][kTiles * kBatchTile];
-  const uint32 pre = nonempty_rows[row_id];
-  const uint32 start = row_splits[pre];
-  const uint32 end = row_splits[pre + 1];
-  float spike[kTiles][kPack];
-  float grad[kTiles][kPack];
-#pragma unroll
-  for (int tile_id = 0; tile_id < kTiles; ++tile_id) {
-#pragma unroll
-    for (int sample = 0; sample < kPack; ++sample) {
-      const int batch = tile_id * kBatchTile + sub * kPack + sample;
-      spike[tile_id][sample] =
-          AsFloat(spikes[static_cast<int64_t>(batch) * n_pre + pre]);
-      grad[tile_id][sample] = 0.0f;
-    }
-  }
-  const int target = ReverseBits<3>(sub & (kPerSlot - 1));
-  for (uint32 base = start + warp * kTile; base < end;
-       base += kWarps * kTile) {
-    const uint32 edge_lane = base + lane;
-    const bool own = lane < kTile && edge_lane < end;
-    const uint32 my_pair = own ? LoadEdgeIndex(pair_ids + edge_lane) : 0u;
-    const float my_weight =
-        own ? LoadEdgeWeight<W>(weights + V1_EDGE_INDEX(edge_lane)) : 0.0f;
-    float partial[kPerSlot] = {};
-#pragma unroll
-    for (int tile_id = 0; tile_id < kTiles; ++tile_id) {
-      const float* tile_projection =
-          projected + static_cast<int64_t>(tile_id) * n_pairs * kBatchTile;
-#pragma unroll
-      for (int step = 0; step < kPerSlot; ++step) {
-        const int column = kSlots * step + slot;
-        const uint32 pair = __shfl_sync(0xffffffff, my_pair, column);
-        const float weight = __shfl_sync(0xffffffff, my_weight, column);
-        float value[kPack];
-        if (base + column < end) {
-          PackedProjection<kPack>::Load(
-              tile_projection + static_cast<int64_t>(pair) * kBatchTile +
-                  sub * kPack,
-              value);
-        } else {
-#pragma unroll
-          for (int sample = 0; sample < kPack; ++sample) value[sample] = 0.0f;
-        }
-#pragma unroll
-        for (int sample = 0; sample < kPack; ++sample) {
-          grad[tile_id][sample] += value[sample] * weight;
-          partial[step] += value[sample] * spike[tile_id][sample];
-        }
-      }
-    }
-    ButterflyReduce<kPerSlot / 2, 1>(partial, lane);
-#pragma unroll
-    for (int mask = kPerSlot; mask < kLanesPerEdge; mask <<= 1) {
-      partial[0] += __shfl_xor_sync(0xffffffff, partial[0], mask);
-    }
-    const uint32 edge = base + kSlots * target + slot;
-    if (sub < kPerSlot && edge < end) {
-      StoreEdgeGrad(weight_grad + V1_EDGE_INDEX(edge), partial[0]);
-    }
-  }
-#pragma unroll
-  for (int mask = kLanesPerEdge; mask < 32; mask <<= 1) {
-#pragma unroll
-    for (int tile_id = 0; tile_id < kTiles; ++tile_id) {
-#pragma unroll
-      for (int sample = 0; sample < kPack; ++sample) {
-        grad[tile_id][sample] +=
-            __shfl_xor_sync(0xffffffff, grad[tile_id][sample], mask);
-      }
-    }
-  }
-  if (lane < kLanesPerEdge) {
-#pragma unroll
-    for (int tile_id = 0; tile_id < kTiles; ++tile_id) {
-#pragma unroll
-      for (int sample = 0; sample < kPack; ++sample) {
-        spike_partials[warp][tile_id * kBatchTile + sub * kPack + sample] =
-            grad[tile_id][sample];
-      }
-    }
-  }
-  __syncthreads();
-  if (warp == 0) {
-#pragma unroll
-    for (int tile_id = 0; tile_id < kTiles; ++tile_id) {
-      float total = 0.0f;
-#pragma unroll
-      for (int source = 0; source < kWarps; ++source) {
-        total += spike_partials[source][tile_id * kBatchTile + lane];
-      }
-      const int batch = tile_id * kBatchTile + lane;
-      spike_grad[static_cast<int64_t>(batch) * n_pre + pre] =
-          FromFloat<Eigen::half>(total * AsFloat(*dampening));
+  const int64_t pre = pre_base + lane;
+  for (int sample = warp; sample < kSlice; sample += warps) {
+    const int64_t b = batch_base + sample;
+    if (pre < n_pre && b < batch) {
+      destination[b * n_pre + pre] = FromFloat<T>(tile[lane][sample]);
     }
   }
 }
 
-#include "generic_backward_kernels.cuh"
-
-#define V1_BATCH_CASE(BATCH, TILE, LAUNCH) \
-  case BATCH:                              \
-    LAUNCH(BATCH, TILE);                   \
-    break
-
-template <typename T, typename W, int kBasis>
-Status LaunchForward(OpKernelContext* context, const Tensor& spikes,
-                     const Tensor& active, const Tensor& weights,
-                     const Tensor& post_ids, const Tensor& synapse_types,
-                     const Tensor& row_splits, const Tensor& edge_ids,
-                     const Tensor& basis, int n_post, Tensor* output) {
-  const int64_t n_active = active.dim_size(0);
-  if (n_active == 0) return OkStatus();
-  const int n_basis = basis.dim_size(1);
-  auto device = context->eigen_device<GPUDevice>();
-#define LAUNCH_FORWARD_NORMAL(BATCH, OUTPUT_TYPE, OUTPUT_PTR)            \
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                   \
-      ForwardKernel<T, W, OUTPUT_TYPE, kBasis, BATCH>,                   \
-      static_cast<int>(n_active),                                       \
-      V1_FORWARD_THREADS, 0, device.stream(), n_active, spikes.dim_size(1), \
-      n_post, n_basis, spikes.flat<T>().data(),                         \
-      active.flat<int64_t>().data(), weights.flat<W>().data(),          \
-      post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(), \
-      row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(), \
-      basis.flat<T>().data(), OUTPUT_PTR))
-#define LAUNCH_FORWARD_GROUPED(BATCH)                                   \
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                   \
-      ForwardGroupedStaticBatchKernel<T, W, kBasis, BATCH>,              \
-      static_cast<int>(n_active), V1_FORWARD_THREADS, 0, device.stream(),\
-      n_active, spikes.dim_size(1), n_post, n_basis,                     \
-      spikes.flat<T>().data(), active.flat<int64_t>().data(),            \
-      weights.flat<W>().data(), post_ids.flat<uint32>().data(),          \
-      synapse_types.flat<uint8>().data(), row_splits.flat<uint32>().data(),\
-      edge_ids.flat<uint32>().data(), basis.flat<T>().data(),             \
-      output->flat<T>().data()))
-#if V1_FORWARD_FLOAT_ACCUM
-  Tensor accumulation;
-  TF_RETURN_IF_ERROR(context->allocate_temp(DT_FLOAT, output->shape(), &accumulation));
-  cudaMemsetAsync(accumulation.flat<float>().data(), 0,
-                  accumulation.NumElements() * sizeof(float), device.stream());
-#define LAUNCH_FORWARD(BATCH, TILE) \
-  LAUNCH_FORWARD_NORMAL(BATCH, float, accumulation.flat<float>().data())
-#else
-#define LAUNCH_FORWARD(BATCH, TILE) \
-  LAUNCH_FORWARD_NORMAL(BATCH, T, output->flat<T>().data())
-#endif
-  switch (spikes.dim_size(0)) {
-#if V1_FORWARD_GROUPED
-#define V1_GROUPED_CASE(BATCH) case BATCH: if constexpr (kBasis == 4) { LAUNCH_FORWARD_GROUPED(BATCH); } else { LAUNCH_FORWARD(BATCH, 4); } break
-    V1_GROUPED_CASE(1);
-    V1_GROUPED_CASE(2);
-    V1_GROUPED_CASE(4);
-    V1_GROUPED_CASE(8);
-    V1_GROUPED_CASE(16);
-    V1_GROUPED_CASE(32);
-    V1_GROUPED_CASE(64);
-    V1_GROUPED_CASE(128);
-#undef V1_GROUPED_CASE
-    V1_BATCH_CASE(256, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(512, 4, LAUNCH_FORWARD);
-#else
-    V1_BATCH_CASE(1, 1, LAUNCH_FORWARD);
-    V1_BATCH_CASE(2, 2, LAUNCH_FORWARD);
-    V1_BATCH_CASE(4, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(8, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(16, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(32, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(64, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(128, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(256, 4, LAUNCH_FORWARD);
-    V1_BATCH_CASE(512, 4, LAUNCH_FORWARD);
-#endif
-    default:
-      LAUNCH_FORWARD(0, 1);
-  }
-#undef LAUNCH_FORWARD
-#undef LAUNCH_FORWARD_NORMAL
-#undef LAUNCH_FORWARD_GROUPED
-#if V1_FORWARD_FLOAT_ACCUM
-  constexpr int kCastThreads = 256;
-  const int64_t elements = output->NumElements();
-  const int cast_blocks = static_cast<int>((elements + kCastThreads - 1) / kCastThreads);
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      CastForwardOutputKernel<T>, cast_blocks, kCastThreads, 0, device.stream(),
-      elements, accumulation.flat<float>().data(), output->flat<T>().data()));
-#endif
-  return OkStatus();
-}
-
-template <typename T, typename W, int kBasis>
-Status LaunchBackward(
+// One slice width's backward. P is the projection element: scaled FP16 with
+// FP16 spikes, FP32 with FP32 spikes, which keeps the precision the caller
+// chose.
+template <typename T, typename W, int kBasis, int kSlice, int kPack>
+Status LaunchSlicedPairBackward(
     OpKernelContext* context, const Tensor& spikes, const Tensor& current_grad,
     const Tensor& weights, const Tensor& post_ids, const Tensor& synapse_types,
     const Tensor& row_splits, const Tensor& edge_ids,
     const Tensor& nonempty_rows, const Tensor& basis, const Tensor& dampening,
-    int n_post, Tensor* spike_grad, Tensor* weight_grad) {
+    const Tensor& pair_ids, const Tensor& pair_posts, const Tensor& pair_types,
+    int n_post, Tensor* spike_grad, Tensor* weight_grad, bool accumulate) {
+  constexpr bool kScaled = std::is_same<T, Eigen::half>::value;
+  using P = typename std::conditional<kScaled, __half, float>::type;
   const int64_t n_rows = nonempty_rows.NumElements();
+  const int64_t n_pairs = pair_posts.NumElements();
   const int64_t batch = spikes.dim_size(0);
-  if (batch == 0 || n_rows == 0) return OkStatus();
+  const int64_t n_pre = spikes.dim_size(1);
+  const int64_t n_slices = (batch + kSlice - 1) / kSlice;
+  const int64_t batch_stride = n_slices * kSlice;
   const int n_basis = basis.dim_size(1);
-  const int n_types = basis.dim_size(0);
   auto device = context->eigen_device<GPUDevice>();
-#if V1_PREPROJECT
+  // The projection, plus one all-zero sentinel pair at index n_pairs. It has
+  // the element type of T, so it is allocated as one.
+  const int64_t projected_elements = batch_stride * n_pairs;
   Tensor projected_tensor;
-  const int64_t projected_elements = batch * static_cast<int64_t>(n_post) * n_types;
   TF_RETURN_IF_ERROR(context->allocate_temp(
-      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));
-  float* preprojected = projected_tensor.flat<float>().data();
-  constexpr int kProjectionThreads = 256;
-  const int projection_blocks = static_cast<int>(
-      (projected_elements + kProjectionThreads - 1) / kProjectionThreads);
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      PreprojectBatch32Kernel<T, kBasis>, projection_blocks,
-      kProjectionThreads, 0, device.stream(), projected_elements, n_post,
-      n_basis, n_types, current_grad.flat<T>().data(), basis.flat<T>().data(),
-      preprojected));
-#else
-  const float* preprojected = nullptr;
-#endif
-#define LAUNCH_BACKWARD(BATCH, TILE)                                      \
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                     \
-      BackwardStaticBatchKernel<T, W, kBasis, BATCH, TILE>,               \
-      static_cast<int>(n_rows * (BATCH / TILE)), kThreads, 0,             \
-      device.stream(), spikes.dim_size(1), n_post, n_basis,               \
-      spikes.flat<T>().data(), current_grad.flat<T>().data(),             \
-      weights.flat<W>().data(), post_ids.flat<uint32>().data(),           \
-      synapse_types.flat<uint8>().data(), row_splits.flat<uint32>().data(), \
-      edge_ids.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(), \
-      n_rows, basis.flat<T>().data(), dampening.flat<T>().data(),         \
-      spike_grad->flat<T>().data(), weight_grad->flat<float>().data()))
-#define LAUNCH_WARP_PER_ROW(BATCH, TILE, THREADS)                         \
-  do {                                                                    \
-    constexpr int kWarps = THREADS / 32;                                  \
-    constexpr int kTiles = BATCH / TILE;                                  \
-    const int64_t work_items = n_rows * kTiles;                            \
-    TF_RETURN_IF_ERROR(GpuLaunchKernel(                                    \
-        BackwardWarpPerRowStaticBatchKernel<T, W, kBasis, BATCH, TILE, THREADS>, \
-        static_cast<int>((work_items + kWarps - 1) / kWarps), THREADS, 0,  \
-        device.stream(), spikes.dim_size(1), n_post, n_basis,              \
-        spikes.flat<T>().data(), current_grad.flat<T>().data(),            \
-        weights.flat<W>().data(), post_ids.flat<uint32>().data(),          \
-        synapse_types.flat<uint8>().data(), row_splits.flat<uint32>().data(), \
-        edge_ids.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(), \
-        n_rows, basis.flat<T>().data(), preprojected, n_types, nullptr, 0,  \
-        dampening.flat<T>().data(), spike_grad->flat<T>().data(),          \
-        weight_grad->flat<float>().data()));                               \
-  } while (false)
-  switch (batch) {
-#if V1_WARP_PER_ROW
-    V1_BATCH_CASE(1, 1, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(2, 2, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(4, 4, LAUNCH_BACKWARD);
-    case 8: LAUNCH_WARP_PER_ROW(8, 8, V1_OPT_BACKWARD_THREADS); break;
-    case 16: LAUNCH_WARP_PER_ROW(16, 16, V1_OPT_BACKWARD_THREADS); break;
-    case 32: LAUNCH_WARP_PER_ROW(32, 32, V1_OPT_BACKWARD_THREADS); break;
-    case 64: LAUNCH_WARP_PER_ROW(64, V1_LARGE_BACKWARD_TILE, V1_OPT_BACKWARD_THREADS); break;
-    case 128: LAUNCH_WARP_PER_ROW(128, V1_LARGE_BACKWARD_TILE, V1_OPT_BACKWARD_THREADS); break;
-    case 256: LAUNCH_WARP_PER_ROW(256, V1_LARGE_BACKWARD_TILE, V1_OPT_BACKWARD_THREADS); break;
-    case 512: LAUNCH_WARP_PER_ROW(512, V1_OPT_BATCH512_TILE, V1_OPT_BATCH512_THREADS); break;
-#else
-    V1_BATCH_CASE(1, 1, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(2, 2, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(4, 4, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(8, 4, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(16, 4, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(32, V1_BATCH32_TILE, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(64, 4, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(128, 4, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(256, 4, LAUNCH_BACKWARD);
-    V1_BATCH_CASE(512, 4, LAUNCH_BACKWARD);
-#endif
-    default: {
-      constexpr int kRuntimeTile = 4;
-      const int64_t tiles = (batch + kRuntimeTile - 1) / kRuntimeTile;
-      TF_RETURN_IF_ERROR(GpuLaunchKernel(
-          BackwardRuntimeBatchKernel<T, W, kBasis, kRuntimeTile>,
-          static_cast<int>(tiles * n_rows), kThreads, 0, device.stream(), batch,
-          spikes.dim_size(1), n_post, n_basis, spikes.flat<T>().data(),
-          current_grad.flat<T>().data(),
-          weights.flat<W>().data(), post_ids.flat<uint32>().data(),
-          synapse_types.flat<uint8>().data(), row_splits.flat<uint32>().data(),
-          edge_ids.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),
-          n_rows, basis.flat<T>().data(), dampening.flat<T>().data(),
-          spike_grad->flat<T>().data(), weight_grad->flat<float>().data()));
-    }
+      DataTypeToEnum<T>::value, TensorShape({projected_elements + batch_stride}),
+      &projected_tensor));
+  P* projected = reinterpret_cast<P*>(projected_tensor.flat<T>().data());
+  cudaMemsetAsync(projected + projected_elements, 0, batch_stride * sizeof(P),
+                  device.stream());
+  float* scale = nullptr;
+  Tensor scale_tensor;
+  if constexpr (kScaled) {
+    // [scale, 1 / scale] in floats, then the abs-max bits.
+    TF_RETURN_IF_ERROR(context->allocate_temp(DT_FLOAT, TensorShape({3}), &scale_tensor));
+    scale = scale_tensor.flat<float>().data();
+    unsigned int* max_bits = reinterpret_cast<unsigned int*>(scale + 2);
+    cudaMemsetAsync(max_bits, 0, sizeof(unsigned int), device.stream());
+    TF_RETURN_IF_ERROR(GpuLaunchKernel(
+        AbsMaxFiniteKernel<T>, 1024, 256, 0, device.stream(),
+        current_grad.NumElements(), current_grad.flat<T>().data(), max_bits));
+    TF_RETURN_IF_ERROR(GpuLaunchKernel(
+        ProjectionScaleKernel, 1, 32, 0, device.stream(), max_bits,
+        basis.flat<float>().data(), static_cast<int>(basis.dim_size(0)), n_basis, scale));
   }
-#undef LAUNCH_BACKWARD
-#undef LAUNCH_WARP_PER_ROW
-  return OkStatus();
+  constexpr int kPairsPerTile = 32;
+  TF_RETURN_IF_ERROR(GpuLaunchKernel(
+      PreprojectPairsTiledKernel<T, P, kBasis, kSlice, kPairsPerTile>,
+      dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) / kPairsPerTile),
+           static_cast<unsigned>(n_slices)),
+      128, 0, device.stream(), n_post, n_basis, n_pairs, batch, batch_stride,
+      current_grad.flat<T>().data(), basis.flat<float>().data(),
+      pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(), projected, scale));
+  Tensor spike_grad_t;
+  TF_RETURN_IF_ERROR(context->allocate_temp(
+      DataTypeToEnum<T>::value, TensorShape({n_pre * batch_stride}), &spike_grad_t));
+  const dim3 row_grid(
+      static_cast<unsigned>((n_rows + kBackwardRowsPerBlock - 1) / kBackwardRowsPerBlock),
+      static_cast<unsigned>(n_slices));
+#define LAUNCH_ROWS(MULTI_SLICE)                                                    \
+  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                               \
+      BackwardRowPerWarpKernel<T, W, P, kSlice, kPack, kBackwardRowsPerBlock,       \
+                               MULTI_SLICE>,                                        \
+      row_grid, 32 * kBackwardRowsPerBlock, 0, device.stream(), projected,          \
+      batch_stride, weights.flat<W>().data(), pair_ids.flat<uint32>().data(),       \
+      edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),             \
+      nonempty_rows.flat<uint32>().data(), n_rows, dampening.flat<T>().data(),      \
+      spike_grad_t.flat<T>().data(), scale, static_cast<uint32>(n_pairs)))
+  if (n_slices > 1) {
+    LAUNCH_ROWS(true);
+  } else {
+    LAUNCH_ROWS(false);
+  }
+#undef LAUNCH_ROWS
+  TF_RETURN_IF_ERROR(GpuLaunchKernel(
+      TransposeSpikeGradKernel<T, kSlice>,
+      dim3(static_cast<unsigned>((n_pre + 31) / 32), static_cast<unsigned>(n_slices)), 256,
+      0, device.stream(), n_pre, batch, batch_stride, spike_grad_t.flat<T>().data(),
+      spike_grad->flat<T>().data(), row_splits.flat<uint32>().data()));
+  return LaunchEventWeightGrad<T, kBasis>(context, spikes, current_grad, basis,
+                                          post_ids, synapse_types, row_splits,
+                                          edge_ids, n_post, weight_grad, accumulate);
 }
 
+// Any batch size, basis dimension and spike dtype. The slice is the next power
+// of two up to 32; at eight FP16 samples per lane a 32-sample slice line is
+// exactly one 16-byte load, and FP32 packs four. With `accumulate` the weight
+// gradient is added to what `weight_grad` already holds instead of replacing it.
 template <typename T, typename W, int kBasis>
 Status LaunchPairProjectedBackward(
     OpKernelContext* context, const Tensor& spikes, const Tensor& current_grad,
@@ -1290,132 +772,94 @@ Status LaunchPairProjectedBackward(
     const Tensor& row_splits, const Tensor& edge_ids,
     const Tensor& nonempty_rows, const Tensor& basis, const Tensor& dampening,
     const Tensor& pair_ids, const Tensor& pair_posts, const Tensor& pair_types,
-    int n_post, Tensor* spike_grad, Tensor* weight_grad) {
-  const int64_t n_rows = nonempty_rows.NumElements();
-  const int64_t n_pairs = pair_posts.NumElements();
+    int n_post, Tensor* spike_grad, Tensor* weight_grad, bool accumulate = false) {
   const int64_t batch = spikes.dim_size(0);
-  if (batch == 0 || n_rows == 0) return OkStatus();
-  if (batch > 512 || (batch & (batch - 1)) != 0) {
-    return errors::InvalidArgument("pair-projected backward requires a power-of-two batch up to 512");
+  if (batch == 0 || nonempty_rows.NumElements() == 0) {
+    auto stream = context->eigen_device<GPUDevice>().stream();
+    cudaMemsetAsync(spike_grad->flat<T>().data(), 0, spike_grad->TotalBytes(), stream);
+    if (!accumulate)
+      cudaMemsetAsync(weight_grad->flat<float>().data(), 0, weight_grad->TotalBytes(), stream);
+    return OkStatus();
   }
-  const int n_basis = basis.dim_size(1);
-  auto device = context->eigen_device<GPUDevice>();
-#define LAUNCH_PACKED_PAIR(BATCH, PACK) do {                                   Tensor projected_tensor;                                                   const int64_t projected_elements = BATCH * n_pairs;                        TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kProjectionThreads = 128;                                    constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             PreprojectPairsTiledKernel<T, kBasis, BATCH, kPairsPerTile>,                static_cast<int>((n_pairs + kPairsPerTile - 1) / kPairsPerTile),            kProjectionThreads, 0, device.stream(), n_post, n_basis, n_pairs,           current_grad.flat<T>().data(), basis.flat<T>().data(),                      pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          projected_tensor.flat<float>().data()));                                constexpr int kWarps = 1;                                                  constexpr int kTile = 32;                                                  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             BackwardPackedRowKernel<W, BATCH, PACK, kWarps, kTile>,                     static_cast<int>(n_rows), 32 * kWarps, 0, device.stream(),                   spikes.dim_size(1), spikes.flat<T>().data(),                                projected_tensor.flat<float>().data(), weights.flat<W>().data(),            pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),         n_rows, dampening.flat<T>().data(), spike_grad->flat<T>().data(),           weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
-  if constexpr (std::is_same<T, Eigen::half>::value) {
-    switch (batch) {
-      case 1: LAUNCH_PACKED_PAIR(1, 1);
-      case 2: LAUNCH_PACKED_PAIR(2, 2);
-      case 4: LAUNCH_PACKED_PAIR(4, 4);
-      case 8: LAUNCH_PACKED_PAIR(8, 4);
-      case 16: LAUNCH_PACKED_PAIR(16, 4);
-      case 32: LAUNCH_PACKED_PAIR(32, 4);
-    }
-#define LAUNCH_PACKED_LARGE_SERIAL(BATCH) do {                                Tensor projected_tensor;                                                   const int64_t projected_elements = 32 * n_pairs;                           TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          constexpr int kBatchTile = 32;                                             constexpr int kPack = 4;                                                   constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  for (int tile_id = 0; tile_id < BATCH / kBatchTile; ++tile_id) {              const int64_t batch_base = static_cast<int64_t>(tile_id) * kBatchTile;       TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             PreprojectPairsTiledKernel<T, kBasis, 32, kPairsPerTile>,                   static_cast<int>((n_pairs + kPairsPerTile - 1) / kPairsPerTile),            256, 0, device.stream(), n_post, n_basis, n_pairs,                          current_grad.flat<T>().data() + batch_base * n_post * n_basis,              basis.flat<T>().data(), pair_posts.flat<uint32>().data(),                   pair_types.flat<uint8>().data(),                                            projected_tensor.flat<float>().data()));                                if (tile_id == 0) {                                                           TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             BackwardPackedRowKernel<W, 32, kPack, kWarps, kTile, false>,                static_cast<int>(n_rows), 32 * kWarps, 0, device.stream(),                   spikes.dim_size(1), spikes.flat<T>().data() +                                   batch_base * spikes.dim_size(1),                                        projected_tensor.flat<float>().data(), weights.flat<W>().data(),             pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(),                                           nonempty_rows.flat<uint32>().data(), n_rows,                                dampening.flat<T>().data(), spike_grad->flat<T>().data() +                      batch_base * spikes.dim_size(1),                                        weight_grad->flat<float>().data()));                                  } else {                                                                      TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             BackwardPackedRowKernel<W, 32, kPack, kWarps, kTile, true>,                 static_cast<int>(n_rows), 32 * kWarps, 0, device.stream(),                   spikes.dim_size(1), spikes.flat<T>().data() +                                   batch_base * spikes.dim_size(1),                                        projected_tensor.flat<float>().data(), weights.flat<W>().data(),             pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(),                                           nonempty_rows.flat<uint32>().data(), n_rows,                                dampening.flat<T>().data(), spike_grad->flat<T>().data() +                      batch_base * spikes.dim_size(1),                                        weight_grad->flat<float>().data()));                                  }                                                                         }                                                                           return OkStatus();                                                        } while (false)
-#define LAUNCH_PACKED_LARGE_ATOMIC(BATCH) do {                                Tensor projected_tensor;                                                   const int64_t projected_elements = BATCH * n_pairs;                        TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          constexpr int kBatchTile = 32;                                             TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             PreprojectPairsBatchTilesKernel<T, kBasis, BATCH, kPairsPerTile>,           dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) /                                             kPairsPerTile), BATCH / kBatchTile),             256, 0, device.stream(), n_post, n_basis, n_pairs,                          current_grad.flat<T>().data(), basis.flat<T>().data(),                      pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          projected_tensor.flat<float>().data()));                                cudaMemsetAsync(weight_grad->flat<float>().data(), 0,                                       weight_grad->NumElements() * sizeof(float),                                 device.stream());                                           constexpr int kPack = 4;                                                   constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             BackwardPackedBatchTilesKernel<W, BATCH, kPack, kWarps, kTile>,             dim3(static_cast<unsigned>(n_rows), BATCH / kBatchTile),                     32 * kWarps, 0, device.stream(), spikes.dim_size(1), n_pairs,               spikes.flat<T>().data(), projected_tensor.flat<float>().data(),             weights.flat<W>().data(), pair_ids.flat<uint32>().data(),                   edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),           nonempty_rows.flat<uint32>().data(), n_rows,                                dampening.flat<T>().data(), spike_grad->flat<T>().data(),                   weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
-#define LAUNCH_PACKED_DIRECT(BATCH, WARPS) do {                                      Tensor projected_tensor;                                                   const int64_t projected_elements = BATCH * n_pairs;                        TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             PreprojectPairsBatchTilesKernel<T, kBasis, BATCH, kPairsPerTile>,           dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) /                                             kPairsPerTile), BATCH / 32),                     256, 0, device.stream(), n_post, n_basis, n_pairs,                          current_grad.flat<T>().data(), basis.flat<T>().data(),                      pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          projected_tensor.flat<float>().data()));                                TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             BackwardPackedBatch64DirectKernel<W, BATCH, 4,                                                               WARPS, 32>,               static_cast<int>(n_rows), 32 * WARPS, 0,                    device.stream(),                                                            spikes.dim_size(1), n_pairs, spikes.flat<T>().data(),                      projected_tensor.flat<float>().data(), weights.flat<W>().data(),            pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),         n_rows, dampening.flat<T>().data(), spike_grad->flat<T>().data(),           weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
-#if V1_OPT_LARGE_PAIR_MODE == 2
-    switch (batch) {
-      case 64: LAUNCH_PACKED_DIRECT(64, 1);
-      case 128: LAUNCH_PACKED_DIRECT(128, 2);
-      case 256: LAUNCH_PACKED_DIRECT(256, 1);
-      case 512: LAUNCH_PACKED_DIRECT(512, 1);
-    }
-#elif V1_OPT_LARGE_PAIR_MODE
-    switch (batch) {
-      case 64: LAUNCH_PACKED_LARGE_SERIAL(64);
-      case 128: LAUNCH_PACKED_LARGE_SERIAL(128);
-      case 256: LAUNCH_PACKED_LARGE_SERIAL(256);
-      case 512: LAUNCH_PACKED_LARGE_SERIAL(512);
-    }
-#else
-    switch (batch) {
-      case 64: LAUNCH_PACKED_LARGE_ATOMIC(64);
-      case 128: LAUNCH_PACKED_LARGE_ATOMIC(128);
-      case 256: LAUNCH_PACKED_LARGE_ATOMIC(256);
-      case 512: LAUNCH_PACKED_LARGE_ATOMIC(512);
-    }
-#endif
-#undef LAUNCH_PACKED_DIRECT
-#undef LAUNCH_PACKED_LARGE_SERIAL
-#undef LAUNCH_PACKED_LARGE_ATOMIC
-  }
-#undef LAUNCH_PACKED_PAIR
-  return errors::InvalidArgument("packed pair projection requires float16");
+  constexpr int kWidePack = std::is_same<T, Eigen::half>::value ? 8 : 4;
+#define LAUNCH_SLICE(SLICE, PACK)                                                \
+  return LaunchSlicedPairBackward<T, W, kBasis, SLICE, PACK>(                  \
+      context, spikes, current_grad, weights, post_ids, synapse_types,         \
+      row_splits, edge_ids, nonempty_rows, basis, dampening, pair_ids,         \
+      pair_posts, pair_types, n_post, spike_grad, weight_grad, accumulate)
+  if (batch > 16) LAUNCH_SLICE(32, kWidePack);
+  if (batch > 8) LAUNCH_SLICE(16, 4);
+  if (batch > 4) LAUNCH_SLICE(8, 4);
+  if (batch > 2) LAUNCH_SLICE(4, 4);
+  if (batch > 1) LAUNCH_SLICE(2, 2);
+  LAUNCH_SLICE(1, 1);
+#undef LAUNCH_SLICE
 }
 
-template <typename T, typename W, int kBasis>
-Status LaunchGenericPairProjectedBackward(
-    OpKernelContext* context, const Tensor& spikes, const Tensor& current_grad,
-    const Tensor& weights, const Tensor& row_splits, const Tensor& edge_ids,
-    const Tensor& nonempty_rows, const Tensor& basis, const Tensor& dampening,
-    const Tensor& pair_ids, const Tensor& pair_posts, const Tensor& pair_types,
-    int n_post, Tensor* spike_grad, Tensor* weight_grad) {
-  const int64_t n_rows = nonempty_rows.NumElements();
-  const int64_t n_pairs = pair_posts.NumElements();
-  const int64_t batch = spikes.dim_size(0);
-  if (batch == 0 || n_rows == 0) return OkStatus();
-  if constexpr (!std::is_same<T, Eigen::half>::value) {
-    return errors::InvalidArgument("generic pair projection requires float16");
+// Hands `launch` the buffer the recurrent weight gradient goes to. By default
+// that is output 1, which the kernels overwrite. With `kAccumulate` it is the
+// FP32 [n_edges] variable behind input `accumulator_input`, which the kernels add
+// into while its lock is held, so the training graph never carries a dense
+// per-step weight gradient. The handle lookup rejects a variable that lives on
+// another device, so a replica can only ever add into its own accumulator.
+template <bool kAccumulate, typename Launch>
+Status WithWeightGradBuffer(OpKernelContext* context, int accumulator_input,
+                            int64_t n_edges, Launch launch) {
+  if constexpr (!kAccumulate) {
+    Tensor* weight_grad;
+    TF_RETURN_IF_ERROR(
+        context->allocate_output(1, TensorShape({n_edges}), &weight_grad));
+    return launch(weight_grad);
+  } else {
+    core::RefCountPtr<Var> variable;
+    TF_RETURN_IF_ERROR(LookupResource(
+        context, HandleFromInput(context, accumulator_input), &variable));
+    mutex_lock lock(*variable->mu());
+    Tensor* accumulator = variable->tensor();
+    if (!variable->is_initialized || accumulator->dtype() != DT_FLOAT ||
+        accumulator->NumElements() != n_edges) {
+      return errors::InvalidArgument(
+          "the accumulator must be an initialized float32 [n_edges] variable");
+    }
+    if (!accumulator->RefCountIsOne()) {
+      // A read of the current value is still alive, so adding in place would
+      // change what it sees. Copy on write, as TensorFlow's own resource
+      // update ops do.
+      Tensor copy;
+      TF_RETURN_IF_ERROR(
+          context->allocate_temp(DT_FLOAT, accumulator->shape(), &copy));
+      cudaMemcpyAsync(copy.flat<float>().data(), accumulator->flat<float>().data(),
+                      accumulator->TotalBytes(), cudaMemcpyDeviceToDevice,
+                      context->eigen_device<GPUDevice>().stream());
+      *accumulator = copy;
+    }
+    return launch(accumulator);
   }
-  const int n_basis = basis.dim_size(1);
-  auto device = context->eigen_device<GPUDevice>();
-  Tensor projected_tensor;
-  TF_RETURN_IF_ERROR(context->allocate_temp(
-      DT_FLOAT, TensorShape({n_pairs * batch}), &projected_tensor));
-  constexpr int kPairsPerTile = 32;
-  const int64_t batch_tiles = (batch + 31) / 32;
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      PreprojectGenericPairsKernel<T, kBasis, kPairsPerTile>,
-      dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) / kPairsPerTile),
-           static_cast<unsigned>(batch_tiles)),
-      256, 0, device.stream(), batch, n_post, n_basis, n_pairs,
-      current_grad.flat<T>().data(), basis.flat<T>().data(),
-      pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),
-      projected_tensor.flat<float>().data()));
-  constexpr int kWarps = 2;
-  constexpr int kTile = 32;
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      GenericRecurrentWeightKernel<T, W, kWarps, kTile>,
-      static_cast<int>(n_rows), 32 * kWarps, 0, device.stream(), batch,
-      spikes.dim_size(1), spikes.flat<T>().data(),
-      projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),
-      edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),
-      nonempty_rows.flat<uint32>().data(), n_rows,
-      weight_grad->flat<float>().data()));
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(
-      GenericRecurrentSpikeKernel<T, W, kWarps, kTile>,
-      dim3(static_cast<unsigned>(n_rows), static_cast<unsigned>(batch_tiles)),
-      32 * kWarps, 0, device.stream(), batch, spikes.dim_size(1),
-      projected_tensor.flat<float>().data(), weights.flat<W>().data(),
-      pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),
-      row_splits.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),
-      n_rows, dampening.flat<T>().data(), spike_grad->flat<T>().data()));
-  return OkStatus();
 }
 
-#undef V1_BATCH_CASE
+// ---------------------------------------------------------------------------
+// Operators
+// ---------------------------------------------------------------------------
 
 template <typename T, typename W>
 class V1CsrForwardOp : public OpKernel {
  public:
   explicit V1CsrForwardOp(OpKernelConstruction* context) : OpKernel(context) {
     OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("aggregate_runs", &aggregate_runs_));
   }
 
   void Compute(OpKernelContext* context) override {
     const Tensor& spikes = context->input(0);
-    const Tensor& active = context->input(1);
-    const Tensor& weights = context->input(2);
-    const Tensor& post_ids = context->input(3);
-    const Tensor& synapse_types = context->input(4);
-    const Tensor& row_splits = context->input(5);
-    const Tensor& edge_ids = context->input(6);
-    const Tensor& basis = context->input(7);
-    const Tensor& initial = context->input(8);
+    const Tensor& weights = context->input(1);
+    const Tensor& post_ids = context->input(2);
+    const Tensor& synapse_types = context->input(3);
+    const Tensor& row_splits = context->input(4);
+    const Tensor& edge_ids = context->input(5);
+    const Tensor& basis = context->input(6);
+    const Tensor& initial = context->input(7);
     OP_REQUIRES(context, spikes.dims() == 2,
                 errors::InvalidArgument("spikes must be rank two"));
-    OP_REQUIRES(context, active.dims() == 2 && active.dim_size(1) == 2,
-                errors::InvalidArgument("active_indices must have shape [N,2]"));
     OP_REQUIRES(context, basis.dims() == 2 && basis.dim_size(1) > 0,
                 errors::InvalidArgument("basis must be [n_types,n_basis], n_basis > 0"));
     OP_REQUIRES(context, row_splits.NumElements() == spikes.dim_size(1) + 1,
@@ -1434,7 +878,7 @@ class V1CsrForwardOp : public OpKernel {
       // scatter lands directly on the previous source's currents and costs no
       // initialization traffic at all. Otherwise seed a fresh buffer with it.
       OP_REQUIRES_OK(context,
-                     context->forward_input_or_allocate_output({8}, 0, shape,
+                     context->forward_input_or_allocate_output({7}, 0, shape,
                                                                &output));
       if (output->flat<T>().data() != initial.flat<T>().data()) {
         cudaMemcpyAsync(output->flat<T>().data(), initial.flat<T>().data(),
@@ -1448,83 +892,23 @@ class V1CsrForwardOp : public OpKernel {
     }
     if (n_basis == 4) {
       OP_REQUIRES_OK(context, LaunchForward<T, W, 4>(
-                                  context, spikes, active, weights, post_ids,
+                                  context, spikes, weights, post_ids,
                                   synapse_types, row_splits, edge_ids, basis,
-                                  n_post_, output));
+                                  n_post_, aggregate_runs_, output));
     } else {
       OP_REQUIRES_OK(context, LaunchForward<T, W, 0>(
-                                  context, spikes, active, weights, post_ids,
+                                  context, spikes, weights, post_ids,
                                   synapse_types, row_splits, edge_ids, basis,
-                                  n_post_, output));
+                                  n_post_, aggregate_runs_, output));
     }
   }
 
  private:
   int n_post_;
+  bool aggregate_runs_ = true;
 };
 
-template <typename T, typename W>
-class V1CsrBackwardOp : public OpKernel {
- public:
-  explicit V1CsrBackwardOp(OpKernelConstruction* context) : OpKernel(context) {
-    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
-    OP_REQUIRES_OK(context, context->GetAttr("n_edges", &n_edges_));
-  }
-
-  void Compute(OpKernelContext* context) override {
-    const Tensor& spikes = context->input(0);
-    const Tensor& current_grad = context->input(1);
-    const Tensor& weights = context->input(2);
-    const Tensor& post_ids = context->input(3);
-    const Tensor& synapse_types = context->input(4);
-    const Tensor& row_splits = context->input(5);
-    const Tensor& edge_ids = context->input(6);
-    const Tensor& nonempty_rows = context->input(7);
-    const Tensor& basis = context->input(8);
-    const Tensor& dampening = context->input(9);
-    OP_REQUIRES(context, spikes.dims() == 2 && basis.dims() == 2,
-                errors::InvalidArgument("spikes and basis must be rank two"));
-    OP_REQUIRES(context, basis.dim_size(1) > 0,
-                errors::InvalidArgument("basis dimension must be positive"));
-    OP_REQUIRES(context,
-                current_grad.dims() == 2 &&
-                    current_grad.dim_size(0) == spikes.dim_size(0) * n_post_ &&
-                    current_grad.dim_size(1) == basis.dim_size(1),
-                errors::InvalidArgument("current_grad has an incompatible shape"));
-    OP_REQUIRES(context, dampening.NumElements() == 1,
-                errors::InvalidArgument("dampening must be scalar"));
-    Tensor* spike_grad;
-    Tensor* weight_grad;
-    OP_REQUIRES_OK(context,
-                   context->allocate_output(0, spikes.shape(), &spike_grad));
-    OP_REQUIRES_OK(context, context->allocate_output(
-                                1, TensorShape({n_edges_}), &weight_grad));
-    auto device = context->eigen_device<GPUDevice>();
-    cudaMemsetAsync(spike_grad->flat<T>().data(), 0,
-                    spike_grad->NumElements() * sizeof(T), device.stream());
-    cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
-                    weight_grad->NumElements() * sizeof(float), device.stream());
-    if (basis.dim_size(1) == 4) {
-      OP_REQUIRES_OK(context, LaunchBackward<T, W, 4>(
-                                  context, spikes, current_grad, weights,
-                                  post_ids, synapse_types, row_splits, edge_ids,
-                                  nonempty_rows, basis, dampening, n_post_,
-                                  spike_grad, weight_grad));
-    } else {
-      OP_REQUIRES_OK(context, LaunchBackward<T, W, 0>(
-                                  context, spikes, current_grad, weights,
-                                  post_ids, synapse_types, row_splits, edge_ids,
-                                  nonempty_rows, basis, dampening, n_post_,
-                                  spike_grad, weight_grad));
-    }
-  }
-
- private:
-  int n_post_;
-  int n_edges_;
-};
-
-template <typename T, typename W>
+template <typename T, typename W, bool kAccumulate = false>
 class V1CsrBackwardPairProjectedOp : public OpKernel {
  public:
   explicit V1CsrBackwardPairProjectedOp(OpKernelConstruction* context)
@@ -1547,49 +931,34 @@ class V1CsrBackwardPairProjectedOp : public OpKernel {
     const Tensor& pair_ids = context->input(10);
     const Tensor& pair_posts = context->input(11);
     const Tensor& pair_types = context->input(12);
-    OP_REQUIRES(context, spikes.dims() == 2 && spikes.dim_size(0) >= 1,
-                errors::InvalidArgument("spikes batch must be positive"));
+    OP_REQUIRES(context, spikes.dims() == 2,
+                errors::InvalidArgument("spikes must be rank two"));
     OP_REQUIRES(context, basis.dims() == 2 && basis.dim_size(1) > 0,
                 errors::InvalidArgument("basis dimension must be positive"));
+    OP_REQUIRES(context,
+                current_grad.dims() == 2 &&
+                    current_grad.dim_size(0) == spikes.dim_size(0) * n_post_ &&
+                    current_grad.dim_size(1) == basis.dim_size(1),
+                errors::InvalidArgument("current_grad has an incompatible shape"));
+    OP_REQUIRES(context, dampening.NumElements() == 1,
+                errors::InvalidArgument("dampening must be scalar"));
     OP_REQUIRES(context, pair_ids.NumElements() == post_ids.NumElements(),
                 errors::InvalidArgument("pair_ids must align with CSR edges"));
     OP_REQUIRES(context, pair_posts.NumElements() == pair_types.NumElements(),
                 errors::InvalidArgument("pair metadata lengths differ"));
     Tensor* spike_grad;
-    Tensor* weight_grad;
     OP_REQUIRES_OK(context, context->allocate_output(0, spikes.shape(), &spike_grad));
-    OP_REQUIRES_OK(context, context->allocate_output(
-                                1, TensorShape({n_edges_}), &weight_grad));
-    auto device = context->eigen_device<GPUDevice>();
-    // Rows with no edges are never visited, so the spike gradient is cleared.
-    // The weight gradient is not: both backward kernels write every CSR
-    // position exactly once, and `nonempty_rows` covers every position, so
-    // clearing 321 MiB first would only cost write bandwidth.
-    cudaMemsetAsync(spike_grad->flat<T>().data(), 0,
-                    spike_grad->NumElements() * sizeof(T), device.stream());
-    const int64_t batch = spikes.dim_size(0);
-    const bool specialized =
-        basis.dim_size(1) == 4 && batch <= 512 && (batch & (batch - 1)) == 0;
-    if (specialized) {
-      OP_REQUIRES_OK(context, LaunchPairProjectedBackward<T, W, 4>(
-                                  context, spikes, current_grad, weights,
-                                  post_ids, synapse_types, row_splits, edge_ids,
-                                  nonempty_rows, basis, dampening, pair_ids,
-                                  pair_posts, pair_types, n_post_, spike_grad,
-                                  weight_grad));
-    } else if (basis.dim_size(1) == 4) {
-      OP_REQUIRES_OK(context, LaunchGenericPairProjectedBackward<T, W, 4>(
-                                  context, spikes, current_grad, weights,
-                                  row_splits, edge_ids, nonempty_rows, basis,
-                                  dampening, pair_ids, pair_posts, pair_types,
-                                  n_post_, spike_grad, weight_grad));
-    } else {
-      OP_REQUIRES_OK(context, LaunchGenericPairProjectedBackward<T, W, 0>(
-                                  context, spikes, current_grad, weights,
-                                  row_splits, edge_ids, nonempty_rows, basis,
-                                  dampening, pair_ids, pair_posts, pair_types,
-                                  n_post_, spike_grad, weight_grad));
-    }
+#define LAUNCH_BACKWARD(BASIS)                                                     \
+  LaunchPairProjectedBackward<T, W, BASIS>(                                        \
+      context, spikes, current_grad, weights, post_ids, synapse_types,            \
+      row_splits, edge_ids, nonempty_rows, basis, dampening, pair_ids,            \
+      pair_posts, pair_types, n_post_, spike_grad, weight_grad, kAccumulate)
+    OP_REQUIRES_OK(context, WithWeightGradBuffer<kAccumulate>(
+                                context, 13, n_edges_, [&](Tensor* weight_grad) {
+                                  return basis.dim_size(1) == 4 ? LAUNCH_BACKWARD(4)
+                                                                : LAUNCH_BACKWARD(0);
+                                }));
+#undef LAUNCH_BACKWARD
   }
 
  private:
@@ -1597,19 +966,20 @@ class V1CsrBackwardPairProjectedOp : public OpKernel {
   int n_edges_;
 };
 
-
 #ifndef V1_KERNEL_IMPLEMENTATION_ONLY
 #define REGISTER_TYPE(T)                                                   \
   REGISTER_KERNEL_BUILDER(                                                 \
-      Name("V1CsrForward").Device(DEVICE_GPU).TypeConstraint<T>("T"),     \
+      Name("V1CsrForward").Device(DEVICE_GPU).TypeConstraint<T>("T"),       \
       V1CsrForwardOp<T, float>);                                           \
   REGISTER_KERNEL_BUILDER(                                                 \
-      Name("V1CsrBackward").Device(DEVICE_GPU).TypeConstraint<T>("T"),    \
-      V1CsrBackwardOp<T, float>);                                          \
-  REGISTER_KERNEL_BUILDER(                                                 \
-      Name("V1CsrBackwardPairProjected")                                  \
+      Name("V1CsrBackwardPairProjected")                                    \
           .Device(DEVICE_GPU).TypeConstraint<T>("T"),                      \
-      V1CsrBackwardPairProjectedOp<T, float>);
+      V1CsrBackwardPairProjectedOp<T, float>);                              \
+  REGISTER_KERNEL_BUILDER(                                                 \
+      Name("V1CsrBackwardPairProjectedAccumulate")                          \
+          .Device(DEVICE_GPU).TypeConstraint<T>("T")                       \
+          .HostMemory("accumulator"),                                      \
+      V1CsrBackwardPairProjectedOp<T, float, true>);
 
 TF_CALL_half(REGISTER_TYPE);
 TF_CALL_float(REGISTER_TYPE);

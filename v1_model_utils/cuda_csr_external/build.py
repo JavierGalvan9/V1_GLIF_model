@@ -25,7 +25,6 @@ HERE = Path(__file__).resolve().parent
 BUILD_FLAGS = (
     "-DV1_EXTERNAL_THREADS=1024",
     "-DV1_EXTERNAL_BATCH32_TILE=32",
-    "-DV1_EXTERNAL_HALF2=1",
     f"-DV1_DIRECT_CSR={int(DIRECT_CSR)}",
     "--expt-relaxed-constexpr",
     "--use_fast_math",

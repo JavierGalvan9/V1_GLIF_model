@@ -1,8 +1,10 @@
+import contextlib
 import numpy as np
 import tensorflow as tf
 import os
 import pickle as pkl
 from .cuda_csr_recurrent import (
+    accumulate_recurrent_weight_gradient,
     build_csr_connectivity,
     calculate_recurrent_csr_currents,
 )
@@ -940,8 +942,14 @@ class V1Column(tf.keras.layers.Layer):
         with open(path, "rb") as f:
             syn_id_to_syn_weights_dict = pkl.load(f)
         synaptic_basis_weights = np.array(list(syn_id_to_syn_weights_dict.values()))
-        # self.synaptic_basis_weights = tf.constant(synaptic_basis_weights, dtype=self.compute_dtype)
-        self.synaptic_basis_weights = tf.constant(synaptic_basis_weights, dtype=self.compute_dtype)
+        # The CUDA kernels take the basis in FP32: rounding these 360 constants to
+        # the compute dtype would bias every synaptic contribution. The
+        # TensorFlow reference backend multiplies it with compute-dtype weights,
+        # so it keeps that dtype.
+        basis_dtype = (
+            tf.float32 if self._synaptic_current_backend == "cuda" else self.compute_dtype
+        )
+        self.synaptic_basis_weights = tf.constant(synaptic_basis_weights, dtype=basis_dtype)
 
         ### Network recurrent connectivity ###
         indices = np.array(network["synapses"]["indices"])
@@ -1085,7 +1093,7 @@ class V1Column(tf.keras.layers.Layer):
                 n_pre=self.lgn_input_dense_shape[1],
                 n_post=self.lgn_input_dense_shape[0],
                 weights_csr_ordered=self._weights_csr_ordered,
-                needs_backward=train_input or self._compute_lgn_activity_gradient,
+                needs_activity_backward=self._compute_lgn_activity_gradient,
             )
         else:
             self.input_syn_ids = tf.constant(input_syn_ids, dtype=tf.int64)
@@ -1126,7 +1134,9 @@ class V1Column(tf.keras.layers.Layer):
                 n_pre=self.bkg_input_dense_shape[1],
                 n_post=self.bkg_input_dense_shape[0],
                 weights_csr_ordered=self._weights_csr_ordered,
-                needs_backward=train_noise or self._compute_bkg_activity_gradient,
+                needs_activity_backward=self._compute_bkg_activity_gradient,
+                # Poisson background: every row is active every step.
+                sparse_activity=False,
             )
         else:
             self.pre_bkg_ind_table = make_pre_ind_table(
@@ -1324,7 +1334,10 @@ class V1Column(tf.keras.layers.Layer):
 
         i_in = tf.TensorArray(dtype=self.compute_dtype, size=self._n_syn_basis)
         for r_id in range(self._n_syn_basis):
-            input_weights_factors = tf.gather(self.synaptic_basis_weights[:, r_id], self.input_syn_ids, axis=0) # shape (n_input_synapses,)
+            input_weights_factors = tf.cast(
+                tf.gather(self.synaptic_basis_weights[:, r_id], self.input_syn_ids, axis=0),
+                self.compute_dtype,
+            ) # shape (n_input_synapses,)
             weights_syn_receptors = tf.cast(self.input_weight_values, self.compute_dtype) * input_weights_factors
             sparse_w_in = tf.sparse.SparseTensor(
                 self.input_indices,
@@ -1358,17 +1371,14 @@ class V1Column(tf.keras.layers.Layer):
         returning a separate tensor for a later add.
         """
         if self._synaptic_current_backend == "cuda":
-            active_inputs = x_t if x_t.dtype == tf.bool else x_t > 0
-            activity = tf.cast(active_inputs, dtype=self.compute_dtype)
+            # LGN inputs are 0/1 spikes: Keras casts the bool batch to the compute
+            # dtype once at the model input, so a floating x_t is used as-is and
+            # is its own straight-through activity gradient.
+            activity = tf.cast(x_t, dtype=self.compute_dtype)
             compute_activity_gradient = getattr(
                 self, "_compute_lgn_activity_gradient", False
             )
-            if compute_activity_gradient and x_t.dtype.is_floating:
-                differentiable_input = tf.cast(x_t, self.compute_dtype)
-                activity += differentiable_input - tf.stop_gradient(
-                    differentiable_input
-                )
-            else:
+            if not (compute_activity_gradient and x_t.dtype.is_floating):
                 activity = tf.stop_gradient(activity)
             return calculate_external_csr_currents(
                 activity,
@@ -1442,11 +1452,13 @@ class V1Column(tf.keras.layers.Layer):
             shape=poisson_shape,
             seed=noise_seed,
             lam=self.bkg_spike_prob,
-            dtype=tf.int32,
+            # Counts are small integers, exact in fp16, so the CUDA path takes the
+            # compute dtype directly and saves a per-step cast kernel.
+            dtype=self.compute_dtype if self._synaptic_current_backend == "cuda" else tf.int32,
         ) # this operation is done in the CPU (no support for stateless poisson in GPU). However, the operation is done in parallel with GPU work so it only adds a small communication overhead. Do not try to optimize this to run in GPU, as it will be slower than the current implementation.
 
         if self._synaptic_current_backend == "cuda":
-            activity = tf.cast(rest_of_brain, dtype=self.compute_dtype)
+            activity = rest_of_brain
             compute_activity_gradient = getattr(
                 self, "_compute_bkg_activity_gradient", False
             )
@@ -1611,6 +1623,18 @@ class V1Column(tf.keras.layers.Layer):
         return new_v, new_r, new_asc, new_psc_rise, new_psc
 
     @property
+    def accumulated_weight_gradient_variable(self):
+        """The trainable recurrent weight whose gradient the CUDA backward adds in place.
+
+        ``None`` under the TensorFlow backend or when the recurrent weights are
+        frozen. See :class:`SegmentedRecomputeRunner`.
+        """
+        weights = self.recurrent_weight_values
+        if self._synaptic_current_backend == "cuda" and weights.trainable:
+            return weights
+        return None
+
+    @property
     def output_size(self):
         """Width of the packed per-timestep output returned by ``call``."""
         visible_neurons = (
@@ -1735,7 +1759,7 @@ class V1Column(tf.keras.layers.Layer):
             # One add_n reads the three sources once instead of chaining two adds.
             rec_inputs = tf.add_n([i_rec, external_current, i_noise])
         # Reshape i_rec_flat back to [batch_size, num_neurons]
-        rec_inputs = tf.reshape(rec_inputs, [batch_size, self._n_neurons * self._n_syn_basis])
+        rec_inputs = tf.reshape(rec_inputs, [-1, self._n_neurons * self._n_syn_basis])
         # The master weights are pre-divided by lr_scale, so this restores the
         # requested scale. At lr_scale == 1 it is an identity over ~26 M
         # elements, so do not emit it at all.
@@ -2261,7 +2285,17 @@ def _unpack_spike_words(packed, width, dtype, word_bits):
 
 
 class SegmentedRecomputeRunner:
-    """Run an RNN in recomputed temporal chunks while preserving exact BPTT."""
+    """Run an RNN in recomputed temporal chunks while preserving exact BPTT.
+
+    ``accumulated_variable`` is a Keras variable whose gradient the CUDA
+    recurrent backward adds in place (``V1Column.accumulated_weight_gradient_variable``).
+    Its per-timestep gradient is then never a tensor the reverse pass has to sum:
+    every step adds into one FP32 accumulator, which the runner zeroes before
+    the reverse pass and reads once after it. The accumulator is replica-local
+    (``ON_READ``), so under a distribution strategy each replica returns its own
+    partial gradient and the optimizer all-reduces it as usual. The runner is
+    not trackable, so the accumulator never reaches a checkpoint.
+    """
 
     _PACKED_SPIKES_PER_WORD = 31
 
@@ -2272,6 +2306,7 @@ class SegmentedRecomputeRunner:
         chunk_size,
         differentiate_inputs=True,
         pack_spike_checkpoints=False,
+        accumulated_variable=None,
     ):
         sequence_length = int(sequence_length)
         chunk_size = int(chunk_size)
@@ -2294,6 +2329,22 @@ class SegmentedRecomputeRunner:
             for start in range(0, sequence_length, chunk_size)
         )
         self.n_chunks = len(self.chunk_sizes)
+        # The backing variable is what the custom gradient reports as used; in
+        # a replica context that is the distributed variable itself.
+        self._accumulated_variable = (
+            None if accumulated_variable is None else accumulated_variable.value
+        )
+        self._weight_gradient_accumulator = (
+            None
+            if accumulated_variable is None
+            else tf.Variable(
+                tf.zeros(accumulated_variable.shape, tf.float32),
+                trainable=False,
+                name="recurrent_weight_gradient_accumulator",
+                synchronization=tf.VariableSynchronization.ON_READ,
+                aggregation=tf.VariableAggregation.SUM,
+            )
+        )
         self.n_sequence_outputs = getattr(
             core_model, "_v1_sequence_output_count", None
         )
@@ -2460,7 +2511,21 @@ class SegmentedRecomputeRunner:
                 zip(state_dtypes, final_state_gradients)
             )
         )
-        variable_gradients = tuple(tf.zeros_like(value) for value in variables)
+        # The accumulated variable leaves the tape targets and the loop carry,
+        # which would otherwise hold dense zeros for it: its gradient arrives
+        # through the accumulator instead.
+        accumulated_index = next(
+            (
+                index for index, variable in enumerate(variables)
+                if variable is self._accumulated_variable
+            ),
+            None,
+        )
+        tape_variables = (
+            variables if accumulated_index is None
+            else variables[:accumulated_index] + variables[accumulated_index + 1:]
+        )
+        variable_gradients = tuple(tf.zeros_like(value) for value in tape_variables)
 
         def reverse_chunk(
             chunk_index,
@@ -2497,7 +2562,7 @@ class SegmentedRecomputeRunner:
                 if inputs_are_differentiable:
                     tape.watch(chunk)
                 tape.watch(differentiable_state)
-                tape.watch(variables)
+                tape.watch(tape_variables)
                 recomputed = self._run_chunk(chunk, *boundary_state)
 
             chunk_sequence_gradients = tuple(
@@ -2511,7 +2576,7 @@ class SegmentedRecomputeRunner:
                 for index, dtype in enumerate(state_dtypes)
             )
             input_targets = (chunk,) if inputs_are_differentiable else ()
-            targets = input_targets + differentiable_state + variables
+            targets = input_targets + differentiable_state + tape_variables
             gradients = tape.gradient(
                 recomputed,
                 targets,
@@ -2545,14 +2610,20 @@ class SegmentedRecomputeRunner:
                 )
             return input_history, tuple(next_state_cotangents), next_variable_gradients
 
-        if self.remainder_size:
-            input_gradients, state_cotangents, variable_gradients = reverse_chunk(
-                tf.constant(self.n_full_chunks),
-                self.remainder_size,
-                input_gradients,
-                state_cotangents,
-                variable_gradients,
-            )
+        if accumulated_index is None:
+            accumulation = contextlib.nullcontext()
+        else:
+            accumulator = self._weight_gradient_accumulator
+            # Every accumulating kernel consumes the handle, so publishing it
+            # after the zeroing orders the whole reverse pass behind it.
+            with tf.control_dependencies([
+                accumulator.assign(
+                    tf.zeros(accumulator.shape, accumulator.dtype), read_value=False
+                )
+            ]):
+                accumulation = accumulate_recurrent_weight_gradient(
+                    tf.identity(accumulator.handle)
+                )
 
         def run_reverse_full_chunk(
             chunk_index, input_history, output_state_cotangents,
@@ -2567,17 +2638,38 @@ class SegmentedRecomputeRunner:
             )
             return chunk_index - 1, input_history, state_values, variable_values
 
-        _, input_gradients, state_cotangents, variable_gradients = tf.while_loop(
-            lambda chunk_index, _inputs, _states, _variables: chunk_index >= 0,
-            run_reverse_full_chunk,
-            (
-                tf.constant(self.n_full_chunks - 1),
-                input_gradients,
-                state_cotangents,
-                variable_gradients,
-            ),
-            parallel_iterations=1,
-        )
+        with accumulation:
+            if self.remainder_size:
+                input_gradients, state_cotangents, variable_gradients = reverse_chunk(
+                    tf.constant(self.n_full_chunks),
+                    self.remainder_size,
+                    input_gradients,
+                    state_cotangents,
+                    variable_gradients,
+                )
+            _, input_gradients, state_cotangents, variable_gradients = tf.while_loop(
+                lambda chunk_index, _inputs, _states, _variables: chunk_index >= 0,
+                run_reverse_full_chunk,
+                (
+                    tf.constant(self.n_full_chunks - 1),
+                    input_gradients,
+                    state_cotangents,
+                    variable_gradients,
+                ),
+                parallel_iterations=1,
+            )
+        if accumulated_index is not None:
+            # The reverse loop's outputs exist only once it has finished, so
+            # the read sees every chunk's contribution.
+            with tf.control_dependencies(tf.nest.flatten(state_cotangents)):
+                accumulated_gradient = tf.cast(
+                    accumulator.read_value(), variables[accumulated_index].dtype
+                )
+            variable_gradients = (
+                variable_gradients[:accumulated_index]
+                + (accumulated_gradient,)
+                + variable_gradients[accumulated_index:]
+            )
         if inputs_are_differentiable:
             input_chunks = tuple(
                 input_gradients[0].read(index) for index in range(self.n_chunks)

@@ -3,6 +3,8 @@
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/util/gpu_kernel_helper.h"
+#include <type_traits>
+#include <limits>
 
 using namespace tensorflow;
 using GPUDevice = Eigen::GpuDevice;
@@ -10,6 +12,8 @@ template <typename T> __device__ float F(T x) { return static_cast<float>(x); }
 template <typename T> __device__ T V(float x) { return static_cast<T>(x); }
 
 constexpr int kBasis = 4;
+constexpr int kTileBatch = 2;
+constexpr int kTileThreads = 512;
 
 // The per-neuron float32 constants both kernels read. Each syn entry is one
 // (neuron, basis) pair, [x, y, z, w] = [syn_decay, psc_initial, psc_factor,
@@ -24,7 +28,7 @@ struct Constants {
 // T; everything else is float32 (see glif_state_ops.cc). z_buf holds `slots`
 // delay slots of `neurons` spikes per sample, newest first.
 template <typename T, typename R, int Basis>
-__global__ void ForwardKernel(int64_t count, int neurons, int slots,
+__global__ void ForwardKernel(int64_t count, int neurons, int slots, int n_basis,
     const T* z_buf, const float* v, const R* r, const float* asc,
     const T* rise, const T* psc, const T* inputs, Constants k, const R* t_ref,
     const float* dt, const float* v_reset, const float* v_th, bool hard_reset,
@@ -33,19 +37,20 @@ __global__ void ForwardKernel(int64_t count, int neurons, int slots,
     T* voltage_out) {
   const float step = *dt; const float rest = *v_reset;
   const float threshold = *v_th;
+  const int width = Basis == 0 ? n_basis : Basis;
   GPU_1D_KERNEL_LOOP(i, count) {
     const int64_t sample = i / neurons;
     const int neuron = i - sample * neurons;
     const int64_t history = sample * slots * neurons + neuron;
-    const int parameter_base = neuron * Basis;
-    const int64_t state_base = i * Basis;
+    const int parameter_base = neuron * width;
+    const int64_t state_base = i * width;
     const float reset = F(z_buf[history]);
     // Each current source is convolved with the membrane kernel through its own
     // coefficient; the coefficients encode the integration scheme.
     float drive = k.asc_factor[2*neuron]*asc[2*i] +
                   k.asc_factor[2*neuron+1]*asc[2*i+1];
     #pragma unroll
-    for (int b = 0; b < Basis; ++b) {
+    for (int b = 0; b < width; ++b) {
       const int64_t j = state_base + b;
       const float4 c = k.syn[parameter_base + b];
       const float old_rise = F(rise[j]); const float old_psc = F(psc[j]);
@@ -79,7 +84,7 @@ __global__ void ForwardKernel(int64_t count, int neurons, int slots,
 }
 
 template <typename T, int Basis>
-__global__ void BackwardKernel(int64_t count, int neurons, int slots,
+__global__ void BackwardKernel(int64_t count, int neurons, int slots, int n_basis,
     const T* z_buf, const float* new_v, const bool* refractory, Constants k,
     const float* dt, const float* v_th, const float* sigma,
     const float* amplitude, int surrogate, const T* gspikes, const T* gz_buf,
@@ -89,9 +94,149 @@ __global__ void BackwardKernel(int64_t count, int neurons, int slots,
     float* asc_grad, T* rise_grad, T* psc_grad, T* input_grad) {
   const float step = *dt; const float threshold = *v_th;
   const float scale = *sigma; const float gain = *amplitude;
+  const int width = Basis == 0 ? n_basis : Basis;
   GPU_1D_KERNEL_LOOP(i, count) {
     const int64_t sample = i / neurons;
     const int neuron = i - sample * neurons;
+    const int64_t history = sample * slots * neurons + neuron;
+    const bool blocked = refractory[i];
+    // The surrogate of the threshold. Both consumers of a spike read it in T,
+    // so the upstream gradient is summed in T before it meets the float32
+    // surrogate of the float32 membrane.
+    const float vs = new_v[i] - threshold;
+    float shape;
+    if (surrogate == 1) {
+      shape = expf(-(vs * vs) / (scale * scale));
+    } else if (surrogate == 2) {
+      shape = expf(-scale * fabsf(vs));
+    } else {
+      shape = fmaxf(1.0f - fabsf(vs), 0.0f);
+    }
+    const T upstream = static_cast<T>(F(gspikes[i]) + F(gz_buf[history]));
+    float membrane_g = gv[i] + (blocked ? 0.0f : F(upstream) * (shape * gain));
+    if (emit_voltage) membrane_g += F(gvoltage[i]);
+    const float active_gv = hard_reset && blocked ? 0.0f : membrane_g;
+    // detach_reset gates the membrane reset; detach_asc_reset gates every path
+    // through the ASC this spike injects - both its own state and the drive it
+    // contributes to the membrane within this step.
+    const float asc_reset_g = detach_asc_reset ? 0.0f :
+        active_gv*k.asc_spike_factor[neuron] +
+        ga[2*i]*k.asc_amps[2*neuron] + ga[2*i+1]*k.asc_amps[2*neuron+1];
+    const T z_grad = V<T>((detach_reset ? 0.0f : active_gv*k.reset_coeff[neuron])
+                          + asc_reset_g);
+    // The shifted history hands each slot's gradient to the slot before it;
+    // the newest slot also carries prev_z's gradient.
+    z_buf_grad[history] = slots > 1
+        ? V<T>(F(gz_buf[history + neurons]) + F(z_grad)) : z_grad;
+    for (int slot = 1; slot < slots; ++slot)
+      z_buf_grad[history + slot*neurons] = slot + 1 < slots
+          ? gz_buf[history + (slot+1)*neurons] : static_cast<T>(0.0f);
+    // The hard reset replaces the pre-spike membrane, so it carries no gradient.
+    v_grad[i] = active_gv*k.decay[neuron]*
+        (hard_reset ? 1.0f - F(z_buf[history]) : 1.0f);
+    asc_grad[2*i] = active_gv*k.asc_factor[2*neuron] +
+                    ga[2*i]*k.asc_decay[2*neuron];
+    asc_grad[2*i+1] = active_gv*k.asc_factor[2*neuron+1] +
+                      ga[2*i+1]*k.asc_decay[2*neuron+1];
+    const int parameter_base = neuron*width; const int64_t state_base = i*width;
+    #pragma unroll
+    for (int b = 0; b < width; ++b) {
+      const int64_t j = state_base+b;
+      const float4 c = k.syn[parameter_base + b];
+      rise_grad[j] = V<T>(F(grise[j])*c.x + F(gpsc[j])*step*c.x +
+                          active_gv*c.w);
+      psc_grad[j] = V<T>(F(gpsc[j])*c.x + active_gv*c.z);
+      input_grad[j] = V<T>(F(grise[j])*c.y);
+    }
+  }
+}
+
+// For four bases, neighbouring samples reuse the same four neuron coefficients.
+// The generic kernel below handles every other positive basis width.
+template <typename T, typename R, int Basis>
+__global__ void ForwardKernelTiled(int64_t count, int neurons, int slots, int n_basis,
+    const T* z_buf, const float* v, const R* r, const float* asc,
+    const T* rise, const T* psc, const T* inputs, Constants k, const R* t_ref,
+    const float* dt, const float* v_reset, const float* v_th, bool hard_reset,
+    bool emit_voltage, T* spikes, T* new_z_buf, float* new_v, R* new_r,
+    float* new_asc, T* new_rise, T* new_psc, bool* refractory_out,
+    T* voltage_out) {
+  const float step = *dt; const float rest = *v_reset;
+  const float threshold = *v_th;
+  const int64_t batch = count / neurons;
+  for (int neuron = blockIdx.x * blockDim.x + threadIdx.x;
+       neuron < neurons; neuron += blockDim.x * gridDim.x) {
+    float4 coeff[Basis];
+#pragma unroll
+    for (int b = 0; b < Basis; ++b) coeff[b] = k.syn[neuron * Basis + b];
+    const int64_t first_sample = static_cast<int64_t>(blockIdx.y) * kTileBatch;
+    for (int64_t sample = first_sample;
+         sample < batch && sample < first_sample + kTileBatch; ++sample) {
+    const int64_t i = sample * neurons + neuron;
+    const int64_t history = sample * slots * neurons + neuron;
+    const int parameter_base = neuron * Basis;
+    const int64_t state_base = i * Basis;
+    const float reset = F(z_buf[history]);
+    // Each current source is convolved with the membrane kernel through its own
+    // coefficient; the coefficients encode the integration scheme.
+    float drive = k.asc_factor[2*neuron]*asc[2*i] +
+                  k.asc_factor[2*neuron+1]*asc[2*i+1];
+    #pragma unroll
+    for (int b = 0; b < Basis; ++b) {
+      const int64_t j = state_base + b;
+      const float4 c = coeff[b];
+      const float old_rise = F(rise[j]); const float old_psc = F(psc[j]);
+      drive += c.z*old_psc + c.w*old_rise;
+      new_rise[j] = V<T>(old_rise*c.x + F(inputs[j])*c.y);
+      new_psc[j] = V<T>(old_psc*c.x + step*c.x*old_rise);
+    }
+    const int refractory = max(static_cast<int>(r[i]) +
+        static_cast<int>(reset)*static_cast<int>(t_ref[neuron])-1, 0);
+    // The reset and the ASC this spike injects both act within this step.
+    float voltage = k.decay[neuron]*v[i] + drive +
+        (k.reset_coeff[neuron] + k.asc_spike_factor[neuron])*reset;
+    // A hard reset puts the membrane at v_reset at the spike time instead.
+    if (hard_reset) voltage += reset*(k.decay[neuron]*(rest - v[i]) -
+                                      k.reset_coeff[neuron]);
+    if (hard_reset && refractory > 0) voltage = rest;
+    const R counter = static_cast<R>(refractory);
+    new_v[i] = voltage; new_r[i] = counter;
+    new_asc[2*i] = k.asc_decay[2*neuron]*asc[2*i] + reset*k.asc_amps[2*neuron];
+    new_asc[2*i+1] = k.asc_decay[2*neuron+1]*asc[2*i+1] +
+                     reset*k.asc_amps[2*neuron+1];
+    // The threshold reads the membrane still in registers.
+    const bool blocked = counter > 0;
+    const T spike = static_cast<T>(!blocked && voltage - threshold > 0.0f);
+    spikes[i] = spike; refractory_out[i] = blocked;
+    new_z_buf[history] = spike;
+    for (int slot = 1; slot < slots; ++slot)
+      new_z_buf[history + slot*neurons] = z_buf[history + (slot-1)*neurons];
+    if (emit_voltage) voltage_out[i] = V<T>(voltage);
+    }
+  }
+}
+
+template <typename T, int Basis>
+__global__ void BackwardKernelTiled(int64_t count, int neurons, int slots, int n_basis,
+    const T* z_buf, const float* new_v, const bool* refractory, Constants k,
+    const float* dt, const float* v_th, const float* sigma,
+    const float* amplitude, int surrogate, const T* gspikes, const T* gz_buf,
+    const float* gv, const float* ga, const T* grise, const T* gpsc,
+    const T* gvoltage, bool hard_reset, bool detach_reset,
+    bool detach_asc_reset, bool emit_voltage, T* z_buf_grad, float* v_grad,
+    float* asc_grad, T* rise_grad, T* psc_grad, T* input_grad) {
+  const float step = *dt; const float threshold = *v_th;
+  const float scale = *sigma; const float gain = *amplitude;
+  const int64_t batch = count / neurons;
+  for (int neuron = blockIdx.x * blockDim.x + threadIdx.x;
+       neuron < neurons; neuron += blockDim.x * gridDim.x) {
+    float4 coeff[Basis];
+#pragma unroll
+    for (int b = 0; b < Basis; ++b) coeff[b] = k.syn[neuron * Basis + b];
+    const int64_t first_sample = static_cast<int64_t>(blockIdx.y) * kTileBatch;
+    for (int64_t sample = first_sample;
+         sample < batch && sample < first_sample + kTileBatch; ++sample) {
+    const int64_t i = sample * neurons + neuron;
     const int64_t history = sample * slots * neurons + neuron;
     const bool blocked = refractory[i];
     // The surrogate of the threshold. Both consumers of a spike read it in T,
@@ -136,11 +281,12 @@ __global__ void BackwardKernel(int64_t count, int neurons, int slots,
     #pragma unroll
     for (int b = 0; b < Basis; ++b) {
       const int64_t j = state_base+b;
-      const float4 c = k.syn[parameter_base + b];
+      const float4 c = coeff[b];
       rise_grad[j] = V<T>(F(grise[j])*c.x + F(gpsc[j])*step*c.x +
                           active_gv*c.w);
       psc_grad[j] = V<T>(F(gpsc[j])*c.x + active_gv*c.z);
       input_grad[j] = V<T>(F(grise[j])*c.y);
+    }
     }
   }
 }
@@ -148,8 +294,8 @@ __global__ void BackwardKernel(int64_t count, int neurons, int slots,
 // The float4 loads need a whole, 16-byte aligned coefficient block.
 static absl::Status ValidateSynapticCoefficients(const Tensor& coeffs, int64_t neurons,
                                            int64_t basis) {
-  if (basis != kBasis)
-    return errors::InvalidArgument("the fused GLIF kernel requires four synaptic bases");
+  if (basis <= 0 || basis > std::numeric_limits<int>::max())
+    return errors::InvalidArgument("synaptic basis dimension is out of range");
   if (coeffs.NumElements() != neurons * basis * 4)
     return errors::InvalidArgument("syn_coeffs must hold four constants per neuron and basis");
   if (reinterpret_cast<uintptr_t>(coeffs.flat<float>().data()) % alignof(float4) != 0)
@@ -162,8 +308,28 @@ static absl::Status ValidateHistory(const Tensor& z_buf, const Tensor& v) {
   if (z_buf.dims() != 2 || v.dims() != 2 || z_buf.dim_size(0) != v.dim_size(0))
     return errors::InvalidArgument("z_buf and v must be [batch, ...] with one batch");
   const int64_t neurons = v.dim_size(1);
-  if (neurons == 0 || z_buf.dim_size(1) == 0 || z_buf.dim_size(1) % neurons != 0)
+  if (neurons == 0 || neurons > std::numeric_limits<int>::max() ||
+      z_buf.dim_size(1) == 0 || z_buf.dim_size(1) % neurons != 0)
     return errors::InvalidArgument("z_buf width must be a positive multiple of neurons");
+  return absl::OkStatus();
+}
+
+static absl::Status ValidateState(const Tensor& value, int64_t batch,
+                                   int64_t neurons, int64_t width,
+                                   const char* name) {
+  if (value.dims() != 2 || value.dim_size(0) != batch ||
+      width <= 0 || value.dim_size(1) != neurons * width)
+    return errors::InvalidArgument(name, " has an incompatible state shape");
+  return absl::OkStatus();
+}
+
+static absl::Status ValidateConstants(OpKernelContext* c, int first,
+                                       int64_t neurons) {
+  for (int index = 1; index < 7; ++index) {
+    const int64_t width = index == 1 || index == 2 || index == 4 ? 2 : 1;
+    if (c->input(first + index).NumElements() != neurons * width)
+      return errors::InvalidArgument("GLIF constant shape mismatch at ", first + index);
+  }
   return absl::OkStatus();
 }
 
@@ -191,6 +357,19 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
     OP_REQUIRES_OK(c, ValidateHistory(z_buf, v));
     const int neurons = v.dim_size(1);
     const int slots = z_buf.dim_size(1) / neurons;
+    OP_REQUIRES(c, psc.dims() == 2 && psc.dim_size(1) % neurons == 0,
+                errors::InvalidArgument("psc must contain whole synaptic bases"));
+    const int64_t basis = psc.dim_size(1) / neurons;
+    OP_REQUIRES_OK(c, ValidateState(psc, v.dim_size(0), neurons, basis, "psc"));
+    OP_REQUIRES_OK(c, ValidateState(c->input(4), v.dim_size(0), neurons, basis, "rise"));
+    OP_REQUIRES_OK(c, ValidateState(c->input(6), v.dim_size(0), neurons, basis, "inputs"));
+    OP_REQUIRES_OK(c, ValidateState(c->input(3), v.dim_size(0), neurons, 2, "asc"));
+    OP_REQUIRES_OK(c, ValidateState(c->input(2), v.dim_size(0), neurons, 1, "r"));
+    OP_REQUIRES_OK(c, ValidateConstants(c, 7, neurons));
+    OP_REQUIRES(c, c->input(14).NumElements() == neurons &&
+                   c->input(15).NumElements() == 1 && c->input(16).NumElements() == 1 &&
+                   c->input(17).NumElements() == 1,
+                errors::InvalidArgument("refractory or scalar constant shape mismatch"));
     OP_REQUIRES_OK(c, ValidateSynapticCoefficients(c->input(7), neurons,
                                                    psc.dim_size(1) / neurons));
     Tensor *spikes, *nz, *ov, *orr, *oa, *orise, *opsc, *refractory, *voltage;
@@ -205,10 +384,28 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
     OP_REQUIRES_OK(c, c->allocate_output(
         8, emit_voltage_ ? v.shape() : TensorShape({0}), &voltage));
     auto& d = c->eigen_device<GPUDevice>();
-    auto cfg = GetGpuLaunchConfig(v.NumElements(), d);
-    OP_REQUIRES_OK(c, GpuLaunchKernel(ForwardKernel<T, R, kBasis>,
-        cfg.block_count, cfg.thread_per_block, 0, d.stream(),
-        v.NumElements(), neurons, slots,
+    auto launch = [&](auto tag) {
+      constexpr int B = decltype(tag)::value;
+      auto kernel = [] {
+        if constexpr (B == kBasis) return ForwardKernelTiled<T, R, kBasis>;
+        else return ForwardKernel<T, R, 0>;
+      }();
+      dim3 blocks;
+      int threads;
+      if constexpr (B == kBasis) {
+        auto cfg = GetGpuLaunchConfigFixedBlockSize(
+            neurons, d, kernel, 0, kTileThreads);
+        blocks = dim3(cfg.block_count,
+                      (v.dim_size(0) + kTileBatch - 1) / kTileBatch);
+        threads = cfg.thread_per_block;
+      } else {
+        auto cfg = GetGpuLaunchConfig(v.NumElements(), d);
+        blocks = dim3(cfg.block_count);
+        threads = cfg.thread_per_block;
+      }
+      return GpuLaunchKernel(kernel,
+        blocks, threads, 0, d.stream(),
+        v.NumElements(), neurons, slots, psc.dim_size(1) / neurons,
         z_buf.flat<T>().data(), v.flat<float>().data(),
         c->input(2).flat<R>().data(), c->input(3).flat<float>().data(),
         c->input(4).flat<T>().data(), psc.flat<T>().data(),
@@ -220,7 +417,13 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
         ov->flat<float>().data(), orr->flat<R>().data(),
         oa->flat<float>().data(), orise->flat<T>().data(),
         opsc->flat<T>().data(), refractory->flat<bool>().data(),
-        voltage->flat<T>().data()));
+        voltage->flat<T>().data());
+    };
+    if (basis == kBasis) {
+      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 4>{}));
+    } else {
+      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 0>{}));
+    }
   }
  private:
   bool hard_; bool emit_voltage_;
@@ -243,6 +446,20 @@ template <typename T> class BackwardOp : public OpKernel {
     OP_REQUIRES_OK(c, ValidateHistory(z_buf, new_v));
     const int neurons = new_v.dim_size(1);
     const int slots = z_buf.dim_size(1) / neurons;
+    OP_REQUIRES(c, grise.dims() == 2 && grise.dim_size(1) % neurons == 0,
+                errors::InvalidArgument("grad_rise must contain whole synaptic bases"));
+    const int64_t basis = grise.dim_size(1) / neurons;
+    OP_REQUIRES_OK(c, ValidateState(grise, new_v.dim_size(0), neurons, basis, "grad_rise"));
+    OP_REQUIRES_OK(c, ValidateState(c->input(19), new_v.dim_size(0), neurons, basis, "grad_psc"));
+    OP_REQUIRES_OK(c, ValidateState(c->input(17), new_v.dim_size(0), neurons, 2, "grad_asc"));
+    for (int index : {2, 14, 16})
+      OP_REQUIRES_OK(c, ValidateState(c->input(index), new_v.dim_size(0), neurons, 1, "gradient"));
+    OP_REQUIRES(c, c->input(15).shape() == z_buf.shape(),
+                errors::InvalidArgument("grad_history shape mismatch"));
+    OP_REQUIRES_OK(c, ValidateConstants(c, 3, neurons));
+    for (int index = 10; index <= 13; ++index)
+      OP_REQUIRES(c, c->input(index).NumElements() == 1,
+                  errors::InvalidArgument("backward scalar constant shape mismatch"));
     OP_REQUIRES_OK(c, ValidateSynapticCoefficients(c->input(3), neurons,
                                                    grise.dim_size(1) / neurons));
     OP_REQUIRES(c, !emit_voltage_ ||
@@ -256,10 +473,28 @@ template <typename T> class BackwardOp : public OpKernel {
     OP_REQUIRES_OK(c, c->allocate_output(4, grise.shape(), &pg));
     OP_REQUIRES_OK(c, c->allocate_output(5, grise.shape(), &ig));
     auto& d = c->eigen_device<GPUDevice>();
-    auto cfg = GetGpuLaunchConfig(new_v.NumElements(), d);
-    OP_REQUIRES_OK(c, GpuLaunchKernel(BackwardKernel<T, kBasis>,
-        cfg.block_count, cfg.thread_per_block, 0, d.stream(),
-        new_v.NumElements(), neurons, slots,
+    auto launch = [&](auto tag) {
+      constexpr int B = decltype(tag)::value;
+      auto kernel = [] {
+        if constexpr (B == kBasis) return BackwardKernelTiled<T, kBasis>;
+        else return BackwardKernel<T, 0>;
+      }();
+      dim3 blocks;
+      int threads;
+      if constexpr (B == kBasis) {
+        auto cfg = GetGpuLaunchConfigFixedBlockSize(
+            neurons, d, kernel, 0, kTileThreads);
+        blocks = dim3(cfg.block_count,
+                      (new_v.dim_size(0) + kTileBatch - 1) / kTileBatch);
+        threads = cfg.thread_per_block;
+      } else {
+        auto cfg = GetGpuLaunchConfig(new_v.NumElements(), d);
+        blocks = dim3(cfg.block_count);
+        threads = cfg.thread_per_block;
+      }
+      return GpuLaunchKernel(kernel,
+        blocks, threads, 0, d.stream(),
+        new_v.NumElements(), neurons, slots, grise.dim_size(1) / neurons,
         z_buf.flat<T>().data(), new_v.flat<float>().data(),
         c->input(2).flat<bool>().data(), ReadConstants(c, 3),
         c->input(10).flat<float>().data(), c->input(11).flat<float>().data(),
@@ -271,7 +506,13 @@ template <typename T> class BackwardOp : public OpKernel {
         hard_, detach_, detach_asc_, emit_voltage_,
         zg->flat<T>().data(), vg->flat<float>().data(),
         ag->flat<float>().data(), rg->flat<T>().data(),
-        pg->flat<T>().data(), ig->flat<T>().data()));
+        pg->flat<T>().data(), ig->flat<T>().data());
+    };
+    if (basis == kBasis) {
+      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 4>{}));
+    } else {
+      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 0>{}));
+    }
   }
  private:
   int surrogate_; bool hard_; bool detach_; bool detach_asc_;

@@ -2,7 +2,7 @@ template <typename T, int kBasis, int kPairsPerTile>
 __global__ void ProjectGenericPairsKernel(
     int64_t batch_size, int n_post, int n_basis, int64_t n_pairs,
     const uint32* pair_posts, const uint8* pair_types, const T* current_grad,
-    const T* basis, float* projected) {
+    const float* basis, float* projected) {
   constexpr int kBatchTile = 32;
   constexpr int kElements = kPairsPerTile * kBatchTile;
   __shared__ float tile[kBatchTile][kPairsPerTile + 2];

@@ -37,64 +37,102 @@ existing checkpoints stay loadable and per-edge tools keep working;
 `V1Column.translate_checkpointed_layout` moves weights and the optimizer slots
 that mirror them across that boundary.
 
+## Forward
+
+The forward is a scatter over the active `(batch, presynaptic row)` slots.
+`BuildActiveQueue` finds them on the device with an ordered stream compaction
+(`cub::DeviceSelect`), packing each as `batch << 21 | row`, and keeps the count
+on the device. The old host `tf.where` computed the same ordered list but copied
+its count to the host to size the output, so every forward waited on that round
+trip. Rows are limited to 2^21 and the batch to 2^11; the operator rejects
+anything larger. The same path runs at every firing rate and batch size.
+
+A fixed 4,512-block grid consumes the queue, each block taking the next slots
+from an atomic ticket (about 1,024 edges of work per ticket: one LGN row, or
+seven recurrent ones). Consumption therefore follows the queue's row-major
+order, so concurrent blocks scatter into the same few samples' currents. That
+order matters once the currents outgrow L2: with an unordered queue the
+recurrent forward was 2-4x slower from batch 64 up, and a static grid stride
+over the ordered queue, which lets blocks drift apart, was 1.5x slower at batch
+128 and 3.2x at 512 while gaining at most 0.02 ms at batch 32 or below.
+
+For a connectivity whose rows repeat a target (LGN: 1.42 edges per target on
+average, one per synapse type), `ForwardKernel` sums the edges that land on the
+same postsynaptic neuron within a warp, in FP32 registers, before a single lane
+issues the atomic (a `half2` one for FP16 currents and an even basis width).
+That removes atomics and roundings, and relies on posts ascending within a CSR
+row, which `build_csr_connectivity` guarantees. Recurrent rows never repeat a
+target, so they take a plain one-thread-per-edge scatter with no warp
+collectives. `csr_order.repeats_targets` decides this once when the
+connectivity is built, and the wrappers pass it as the `aggregate_runs`
+attribute. Four basis columns are unrolled; any other width loops.
+
 ## Compact pair-projected backward
 
-At batch 32 with the four-column basis, the backward pass projects each distinct
-`(postsynaptic neuron, synapse type)` pair onto the basis once rather than once
-per edge (1,675,548 pairs for 84,132,910 edges in the 203,816-neuron network),
-then runs a packed batch-lane row kernel over the result. Everything stays FP32:
-the projection, the spike-gradient accumulation, and the butterfly that reduces
-the weight gradient. `pair_projection_applies` gates the compact path strictly on
-batch 32 and four basis columns; FP32 and every other batch size or basis
-dimension retain the established batch-lane/general kernels. The build enables
-the packed specialization for SM120 and newer; older architectures retain the
-batch-lane path until independently benchmarked. It uses no tensor cores, so
-that gate is a qualification boundary rather than a hardware requirement.
+The backward projects each distinct `(postsynaptic neuron, synapse type)` pair
+onto the basis once rather than once per edge (1,675,972 pairs for 84,145,692
+edges in the 203,816-neuron network). One path serves every batch size, basis
+dimension and spike dtype. The batch is processed in slices of
+`min(32, next power of two)` samples; the projection is laid out
+`[pair, batch_stride]` with the stride a whole number of slices, padding
+samples project to zero, and the spike-gradient kernels run one grid row per
+slice. The backward is split into two halves:
 
-Three things make it fast, and none of them changes what the operation computes:
+- **Spike gradient (SpMM).** With FP16 spikes the projection is stored as FP16,
+  scaled by a power of two that `AbsMaxFiniteKernel` and `ProjectionScaleKernel`
+  derive on the device from the largest finite `|current_grad|`. Without the
+  scale these values sit near FP16's flush-to-zero floor. A power of two is
+  exact in both directions, so the only error added is mantissa rounding, and
+  the row kernel divides it back out after its FP32 accumulation. Sixteen-bit
+  elements let a lane load eight samples of a 32-sample slice in one 16-byte
+  transaction. FP32 spikes keep an FP32 projection (four samples per load), so a
+  caller that chose FP32 keeps its precision. `BackwardRowPerWarpKernel` gives
+  each CSR row a warp, four warps per block, with no shared memory; out-of-range
+  lanes read an all-zero sentinel pair instead of branching. It stores the
+  result as `[pre, batch_stride]`, one contiguous line per row, and
+  `TransposeSpikeGradKernel` restores `[batch, pre]` and writes the zeros of
+  edgeless rows, so the output is never cleared first.
+- **Weight gradient (event driven, `event_weight_grad.cuh`).** The spikes are
+  sparse, so `EventRowQueueKernel` queues each row that fired, one item per
+  1,024 edges so long rows spread over several blocks, and
+  `EventWeightGradKernel` rebuilds the projection in FP32 from `current_grad`
+  and the basis for the row's active samples only, which it compacts in
+  ascending order. Each edge has one writer and a fixed summation order, so
+  there are no atomics and the result is deterministic. Rows that never fired
+  get an exact zero, so a non-finite upstream gradient no longer reaches the
+  weight gradient of silent rows. Mixed-precision loss scaling still sees it
+  through the spike gradient and the firing rows. The external operator uses the
+  same kernels for the LGN weight gradient.
 
-- **Packed batch lanes.** A lane holds four consecutive batch samples instead of
-  one, so an edge needs eight lanes rather than 32 and one 16-byte load serves
-  four edge slots at once. A 32-edge tile issues eight projection loads instead
-  of 32. The bytes moved are unchanged.
-- **Butterfly weight-gradient reduction.** The cross-lane sum costs about one
-  shuffle per edge and no shared memory, replacing a shared-memory round trip
-  through a tensor-core fragment whose `mma_sync` was fifteen-sixteenths wasted
-  (every A row held the same spike vector). Shared memory per block falls from
-  6,400 B to 256 B, so an SM runs its full 24 blocks instead of 16.
-- **Tiled projection.** Writing the pair-major layout directly puts consecutive
-  threads on current gradients 1.6 MiB apart, so a warp fetches 1 KiB to use
-  256 B. Reading pair-contiguous and transposing through shared memory
-  coalesces both halves.
+## In-place weight-gradient accumulation
 
-The redundant 321 MiB `weight_grad` clear is also gone: both backward kernels
-write every CSR position exactly once.
+Returned as a tensor, the recurrent weight gradient is a dense 336 MB value per
+timestep that the RNN loop's gradient sums (`AddN`) across the whole sequence.
+`V1CsrBackwardPairProjectedAccumulate` (and `V1CsrBackwardAccumulateResource`)
+instead add it into an FP32 `[n_edges]` resource variable and return only the
+spike gradient; the event kernel already adds per edge, so the only change is
+that nothing clears the buffer first. A read of the variable that is still
+alive makes the op copy on write.
 
-`BackwardPackedRowKernel` compiles to 44 registers and 256 bytes of shared
-memory with no stack frame and no spills; `PreprojectPairsTiledKernel` to 35
-registers and 4,352 bytes. Both leave an SM free to hold its full block
-complement.
+`SegmentedRecomputeRunner` drives it when it is given
+`V1Column.accumulated_weight_gradient_variable`: it zeroes its accumulator,
+publishes the handle through `accumulate_recurrent_weight_gradient` for the
+reverse pass, and reads the total once afterwards. The recurrent weight is
+dropped from the recomputed chunks' tape targets, so no dense zero placeholder
+or loop-carried gradient is built for it. The accumulator is a replica-local
+(`ON_READ`) variable and the handle is published per thread, because
+`MirroredStrategy` traces each replica in its own thread; each replica adds
+only into the accumulator on its own GPU (the handle lookup refuses any other
+device) and returns its own partial gradient, which the optimizer all-reduces
+exactly as before.
 
-Measured on the 203,816-neuron network against the previous tensor-row
-production kernel, on an otherwise idle SM120 GPU:
-
-| | Previous | Current | Change |
-|---|---:|---:|---:|
-| Row kernel | 3.863 ms | 2.046 ms | -47.0% |
-| Compact projection | 0.355 ms | 0.220 ms | -38.0% |
-| Weight-gradient clear | 0.187 ms | removed | -100% |
-| Total device time | 4.416 ms | 2.277 ms | **-48.4%** |
-| Real training update | 5.811 s | 4.464 s | **-23.2%** |
-
-It is also *more accurate* than the kernel it replaces. Against the FP32
-batch-lane path, which never rounds anything to half, the previous tensor-row
-kernel's weight gradient carried 5.4e-6 mean absolute error because it converted
-the projected value to half for the tensor-core dot product; the packed kernel's
-carries 3.5e-12, and its spike gradient matches the previous kernel's accuracy.
-An FP16 projection would be a further 13 points faster but makes the spike
-gradient about 865 times less accurate, so it was not taken. See
-`wmma_recurrent_analysis_20260901/REPORT.md` for the full comparison, the
-variants that were screened and rejected, and what remains unqualified.
+Measured on the 203,816-neuron network at the production operating point, the
+synaptic path per timestep went from 3.886 ms to 2.437 ms, and a real training
+update from 3.557 s to 2.800 s. Against an FP64 reference the 25-step
+accumulated weight gradient went from 2.09e-4 to 5.4e-8, LGN currents from
+5.14e-3 to 1.45e-3, and recurrent currents from 3.33e-4 to 2.52e-4 (the FP16
+store floor is 2.07e-4). See `kernel_opt_20260920/OPTIMIZATION_REPORT.md` for the
+measurements, the ablations and the variants that were rejected.
 
 ## Neuron layout
 
@@ -174,16 +212,14 @@ cached under their CUDA ABI and architecture directory (for example,
 for the visible GPUs.
 
 The operator dispatches four basis columns to an unrolled specialization and
-uses a runtime loop for every other positive basis dimension. Batch sizes
-`1, 2, 4, 8, 16, 32, 64, 128, 256` have separate compiled forward and backward
-kernels. Other positive batch sizes use the generic dispatch.
-The generic backward path processes runtime batches in four-sample tiles and
-skips zero weight-gradient writes, which keeps arbitrary batches efficient for
-the model's sparse firing regime.
-
+uses a runtime loop for every other positive basis dimension. The forward does
+not depend on the batch; the backward compiles one kernel set per slice width
+(1, 2, 4, 8, 16, 32) and covers any batch with them.
 Training defaults to `--acceleration=auto`. Use `--acceleration=cuda` to
 require the optimized kernels or `--acceleration=tensorflow` for the reference
 implementation.
 
-The CUDA kernels consume the FP32 recurrent master weights directly. Activations
-and synaptic basis values still use the model compute dtype.
+The CUDA kernels consume the FP32 recurrent master weights directly, and take
+the synaptic basis in FP32: `V1Column` builds it in FP32 for the CUDA backend,
+because rounding those 360 constants to FP16 biases every contribution.
+Activations and currents use the model compute dtype.

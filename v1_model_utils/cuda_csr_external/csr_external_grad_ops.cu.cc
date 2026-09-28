@@ -19,9 +19,6 @@ using GPUDevice = Eigen::GpuDevice;
 #ifndef V1_EXTERNAL_BATCH32_TILE
 #define V1_EXTERNAL_BATCH32_TILE 4
 #endif
-#ifndef V1_EXTERNAL_HALF2
-#define V1_EXTERNAL_HALF2 0
-#endif
 #ifndef V1_DIRECT_CSR
 #define V1_DIRECT_CSR 0
 #endif
@@ -43,6 +40,8 @@ using GPUDevice = Eigen::GpuDevice;
 constexpr int64_t kEdgeIdsPerEdge = V1_DIRECT_CSR ? 0 : 1;
 
 constexpr int kThreads = V1_EXTERNAL_THREADS;
+
+#include "../cuda_csr_recurrent/event_weight_grad.cuh"
 
 template <typename T>
 __device__ __forceinline__ float4 LoadBkgFour(const T* values) {
@@ -78,7 +77,7 @@ template <typename T>
 __global__ void BkgGatherKernel(
     int n_pre, int n_post, const T* activity, const float* weights,
     const uint32* rows, const uint32* pre_ids, const uint32* edge_ids,
-    const uint8* types, const T* basis, const T* initial, T* output) {
+    const uint8* types, const float* basis, const T* initial, T* output) {
   const int post = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (post >= n_post) return;
   const int batch = blockIdx.y;
@@ -150,7 +149,7 @@ class BkgCsrForwardOp : public OpKernel {
                                 rows.flat<uint32>().data(),
                                 pre_ids.flat<uint32>().data(),
                                 edge_ids.flat<uint32>().data(),
-                                types.flat<uint8>().data(), basis.flat<T>().data(),
+                                types.flat<uint8>().data(), basis.flat<float>().data(),
                                 initial.NumElements() ? initial.flat<T>().data()
                                                       : nullptr,
                                 output->flat<T>().data()));
@@ -173,7 +172,7 @@ __device__ __forceinline__ float AsFloat(T value) {
 template <typename T, int kBasis>
 struct BasisProjection {
   __device__ __forceinline__ static float Apply(
-      const T* upstream, const T* basis, int type, int n_basis) {
+      const T* upstream, const float* basis, int type, int n_basis) {
     float result = 0.0f;
 #pragma unroll
     for (int receptor = 0; receptor < kBasis; ++receptor) {
@@ -187,7 +186,7 @@ struct BasisProjection {
 template <typename T>
 struct BasisProjection<T, 0> {
   __device__ __forceinline__ static float Apply(
-      const T* upstream, const T* basis, int type, int n_basis) {
+      const T* upstream, const float* basis, int type, int n_basis) {
     float result = 0.0f;
     for (int receptor = 0; receptor < n_basis; ++receptor) {
       result += AsFloat(upstream[receptor]) *
@@ -197,35 +196,13 @@ struct BasisProjection<T, 0> {
   }
 };
 
-#if V1_EXTERNAL_HALF2
-template <>
-struct BasisProjection<Eigen::half, 4> {
-  __device__ __forceinline__ static float Apply(
-      const Eigen::half* upstream, const Eigen::half* basis, int type,
-      int n_basis) {
-    const float2 u01 = __half22float2(
-        *reinterpret_cast<const __half2*>(upstream));
-    const float2 u23 = __half22float2(
-        *reinterpret_cast<const __half2*>(upstream + 2));
-    const Eigen::half* type_basis = basis + type * 4;
-    const float2 b01 = __half22float2(
-        *reinterpret_cast<const __half2*>(type_basis));
-    const float2 b23 = __half22float2(
-        *reinterpret_cast<const __half2*>(type_basis + 2));
-    return fmaf(u01.x, b01.x,
-                fmaf(u01.y, b01.y,
-                     fmaf(u23.x, b23.x, u23.y * b23.y)));
-  }
-};
-#endif
-
 template <typename T, int kBasis, int kBatch, int kTile>
 __global__ void WeightBackwardStaticBatchKernel(
     int64_t n_pre, int n_post, int n_basis, const T* activity,
     const T* current_grad, const uint32* post_ids,
     const uint8* synapse_types, const uint32* row_splits,
     const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const T* basis, float* weight_grad) {
+    const float* basis, float* weight_grad) {
   static_assert(kBatch % kTile == 0, "batch tiles must divide the batch");
   const int64_t tile_id = blockIdx.x / n_rows;
   const int64_t row_id = blockIdx.x - tile_id * n_rows;
@@ -262,7 +239,7 @@ __global__ void WeightBackwardRuntimeBatchKernel(
     const T* activity, const T* current_grad, const uint32* post_ids,
     const uint8* synapse_types, const uint32* row_splits,
     const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const T* basis, float* weight_grad) {
+    const float* basis, float* weight_grad) {
   const int64_t tile_id = blockIdx.x / n_rows;
   const int64_t row_id = blockIdx.x - tile_id * n_rows;
   if (row_id >= n_rows) return;
@@ -403,7 +380,7 @@ __host__ __forceinline__ uint32 RowSplitCount(int64_t n_rows) {
 template <typename T, int kBasis, int kBatch, int kPairsPerTile>
 __global__ void ProjectCompactTiledKernel(
     int n_post, int n_basis, int64_t n_pairs, const uint32* pair_posts,
-    const uint8* pair_types, const T* current_grad, const T* basis,
+    const uint8* pair_types, const T* current_grad, const float* basis,
     float* projected) {
   constexpr int kTileElements = kPairsPerTile * kBatch;
   __shared__ float tile[kBatch][kPairsPerTile + 2];
@@ -611,7 +588,7 @@ __global__ void ActivityBackwardKernel(
     const T* current_grad, const float* weights, const uint32* post_ids,
     const uint8* synapse_types, const uint32* row_splits,
     const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const T* basis, T* activity_grad) {
+    const float* basis, T* activity_grad) {
   __shared__ float partial[kTile][256];
   const int64_t tile_id = blockIdx.x / n_rows;
   const int64_t row_id = blockIdx.x - tile_id * n_rows;
@@ -663,7 +640,7 @@ __global__ void ActivityBackwardKernel(
 template <typename T, int kBasis, int kBatch, int kPairsPerTile>
 __global__ void ProjectCompactBatchTilesKernel(
     int n_post, int n_basis, int64_t n_pairs, const uint32* pair_posts,
-    const uint8* pair_types, const T* current_grad, const T* basis,
+    const uint8* pair_types, const T* current_grad, const float* basis,
     float* projected) {
   constexpr int kBatchTile = 32;
   constexpr int kElements = kPairsPerTile * kBatchTile;
@@ -855,7 +832,7 @@ Status LaunchWeightBackward(
   auto device = context->eigen_device<GPUDevice>();
   if (std::is_same<T, Eigen::half>::value && kBasis == 4 &&
       pair_posts.NumElements() > 0 && batch <= 32 && (batch & (batch - 1)) == 0) {
-#define LAUNCH_COMPACT_WEIGHT(BATCH, PACK) do {                                Tensor projected_tensor;                                                   const int64_t projected_elements = pair_posts.NumElements() * BATCH;       TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactTiledKernel<T, kBasis, BATCH, kPairsPerTile>,                 static_cast<int>((pair_posts.NumElements() + kPairsPerTile - 1) /                            kPairsPerTile),                                            256, 0, device.stream(), n_post, n_basis, pair_posts.NumElements(),         pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<T>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             WeightBackwardPackedKernel<T, BATCH, PACK, kWarps, kTile>,                  dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                 device.stream(), activity.dim_size(1), activity.flat<T>().data(),           projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),         edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),           nonempty_rows.flat<uint32>().data(), n_rows, splits,                        weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
+#define LAUNCH_COMPACT_WEIGHT(BATCH, PACK) do {                                Tensor projected_tensor;                                                   const int64_t projected_elements = pair_posts.NumElements() * BATCH;       TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactTiledKernel<T, kBasis, BATCH, kPairsPerTile>,                 static_cast<int>((pair_posts.NumElements() + kPairsPerTile - 1) /                            kPairsPerTile),                                            256, 0, device.stream(), n_post, n_basis, pair_posts.NumElements(),         pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<float>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             WeightBackwardPackedKernel<T, BATCH, PACK, kWarps, kTile>,                  dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                 device.stream(), activity.dim_size(1), activity.flat<T>().data(),           projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),         edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),           nonempty_rows.flat<uint32>().data(), n_rows, splits,                        weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
     switch (batch) {
       case 1: LAUNCH_COMPACT_WEIGHT(1, 1);
       case 2: LAUNCH_COMPACT_WEIGHT(2, 2);
@@ -866,7 +843,7 @@ Status LaunchWeightBackward(
     }
 #undef LAUNCH_COMPACT_WEIGHT
   }
-#define LAUNCH_COMPACT_WEIGHT_LARGE(BATCH) do {                                Tensor projected_tensor;                                                   const int64_t n_pairs = pair_posts.NumElements();                          TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({n_pairs * BATCH}), &projected_tensor));          constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactBatchTilesKernel<T, kBasis, BATCH, kPairsPerTile>,            dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) /                                             kPairsPerTile), BATCH / 32),                     256, 0, device.stream(), n_post, n_basis, n_pairs,                          pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<T>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             WeightBackwardPackedLargeKernel<T, BATCH, kWarps, kTile>,                  dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                device.stream(), activity.dim_size(1), activity.flat<T>().data(),           projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),         edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),           nonempty_rows.flat<uint32>().data(), n_rows, splits,                        weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
+#define LAUNCH_COMPACT_WEIGHT_LARGE(BATCH) do {                                Tensor projected_tensor;                                                   const int64_t n_pairs = pair_posts.NumElements();                          TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({n_pairs * BATCH}), &projected_tensor));          constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactBatchTilesKernel<T, kBasis, BATCH, kPairsPerTile>,            dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) /                                             kPairsPerTile), BATCH / 32),                     256, 0, device.stream(), n_post, n_basis, n_pairs,                          pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<float>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             WeightBackwardPackedLargeKernel<T, BATCH, kWarps, kTile>,                  dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                device.stream(), activity.dim_size(1), activity.flat<T>().data(),           projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),         edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),           nonempty_rows.flat<uint32>().data(), n_rows, splits,                        weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
   if (std::is_same<T, Eigen::half>::value && kBasis == 4 &&
       pair_posts.NumElements() > 0) {
     switch (batch) {
@@ -891,7 +868,7 @@ Status LaunchWeightBackward(
              static_cast<unsigned>(batch_tiles)),
         256, 0, device.stream(), batch, n_post, n_basis, n_pairs,
         pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),
-        current_grad.flat<T>().data(), basis.flat<T>().data(),
+        current_grad.flat<T>().data(), basis.flat<float>().data(),
         projected_tensor.flat<float>().data()));
     constexpr int kWarps = 2;
     constexpr int kTile = 32;
@@ -914,7 +891,7 @@ Status LaunchWeightBackward(
       activity.flat<T>().data(), current_grad.flat<T>().data(),          \
       post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(), \
       row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(),  \
-      nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<T>().data(), \
+      nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<float>().data(), \
       weight_grad->flat<float>().data()))
   switch (batch) {
     EXTERNAL_BATCH_CASE(1, 1, LAUNCH_STATIC);
@@ -942,7 +919,7 @@ Status LaunchWeightBackward(
           activity.flat<T>().data(), current_grad.flat<T>().data(),
           post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(),
           row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(),
-          nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<T>().data(),
+          nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<float>().data(),
           weight_grad->flat<float>().data()));
     }
   }
@@ -965,7 +942,7 @@ Status LaunchActivityBackward(
   auto device = context->eigen_device<GPUDevice>();
   if (std::is_same<T, Eigen::half>::value && kBasis == 4 &&
       pair_posts.NumElements() > 0 && batch <= 32 && (batch & (batch - 1)) == 0) {
-#define LAUNCH_COMPACT_ACTIVITY(BATCH, PACK) do {                              Tensor projected_tensor;                                                   const int64_t projected_elements = pair_posts.NumElements() * BATCH;       TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactTiledKernel<T, kBasis, BATCH, kPairsPerTile>,                 static_cast<int>((pair_posts.NumElements() + kPairsPerTile - 1) /                            kPairsPerTile),                                            256, 0, device.stream(), n_post, n_basis, pair_posts.NumElements(),         pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<T>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                Tensor scratch_tensor;                                                      float* scratch = nullptr;                                                   const int64_t elements = activity_grad->NumElements();                      if (splits > 1) {                                                             TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({elements}), &scratch_tensor));                   scratch = scratch_tensor.flat<float>().data();                              cudaMemsetAsync(scratch, 0, elements * sizeof(float), device.stream());     }                                                                           TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ActivityBackwardPackedKernel<T, BATCH, PACK, kWarps, kTile>,                dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                 device.stream(), row_splits.NumElements() - 1,                              projected_tensor.flat<float>().data(), weights.flat<float>().data(),         pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),         n_rows, splits, scratch, activity_grad->flat<T>().data()));              if (scratch != nullptr) {                                                     TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             CastActivityGradKernel<T>, static_cast<int>((elements + 255) / 256),           256, 0, device.stream(), elements, scratch,                                 activity_grad->flat<T>().data()));                                    }                                                                           return OkStatus();                                                        } while (false)
+#define LAUNCH_COMPACT_ACTIVITY(BATCH, PACK) do {                              Tensor projected_tensor;                                                   const int64_t projected_elements = pair_posts.NumElements() * BATCH;       TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactTiledKernel<T, kBasis, BATCH, kPairsPerTile>,                 static_cast<int>((pair_posts.NumElements() + kPairsPerTile - 1) /                            kPairsPerTile),                                            256, 0, device.stream(), n_post, n_basis, pair_posts.NumElements(),         pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<float>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                Tensor scratch_tensor;                                                      float* scratch = nullptr;                                                   const int64_t elements = activity_grad->NumElements();                      if (splits > 1) {                                                             TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({elements}), &scratch_tensor));                   scratch = scratch_tensor.flat<float>().data();                              cudaMemsetAsync(scratch, 0, elements * sizeof(float), device.stream());     }                                                                           TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ActivityBackwardPackedKernel<T, BATCH, PACK, kWarps, kTile>,                dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                 device.stream(), row_splits.NumElements() - 1,                              projected_tensor.flat<float>().data(), weights.flat<float>().data(),         pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),         n_rows, splits, scratch, activity_grad->flat<T>().data()));              if (scratch != nullptr) {                                                     TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             CastActivityGradKernel<T>, static_cast<int>((elements + 255) / 256),           256, 0, device.stream(), elements, scratch,                                 activity_grad->flat<T>().data()));                                    }                                                                           return OkStatus();                                                        } while (false)
     switch (batch) {
       case 1: LAUNCH_COMPACT_ACTIVITY(1, 1);
       case 2: LAUNCH_COMPACT_ACTIVITY(2, 2);
@@ -976,7 +953,7 @@ Status LaunchActivityBackward(
     }
 #undef LAUNCH_COMPACT_ACTIVITY
   }
-#define LAUNCH_COMPACT_ACTIVITY_LARGE(BATCH) do {                              Tensor projected_tensor;                                                   const int64_t n_pairs = pair_posts.NumElements();                          TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({n_pairs * BATCH}), &projected_tensor));          constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactBatchTilesKernel<T, kBasis, BATCH, kPairsPerTile>,            dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) /                                             kPairsPerTile), BATCH / 32),                     256, 0, device.stream(), n_post, n_basis, n_pairs,                          pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<T>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                Tensor scratch_tensor;                                                      float* scratch = nullptr;                                                   const int64_t elements = activity_grad->NumElements();                      if (splits > 1) {                                                             TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({elements}), &scratch_tensor));                   scratch = scratch_tensor.flat<float>().data();                              cudaMemsetAsync(scratch, 0, elements * sizeof(float), device.stream());     }                                                                           TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ActivityBackwardPackedLargeKernel<T, BATCH, kWarps, kTile>,                dim3(static_cast<unsigned>(n_rows), splits, BATCH / 32),                    32 * kWarps, 0, device.stream(), row_splits.NumElements() - 1,              projected_tensor.flat<float>().data(), weights.flat<float>().data(),         pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),         n_rows, splits, scratch, activity_grad->flat<T>().data()));              if (scratch != nullptr) {                                                     TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             CastActivityGradKernel<T>, static_cast<int>((elements + 255) / 256),           256, 0, device.stream(), elements, scratch,                                 activity_grad->flat<T>().data()));                                    }                                                                           return OkStatus();                                                        } while (false)
+#define LAUNCH_COMPACT_ACTIVITY_LARGE(BATCH) do {                              Tensor projected_tensor;                                                   const int64_t n_pairs = pair_posts.NumElements();                          TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({n_pairs * BATCH}), &projected_tensor));          constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactBatchTilesKernel<T, kBasis, BATCH, kPairsPerTile>,            dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) /                                             kPairsPerTile), BATCH / 32),                     256, 0, device.stream(), n_post, n_basis, n_pairs,                          pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<float>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                Tensor scratch_tensor;                                                      float* scratch = nullptr;                                                   const int64_t elements = activity_grad->NumElements();                      if (splits > 1) {                                                             TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({elements}), &scratch_tensor));                   scratch = scratch_tensor.flat<float>().data();                              cudaMemsetAsync(scratch, 0, elements * sizeof(float), device.stream());     }                                                                           TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ActivityBackwardPackedLargeKernel<T, BATCH, kWarps, kTile>,                dim3(static_cast<unsigned>(n_rows), splits, BATCH / 32),                    32 * kWarps, 0, device.stream(), row_splits.NumElements() - 1,              projected_tensor.flat<float>().data(), weights.flat<float>().data(),         pair_ids.flat<uint32>().data(), edge_ids.flat<uint32>().data(),             row_splits.flat<uint32>().data(), nonempty_rows.flat<uint32>().data(),         n_rows, splits, scratch, activity_grad->flat<T>().data()));              if (scratch != nullptr) {                                                     TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             CastActivityGradKernel<T>, static_cast<int>((elements + 255) / 256),           256, 0, device.stream(), elements, scratch,                                 activity_grad->flat<T>().data()));                                    }                                                                           return OkStatus();                                                        } while (false)
   if (std::is_same<T, Eigen::half>::value && kBasis == 4 &&
       pair_posts.NumElements() > 0) {
     switch (batch) {
@@ -1001,7 +978,7 @@ Status LaunchActivityBackward(
              static_cast<unsigned>(batch_tiles)),
         256, 0, device.stream(), batch, n_post, n_basis, n_pairs,
         pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),
-        current_grad.flat<T>().data(), basis.flat<T>().data(),
+        current_grad.flat<T>().data(), basis.flat<float>().data(),
         projected_tensor.flat<float>().data()));
     constexpr int kWarps = 2;
     constexpr int kTile = 32;
@@ -1042,12 +1019,18 @@ Status LaunchActivityBackward(
       current_grad.flat<T>().data(), weights.flat<float>().data(),
       post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(),
       row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(),
-      nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<T>().data(),
+      nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<float>().data(),
       activity_grad->flat<T>().data());
 }
 
 #undef EXTERNAL_BATCH_CASE
 
+// The weight gradient has two implementations, and the connectivity picks one:
+// - event driven (event_weight_grad.cuh) for sparse activity such as LGN, where
+//   only rows with an active sample are visited;
+// - the dense compact pair-projected SDDMM for dense activity such as the
+//   Poisson BKG input, where every row is active in every step and the event
+//   path would skip nothing and gather the upstream gradient per edge instead.
 template <typename T>
 class ExternalCsrWeightBackwardOp : public OpKernel {
  public:
@@ -1055,6 +1038,7 @@ class ExternalCsrWeightBackwardOp : public OpKernel {
       : OpKernel(context) {
     OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
     OP_REQUIRES_OK(context, context->GetAttr("n_edges", &n_edges_));
+    OP_REQUIRES_OK(context, context->GetAttr("sparse_activity", &sparse_activity_));
   }
 
   void Compute(OpKernelContext* context) override {
@@ -1084,42 +1068,48 @@ class ExternalCsrWeightBackwardOp : public OpKernel {
     OP_REQUIRES(context, post_ids.NumElements() == n_edges_ &&
                                  synapse_types.NumElements() == n_edges_ &&
                                  edge_ids.NumElements() ==
-                                     n_edges_ * kEdgeIdsPerEdge &&
-                                 pair_ids.NumElements() == n_edges_,
+                                     n_edges_ * kEdgeIdsPerEdge,
                 errors::InvalidArgument("edge metadata size mismatch"));
-    OP_REQUIRES(context, pair_posts.NumElements() == pair_types.NumElements(),
-                errors::InvalidArgument("pair metadata size mismatch"));
+    OP_REQUIRES(context,
+                sparse_activity_ || (pair_ids.NumElements() == n_edges_ &&
+                                     pair_posts.NumElements() == pair_types.NumElements()),
+                errors::InvalidArgument(
+                    "the dense weight backward needs the per-edge pair projection"));
     Tensor* weight_grad;
     OP_REQUIRES_OK(context, context->allocate_output(
                                 0, TensorShape({n_edges_}), &weight_grad));
-    auto device = context->eigen_device<GPUDevice>();
-    // Skipping this clear is worth 365 MiB of write bandwidth on LGN, but only
-    // the compact path earns it: its packed kernel's row splits partition every
-    // row, so each CSR position is written exactly once.
+    if (sparse_activity_) {
+#define LAUNCH_EVENT(BASIS)                                                          OP_REQUIRES_OK(context, LaunchEventWeightGrad<T, BASIS>(                                                      context, activity, current_grad, basis, post_ids,                                synapse_types, row_splits, edge_ids, n_post_,                                    weight_grad))
+      if (basis.dim_size(1) == 4) {
+        LAUNCH_EVENT(4);
+      } else {
+        LAUNCH_EVENT(0);
+      }
+#undef LAUNCH_EVENT
+      return;
+    }
+    // Skipping this clear is only safe on the compact path: its packed
+    // kernel's row splits partition every row, so each CSR position is written
+    // exactly once.
     if (!UsesCompactWeightPath<T>(activity.dim_size(0), basis.dim_size(1),
                                   pair_posts.NumElements())) {
       cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
                       weight_grad->NumElements() * sizeof(float),
                       context->eigen_device<GPUDevice>().stream());
     }
+#define LAUNCH_DENSE(BASIS)                                                          OP_REQUIRES_OK(context, LaunchWeightBackward<T, BASIS>(                                                       context, activity, current_grad, post_ids,                                       synapse_types, row_splits, edge_ids, nonempty_rows,                               basis, pair_ids, pair_posts, pair_types, n_post_,                                weight_grad))
     if (basis.dim_size(1) == 4) {
-      OP_REQUIRES_OK(context, LaunchWeightBackward<T, 4>(
-                                  context, activity, current_grad, post_ids,
-                                  synapse_types, row_splits, edge_ids,
-                                  nonempty_rows, basis, pair_ids, pair_posts,
-                                  pair_types, n_post_, weight_grad));
+      LAUNCH_DENSE(4);
     } else {
-      OP_REQUIRES_OK(context, LaunchWeightBackward<T, 0>(
-                                  context, activity, current_grad, post_ids,
-                                  synapse_types, row_splits, edge_ids,
-                                  nonempty_rows, basis, pair_ids, pair_posts,
-                                  pair_types, n_post_, weight_grad));
+      LAUNCH_DENSE(0);
     }
+#undef LAUNCH_DENSE
   }
 
  private:
   int n_post_;
   int n_edges_;
+  bool sparse_activity_ = true;
 };
 
 template <typename T>

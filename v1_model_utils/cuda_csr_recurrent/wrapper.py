@@ -1,7 +1,9 @@
 """Python interface for the fused recurrent-current CUDA operator."""
 
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 
 import numpy as np
 import tensorflow as tf
@@ -16,13 +18,10 @@ from v1_model_utils.cuda_csr_resources import (
 )
 
 
-SPECIALIZED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 _OPS = None
-
-
-def _active_rows_or_pairs(values, basis_values):
-    """Return active ``(batch, presynaptic row)`` pairs."""
-    return tf.where(values != tf.cast(0, values.dtype))
+# Per thread, because MirroredStrategy traces every replica in its own thread:
+# a replica's backward must only ever see its own accumulator.
+_WEIGHT_GRADIENT_ACCUMULATOR = threading.local()
 
 
 def _edge_index_tensor(order):
@@ -67,6 +66,8 @@ class CsrConnectivity:
     pair_posts: tf.Tensor | None = None
     pair_types: tf.Tensor | None = None
     n_pairs: int = 0
+    # Whether some row sends two edges to one target; see csr_order.repeats_targets.
+    repeats_targets: bool = True
 
 
 def _compact_pairs(post_ids, synapse_types):
@@ -107,14 +108,6 @@ def to_original_order(values, connectivity):
     return restored
 
 
-def kernel_variant(n_basis, batch_size):
-    """Return the CUDA specialization selected for diagnostic reporting."""
-    basis = "basis4" if int(n_basis) == 4 else "generic_basis"
-    batch = int(batch_size)
-    suffix = f"batch{batch}" if batch in SPECIALIZED_BATCH_SIZES else "generic_batch"
-    return f"{basis}_{suffix}"
-
-
 def _load_ops():
     global _OPS
     if _OPS is None:
@@ -126,7 +119,7 @@ def _load_ops():
                 directory / "build.py",
                 directory / "csr_recurrent_ops.cc",
                 directory / "csr_recurrent_ops.cu.cc",
-                directory / "generic_backward_kernels.cuh",
+                directory / "event_weight_grad.cuh",
             ),
             build_module="v1_model_utils.cuda_csr_recurrent.build",
             build_flags=build_flags_for,
@@ -209,6 +202,7 @@ def build_csr_connectivity(
         n_edges=int(indices.shape[0]),
         edge_order=order,
         weights_csr_ordered=bool(weights_csr_ordered),
+        repeats_targets=csr_order.repeats_targets(ordered_posts, row_splits),
         **pairs,
     )
     if resource_mode_enabled():
@@ -222,24 +216,35 @@ def build_csr_connectivity(
     return connectivity
 
 
-def pair_projection_applies(spike_values, basis_values, connectivity):
-    """Whether the compact pair-projected backward specialization can run.
+@contextlib.contextmanager
+def accumulate_recurrent_weight_gradient(handle):
+    """Add recurrent weight gradients built in this block into ``handle``.
 
-    It uses specialized basis-4/power-of-two kernels where available and the
-    optimized generic pair-projected path above its measured crossover.
+    ``handle`` is the resource handle of an FP32 ``[n_edges]`` variable, as a
+    tensor of the graph that builds the backward. Gradient functions traced in
+    the block add their weight gradient to it in place and return ``None`` for
+    the weights, so the loop gradient that encloses them never sums a dense
+    per-step weight gradient. The caller zeroes the variable first and reads
+    the total afterwards.
     """
-    if connectivity.pair_ids is None or connectivity.n_pairs == 0:
-        return False
-    batch = spike_values.shape[0]
-    n_basis = basis_values.shape[-1]
-    specialized = n_basis == 4 and batch in SPECIALIZED_BATCH_SIZES
-    optimized_generic = (n_basis != 4 and batch >= 2) or (n_basis == 4 and batch >= 32)
-    return spike_values.dtype == tf.float16 and (specialized or optimized_generic)
+    previous = getattr(_WEIGHT_GRADIENT_ACCUMULATOR, "handle", None)
+    _WEIGHT_GRADIENT_ACCUMULATOR.handle = handle
+    try:
+        yield
+    finally:
+        _WEIGHT_GRADIENT_ACCUMULATOR.handle = previous
 
 
-def empty_like_currents(basis):
-    """The sentinel `initial` value meaning "start from zero"."""
-    return tf.zeros((0, 0), basis.dtype)
+def _weight_gradient_accumulator():
+    return getattr(_WEIGHT_GRADIENT_ACCUMULATOR, "handle", None)
+
+
+def empty_like_currents(values):
+    """The sentinel `initial` value meaning "start from zero".
+
+    Currents take the dtype of the spikes (or activity) that drive them.
+    """
+    return tf.zeros((0, 0), values.dtype)
 
 
 def calculate_recurrent_csr_currents(
@@ -249,9 +254,12 @@ def calculate_recurrent_csr_currents(
 
     ``initial`` accumulates this source's currents on top of another source's
     output, which avoids materializing a separate tensor and adding it later.
-    Its gradient is the upstream gradient unchanged.
+    Its gradient is the upstream gradient unchanged. The kernels take the
+    synaptic basis in FP32; pass the unrounded values, since casting an
+    already-rounded FP16 basis back up recovers nothing.
     """
     require_csr_ordered_weights(connectivity, "recurrent connectivity")
+    basis = tf.cast(basis, tf.float32)
     if connectivity.resource_name is not None:
         return _calculate_resource_currents(
             spikes, weights, basis, dampening, connectivity, initial=initial
@@ -276,7 +284,6 @@ def calculate_recurrent_csr_currents(
     ):
         currents = ops.v1_csr_forward(
             spike_values,
-            _active_rows_or_pairs(spike_values, basis_values),
             weight_values,
             post_ids,
             synapse_types,
@@ -285,13 +292,11 @@ def calculate_recurrent_csr_currents(
             basis_values,
             initial_values,
             n_post=connectivity.n_post,
-        )
-        use_pairs = pair_projection_applies(
-            spike_values, basis_values, connectivity
+            aggregate_runs=connectivity.repeats_targets,
         )
 
         def grad(current_grad):
-            common = (
+            inputs = (
                 spike_values,
                 current_grad,
                 weight_values,
@@ -302,31 +307,28 @@ def calculate_recurrent_csr_currents(
                 nonempty_rows,
                 basis_values,
                 tf.cast(dampening_value, spike_values.dtype),
+                pair_ids,
+                pair_posts,
+                pair_types,
             )
-            if use_pairs:
+            sizes = {"n_post": connectivity.n_post, "n_edges": connectivity.n_edges}
+            accumulator = _weight_gradient_accumulator()
+            if accumulator is None:
                 spike_grad, weight_grad = ops.v1_csr_backward_pair_projected(
-                    *common,
-                    pair_ids,
-                    pair_posts,
-                    pair_types,
-                    n_post=connectivity.n_post,
-                    n_edges=connectivity.n_edges,
+                    *inputs, **sizes
                 )
+                weight_grad = tf.cast(weight_grad, weight_values.dtype)
             else:
-                spike_grad, weight_grad = ops.v1_csr_backward(
-                    *common,
-                    n_post=connectivity.n_post,
-                    n_edges=connectivity.n_edges,
+                spike_grad = ops.v1_csr_backward_pair_projected_accumulate(
+                    *inputs, accumulator, **sizes
                 )
+                weight_grad = None
             # The trailing gradient belongs to `initial`, which enters the
             # output additively, so the upstream gradient passes straight
             # through. With no accumulator the input is an empty sentinel, and
             # its gradient has to stay unset rather than take the output shape.
             initial_grad = None if initial is None else current_grad
-            return (
-                spike_grad,
-                tf.cast(weight_grad, weight_values.dtype),
-            ) + (None,) * 10 + (initial_grad,)
+            return (spike_grad, weight_grad) + (None,) * 10 + (initial_grad,)
 
         return currents, grad
 
@@ -343,7 +345,7 @@ def calculate_recurrent_csr_currents(
         connectivity.pair_ids,
         connectivity.pair_posts,
         connectivity.pair_types,
-        empty_like_currents(basis) if initial is None else initial,
+        empty_like_currents(spikes) if initial is None else initial,
     )
 
 
@@ -356,45 +358,45 @@ def _calculate_resource_currents(
     def fused(
         spike_values, weight_values, basis_values, dampening_value, initial_values
     ):
-        active = _active_rows_or_pairs(spike_values, basis_values)
-        # Same gate as the tensor backend, so a replica running on the resource
-        # backend reaches the same specialized backward kernel.
-        use_pairs = pair_projection_applies(
-            spike_values, basis_values, connectivity
-        )
         currents = ops.v1_csr_forward_resource(
             spike_values,
-            active,
             weight_values,
             basis_values,
             initial_values,
             n_post=connectivity.n_post,
             resource_name=connectivity.resource_name,
+            aggregate_runs=connectivity.repeats_targets,
         )
 
         def grad(current_grad):
-            spike_grad, weight_grad = ops.v1_csr_backward_resource(
+            inputs = (
                 spike_values,
                 current_grad,
                 weight_values,
                 basis_values,
                 tf.cast(dampening_value, spike_values.dtype),
-                n_post=connectivity.n_post,
-                n_edges=connectivity.n_edges,
-                resource_name=connectivity.resource_name,
-                pair_projected=use_pairs,
             )
+            attributes = {
+                "n_post": connectivity.n_post,
+                "n_edges": connectivity.n_edges,
+                "resource_name": connectivity.resource_name,
+            }
+            accumulator = _weight_gradient_accumulator()
+            if accumulator is None:
+                spike_grad, weight_grad = ops.v1_csr_backward_resource(
+                    *inputs, **attributes
+                )
+                weight_grad = tf.cast(weight_grad, weight_values.dtype)
+            else:
+                spike_grad = ops.v1_csr_backward_accumulate_resource(
+                    *inputs, accumulator, **attributes
+                )
+                weight_grad = None
             # `initial` enters the output additively, so the upstream gradient
             # passes straight through. With no accumulator the input is an
             # empty sentinel and its gradient has to stay unset.
             initial_grad = None if initial is None else current_grad
-            return (
-                spike_grad,
-                tf.cast(weight_grad, weight_values.dtype),
-                None,
-                None,
-                initial_grad,
-            )
+            return spike_grad, weight_grad, None, None, initial_grad
 
         return currents, grad
 
@@ -403,5 +405,5 @@ def _calculate_resource_currents(
         weights,
         basis,
         tf.cast(dampening, spikes.dtype),
-        empty_like_currents(basis) if initial is None else initial,
+        empty_like_currents(spikes) if initial is None else initial,
     )

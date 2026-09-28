@@ -255,12 +255,12 @@ def test_resource_backward_matches_tensor_backend_at_the_hot_batch(
 @pytest.mark.skipif(
     not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required"
 )
-def test_pair_projected_backward_is_refused_without_the_projection(monkeypatch):
-    """A connectivity built without a backward cannot serve the specialization.
+def test_recurrent_backward_is_refused_without_the_projection(monkeypatch):
+    """A connectivity built without a pair projection cannot serve the backward.
 
-    The LGN and BKG inputs upload an empty pair projection because their
-    backward never runs. Asking the resource operator for the pair-projected
-    kernel anyway has to fail loudly rather than read absent metadata.
+    The LGN and BKG inputs upload an empty pair projection when their activity
+    is never differentiated. Asking the resource operator for the recurrent
+    backward on one has to fail loudly rather than read absent metadata.
     """
     from v1_model_utils.cuda_csr_resources import load_ops
 
@@ -268,7 +268,7 @@ def test_pair_projected_backward_is_refused_without_the_projection(monkeypatch):
     indices = np.array([[0, 0], [1, 0], [0, 1], [1, 2]], np.int64)
     types = np.array([0, 0, 0, 0], np.int64)
     connectivity = build_external_csr(
-        indices, types, 3, 2, needs_backward=False
+        indices, types, 3, 2, needs_activity_backward=False
     )
     assert connectivity.resource_name is not None
     assert int(tf.size(connectivity.pair_ids)) == 0
@@ -283,7 +283,6 @@ def test_pair_projected_backward_is_refused_without_the_projection(monkeypatch):
             n_post=2,
             n_edges=4,
             resource_name=connectivity.resource_name,
-            pair_projected=True,
         )
 
 

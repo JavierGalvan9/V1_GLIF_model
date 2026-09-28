@@ -60,7 +60,7 @@ def load_ops():
                 directory.parent
                 / "cuda_csr_recurrent/csr_recurrent_ops.cu.cc",
                 directory.parent
-                / "cuda_csr_recurrent/generic_backward_kernels.cuh",
+                / "cuda_csr_recurrent/event_weight_grad.cuh",
                 directory.parent
                 / "cuda_csr_external/csr_external_grad_ops.cu.cc",
                 directory.parent

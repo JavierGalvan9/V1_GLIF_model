@@ -24,10 +24,10 @@ REGISTER_OP("V1CsrForwardResource")
     .Attr("T: {half, float}")
     .Attr("n_post: int >= 1")
     .Attr("resource_name: string")
+    .Attr("aggregate_runs: bool = true")
     .Input("spikes: T")
-    .Input("active_indices: int64")
     .Input("weights: float")
-    .Input("basis: T")
+    .Input("basis: float")
     // Currents to accumulate on top of, or an empty tensor to start from zero.
     .Input("initial: T")
     .Output("currents: T")
@@ -35,7 +35,7 @@ REGISTER_OP("V1CsrForwardResource")
       shape_inference::ShapeHandle spikes;
       shape_inference::ShapeHandle basis;
       TF_RETURN_IF_ERROR(context->WithRank(context->input(0), 2, &spikes));
-      TF_RETURN_IF_ERROR(context->WithRank(context->input(3), 2, &basis));
+      TF_RETURN_IF_ERROR(context->WithRank(context->input(2), 2, &basis));
       int n_post;
       TF_RETURN_IF_ERROR(context->GetAttr("n_post", &n_post));
       shape_inference::DimensionHandle rows;
@@ -50,13 +50,10 @@ REGISTER_OP("V1CsrBackwardResource")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")
-    // Whether to run the compact pair-projected backward. The Python wrapper
-    // owns the decision so both connectivity backends share one gate.
-    .Attr("pair_projected: bool = false")
     .Input("spikes: T")
     .Input("current_grad: T")
     .Input("weights: float")
-    .Input("basis: T")
+    .Input("basis: float")
     .Input("dampening: T")
     .Output("spike_grad: T")
     .Output("weight_grad: float")
@@ -70,14 +67,39 @@ REGISTER_OP("V1CsrBackwardResource")
       return OkStatus();
     });
 
+// V1CsrBackwardResource, adding the weight gradient in place into the FP32
+// [n_edges] resource variable `accumulator` instead of returning it. See
+// V1CsrBackwardPairProjectedAccumulate.
+REGISTER_OP("V1CsrBackwardAccumulateResource")
+    .Attr("T: {half, float}")
+    .Attr("n_post: int >= 1")
+    .Attr("n_edges: int >= 0")
+    .Attr("resource_name: string")
+    .Input("spikes: T")
+    .Input("current_grad: T")
+    .Input("weights: float")
+    .Input("basis: float")
+    .Input("dampening: T")
+    .Input("accumulator: resource")
+    .Output("spike_grad: T")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* context) {
+      shape_inference::ShapeHandle spikes;
+      TF_RETURN_IF_ERROR(context->WithRank(context->input(0), 2, &spikes));
+      context->set_output(0, spikes);
+      return OkStatus();
+    });
+
 REGISTER_OP("ExternalCsrWeightBackwardResource")
     .Attr("T: {half, float}")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")
+    // Event-driven for sparse activity (LGN), dense pair-projected otherwise.
+    .Attr("sparse_activity: bool = true")
     .Input("activity: T")
     .Input("current_grad: T")
-    .Input("basis: T")
+    .Input("basis: float")
     .Output("weight_grad: float")
     .SetShapeFn([](shape_inference::InferenceContext* context) {
       shape_inference::ShapeHandle activity;
@@ -96,7 +118,7 @@ REGISTER_OP("ExternalCsrActivityBackwardResource")
     .Attr("resource_name: string")
     .Input("current_grad: T")
     .Input("weights: float")
-    .Input("basis: T")
+    .Input("basis: float")
     .Output("activity_grad: T")
     .SetShapeFn([](shape_inference::InferenceContext* context) {
       shape_inference::ShapeHandle current_grad;

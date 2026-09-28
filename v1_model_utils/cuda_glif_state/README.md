@@ -19,6 +19,13 @@ The CUDA backward kernel supports the `triangular`, `gaussian`, and `slayer`
 surrogate gradients selected through `surrogate_gradient`. The legacy
 `pseudo_gauss=True` option remains an alias for `surrogate_gradient="gaussian"`.
 
+The fused operators accept any positive synaptic basis dimension. They select
+the two-sample coefficient-reuse kernels whenever the basis dimension is four;
+other dimensions use the runtime-basis kernels. Forward and backward make the
+same choice from their validated synaptic-state shapes. Dispatch does not depend
+on batch size. The four-basis path uses 512 threads per block and tiles two
+samples per neuron so it can reuse the four coefficient blocks.
+
 Builds are architecture-keyed and validated against the active TensorFlow/CUDA
 environment:
 

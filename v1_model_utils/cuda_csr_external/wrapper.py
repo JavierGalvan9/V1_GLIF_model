@@ -12,7 +12,10 @@ from v1_model_utils.cuda_csr_external.build import build_flags_for, DIRECT_CSR
 from v1_model_utils.cuda_csr_recurrent.build import (
     build_flags_for as recurrent_build_flags_for,
 )
-from v1_model_utils.cuda_csr_recurrent.wrapper import require_csr_ordered_weights
+from v1_model_utils.cuda_csr_recurrent.wrapper import (
+    empty_like_currents,
+    require_csr_ordered_weights,
+)
 from v1_model_utils.cuda_csr_resources import (
     initialize_resource,
     load_ops as load_resource_ops,
@@ -23,11 +26,6 @@ from v1_model_utils.cuda_csr_resources import (
 SPECIALIZED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 _OPS = None
 _RECURRENT_OPS = None
-
-
-def _active_rows_or_pairs(values, basis_values):
-    """Return active ``(batch, presynaptic row)`` pairs."""
-    return tf.where(values != tf.cast(0, values.dtype))
 
 
 def _edge_index_tensor(order):
@@ -72,15 +70,21 @@ class CsrConnectivity:
     incoming_pre_ids: tf.Tensor | None = None
     incoming_edge_ids: tf.Tensor | None = None
     incoming_types: tf.Tensor | None = None
+    # Sparse activity (LGN) takes the event-driven weight gradient; dense
+    # activity (the Poisson BKG) the compact pair-projected one.
+    sparse_activity: bool = True
+    # Whether some row sends two edges to one target; see csr_order.repeats_targets.
+    repeats_targets: bool = True
 
 
 def _compact_pairs(post_ids, synapse_types, needed=True):
     """Return the unique postsynaptic/type projection shared by each edge.
 
-    Only the backward kernels project onto the basis per pair, so a
-    connectivity that is never differentiated - LGN input under
-    ``--notrain_input`` with no activity gradient - carries empty metadata
-    instead of one uint32 per edge that nothing reads.
+    The activity gradient and the dense weight gradient project onto the basis
+    per pair; the event-driven weight gradient reads the edges directly. So a
+    sparse connectivity whose activity is never differentiated - the default
+    LGN input - carries empty metadata instead of one uint32 per edge that
+    nothing reads: 365 MiB on the LGN input of the 203,816-neuron network.
     """
     if not needed:
         return {
@@ -136,15 +140,18 @@ def kernel_variant(n_basis, batch_size):
 
 def build_csr_connectivity(
     indices, synapse_types, n_pre, n_post, weights_csr_ordered=False,
-    needs_backward=True,
+    needs_activity_backward=True, sparse_activity=True,
 ):
     """Create compact pre-CSR metadata while preserving edge weight order.
 
     Set ``weights_csr_ordered`` when the caller's edges already follow this
     operator's CSR order; the derived permutation is then asserted to be the
-    identity. Clear ``needs_backward`` when neither an activity nor a weight
-    gradient will ever be requested, so the per-edge pair projection is not
-    built or uploaded.
+    identity. Clear ``needs_activity_backward`` when no activity gradient will
+    ever be requested, so a sparse connectivity does not build or upload the
+    per-edge pair projection. Clear ``sparse_activity`` for an input that is
+    active in most rows every step, such as the Poisson background: its weight
+    gradient then uses the dense pair-projected kernel, which needs the
+    projection, instead of the event-driven one.
     """
     indices = np.asarray(indices)
     types = np.asarray(synapse_types)
@@ -194,7 +201,11 @@ def build_csr_connectivity(
         n_edges=int(indices.shape[0]),
         edge_order=order,
         weights_csr_ordered=bool(weights_csr_ordered),
-        **_compact_pairs(ordered_posts, ordered_types, needs_backward),
+        sparse_activity=bool(sparse_activity),
+        repeats_targets=csr_order.repeats_targets(ordered_posts, offsets),
+        **_compact_pairs(
+            ordered_posts, ordered_types, needs_activity_backward or not sparse_activity
+        ),
         **_bkg_incoming_metadata(
             ordered_posts,
             ordered_types,
@@ -226,7 +237,7 @@ def _load_ops():
                 recurrent_directory / "build.py",
                 recurrent_directory / "csr_recurrent_ops.cc",
                 recurrent_directory / "csr_recurrent_ops.cu.cc",
-                recurrent_directory / "generic_backward_kernels.cuh",
+                recurrent_directory / "event_weight_grad.cuh",
             ),
             build_module="v1_model_utils.cuda_csr_recurrent.build",
             build_flags=recurrent_build_flags_for,
@@ -240,6 +251,7 @@ def _load_ops():
                 directory / "csr_external_grad_ops.cc",
                 directory / "csr_external_grad_ops.cu.cc",
                 directory / "generic_backward_kernels.cuh",
+                recurrent_directory / "event_weight_grad.cuh",
             ),
             build_module="v1_model_utils.cuda_csr_external.build",
             build_flags=build_flags_for,
@@ -265,11 +277,12 @@ def calculate_external_csr_currents(
     derivatives are neither allocated nor computed.
 
     ``initial`` accumulates these currents on top of another source's output
-    rather than returning a separate tensor for a later add to combine.
+    rather than returning a separate tensor for a later add to combine. The
+    kernels take the synaptic basis in FP32.
     """
     activity = tf.convert_to_tensor(activity)
     weights = tf.convert_to_tensor(weights, tf.float32)
-    basis = tf.cast(basis, activity.dtype)
+    basis = tf.cast(basis, tf.float32)
     if activity.shape.rank != 2:
         raise ValueError("activity must be rank two")
     if activity.shape[-1] is not None and int(activity.shape[-1]) != connectivity.n_pre:
@@ -320,10 +333,8 @@ def calculate_external_csr_currents(
                 n_post=connectivity.n_post,
             )
         else:
-            active = _active_rows_or_pairs(values, basis_values)
             currents = recurrent_ops.v1_csr_forward(
                 values,
-                active,
                 master_weights,
                 post_ids,
                 synapse_types,
@@ -332,6 +343,7 @@ def calculate_external_csr_currents(
                 basis_values,
                 initial_values,
                 n_post=connectivity.n_post,
+                aggregate_runs=connectivity.repeats_targets,
             )
 
         def grad(upstream):
@@ -365,6 +377,7 @@ def calculate_external_csr_currents(
                     pair_ids,
                     pair_posts,
                     pair_types,
+                    sparse_activity=connectivity.sparse_activity,
                     n_post=connectivity.n_post,
                     n_edges=connectivity.n_edges,
                 )
@@ -388,7 +401,7 @@ def calculate_external_csr_currents(
         connectivity.row_splits,
         connectivity.edge_ids,
         connectivity.nonempty_rows,
-        tf.zeros((0, 0), basis.dtype) if initial is None else initial,
+        empty_like_currents(activity) if initial is None else initial,
         connectivity.pair_ids,
         connectivity.pair_posts,
         connectivity.pair_types,
@@ -409,15 +422,14 @@ def _calculate_resource_currents(
 
     @tf.custom_gradient
     def fused(values, master_weights, basis_values, initial_values):
-        active = _active_rows_or_pairs(values, basis_values)
         currents = ops.v1_csr_forward_resource(
             values,
-            active,
             master_weights,
             basis_values,
             initial_values,
             n_post=connectivity.n_post,
             resource_name=connectivity.resource_name,
+            aggregate_runs=connectivity.repeats_targets,
         )
 
         def grad(upstream):
@@ -436,6 +448,7 @@ def _calculate_resource_currents(
                     values,
                     upstream,
                     basis_values,
+                    sparse_activity=connectivity.sparse_activity,
                     n_post=connectivity.n_post,
                     n_edges=connectivity.n_edges,
                     resource_name=connectivity.resource_name,
@@ -451,8 +464,6 @@ def _calculate_resource_currents(
         return currents, grad
 
     return fused(
-        tf.convert_to_tensor(activity),
-        tf.convert_to_tensor(weights, tf.float32),
-        tf.cast(basis, activity.dtype),
-        tf.zeros((0, 0), basis.dtype) if initial is None else initial,
+        activity, weights, basis,
+        empty_like_currents(activity) if initial is None else initial,
     )

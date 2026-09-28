@@ -126,3 +126,14 @@ def test_compact_pairs_covers_the_full_synapse_type_range():
     np.testing.assert_array_equal(codes.astype(np.uint64), ref_codes)
     np.testing.assert_array_equal(pair_ids.astype(np.int64), ref_ids)
     assert codes.size == 4
+
+
+def test_repeats_targets_ignores_repeats_across_row_boundaries():
+    # Rows [0, 1, 2 | 2, 5]: the two 2s straddle a row boundary.
+    posts = np.array([0, 1, 2, 2, 5])
+    assert not csr_order.repeats_targets(posts, np.array([0, 3, 5]))
+    # Rows [0, 1 | 2, 2, 5]: two edges of one row share post 2.
+    assert csr_order.repeats_targets(posts, np.array([0, 2, 5]))
+    # Empty rows leave repeated boundaries in row_splits.
+    assert not csr_order.repeats_targets(posts, np.array([0, 3, 3, 5, 5]))
+    assert not csr_order.repeats_targets(np.array([], np.int64), np.array([0, 0]))

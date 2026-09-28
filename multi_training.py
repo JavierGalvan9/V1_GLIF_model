@@ -655,6 +655,9 @@ def main(_):
                 chunk_size=flags.gradient_checkpoint_chunk_size,
                 differentiate_inputs=False,
                 pack_spike_checkpoints=flags.pack_spike_checkpoints,
+                accumulated_variable=(
+                    rsnn_layer.cell.accumulated_weight_gradient_variable
+                ),
             )
             print(
                 "Gradient checkpointing: segmented exact BPTT "

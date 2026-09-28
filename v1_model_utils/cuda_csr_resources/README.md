@@ -23,8 +23,9 @@ tests and benchmarks. Single-replica training keeps the tensor-backed
 operators, whose background-input forward carries a gather specialization this
 library does not implement - worth about 3% of a step at batch 32.
 
-The library provides recurrent forward/backward and the external weight-only
-and activity backward operations. Two contracts are shared with the tensor
+The library provides recurrent forward/backward (including the in-place
+accumulating backward, see `cuda_csr_recurrent/README.md`) and the external
+weight-only and activity backward operations. Two contracts are shared with the tensor
 backend and must not drift:
 
 - **Compile flags.** `csr_resource_ops.cu.cc` `#include`s the recurrent and
@@ -32,9 +33,14 @@ backend and must not drift:
   other compiles two different kernels from one source file.
   `cuda_csr_config.architecture_kernel_flags` is the single definition of the
   architecture-dependent flags for all three build modules.
-- **Kernel selection.** The Python wrapper decides whether the compact
-  pair-projected backward applies (`pair_projection_applies`) and passes the
-  answer as the `pair_projected` attribute, so both backends read one gate.
+- **Kernel selection.** Both backends call the same launchers: one
+  pair-projected recurrent backward for every shape, and the shared
+  event-driven weight gradient for the external inputs.
+- **Operator interface.** Like the tensor backend, the forward finds its
+  active rows on the device (there is no `active_indices` input) and every
+  operator takes the synaptic basis in FP32. Note that the included sources
+  see `uint32` redefined as `int32`, so kernel code that shifts or masks packed
+  words must use `unsigned int`.
 
 A connectivity declared without a backward (`needs_backward=False`, the LGN and
 BKG inputs) uploads an empty pair projection. Initialization accepts that; the

@@ -81,3 +81,22 @@ def compact_pairs(post_ids, synapse_types):
     lookup = np.zeros(size, np.uint32)
     lookup[unique_codes] = np.arange(unique_codes.size, dtype=np.uint32)
     return unique_codes, lookup[codes]
+
+
+def repeats_targets(post_ids, row_splits):
+    """Whether any CSR row sends two edges to the same postsynaptic neuron.
+
+    Posts ascend within a row, so a repeat is two adjacent equal posts that are
+    not separated by a row boundary. The forward's warp-level aggregation only
+    pays when this is true (LGN: one edge per synapse type between a pair of
+    neurons); recurrent rows never repeat a target.
+    """
+    posts = np.asarray(post_ids)
+    if posts.size < 2:
+        return False
+    same = posts[1:] == posts[:-1]
+    # Position i + 1 opening a new row separates edges i and i + 1.
+    starts = np.asarray(row_splits)[1:-1].astype(np.int64)
+    starts = starts[(starts > 0) & (starts < posts.size)]
+    same[starts - 1] = False
+    return bool(same.any())

@@ -25,11 +25,11 @@ def _csr_sorted(indices, synapse_types, weights):
     return indices[order], synapse_types[order], weights[order]
 
 
-def _connectivity(indices, synapse_types, n_pre, n_post):
+def _connectivity(indices, synapse_types, n_pre, n_post, **kwargs):
     """Build connectivity, declaring the CSR ordering the kernels require."""
     return build_csr_connectivity(
         indices, synapse_types, n_pre=n_pre, n_post=n_post,
-        weights_csr_ordered=DIRECT_CSR,
+        weights_csr_ordered=DIRECT_CSR, **kwargs,
     )
 
 
@@ -147,10 +147,14 @@ def test_fixed_four_bkg_forward_and_gradients(dtype):
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize("n_basis", [4, 5])
 @pytest.mark.parametrize("batch_size", SPECIALIZED_BATCH_SIZES + RUNTIME_BATCH_SIZES)
-def test_full_forward_and_backward(batch_size, n_basis):
+@pytest.mark.parametrize("sparse_activity", [True, False])
+def test_full_forward_and_backward(batch_size, n_basis, sparse_activity):
     fixture = _fixture(batch_size, n_basis)
     indices, synapse_types, activity, weights, basis, upstream = fixture
-    connectivity = _connectivity(indices, synapse_types, n_pre=4, n_post=3)
+    # Event-driven (sparse) and dense pair-projected weight gradients.
+    connectivity = _connectivity(
+        indices, synapse_types, n_pre=4, n_post=3, sparse_activity=sparse_activity
+    )
     activity_tensor = tf.constant(activity)
     master_weights = tf.Variable(weights)
     with tf.GradientTape() as tape:
@@ -167,16 +171,23 @@ def test_full_forward_and_backward(batch_size, n_basis):
     expected = _reference(*fixture)
     np.testing.assert_allclose(currents.numpy(), expected[0], rtol=2e-5, atol=2e-5)
     np.testing.assert_allclose(activity_grad.numpy(), expected[1], rtol=2e-5, atol=2e-5)
-    np.testing.assert_allclose(weight_grad.numpy(), expected[2], rtol=2e-5, atol=2e-5)
+    # FP32 accumulation order (atomic batch tiles on the dense path) leaves
+    # round-off proportional to the magnitude of the summed terms.
+    np.testing.assert_allclose(weight_grad.numpy(), expected[2], rtol=2e-5,
+                               atol=2e-6 * np.abs(expected[2]).max())
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize("n_basis", [3, 4, 7])
 @pytest.mark.parametrize("batch_size", SPECIALIZED_BATCH_SIZES + RUNTIME_BATCH_SIZES)
-def test_weight_only_backward(batch_size, n_basis):
+@pytest.mark.parametrize("sparse_activity", [True, False])
+def test_weight_only_backward(batch_size, n_basis, sparse_activity):
     fixture = _fixture(batch_size, n_basis)
     indices, synapse_types, activity, weights, basis, upstream = fixture
-    connectivity = _connectivity(indices, synapse_types, n_pre=4, n_post=3)
+    connectivity = _connectivity(
+        indices, synapse_types, n_pre=4, n_post=3, sparse_activity=sparse_activity,
+        needs_activity_backward=False,
+    )
     activity_tensor = tf.constant(activity)
     master_weights = tf.Variable(weights)
     with tf.GradientTape() as tape:
@@ -193,7 +204,10 @@ def test_weight_only_backward(batch_size, n_basis):
     expected = _reference(*fixture)
     assert activity_grad is None
     np.testing.assert_allclose(currents.numpy(), expected[0], rtol=2e-5, atol=2e-5)
-    np.testing.assert_allclose(weight_grad.numpy(), expected[2], rtol=2e-5, atol=2e-5)
+    # FP32 accumulation order (atomic batch tiles on the dense path) leaves
+    # round-off proportional to the magnitude of the summed terms.
+    np.testing.assert_allclose(weight_grad.numpy(), expected[2], rtol=2e-5,
+                               atol=2e-6 * np.abs(expected[2]).max())
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
@@ -341,7 +355,7 @@ def test_v1_lgn_and_background_adapters_produce_weight_gradients_only():
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize("activity_enabled", [False, True])
-def test_v1_lgn_activity_gradient_flag_preserves_binary_forward(activity_enabled):
+def test_v1_lgn_activity_gradient_flag_uses_spikes_as_is(activity_enabled):
     indices, synapse_types, activity, weights, basis, _ = _fixture(2, 4)
     connectivity = _connectivity(indices, synapse_types, n_pre=4, n_post=3)
     cell = SimpleNamespace(
@@ -353,15 +367,14 @@ def test_v1_lgn_activity_gradient_flag_preserves_binary_forward(activity_enabled
         synaptic_basis_weights=tf.constant(basis),
         input_csr=connectivity,
     )
-    values = tf.constant(activity)
-    binary_values = tf.cast(values > 0, tf.float32)
+    values = tf.cast(tf.constant(activity) > 0, tf.float32)
     with tf.GradientTape() as tape:
         tape.watch(values)
         output = V1Column.calculate_input_current_from_spikes(cell, values)
         loss = tf.reduce_sum(output)
     gradient = tape.gradient(loss, values)
     expected = calculate_external_csr_currents(
-        binary_values,
+        values,
         cell.input_weight_values,
         basis,
         connectivity,

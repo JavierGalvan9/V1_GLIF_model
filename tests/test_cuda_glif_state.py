@@ -1,6 +1,7 @@
 """Parity tests for the shared differentiable CUDA state-transition adapter."""
 
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ import tensorflow as tf
 
 from v1_model_utils import cuda_csr_recurrent, spatial_layout
 from v1_model_utils.models import V1Column, _has_homogeneous_cuda_devices
+from v1_model_utils.cuda_glif_state.wrapper import update_glif_state
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +123,62 @@ def _previous_spike_gradient(cell, inputs, state, state_index):
         _, new_state = cell(inputs, watched_state)
         loss = tf.reduce_sum(tf.cast(new_state[state_index], tf.float32))
     return tape.gradient(loss, previous_spikes)
+
+
+@pytest.mark.parametrize("basis_dim", [1, 2, 5])
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+def test_cuda_glif_generic_basis_forward_and_gradients(basis_dim, dtype):
+    """The model adapter must use the runtime-basis path outside four bases."""
+    if not tf.config.list_physical_devices("GPU"):
+        pytest.skip("requires CUDA")
+    batch, neurons, slots = 2, 3, 3
+    coefficients = np.zeros((neurons, basis_dim, 4), np.float32)
+    coefficients[..., 0] = 0.8
+    coefficients[..., 1] = 0.3
+    coefficients[..., 2] = 0.2
+    coefficients[..., 3] = 0.4
+    cell = SimpleNamespace(
+        syn_coeffs=tf.constant(coefficients),
+        asc_decay=tf.zeros((2 * neurons,), tf.float32),
+        asc_amps=tf.zeros((2 * neurons,), tf.float32),
+        decay=tf.ones((neurons,), tf.float32),
+        asc_factor=tf.zeros((2 * neurons,), tf.float32),
+        reset_coeff=tf.zeros((neurons,), tf.float32),
+        asc_spike_factor=tf.zeros((neurons,), tf.float32),
+        t_ref_steps=tf.zeros((neurons,), tf.int8),
+        _dt=tf.constant(0.5),
+        v_reset=tf.constant(0.0),
+        v_th=tf.constant(10.0),
+        _gauss_std=tf.constant(1.0),
+        _dampening_factor=tf.constant(1.0),
+        _return_voltage_sequences=False,
+        _hard_reset=False,
+        _surrogate_gradient="triangular",
+        _detach_reset=True,
+        _detach_asc_reset=True,
+    )
+    state_shape = (batch, neurons * basis_dim)
+    rise = tf.Variable(tf.fill(state_shape, tf.cast(0.25, dtype)))
+    psc = tf.Variable(tf.fill(state_shape, tf.cast(0.5, dtype)))
+    inputs = tf.Variable(tf.fill(state_shape, tf.cast(0.75, dtype)))
+    with tf.GradientTape() as tape:
+        spikes, _, state = update_glif_state(
+            tf.zeros((batch, slots * neurons), dtype),
+            tf.zeros((batch, neurons), tf.float32),
+            tf.zeros((batch, neurons), tf.int8),
+            tf.zeros((batch, 2 * neurons), tf.float32),
+            rise, psc, inputs, cell=cell,
+        )
+        loss = sum(tf.reduce_sum(tf.cast(state[index], tf.float32)) for index in (1, 4, 5))
+    rise_grad, psc_grad, input_grad = tape.gradient(loss, (rise, psc, inputs))
+    np.testing.assert_array_equal(spikes.numpy(), np.zeros_like(spikes.numpy()))
+    np.testing.assert_allclose(state[1].numpy(), 0.2 * basis_dim,
+                               rtol=0, atol=2e-6)
+    for actual, expected in ((state[4], 0.425), (state[5], 0.5),
+                             (rise_grad, 1.6), (psc_grad, 1.0),
+                             (input_grad, 0.3)):
+        np.testing.assert_allclose(actual.numpy(), expected,
+                                   rtol=0, atol=2e-3 if dtype == tf.float16 else 2e-6)
 
 
 @pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
