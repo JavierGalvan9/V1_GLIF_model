@@ -1478,39 +1478,70 @@ class SynchronizationLoss(Layer):
 
         if trim:
             spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
-        duration_ms = tf.cast(tf.shape(spikes)[1], tf.int32)
-        bin_limit_ms = duration_ms // 2
-        bin_sizes_mask = self._bin_sizes_ms_tf < bin_limit_ms
-        experimental_fanos_mean = tf.boolean_mask(self.experimental_fanos_mean, bin_sizes_mask)
-
         n_trials, duration = spikes.shape[0], spikes.shape[1]
         if n_trials is None or duration is None:
             raise ValueError(
                 "SynchronizationLoss needs statically known batch and sequence "
                 f"dimensions, got {spikes.shape}."
             )
-        plan = self._plan(n_trials)
-        per_trial, max_count = plan["per_trial"], plan["max_count"]
+        plan = self.prepare_sampled_trace_plan(n_trials, spikes.dtype)
+        selected_spikes_sample = self.gather_sampled_traces(
+            spikes, plan, tf.range(n_trials, dtype=tf.int32)
+        )
+        return self.loss_from_sampled_traces(selected_spikes_sample)
 
+    def prepare_sampled_trace_plan(self, n_trials, spike_dtype):
+        """Draw one global trial plan before a chunked validation rollout.
+
+        Call this once on the same replica that previously evaluated the full
+        synchronization loss. Trial indices passed to ``gather_sampled_traces``
+        refer to this global plan, so chunks and replicas can be assembled in
+        the original trial order without retaining the full spike tensor.
+        """
+        n_trials = int(n_trials)
+        plan = self._plan(n_trials)
         call_seed = self._next_seed_pair()
         shuffled_e_ids = self._draw_pool(call_seed, plan["n_epochs"])
         sample_ids = tf.gather(
             shuffled_e_ids, tf.constant(plan["positions"], dtype=tf.int32)
         )
+        return (
+            sample_ids,
+            tf.constant(plan["neuron_mask"], dtype=spike_dtype),
+            plan["per_trial"],
+            plan["max_count"],
+        )
 
-        # One gather for every sample at once. The previous implementation ran
-        # an n_samples-iteration tf.while_loop whose dynamically indexed
-        # `spikes[sample_trial]` slice forced a dense per-trial gradient to be
-        # zero-filled and accumulated on every iteration, and whose
-        # data-dependent reshuffle test synchronised the host each time round.
-        neuron_mask = tf.constant(plan["neuron_mask"], dtype=spikes.dtype)
-        selected_spikes_sample = _gather_population_traces(
-            spikes, sample_ids, neuron_mask,
+    def gather_sampled_traces(self, spikes, plan, trial_indices):
+        """Return selected population traces from a time chunk.
+
+        The result is trial-major ``[local_trials * per_trial, chunk_time]``.
+        Concatenate chunks along time, then concatenate replica trial groups
+        along the first dimension before ``loss_from_sampled_traces``.
+        """
+        n_trials, duration = spikes.shape[0], spikes.shape[1]
+        if n_trials is None or duration is None:
+            raise ValueError(
+                "SynchronizationLoss needs statically known batch and sequence "
+                f"dimensions, got {spikes.shape}."
+            )
+        sample_ids, neuron_mask, per_trial, max_count = plan
+        trial_indices = tf.convert_to_tensor(trial_indices, dtype=tf.int32)
+        selected = _gather_population_traces(
+            spikes,
+            tf.gather(sample_ids, trial_indices),
+            tf.gather(neuron_mask, trial_indices),
             n_trials, duration, per_trial, max_count,
         )
-        if selected_spikes_sample.dtype != self._dtype:
-            selected_spikes_sample = tf.cast(selected_spikes_sample, self._dtype)
+        return tf.cast(selected, self._dtype)
 
+    def loss_from_sampled_traces(self, selected_spikes_sample):
+        """Evaluate Fano loss after sampled time chunks have been assembled."""
+        duration_ms = tf.cast(tf.shape(selected_spikes_sample)[1], tf.int32)
+        bin_sizes_mask = self._bin_sizes_ms_tf < duration_ms // 2
+        experimental_fanos_mean = tf.boolean_mask(
+            self.experimental_fanos_mean, bin_sizes_mask
+        )
         fanos_mean = self.pop_fano_tf(selected_spikes_sample)
         fanos_mean = tf.boolean_mask(fanos_mean, bin_sizes_mask)
         # # Calculate MSE between the experimental and calculated Fano factors
@@ -1648,7 +1679,8 @@ class OrientationSelectivityLoss:
                  rolling_max_decay=0.9999,
                  rolling_gradient_correction=True,
                  rolling_max_gradient_scale=20.0,
-                 rolling_warmup=True):
+                 rolling_warmup=True,
+                 batch_emd_alignment_weight=1.0):
 
         self._network = network
         self._osi_cost = osi_cost
@@ -1663,6 +1695,7 @@ class OrientationSelectivityLoss:
         self.data_dir = data_dir
         self._rolling_gradient_correction = bool(rolling_gradient_correction)
         self._rolling_warmup = bool(rolling_warmup)
+        self._batch_emd_alignment_weight = float(batch_emd_alignment_weight)
         self._rolling_target_sample_ess = tf.constant(
             float(rolling_target_sample_ess), dtype=self._dtype
         )
@@ -1689,6 +1722,7 @@ class OrientationSelectivityLoss:
                 "crowd_osi",
                 "rolling_osi_emd",
                 "adaptative_crowd_osi",
+                "batch_osi_emd",
             )
         ):
             self.np_core_mask = self._core_mask.numpy()
@@ -1731,6 +1765,10 @@ class OrientationSelectivityLoss:
             self._rolling_one_minus_decay = tf.constant(1.0 - resolved_decay, dtype=self._dtype)
             self._rolling_epsilon = tf.constant(rolling_epsilon, dtype=self._dtype)
             self._initialize_rolling_osi_emd_targets()
+
+        elif self._method == "batch_osi_emd":
+            self._rolling_epsilon = tf.constant(rolling_epsilon, dtype=self._dtype)
+            self._initialize_emd_targets()
 
     def _uses_rolling_state(self):
         return self._method in ("rolling_osi_emd", "adaptative_crowd_osi")
@@ -1899,13 +1937,25 @@ class OrientationSelectivityLoss:
         )
 
     def _initialize_rolling_osi_emd_targets(self):
+        self._initialize_emd_targets()
+        self._initialize_rolling_state_variables(len(self._tuning_angles))
+
+    def _initialize_emd_targets(self):
+        """Build the per-cell-type neuron groups and their target OSI/DSI CDFs.
+
+        Shared by every EMD-style method. Each cell type's Neuropixels OSI/DSI
+        sample is resampled onto as many quantiles as the model has neurons of
+        that type, so the EMD reduces to a mean absolute difference between two
+        equally long sorted vectors.
+        """
         self._target_osi_dsi = self.get_neuropixels_osi_dsi()
         self._min_rates_threshold = tf.constant(0.0005, dtype=self._dtype)
 
-        n_nodes = len(self._tuning_angles)
         group_indices = []
         osi_target_values = []
         dsi_target_values = []
+        osi_empirical_values = []
+        dsi_empirical_values = []
         cell_type_count = []
 
         for cell_type in CELL_TYPE_ORDER:
@@ -1922,12 +1972,14 @@ class OrientationSelectivityLoss:
             group_indices.append(node_ids)
             osi_target_values.append(resample_sorted_distribution(exp_osi, node_ids.size))
             dsi_target_values.append(resample_sorted_distribution(exp_dsi, node_ids.size))
+            osi_empirical_values.append(np.sort(exp_osi))
+            dsi_empirical_values.append(np.sort(exp_dsi))
             cell_type_count.append(float(node_ids.size))
 
         if not group_indices:
             raise ValueError(
-                "rolling_osi_emd requires at least one cell type with both model neurons "
-                "and Neuropixels OSI/DSI samples."
+                f"{self._method} requires at least one cell type with both model "
+                "neurons and Neuropixels OSI/DSI samples."
             )
 
         row_splits = np.zeros(len(group_indices) + 1, dtype=np.int32)
@@ -1952,10 +2004,30 @@ class OrientationSelectivityLoss:
             row_splits_tf,
             validate=False,
         )
+        osi_empirical_row_splits = np.zeros(len(group_indices) + 1, dtype=np.int32)
+        osi_empirical_row_splits[1:] = np.cumsum(
+            [values.size for values in osi_empirical_values], dtype=np.int32
+        )
+        dsi_empirical_row_splits = np.zeros(len(group_indices) + 1, dtype=np.int32)
+        dsi_empirical_row_splits[1:] = np.cumsum(
+            [values.size for values in dsi_empirical_values], dtype=np.int32
+        )
+        self._osi_empirical_distributions = tf.RaggedTensor.from_row_splits(
+            tf.convert_to_tensor(
+                np.concatenate(osi_empirical_values), dtype=self._dtype
+            ),
+            tf.convert_to_tensor(osi_empirical_row_splits, dtype=tf.int32),
+            validate=False,
+        )
+        self._dsi_empirical_distributions = tf.RaggedTensor.from_row_splits(
+            tf.convert_to_tensor(
+                np.concatenate(dsi_empirical_values), dtype=self._dtype
+            ),
+            tf.convert_to_tensor(dsi_empirical_row_splits, dtype=tf.int32),
+            validate=False,
+        )
         self.cell_type_count = tf.constant(cell_type_count, dtype=self._dtype)
         self._n_node_types = tf.constant(len(group_indices), dtype=tf.int32)
-
-        self._initialize_rolling_state_variables(n_nodes)
 
     def get_rolling_state(self):
         if not self._uses_rolling_state():
@@ -2499,6 +2571,144 @@ class OrientationSelectivityLoss:
 
         return (numerator / denominator) * self._osi_cost
 
+    def _batch_signed_selectivity_components(
+        self, rates, radians_delta_angle, harmonic
+    ):
+        """Return phase-anchored real and imaginary selectivity components.
+
+        Keeping the sign of the real component is essential: it distinguishes the wired preference from an
+        orientation reversal (90 degrees for OSI, 180 degrees for DSI).
+        """
+        phase = tf.cast(harmonic, self._dtype) * radians_delta_angle
+        total = tf.reduce_sum(rates, axis=0)
+        safe_total = tf.maximum(total, self._rolling_epsilon)
+        real = tf.reduce_sum(rates * tf.math.cos(phase), axis=0) / safe_total
+        imag = tf.reduce_sum(rates * tf.math.sin(phase), axis=0) / safe_total
+        return real, imag
+
+    def _batch_signed_osi_dsi_components(self, rates, angle, normalizer=None):
+        """Return signed, phase-anchored OSI and DSI components for the loss."""
+        del normalizer
+        rates = self._prepare_rates(rates, None)
+        radians_delta_angle = self._radians_delta_angle(angle)
+        osi_real, osi_imag = self._batch_signed_selectivity_components(
+            rates, radians_delta_angle, 2
+        )
+        dsi_real, dsi_imag = self._batch_signed_selectivity_components(
+            rates, radians_delta_angle, 1
+        )
+        total_rates = tf.reduce_sum(rates, axis=0)
+        return osi_real, osi_imag, dsi_real, dsi_imag, total_rates
+
+    def _resample_tensor_distribution(self, sorted_values, n_samples):
+        """Linearly resample a sorted empirical distribution to a dynamic size."""
+        source_size = tf.shape(sorted_values)[0]
+        positions = tf.linspace(
+            tf.zeros((), dtype=self._dtype),
+            tf.cast(source_size - 1, self._dtype),
+            n_samples,
+        )
+        lower = tf.cast(tf.floor(positions), tf.int32)
+        upper = tf.minimum(lower + 1, source_size - 1)
+        weight = positions - tf.cast(lower, self._dtype)
+        return (
+            tf.gather(sorted_values, lower) * (1.0 - weight)
+            + tf.gather(sorted_values, upper) * weight
+        )
+
+    @tf.function(jit_compile=False)
+    def batch_osi_emd_loss_from_rates(self, rates, angle, normalizer=None):
+        """Distributional OSI/DSI loss from a single large gratings batch.
+
+        Unlike `rolling_osi_emd`, nothing is carried between steps: with enough
+        gratings samples per batch the per-neuron estimate is usable on its own,
+        so there is no EMA state to checkpoint, no stale-moment gradient rescale
+        and no warmup. The quantity minimised here is, up to the resampling of
+        the target, the same per-cell-type EMD that `equal_cell_type_emd`
+        reports at validation.
+
+        The EMD is applied to the signed real component, while the imaginary
+        component is regularized toward zero. This anchors each neuron to the
+        preferred angle supplied by the LGN projection and prevents magnitude
+        matching from accepting a 90-degree OSI reversal or a 180-degree DSI
+        reversal.
+
+        ``normalizer`` is ignored.
+        """
+        osi_real, osi_imag, dsi_real, dsi_imag, total_rates = (
+            self._batch_signed_osi_dsi_components(
+                rates, angle, normalizer=normalizer
+            )
+        )
+        # Match validation semantics: OSI/DSI is undefined for a neuron that did
+        # not fire, so exclude it from the distribution rather than assigning it
+        # selectivity zero. The mask is intentionally non-differentiable; the
+        # firing-rate loss, not this loss, is responsible for activating it.
+        active = tf.stop_gradient(total_rates > 0.0)
+        alignment = tf.constant(
+            self._batch_emd_alignment_weight, dtype=self._dtype
+        )
+        losses = tf.TensorArray(self._dtype, size=self._n_node_types)
+        valid_types = tf.TensorArray(self._dtype, size=self._n_node_types)
+
+        for i in tf.range(self._n_node_types):
+            indices = self._emd_group_indices[i]
+            group_active = tf.gather(active, indices)
+            n_active = tf.math.count_nonzero(group_active, dtype=tf.int32)
+
+            def active_type_loss():
+                current_osi_real = tf.boolean_mask(
+                    tf.gather(osi_real, indices), group_active
+                )
+                current_dsi_real = tf.boolean_mask(
+                    tf.gather(dsi_real, indices), group_active
+                )
+                current_osi_imag = tf.boolean_mask(
+                    tf.gather(osi_imag, indices), group_active
+                )
+                current_dsi_imag = tf.boolean_mask(
+                    tf.gather(dsi_imag, indices), group_active
+                )
+                osi_target = self._resample_tensor_distribution(
+                    self._osi_empirical_distributions[i], n_active
+                )
+                dsi_target = self._resample_tensor_distribution(
+                    self._dsi_empirical_distributions[i], n_active
+                )
+                # Sorting is permutation invariant in the forward pass, but its
+                # gradient must assign tied values to individual target ranks.
+                # Shuffle first so that this otherwise arbitrary assignment does
+                # not repeatedly favor neurons with particular network indices.
+                shuffled_osi_real = tf.random.shuffle(current_osi_real)
+                shuffled_dsi_real = tf.random.shuffle(current_dsi_real)
+                return (
+                    tf.reduce_mean(tf.abs(tf.sort(shuffled_osi_real) - osi_target))
+                    + tf.reduce_mean(tf.abs(tf.sort(shuffled_dsi_real) - dsi_target))
+                    + alignment
+                    * (
+                        tf.reduce_mean(tf.abs(current_osi_imag))
+                        + tf.reduce_mean(tf.abs(current_dsi_imag))
+                    )
+                )
+
+            zero = tf.reduce_sum(tf.gather(osi_real, indices)) * 0.0
+            losses = losses.write(
+                i, tf.cond(n_active > 0, active_type_loss, lambda: zero)
+            )
+            valid_types = valid_types.write(
+                i, tf.cast(n_active > 0, self._dtype)
+            )
+
+        losses = losses.stack()
+        valid_types = valid_types.stack()
+        valid_type_weights = valid_types * self.cell_type_count
+        return (
+            tf.reduce_sum(losses * valid_type_weights)
+            / tf.maximum(
+                tf.reduce_sum(valid_type_weights), self._rolling_epsilon
+            )
+        ) * self._osi_cost
+
     def rolling_osi_emd_loss_from_rates(
         self, rates, angle, normalizer=None, update_state=True
     ):
@@ -2553,6 +2763,10 @@ class OrientationSelectivityLoss:
                 normalizer=normalizer,
                 update_state=update_state,
             )
+        if self._method == "batch_osi_emd":
+            return self.batch_osi_emd_loss_from_rates(
+                rates, angle, normalizer=normalizer
+            )
         raise ValueError(
             f"OSI/DSI method {self._method!r} requires spike sequences."
         )
@@ -2586,6 +2800,12 @@ class OrientationSelectivityLoss:
             update_state=update_state,
         )
 
+    def batch_osi_emd_loss(self, spikes, angle, normalizer=None):
+        rates = self.rates_per_sample_from_spikes(spikes, trim=False)
+        return self.batch_osi_emd_loss_from_rates(
+            rates, angle, normalizer=normalizer
+        )
+
     def __call__(
         self, spikes, angle, trim, normalizer=None, update_state=True
     ):
@@ -2593,6 +2813,7 @@ class OrientationSelectivityLoss:
             "crowd_osi",
             "adaptative_crowd_osi",
             "rolling_osi_emd",
+            "batch_osi_emd",
         ):
             rates = self.rates_per_sample_from_spikes(spikes, trim=trim)
             return self.loss_from_rates(

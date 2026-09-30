@@ -33,6 +33,15 @@ plt.rcParams.update({
 sns.set(style="ticks")
 plt.rcParams['text.usetex'] = shutil.which('latex') is not None
 
+# Colors of the cell classes in the laminar raster plots, shared with animations/.
+CELL_CLASS_COLORS = {
+    "Exc": "r",
+    "Htr3a": "pink",
+    "Vip": "darkviolet",
+    "Sst": "g",
+    "Pvalb": "b",
+}
+
 class InputActivityFigure:
     def __init__(
         self,
@@ -502,29 +511,29 @@ class LaminarPlot:
         # e
         times, ids = np.where(spikes * self.e_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
-        ax.plot(times, _y, ".", color="r", ms=ms, alpha=alpha)
+        ax.plot(times, _y, ".", color=CELL_CLASS_COLORS["Exc"], ms=ms, alpha=alpha)
 
         # Htr3a
         times, ids = np.where(
             spikes * self.htr3a_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
-        ax.plot(times, _y, ".", color="pink", ms=ms, alpha=alpha)
+        ax.plot(times, _y, ".", color=CELL_CLASS_COLORS["Htr3a"], ms=ms, alpha=alpha)
 
         # vip
         times, ids = np.where(spikes * self.vip_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
-        ax.plot(times, _y, ".", color="darkviolet", ms=ms, alpha=alpha)
+        ax.plot(times, _y, ".", color=CELL_CLASS_COLORS["Vip"], ms=ms, alpha=alpha)
 
         # sst
         times, ids = np.where(spikes * self.sst_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
-        ax.plot(times, _y, ".", color="g", ms=ms, alpha=alpha)
+        ax.plot(times, _y, ".", color=CELL_CLASS_COLORS["Sst"], ms=ms, alpha=alpha)
 
         # pvalb
         times, ids = np.where(
             spikes * self.pvalb_mask[None, :].astype(float))
         _y = self.neuron_id_to_y[ids]
-        ax.plot(times, _y, ".", color="b", ms=ms, alpha=alpha)
+        ax.plot(times, _y, ".", color=CELL_CLASS_COLORS["Pvalb"], ms=ms, alpha=alpha)
 
         ##### For l5e neurons #####
 
@@ -539,15 +548,15 @@ class LaminarPlot:
         #     ax.plot(times, _y, '.', color='k', ms=ms, alpha=alpha)
 
         ###########################
-        ax.plot([-1, -1], [-1, -1], ".", color="pink",
+        ax.plot([-1, -1], [-1, -1], ".", color=CELL_CLASS_COLORS["Htr3a"],
                 ms=6, alpha=0.9, label="Htr3a")
-        ax.plot([-1, -1], [-1, -1], ".", color="darkviolet",
+        ax.plot([-1, -1], [-1, -1], ".", color=CELL_CLASS_COLORS["Vip"],
                 ms=6, alpha=0.9, label="Vip")
-        ax.plot([-1, -1], [-1, -1], ".", color="g",
+        ax.plot([-1, -1], [-1, -1], ".", color=CELL_CLASS_COLORS["Sst"],
                 ms=6, alpha=0.9, label="Sst")
-        ax.plot([-1, -1], [-1, -1], ".", color="b",
+        ax.plot([-1, -1], [-1, -1], ".", color=CELL_CLASS_COLORS["Pvalb"],
                 ms=6, alpha=0.9, label="Pvalb")
-        ax.plot([-1, -1], [-1, -1], ".", color="r",
+        ax.plot([-1, -1], [-1, -1], ".", color=CELL_CLASS_COLORS["Exc"],
                 ms=6, alpha=0.9, label="Excitatory")
         # ax.plot([-1, -1], [-1, -1], '.', color='k',
         #         ms=4, alpha=.9, label='Readout (L5e)')

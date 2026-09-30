@@ -11,6 +11,28 @@ def test_configure_policy_rejects_bfloat16():
         tf_utils.configure_policy_and_dtype("bfloat16")
 
 
+def test_untrained_evaluation_skips_checkpoint_restore(tmp_path):
+    flags = SimpleNamespace(restore_from="", dtype="float32")
+    with mock.patch.object(tf_utils, "resolve_checkpoint_directory") as resolve:
+        checkpoint, logdir, epoch = tf_utils.restore_evaluation_checkpoint(
+            flags, object(), lambda _: None, str(tmp_path), current_epoch=-10,
+            evaluate_untrained=True,
+        )
+
+    resolve.assert_not_called()
+    assert checkpoint is None
+    assert logdir == str(tmp_path / "Initial_evaluation")
+    assert (tmp_path / "Initial_evaluation").is_dir()
+    assert epoch == 0
+
+    flags.restore_from = "Best_model"
+    with pytest.raises(ValueError, match="evaluate_untrained"):
+        tf_utils.restore_evaluation_checkpoint(
+            flags, object(), lambda _: None, str(tmp_path),
+            evaluate_untrained=True,
+        )
+
+
 def test_explicit_restore_path_takes_precedence_over_run_checkpoint(tmp_path):
     run_dir = tmp_path / "run"
     intermediate_dir = run_dir / "Intermediate_checkpoints"

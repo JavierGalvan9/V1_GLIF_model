@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <limits>
 #include <type_traits>
 
 #include "tensorflow/core/framework/op_kernel.h"
@@ -41,14 +42,12 @@ using GPUDevice = Eigen::GpuDevice;
 #include "event_weight_grad.cuh"
 
 // The forward's device-built active-row queue packs one (batch, presynaptic
-// row) entry as `batch << kQueueRowBits | row`. 611,448 rows on the
-// 203,816-neuron network needs 20 bits; 21 leaves room to 2,097,152 rows and
-// 11 bits of batch. The entries are plain `unsigned int`, not `uint32`: the
+// row) entry as `batch << row_bits | row`. Choose the row width from the
+// network's presynaptic row count, leaving the remaining bits for the batch.
+// The entries are plain `unsigned int`, not `uint32`: the
 // resource library compiles this file with `uint32` redefined as a signed type,
 // and a signed shift would corrupt batch indices of 1024 and above.
-constexpr int kQueueRowBits = 21;
-constexpr int64_t kQueueMaxRows = int64_t{1} << kQueueRowBits;
-constexpr int64_t kQueueMaxBatch = int64_t{1} << (32 - kQueueRowBits);
+constexpr int kQueueWordBits = std::numeric_limits<unsigned int>::digits;
 // Backward row kernel: one CSR row per warp, four warps per block.
 constexpr int kBackwardRowsPerBlock = 4;
 
@@ -106,8 +105,9 @@ __device__ __forceinline__ void AtomicAddPair(O* address, float first, float sec
 // with the Morton layout, into neighbouring postsynaptic neurons.
 struct PackActiveSlot {
   int64_t n_pre;
+  int row_bits;
   __host__ __device__ unsigned int operator()(int64_t index) const {
-    return static_cast<unsigned int>(((index / n_pre) << kQueueRowBits) | (index % n_pre));
+    return static_cast<unsigned int>(((index / n_pre) << row_bits) | (index % n_pre));
   }
 };
 
@@ -121,11 +121,12 @@ struct SlotIsActive {
 
 template <typename T>
 Status BuildActiveQueue(OpKernelContext* context, const T* spikes, int64_t slots,
-                        int64_t n_pre, unsigned int* queue, unsigned int* queue_count) {
+                        int64_t n_pre, int row_bits, unsigned int* queue,
+                        unsigned int* queue_count) {
   const cub::CountingInputIterator<int64_t> indices(0);
   const cub::TransformInputIterator<unsigned int, PackActiveSlot,
                                     cub::CountingInputIterator<int64_t>>
-      packed(indices, PackActiveSlot{n_pre});
+      packed(indices, PackActiveSlot{n_pre, row_bits});
   const cub::TransformInputIterator<bool, SlotIsActive<T>,
                                     cub::CountingInputIterator<int64_t>>
       active(indices, SlotIsActive<T>{spikes});
@@ -192,7 +193,7 @@ __device__ __forceinline__ void RunSuffixSums(float (&values)[kValues], unsigned
 // `n_basis`.
 template <typename T, typename W, typename O, int kBasis, bool kAggregate>
 __global__ void ForwardKernel(
-    int64_t n_pre, int n_post, int n_basis, const T* spikes,
+    int64_t n_pre, int n_post, int n_basis, int row_bits, const T* spikes,
     const unsigned int* queue, const unsigned int* queue_count, unsigned int* ticket,
     unsigned int slots_per_ticket,
     const W* weights, const uint32* post_ids, const uint8* synapse_types,
@@ -214,8 +215,8 @@ __global__ void ForwardKernel(
     const unsigned int last_slot = min(first_slot + slots_per_ticket, total);
   for (unsigned int active_id = first_slot; active_id < last_slot; ++active_id) {
     const unsigned int packed = queue[active_id];
-    const int64_t batch = packed >> kQueueRowBits;
-    const int64_t pre = packed & ((1u << kQueueRowBits) - 1);
+    const int64_t batch = packed >> row_bits;
+    const int64_t pre = packed & ((1u << row_bits) - 1);
     const float spike = AsFloat(spikes[batch * n_pre + pre]);
     const uint32 start = row_splits[pre];
     const uint32 end = row_splits[pre + 1];
@@ -319,14 +320,17 @@ Status LaunchForward(OpKernelContext* context, const Tensor& spikes,
                      bool aggregate_runs, Tensor* output) {
   const int64_t batch = spikes.dim_size(0);
   const int64_t n_pre = spikes.dim_size(1);
-  if (n_pre > kQueueMaxRows || batch > kQueueMaxBatch) {
-    return errors::InvalidArgument(
-        "the active-row queue packs a row into ", kQueueRowBits, " bits and a batch "
-        "index into the remaining ", 32 - kQueueRowBits, "; got ", n_pre, " rows and a "
-        "batch of ", batch);
-  }
   const int64_t slots = spikes.NumElements();
   if (slots == 0) return OkStatus();
+  int row_bits = 1;
+  while ((uint64_t{1} << row_bits) < static_cast<uint64_t>(n_pre)) ++row_bits;
+  if (row_bits >= kQueueWordBits ||
+      batch > (uint64_t{1} << (kQueueWordBits - row_bits)) ||
+      slots > std::numeric_limits<unsigned int>::max()) {
+    return errors::InvalidArgument(
+        "the active-row queue cannot encode ", n_pre, " rows and a batch of ",
+        batch, " in ", kQueueWordBits, " bits");
+  }
   const int n_basis = basis.dim_size(1);
   auto device = context->eigen_device<GPUDevice>();
   // One slot per (batch, row): 78 MiB at batch 32 on the 203,816-neuron
@@ -337,7 +341,7 @@ Status LaunchForward(OpKernelContext* context, const Tensor& spikes,
   unsigned int* queue_count = queue + slots;   // then the consumers' ticket
   cudaMemsetAsync(queue_count, 0, 2 * sizeof(unsigned int), device.stream());
   TF_RETURN_IF_ERROR(BuildActiveQueue<T>(context, spikes.flat<T>().data(), slots, n_pre,
-                                         queue, queue_count));
+                                         row_bits, queue, queue_count));
   // About 1,024 edges of work per ticket; see ForwardKernel.
   const int64_t mean_edges = std::max<int64_t>(1, post_ids.NumElements() / n_pre);
   const unsigned int slots_per_ticket =
@@ -346,6 +350,7 @@ Status LaunchForward(OpKernelContext* context, const Tensor& spikes,
   TF_RETURN_IF_ERROR(GpuLaunchKernel(                                          \
       ForwardKernel<T, W, OUTPUT_TYPE, kBasis, AGGREGATE>, kEventBlocks,       \
       V1_FORWARD_THREADS, 0, device.stream(), n_pre, n_post, n_basis,          \
+      row_bits,                                                                 \
       spikes.flat<T>().data(), queue, queue_count, queue_count + 1,            \
       slots_per_ticket,                                                        \
       weights.flat<W>().data(),                                                \

@@ -1,4 +1,5 @@
 import contextlib
+import math
 import numpy as np
 import tensorflow as tf
 import os
@@ -16,6 +17,39 @@ from . import spatial_layout
 from .glif_propagators import membrane_coefficients
 from .tf_utils import replica_local_constant
 from numba import njit
+
+
+def poisson_cdf_levels(rate):
+    """Poisson(``rate``) CDF at 0, 1, ... until the tail drops below float64 resolution.
+
+    ``V1Column.calculate_noise_current`` draws a count by inverse transform:
+    the number of these levels that a float64 uniform reaches.
+    """
+    rate = float(rate)
+    if rate < 0:
+        raise ValueError(f"Poisson rate must be non-negative, got {rate}.")
+    count, pmf, cdf, levels = 0, math.exp(-rate), 0.0, []
+    while True:
+        cdf += pmf
+        levels.append(min(cdf, 1.0))
+        count += 1
+        pmf *= rate / count
+        # P(N >= count) <= pmf / (1 - rate / (count + 1)) once count > rate.
+        if count > rate and pmf / (1 - rate / (count + 1)) < 2.0**-53:
+            return np.array(levels, np.float64)
+
+
+def sample_poisson_counts(cdf_levels, shape, seed, dtype):
+    """Stateless Poisson counts by inverse transform, on the current device.
+
+    The count is the number of ``poisson_cdf_levels`` a float64 uniform
+    reaches. ``tf.random.stateless_poisson`` has no GPU kernel, and its
+    per-timestep host round trip cost ~1.5% of a 2-4 GPU training step
+    (Experiments/bkg_noise_table_20260928).
+    """
+    uniform = tf.random.stateless_uniform(shape, seed=seed, dtype=tf.float64)
+    counts = tf.searchsorted(cdf_levels, tf.reshape(uniform, [-1]), side="right")
+    return tf.cast(tf.reshape(counts, shape), dtype)
 
 
 def _keras_op(name, tensorflow_op):
@@ -903,9 +937,8 @@ class V1Column(tf.keras.layers.Layer):
         # loop-carried control flow on the host instead (Enter/Merge/Switch/Exit
         # go from one to seven nodes each), and the same state round-trips at
         # four times the size. Median step time regressed 8.22 s -> 9.10 s, so
-        # int8 is retained. The remaining host dependency to attack is
-        # StatelessRandomPoisson, which has no GPU kernel at all; see
-        # Benchmarks_metrics/host_device_transfer_investigation_20260901.
+        # int8 is retained. The other host dependency, StatelessRandomPoisson
+        # (no GPU kernel), is gone: calculate_noise_current draws on the device.
         if max_ref_steps > 127:
             self._refractory_state_dtype = tf.int16
             print(f"Warning: max refractory period is {max_ref_steps} steps, which exceeds int8 capacity. Using int16 for refractory state.")
@@ -994,13 +1027,6 @@ class V1Column(tf.keras.layers.Layer):
             )
         # add dimension for the weights factors - TensorShape([23525415, 1])
         # weights = tf.expand_dims(weights, axis=1)
-        # Set the sign of the connections (exc or inh). The constraint runs in
-        # every replica after each update; it does not track its condition, so
-        # the mask stays out of the checkpoint.
-        recurrent_weight_positive = replica_local_constant(
-            weights >= 0, name="recurrent_weight_positive"
-        )
-
         # if training the recurrent connection per type, turn off recurrent training
         # of individual connections
         if train_recurrent:
@@ -1011,13 +1037,19 @@ class V1Column(tf.keras.layers.Layer):
         else:
             individual_training = False
 
+        # The sign mask is only needed when optimizer updates apply the constraint.
+        recurrent_constraint = (
+            SignedConstraint(replica_local_constant(
+                weights >= 0, name="recurrent_weight_positive"
+            )) if individual_training else None
+        )
         # Scale the weights
         recurrent_values = weights * recurrent_weight_scale / lr_scale
         self.recurrent_weight_values = self.add_weight(
             shape=recurrent_values.shape,
             initializer=tf.keras.initializers.Constant(recurrent_values),
             name="sparse_recurrent_weights",
-            constraint=SignedConstraint(recurrent_weight_positive),
+            constraint=recurrent_constraint,
             trainable=individual_training,
             dtype=self.variable_dtype
         ) # shape = (n_synapses,)
@@ -1044,7 +1076,7 @@ class V1Column(tf.keras.layers.Layer):
         # self.recurrent_weights_factors = tf.gather(self.synaptic_basis_weights, self.syn_ids, axis=0) # TensorShape([23525415, 5])
         print(f"    > # Recurrent synapses: {len(indices)}")
 
-        del indices, weights, dense_shape, delays, syn_ids, recurrent_weight_positive
+        del indices, weights, dense_shape, delays, syn_ids
 
         ### LGN input connectivity ###
         self.input_dim = lgn_input["n_inputs"]
@@ -1084,15 +1116,17 @@ class V1Column(tf.keras.layers.Layer):
             )
 
         # Define the Tensorflow variables
-        input_weight_positive = replica_local_constant(
-            input_weights >= 0, name="input_weight_positive"
+        input_constraint = (
+            SignedConstraint(replica_local_constant(
+                input_weights >= 0, name="input_weight_positive"
+            )) if train_input else None
         )
         input_values = input_weights * input_weight_scale / lr_scale
         self.input_weight_values = self.add_weight(
             shape=input_values.shape,
             initializer=tf.keras.initializers.Constant(input_values),
             name="sparse_input_weights",
-            constraint=SignedConstraint(input_weight_positive),
+            constraint=input_constraint,
             trainable=train_input,
             dtype=self.variable_dtype
         )
@@ -1111,10 +1145,12 @@ class V1Column(tf.keras.layers.Layer):
             self.pre_input_ind_table = make_pre_ind_table(input_indices, n_source_neurons=self.lgn_input_dense_shape[1])
 
         print(f"    > # LGN input synapses {len(input_indices)}")
-        del input_indices, input_weights, input_syn_ids, input_weight_positive #, input_delays
+        del input_indices, input_weights, input_syn_ids
 
         ### BKG input connectivity ###
-        self._bind_constant("bkg_spike_prob", bkg_firing_rate * 0.001, self.compute_dtype)
+        self._bind_constant(
+            "bkg_count_cdf", poisson_cdf_levels(bkg_firing_rate * 0.001), tf.float64
+        )
         self.bkg_input_dense_shape = (self._n_neurons, bkg_input["n_inputs"],)
         bkg_input_indices = np.array(bkg_input['indices'])
         bkg_input_weights = np.array(bkg_input['weights'])
@@ -1155,15 +1191,17 @@ class V1Column(tf.keras.layers.Layer):
             )
 
         # Define Tensorflow variables
-        bkg_input_weight_positive = replica_local_constant(
-            bkg_input_weights >= 0, name="bkg_input_weight_positive"
+        bkg_input_constraint = (
+            SignedConstraint(replica_local_constant(
+                bkg_input_weights >= 0, name="bkg_input_weight_positive"
+            )) if train_noise else None
         )
         bkg_values = bkg_input_weights * input_weight_scale / lr_scale
         self.bkg_input_weights = self.add_weight(
             shape=bkg_values.shape,
             initializer=tf.keras.initializers.Constant(bkg_values),
             name="rest_of_brain_weights",
-            constraint=SignedConstraint(bkg_input_weight_positive),
+            constraint=bkg_input_constraint,
             trainable=train_noise,
             dtype=self.variable_dtype
         )
@@ -1173,7 +1211,7 @@ class V1Column(tf.keras.layers.Layer):
         # self.bkg_input_weights_factors = tf.gather(self.synaptic_basis_weights, bkg_input_syn_ids, axis=0)
 
         print(f"    > # BKG input synapses {len(bkg_input_indices)}")
-        del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, bkg_input_weight_positive #, bkg_input_delays
+        del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids
 
     # Per population: the trainable weight vector, then any other edge-aligned
     # variables. Each operator derives its own CSR order, so the permutation is
@@ -1279,19 +1317,37 @@ class V1Column(tf.keras.layers.Layer):
         """Reorder edge-aligned variables, and the optimizer slots that mirror them."""
         if not self._edge_orders:
             return
-        move = (
-            spatial_layout.to_csr_edges
-            if to_runtime
-            else spatial_layout.to_original_edges
-        )
-        for _, variable, order in self.edge_aligned_variables():
-            variable.assign(move(variable.numpy(), order))
+        use_gpu = bool(tf.config.list_logical_devices("GPU"))
+        permutations = {}
+
+        def move(population, variable, order):
+            if not use_gpu:
+                reorder = (
+                    spatial_layout.to_csr_edges if to_runtime
+                    else spatial_layout.to_original_edges
+                )
+                variable.assign(reorder(variable.numpy(), order))
+                return
+            if population not in permutations:
+                if to_runtime:
+                    permutation = order
+                else:
+                    permutation = np.empty_like(order)
+                    permutation[order] = np.arange(order.size, dtype=order.dtype)
+                index_dtype = np.int32 if order.size <= np.iinfo(np.int32).max else np.int64
+                permutations[population] = tf.convert_to_tensor(
+                    permutation.astype(index_dtype, copy=False)
+                )
+            variable.assign(tf.gather(variable, permutations[population]))
+
+        for population, variable, order in self.edge_aligned_variables():
+            move(population, variable, order)
         # Slots are handled per population rather than per variable: several
         # edge-aligned variables share a length, and a slot must move once.
         slots = self._optimizer_slots_by_length(optimizer)
-        for _, variable, order in self.edge_weight_variables():
+        for population, variable, order in self.edge_weight_variables():
             for slot in slots.get(int(variable.shape[0]), ()):
-                slot.assign(move(slot.numpy(), order))
+                move(population, slot, order)
 
     def _optimizer_slots_by_length(self, optimizer):
         """Group optimizer slots by length so each follows its own weights.
@@ -1449,14 +1505,14 @@ class V1Column(tf.keras.layers.Layer):
             [tf.cast(batch_size, tf.int32), tf.cast(self.bkg_input_dense_shape[1], tf.int32)],
             axis=0,
         )
-        rest_of_brain = tf.random.stateless_poisson(
-            shape=poisson_shape,
-            seed=noise_seed,
-            lam=self.bkg_spike_prob,
+        rest_of_brain = sample_poisson_counts(
+            self.bkg_count_cdf,
+            poisson_shape,
+            noise_seed,
             # Counts are small integers, exact in fp16, so the CUDA path takes the
             # compute dtype directly and saves a per-step cast kernel.
-            dtype=self.compute_dtype if self._synaptic_current_backend == "cuda" else tf.int32,
-        ) # this operation is done in the CPU (no support for stateless poisson in GPU). However, the operation is done in parallel with GPU work so it only adds a small communication overhead. Do not try to optimize this to run in GPU, as it will be slower than the current implementation.
+            self.compute_dtype if self._synaptic_current_backend == "cuda" else tf.int32,
+        )
 
         if self._synaptic_current_backend == "cuda":
             activity = rest_of_brain
@@ -1973,6 +2029,64 @@ class HeterogeneousStateRNN(tf.keras.layers.RNN):
         if self.return_state:
             return output, *states
         return output
+
+    def inner_loop(self, sequences, initial_state, mask, training=False):
+        """Keras' TensorFlow RNN loop, bounded by ``time < time_steps`` only.
+
+        Keras also passes ``maximum_iterations=time_steps``. TensorFlow then
+        ANDs the two equal bounds on the GPU and copies the result back to the
+        host every timestep, so the host cannot launch timestep t + 1 until
+        timestep t has drained: 135 ms of a 2.73 s training step at 203,816
+        neurons (Experiments/forward_loop_host_gaps_20260928). Everything else
+        is Keras' own loop.
+        """
+        if mask is not None or self.go_backwards or self.unroll:
+            raise NotImplementedError(
+                "HeterogeneousStateRNN runs unmasked, forward, rolled loops only."
+            )
+        cell_kwargs = {"training": training} if self.cell._call_has_training_arg else {}
+
+        def swap_batch_time(tensor):
+            return tf.transpose(tensor, [1, 0, *range(2, tensor.shape.rank)])
+
+        inputs = swap_batch_time(sequences)
+        time_steps = inputs.shape[0] or tf.shape(inputs)[0]
+        input_array = tf.TensorArray(inputs.dtype, size=time_steps).unstack(inputs)
+        # One traced call fixes the output structure; its result is unused and
+        # pruned from the graph, as in Keras.
+        output_zero, _ = self.cell(inputs[0], tuple(initial_state), **cell_kwargs)
+        output_arrays = tuple(
+            tf.TensorArray(
+                output.dtype,
+                size=time_steps if self.return_sequences else 1,
+                element_shape=output.shape,
+            )
+            for output in tf.nest.flatten(output_zero)
+        )
+
+        def step(time, output_arrays, *states):
+            output, new_states = self.cell(input_array.read(time), states, **cell_kwargs)
+            index = time if self.return_sequences else 0
+            output_arrays = tuple(
+                array.write(index, value)
+                for array, value in zip(output_arrays, tf.nest.flatten(output))
+            )
+            return (time + 1, output_arrays, *tf.nest.flatten(new_states))
+
+        _, output_arrays, *states = tf.while_loop(
+            lambda time, *_: time < time_steps,
+            step,
+            (tf.constant(0), output_arrays, *initial_state),
+            parallel_iterations=32,
+            swap_memory=True,
+        )
+        outputs = [swap_batch_time(array.stack()) for array in output_arrays]
+        last_output = [output[:, -1] for output in outputs]
+        return (
+            tf.nest.pack_sequence_as(output_zero, last_output),
+            tf.nest.pack_sequence_as(output_zero, outputs),
+            states,
+        )
 
 
 def create_model(

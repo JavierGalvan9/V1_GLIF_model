@@ -205,6 +205,7 @@ def main(_):
             logdir,
             current_epoch=current_epoch,
             result_name="OSI/DSI",
+            evaluate_untrained=flags.evaluate_untrained,
             runtime_cast_ignored_variables={
                 "projection_v1/kernel",
                 "projection_v1/bias",
@@ -481,6 +482,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_string('data_dir', _data_dir, '')
     absl.app.flags.DEFINE_string('results_dir', _results_dir, '')
     absl.app.flags.DEFINE_string('restore_from', 'Intermediate_checkpoints', '')
+    absl.app.flags.DEFINE_boolean('evaluate_untrained', False, 'Evaluate the seeded model before training, without restoring a checkpoint.')
     absl.app.flags.DEFINE_string('comment', '', '')
     absl.app.flags.DEFINE_string('delays', '100,0', '')
     absl.app.flags.DEFINE_string('scale', '2,2', '')

@@ -21,6 +21,9 @@ from v1_model_utils.model_metrics_analysis import calculate_Firing_Rate, get_bor
 from v1_model_utils.psd_utils import PSDAnalyzer
 import shutil
 import json
+import subprocess
+import sys
+import tempfile
 
 # Set style parameters for publication quality
 plt.rcParams.update({
@@ -1216,6 +1219,9 @@ class Callbacks:
         self.flags = flags
         self.logdir = logdir
         self.write_outputs = bool(write_outputs)
+        self._validation_plot_process = None
+        self._validation_plot_log = None
+        self._plot_timing = {}
         self.strategy = strategy
         self.metrics_keys = metrics_keys
         self.pre_delay = pre_delay
@@ -1284,6 +1290,7 @@ class Callbacks:
         self.epoch = self.flags.run_session * self.flags.n_epochs
 
     def on_train_end(self, metric_values, normalizers=None):
+        self._finish_validation_plot()
         self.train_end_time = time()
         print("\n ---------- Training ended at ",
               dt.datetime.now().strftime('%d-%m-%Y %H:%M'), ' ----------\n')
@@ -1373,23 +1380,25 @@ class Callbacks:
         tf.print(f'\nEpoch {self.epoch:2d}/{self.total_epochs} @ {date_str}')
 
     def on_epoch_end(self, x, v1_spikes, y, metric_values, bkg_noise=None, verbose=True,
-                     x_spont=None, v1_spikes_spont=None, protocol_spikes=None,
-                     protocol_angles=None):
+                     x_spont=None, v1_spikes_spont=None, protocol_selectivity=None,
+                     protocol_rates=None):
+        callback_start = time()
+        timings = {}
 
-        if self.flags.dtype != 'float32':
-            v1_spikes = v1_spikes.numpy().astype(np.float32)
-            x = x.numpy().astype(np.float32)
-            y = y.numpy().astype(np.float32)
-            if x_spont is not None:
-                x_spont = x_spont.numpy().astype(np.float32)
-                v1_spikes_spont = v1_spikes_spont.numpy().astype(np.float32)
-        else:
-            v1_spikes = v1_spikes.numpy()
-            x = x.numpy()
-            y = y.numpy()
-            if x_spont is not None:
-                x_spont = x_spont.numpy()
-                v1_spikes_spont = v1_spikes_spont.numpy()
+        def mark(name, start):
+            timings[name] = time() - start
+
+        def cpu_float32(value):
+            return np.asarray(value.numpy() if hasattr(value, "numpy") else value,
+                              dtype=np.float32)
+
+        start = time()
+        v1_spikes, x, y = map(cpu_float32, (v1_spikes, x, y))
+        if x_spont is not None:
+            x_spont, v1_spikes_spont = map(
+                cpu_float32, (x_spont, v1_spikes_spont)
+            )
+        mark("input_transfer", start)
 
         self.step = 0
         if self.initial_metric_values is None:
@@ -1417,11 +1426,6 @@ class Callbacks:
             val_loss_index = self.metrics_keys.index('train_loss')
             val_loss_value = metric_values[val_loss_index]
 
-        if self.write_outputs:
-            self.plot_losses_curves()
-            if protocol_spikes is not None and protocol_angles is not None:
-                self.plot_protocol_validation_metrics(protocol_spikes, protocol_angles)
-
         if not np.all(np.isfinite(metric_values)):
             non_finite_keys = [k for k, v in zip(self.metrics_keys, metric_values) if not np.isfinite(v)]
             print(f"[ Divergence detected at epoch {self.epoch}: non-finite metrics {non_finite_keys} "
@@ -1432,41 +1436,43 @@ class Callbacks:
         # if self.epoch % 10 == 0:
         #     self.save_latest_model()
 
-        if val_loss_value < self.min_val_loss:
+        is_best = val_loss_value < self.min_val_loss
+        if is_best:
             # if self.no_improve_epochs > 50: # plot the best model results if there has been at least 50 epochs from the last best model
             self.no_improve_epochs = 0
             if self.write_outputs and getattr(self.flags, "save_best_checkpoint", True):
+                start = time()
                 if self.save_best_model():
                     self.min_val_loss = val_loss_value
+                mark("checkpoint", start)
             else:
                 self.min_val_loss = val_loss_value
 
             if self.write_outputs:
-                self.plot_mean_firing_rate_boxplot(v1_spikes, y)
-                self.plot_raster(x, v1_spikes, y, stimulus_type='drifting_gratings')
-
-            if self.write_outputs and v1_spikes_spont is not None:
-                self.plot_spontaneous_boxplot(v1_spikes_spont, y)
-                self.plot_raster(x_spont, v1_spikes_spont, y, stimulus_type='spontaneous')
-                # self.composed_raster(x, v1_spikes, x_spont, v1_spikes_spont, y)
-                # self.composed_raster(x, v1_spikes, x_spont, v1_spikes_spont, y, plot_core_only=False)
-                # self.plot_lgn_activity(x, x_spont)
-                # self.plot_populations_activity(v1_spikes, v1_spikes_spont)
-
-            if self.write_outputs:
+                start = time()
                 self.model_variables_dict['Best'] = {
                     var.name: var.numpy() if len(
                         var.shape) == 1 else var[:, 0].numpy()
                     for var in self.model.trainable_variables
                 }
+                mark("variable_snapshot", start)
 
         else:
             self.no_improve_epochs += 1
 
         if self.write_outputs:
+            start = time()
+            self.enqueue_validation_plots(
+                x, v1_spikes, x_spont, v1_spikes_spont,
+                protocol_selectivity, protocol_rates, best=is_best,
+            )
+            mark("plot_enqueue", start)
+
+            start = time()
             with self.summary_writer.as_default():
                 for k, v in zip(self.metrics_keys, metric_values):
                     tf.summary.scalar(k, v, step=self.epoch)
+            mark("summaries", start)
 
         # EARLY STOPPING CONDITIONS
         if (0 < self.flags.max_time < (time() - self.train_start_time) / 3600):
@@ -1479,30 +1485,85 @@ class Callbacks:
         else:
             stop = False
 
+        timings["total"] = time() - callback_start
+        print("CALLBACK_TIMING " + " ".join(
+            f"{key}={value:.3f}s" for key, value in timings.items()
+        ))
         return stop
 
-    def plot_protocol_validation_metrics(self, protocol_spikes, protocol_angles):
-        metrics = ["Rate at preferred direction (Hz)", "OSI", "DSI"]
-        images_dir = os.path.join(self.logdir, "Boxplots_OSI_DSI")
-        os.makedirs(images_dir, exist_ok=True)
+    def enqueue_validation_plots(self, x, spikes, x_spont, spikes_spont,
+                                 protocol_selectivity, protocol_rates, best):
+        self._finish_validation_plot()
+        directory = os.path.join(self.logdir, "Validation_plot_payloads")
+        os.makedirs(directory, exist_ok=True)
+        snapshot = {
+            "logdir": self.logdir, "epoch": self.epoch,
+            "data_dir": self.flags.data_dir,
+            "neuropixels_df": self.flags.neuropixels_df,
+            "pre_delay": self.pre_delay, "post_delay": self.post_delay,
+            "plot_core_radius": self.flags.plot_core_radius,
+            "frequency": self.flags.temporal_f,
+            "n_nodes": self.network["n_nodes"],
+            "tf_id_to_bmtk_id": self.network["tf_id_to_bmtk_id"],
+            "tuning_angle": self.network["tuning_angle"],
+            "best": best,
+        }
+        snapshot.update({
+            f"history_{key}": np.asarray(values, dtype=np.float32)
+            for key, values in self.epoch_metric_values.items()
+        })
+        if protocol_selectivity is not None:
+            snapshot["pop_names"] = other_v1_utils.pop_names(
+                self.network,
+                core_radius=self.flags.loss_core_radius
+                if self.flags.loss_core_radius > 0 else None,
+                data_dir=self.flags.data_dir,
+            )
+            snapshot["osi"], snapshot["dsi"] = protocol_selectivity
+        if best and protocol_rates is not None:
+            snapshot["evoked_rates"], snapshot["spont_rates"] = protocol_rates
+        if best:
+            snapshot["inputs"] = x
+            snapshot["spikes_packed"] = np.packbits(spikes.astype(bool), axis=-1)
+            if spikes_spont is not None:
+                snapshot["inputs_spont"] = x_spont
+                snapshot["spikes_spont_packed"] = np.packbits(
+                    spikes_spont.astype(bool), axis=-1,
+                )
+        with tempfile.NamedTemporaryFile(
+            suffix=".npz", prefix=f"epoch_{self.epoch}_", dir=directory, delete=False
+        ) as payload:
+            np.savez(payload, **snapshot)
+        log_path = os.path.join(directory, f"Epoch_{self.epoch}_plot.log")
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = "-1"
+        environment["MPLBACKEND"] = "Agg"
+        environment["OMP_NUM_THREADS"] = "2"
+        environment["OPENBLAS_NUM_THREADS"] = "2"
+        environment["MKL_NUM_THREADS"] = "2"
+        environment["TF_NUM_INTRAOP_THREADS"] = "2"
+        environment["TF_NUM_INTEROP_THREADS"] = "1"
+        try:
+            with open(log_path, "w", encoding="utf-8") as log:
+                self._validation_plot_process = subprocess.Popen(
+                    [sys.executable, "-m", "v1_model_utils.validation_plot_worker",
+                     payload.name], env=environment,
+                    stdout=log, stderr=subprocess.STDOUT,
+                )
+            self._validation_plot_log = log_path
+        except Exception:
+            os.unlink(payload.name)
+            raise
 
-        metrics_analysis = ModelMetricsAnalysis(
-            protocol_spikes,
-            protocol_angles,
-            self.network,
-            data_dir=self.flags.data_dir,
-            drifting_gratings_init=self.pre_delay,
-            drifting_gratings_end=protocol_spikes.shape[2] - self.post_delay,
-            core_radius=self.flags.loss_core_radius,
-            save_df=False,
-            df_directory=images_dir,
-            neuropixels_df=self.flags.neuropixels_df,
-        )
-        metrics_analysis(
-            metrics=metrics,
-            directory=images_dir,
-            filename=f"Epoch_{self.epoch}_preferred_rate_osi_dsi",
-        )
+    def _finish_validation_plot(self):
+        process = self._validation_plot_process
+        if process is None:
+            return
+        self._validation_plot_process = None
+        if process.wait() != 0:
+            raise RuntimeError(
+                f"Validation plots failed; see {self._validation_plot_log}"
+            )
 
     def on_step_start(self):
         self.step += 1
@@ -1537,15 +1598,24 @@ class Callbacks:
         locality, but checkpoints stay canonical so that they remain readable
         by every other tool and by runs using a different layout.
         """
+        started = time()
         tf_utils.rebase_checkpointed_layout(
             self.model, to_runtime=False, optimizer=self.optimizer
         )
+        canonical = time()
         try:
-            return manager.save(checkpoint_number=self.epoch)
+            path = manager.save(checkpoint_number=self.epoch)
+            written = time()
+            return path
         finally:
             tf_utils.rebase_checkpointed_layout(
                 self.model, to_runtime=True, optimizer=self.optimizer
             )
+            print("CHECKPOINT_TIMING " + " ".join((
+                f"canonical={canonical - started:.3f}s",
+                f"write={written - canonical:.3f}s" if 'written' in locals() else "write=failed",
+                f"restore={time() - (written if 'written' in locals() else canonical):.3f}s",
+            )))
 
     def save_intermediate_checkpoint(self):
         # Save the checkpoint to reload weights in the osi_dsi_estimator

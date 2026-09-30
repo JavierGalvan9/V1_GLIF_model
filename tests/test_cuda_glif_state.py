@@ -436,7 +436,7 @@ def test_derived_constants_are_untracked_variables(tmp_path):
     keys = [key for key, _ in tf.train.list_variables(path)]
     derived = set(DERIVED_COEFFICIENTS) | set(cell._neuron_constants) | {
         "v_th", "v_reset", "synaptic_basis_weights", "_dt", "_gauss_std",
-        "_dampening_factor", "bkg_spike_prob",
+        "_dampening_factor", "bkg_count_cdf",
     }
     leaked = sorted(
         name for name in derived
@@ -460,7 +460,7 @@ def test_every_replica_reads_the_cell_constants_from_its_own_gpu(tmp_path):
         cell = _cell(tmp_path, backend="tensorflow", dtype=tf.float32)
     names = list(cell._neuron_constants) + [
         "v_th", "v_reset", "synaptic_basis_weights", "_dt", "_gauss_std",
-        "_dampening_factor", "bkg_spike_prob",
+        "_dampening_factor", "bkg_count_cdf",
     ]
     masks = {
         f"{name}.constraint": getattr(cell, name).constraint.condition

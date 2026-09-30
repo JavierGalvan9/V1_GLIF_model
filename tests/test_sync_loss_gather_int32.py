@@ -13,11 +13,12 @@ The oversized case needs ~37 GiB of device memory, so it only runs when
 
 import os
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import tensorflow as tf
 
-from v1_model_utils.loss_functions import _gather_population_traces
+from v1_model_utils.loss_functions import SynchronizationLoss, _gather_population_traces
 
 INT32_MAX = 2**31 - 1
 
@@ -54,6 +55,32 @@ def _inputs(n_trials, duration, n_neurons, per_trial, max_count, dtype, seed=0):
 
 
 class GatherPopulationTracesTest(unittest.TestCase):
+    def test_chunked_replica_traces_match_full_gather(self):
+        n_trials, duration, n_neurons, per_trial, max_count = 4, 60, 500, 3, 90
+        spikes, ids, mask = _inputs(
+            n_trials, duration, n_neurons, per_trial, max_count, tf.float16
+        )
+        plan = (ids, mask, per_trial, max_count)
+        loss = SimpleNamespace(_dtype=tf.float32)
+        expected = _gather_population_traces(
+            spikes, ids, mask, n_trials, duration, per_trial, max_count
+        )
+        replica_traces = []
+        for trial_start in (0, 2):
+            indices = tf.range(trial_start, trial_start + 2)
+            time_chunks = [
+                SynchronizationLoss.gather_sampled_traces(
+                    loss, spikes[trial_start:trial_start + 2, start:end],
+                    plan, indices,
+                )
+                for start, end in ((0, 23), (23, duration))
+            ]
+            replica_traces.append(tf.concat(time_chunks, axis=1))
+        np.testing.assert_array_equal(
+            tf.concat(replica_traces, axis=0).numpy(),
+            tf.cast(expected, tf.float32).numpy(),
+        )
+
     def test_matches_the_pre_xla_formulation(self):
         """Compiling the gather must not change the loss it feeds."""
         n_trials, duration, n_neurons, per_trial, max_count = 4, 60, 500, 3, 90

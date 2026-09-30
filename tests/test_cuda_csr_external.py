@@ -10,7 +10,7 @@ from v1_model_utils.cuda_csr_external import (
     kernel_variant,
 )
 from v1_model_utils.cuda_csr_recurrent import DIRECT_CSR
-from v1_model_utils.models import V1Column
+from v1_model_utils.models import V1Column, poisson_cdf_levels, sample_poisson_counts
 
 
 RUNTIME_BATCH_SIZES = (3, 5, 9)
@@ -339,7 +339,7 @@ def test_v1_lgn_and_background_adapters_produce_weight_gradients_only():
         compute_dtype=tf.float32,
         variable_dtype=tf.float32,
         bkg_input_dense_shape=(3, 4),
-        bkg_spike_prob=tf.constant(3.0),
+        bkg_count_cdf=tf.constant(poisson_cdf_levels(3.0)),
         noise_seed=tf.Variable(17, trainable=False, dtype=tf.int64),
         bkg_input_weights=bkg_weights,
         synaptic_basis_weights=tf.constant(basis),
@@ -383,3 +383,42 @@ def test_v1_lgn_activity_gradient_flag_uses_spikes_as_is(activity_enabled):
     )
     np.testing.assert_allclose(output, expected, rtol=2e-5, atol=2e-5)
     assert (gradient is not None) is activity_enabled
+
+
+@pytest.mark.parametrize("rate", [0.0, 0.25, 3.0, 40.0])
+def test_poisson_cdf_levels_reach_one_and_match_scipy(rate):
+    from scipy import stats
+
+    levels = poisson_cdf_levels(rate)
+    assert np.all(np.diff(levels) >= 0)
+    assert levels[-1] >= 1.0 - 2.0**-52
+    np.testing.assert_allclose(
+        levels, stats.poisson.cdf(np.arange(len(levels)), rate), rtol=0, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize(
+    "device", ["/CPU:0"] + (["/GPU:0"] if tf.config.list_physical_devices("GPU") else [])
+)
+def test_bkg_counts_are_poisson_and_fixed_by_the_seed(device):
+    from scipy import stats
+
+    rate = 0.25  # the 250 Hz background at dt = 1 ms
+    levels = tf.constant(poisson_cdf_levels(rate))
+    with tf.device(device):
+        draws = [
+            sample_poisson_counts(levels, (32, 100), tf.constant([3000, step]), tf.float16)
+            for step in range(300)
+        ]
+        repeat = sample_poisson_counts(levels, (32, 100), tf.constant([3000, 0]), tf.float16)
+    # Placement falls back to the host silently when a GPU kernel is missing.
+    assert all(draw.device.endswith(device[1:]) for draw in draws)
+    counts = np.stack([draw.numpy() for draw in draws]).astype(np.int64)
+    np.testing.assert_array_equal(repeat.numpy(), counts[0])
+    assert not np.array_equal(counts[0], counts[1])
+
+    pmf = stats.poisson.pmf(np.arange(3), rate)
+    expected = np.append(pmf, 1 - pmf.sum()) * counts.size
+    observed = np.bincount(counts.ravel(), minlength=4)
+    observed = np.append(observed[:3], observed[3:].sum())
+    assert stats.chisquare(observed, expected).pvalue > 1e-4

@@ -476,13 +476,14 @@ def test_event_weight_gradient_skips_silent_rows(batch):
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
-def test_forward_rejects_rows_beyond_the_queue_encoding():
+def test_forward_handles_rows_beyond_the_old_queue_encoding():
     n_pre = 2 ** 21 + 1
     connectivity = _connectivity(
         np.array([[0, n_pre - 1]], np.int64), np.array([0], np.int64), n_pre, 1
     )
-    with pytest.raises(tf.errors.InvalidArgumentError, match="active-row queue"):
-        calculate_recurrent_csr_currents(
-            tf.zeros((1, n_pre), tf.float16), tf.Variable([1.0]),
-            tf.ones((1, 4)), 0.37, connectivity,
-        ).numpy()
+    spikes = tf.scatter_nd([[1, n_pre - 1]], [1.0], (2, n_pre))
+    currents = calculate_recurrent_csr_currents(
+        spikes, tf.Variable([2.0]), tf.ones((1, 4)), 0.37, connectivity,
+    ).numpy()
+    np.testing.assert_array_equal(currents[0], 0.0)
+    np.testing.assert_array_equal(currents[1], 2.0)

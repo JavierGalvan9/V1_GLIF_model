@@ -166,8 +166,8 @@ def concatenate_stimulus_batches(grating, spontaneous, dtype):
 def validation_rate_loss_from_rates(
     rates_hz, rate_regularizer, annulus_regularizer=None
 ):
-    """Evaluate a protocol rate target once over all retained trials."""
-    rates = tf.reduce_mean(tf.cast(rates_hz, tf.float32), axis=0) / 1000.0
+    """Evaluate a protocol rate target from mean rates in Hz."""
+    rates = tf.cast(rates_hz, tf.float32) / 1000.0
     rate_loss = rate_regularizer.loss_from_rates(rates)
     if annulus_regularizer is not None:
         rate_loss += annulus_regularizer.loss_from_rates(rates)
@@ -177,6 +177,27 @@ def validation_rate_loss_from_rates(
 def sample_weighted_mean(values, sample_counts):
     """Average batch summaries in proportion to retained sample counts."""
     return float(np.average(values, weights=sample_counts))
+
+
+def combine_replica_rates(rates_hz, sample_counts):
+    """Combine per-neuron mean rates from replicas of possibly unequal size."""
+    return np.average(rates_hz, axis=0, weights=sample_counts).astype(np.float32)
+
+
+def protocol_selectivity_from_rates(rates_hz, angles):
+    """Calculate OSI and DSI from mean rates at each protocol angle."""
+    mean_rates = np.asarray(rates_hz)
+    angles_rad = np.deg2rad(angles)[:, None]
+    denominator = np.sum(mean_rates, axis=0)
+    values = []
+    for harmonic in (2, 1):
+        numerator = np.abs(np.sum(
+            mean_rates * np.exp(1j * harmonic * angles_rad), axis=0
+        ))
+        selectivity = np.full(denominator.shape, np.nan, dtype=np.float32)
+        np.divide(numerator, denominator, out=selectivity, where=denominator != 0)
+        values.append(selectivity)
+    return tuple(values)
 
 
 def sample_stateless_bernoulli_batch(
@@ -247,7 +268,6 @@ def main(_):
     import stim_dataset
     from v1_model_utils.callbacks import Callbacks
     import v1_model_utils.loss_functions as losses
-    from v1_model_utils.model_metrics_analysis import calculate_OSI_DSI
     from v1_model_utils import load_sparse, models, other_v1_utils
     from v1_model_utils import optimizers as optimizer_utils
 
@@ -267,6 +287,16 @@ def main(_):
     # Configure the dtype policy
     mixed_precision, dtype = tf_utils.configure_policy_and_dtype(flags.dtype)
 
+    # On one multi-GPU node (including Nuredduna), prefer MirroredStrategy:
+    # one process builds the model once and runs a replica on each GPU.
+    # The local multi_worker mode starts one process per GPU. Those processes
+    # can trace their training graphs concurrently, but each loads and builds
+    # the model independently and joins cross-process collectives.
+    # Across nodes, use MultiWorkerMirroredStrategy with a cluster launcher
+    # that supplies TF_CONFIG and starts a worker on each node with that
+    # node's GPUs visible. The built-in multi_worker launcher only starts
+    # workers on one node; cross-node worker data placement and initialization
+    # also need validation before that layout is used for training.
     strategy = tf_utils.create_distribution_strategy(
         single_gpu_strategy=flags.single_gpu_strategy,
         multi_worker=_TRAINING_LAUNCH_PLAN.worker_index is not None,
@@ -1435,6 +1465,73 @@ def main(_):
     def distributed_validation_step(x, state_variables):
         return strategy.run(validation_step, args=(x, state_variables))
 
+    def make_compact_validation_step(sync_loss):
+        """Keep only validation summaries while advancing the recurrent state."""
+        n_sequences = sequence_and_state_model._v1_sequence_output_count
+        chunk_size = flags.gradient_checkpoint_chunk_size
+        sync_enabled = hasattr(sync_loss, "gather_sampled_traces")
+
+        def replica_step(x, state, sample_plan):
+            x = int32_safe_cast(x, dtype)
+            seed_helper.advance_noise_seed()
+            state = models.reset_voltage_penalty_state(rsnn_layer.cell, state)
+            counts = tf.zeros((network["n_nodes"],), tf.float32)
+            sampled_chunks = []
+            packed_chunks = []
+            for start in range(0, flags.seq_len, chunk_size):
+                end = min(start + chunk_size, flags.seq_len)
+                outputs = tf.nest.flatten(sequence_and_state_model((x[:, start:end], state)))
+                spikes = outputs[0]
+                state = tuple(outputs[n_sequences:])
+                rate_start = max(start, delays[0]) - start
+                rate_end = min(end, flags.seq_len - delays[1]) - start
+                if rate_start < rate_end:
+                    counts += tf.reduce_sum(
+                        tf.cast(spikes[:, rate_start:rate_end], tf.float32), axis=(0, 1)
+                    )
+                if sync_enabled:
+                    sync_start = max(start, sync_loss._t_start_seconds) - start
+                    sync_end = min(end, sync_loss._t_end_seconds) - start
+                    if sync_start < sync_end:
+                        sampled_chunks.append(sync_loss.gather_sampled_traces(
+                            spikes[:, sync_start:sync_end], sample_plan,
+                            tf.range(real_batch_size, dtype=tf.int32)
+                            + tf.cast(tf.distribute.get_replica_context().replica_id_in_sync_group, tf.int32)
+                            * real_batch_size,
+                        ))
+                packed_chunks.append(models._pack_spike_words(spikes[0], 31))
+            rates = counts * (
+                1000.0 / (real_batch_size * (flags.seq_len - sum(delays)))
+            )
+            sampled = (
+                tf.concat(sampled_chunks, axis=1) if sync_enabled
+                else tf.zeros((0, 0), tf.float32)
+            )
+            return rates, state[-1], sampled, tf.concat(packed_chunks, axis=0)
+
+        @tf.function
+        def distributed_step(x, state, sample_plan):
+            return strategy.run(replica_step, args=(x, state, sample_plan))
+
+        return distributed_step
+
+    compact_gray_step = make_compact_validation_step(spont_sync_loss)
+    compact_evoked_step = make_compact_validation_step(evoked_sync_loss)
+
+    def validation_sample_plan(sync_loss, keep):
+        if not hasattr(sync_loss, "prepare_sampled_trace_plan"):
+            return None
+        sample_ids, neuron_mask, per_trial, max_count = (
+            sync_loss.prepare_sampled_trace_plan(keep, dtype)
+        )
+        padding = global_batch_size - keep
+        return (
+            tf.pad(sample_ids, [[0, padding], [0, 0]]),
+            tf.pad(neuron_mask, [[0, padding], [0, 0], [0, 0]]),
+            per_trial,
+            max_count,
+        )
+
     def resampled_emd(model_values, target_values):
         model_values = np.asarray(model_values, dtype=np.float32)
         target_values = np.asarray(target_values, dtype=np.float32)
@@ -1499,135 +1596,158 @@ def main(_):
             target_df.loc[nonresponding, ["OSI", "DSI"]] = np.nan
         return target_df
 
-    def collect_local_validation_outputs(distributed_x, distributed_z, distributed_v, keep):
-        local_x = strategy.experimental_local_results(distributed_x)
-        local_z = strategy.experimental_local_results(distributed_z)
-        local_v = strategy.experimental_local_results(distributed_v)
-        xs = []
-        zs = []
-        vs = []
-        for x_replica, z_replica, v_replica in zip(local_x, local_z, local_v):
-            xs.append(x_replica)
-            zs.append(z_replica)
-            vs.append(v_replica)
-        return (
-            tf.concat(xs, axis=0)[:keep],
-            tf.concat(zs, axis=0)[:keep],
-            tf.concat(vs, axis=0)[:keep],
-        )
-
-    def trimmed_rates_hz(spikes):
-        trimmed = spikes[:, delays[0]:flags.seq_len - delays[1], :]
-        return np.mean(trimmed.astype(np.float32), axis=1) * 1000.0
-
-    def run_gray_validation_repeats(repeats):
-        spont_rates = []
-        spont_voltage_losses = []
-        spont_sync_losses = []
+    def collect_validation_summaries(distributed_x, distributed_z, distributed_v,
+                                     keep, sync_loss):
+        """Gather compact results on the host without moving spikes to GPU 0."""
+        sync_enabled = hasattr(sync_loss, "prepare_sampled_trace_plan")
+        plan = sync_loss.prepare_sampled_trace_plan(keep, dtype) if sync_enabled else None
+        rates = []
+        sampled_traces = []
+        voltage_losses = []
+        counts = []
         representative = None
         completed = 0
-        retained_counts = []
-
-        while completed < repeats:
-            keep = min(global_batch_size, repeats - completed)
-            x = distributed_sample_probability_batch(
-                spontaneous_prob_base,
-                per_replica_batch_size,
-            )
-            state = distributed_generate_gray_state()
-            z, v = distributed_validation_step(x, state)
-            x_local, z_local, v_local = collect_local_validation_outputs(x, z, v, keep)
-            z_np = z_local.numpy()
-            spont_rates.append(trimmed_rates_hz(z_np))
-            spont_voltage_losses.append(float(voltage_loss_from_source(v_local).numpy()))
-            spont_sync_losses.append(
-                float(tf.cast(spont_sync_loss(z_local, trim=True), tf.float32).numpy())
-            )
+        local_results = zip(
+            strategy.experimental_local_results(distributed_x),
+            strategy.experimental_local_results(distributed_z),
+            strategy.experimental_local_results(distributed_v),
+        )
+        for x_replica, z_replica, v_replica in local_results:
+            count = min(keep - completed, int(z_replica.shape[0]))
+            if count <= 0:
+                break
+            trimmed = z_replica[:count, delays[0]:flags.seq_len - delays[1]]
+            rates.append((
+                tf.reduce_sum(tf.cast(trimmed, tf.float32), axis=(0, 1))
+                * (1000.0 / (count * (flags.seq_len - sum(delays))))
+            ).numpy())
+            voltage_losses.append(float(voltage_loss_from_source(v_replica[:count]).numpy()))
+            counts.append(count)
+            if sync_enabled:
+                sync_spikes = z_replica[:count, sync_loss._t_start_seconds:sync_loss._t_end_seconds]
+                indices = tf.range(completed, completed + count, dtype=tf.int32)
+                sampled_traces.append(sync_loss.gather_sampled_traces(
+                    sync_spikes, plan, indices
+                ).numpy())
             if representative is None:
-                representative = (
-                    x_local[:1],
-                    z_local[:1],
+                packed = models._pack_spike_words(z_replica[0], 31).numpy()
+                bits = np.bitwise_and(
+                    np.right_shift(packed[..., None], np.arange(31, dtype=np.int32)), 1
                 )
-            retained_counts.append(keep)
-            completed += keep
+                representative = (
+                    x_replica[:1].numpy(),
+                    bits.reshape(1, flags.seq_len, -1)[:, :, :network["n_nodes"]].astype(np.float32),
+                )
+            completed += count
 
-        spont_rates = np.concatenate(spont_rates, axis=0)
+        sync_value = 0.0
+        if sync_enabled:
+            traces = tf.convert_to_tensor(np.concatenate(sampled_traces, axis=0))
+            sync_value = float(sync_loss.loss_from_sampled_traces(traces).numpy())
+        return (combine_replica_rates(rates, counts),
+                sample_weighted_mean(voltage_losses, counts), sync_value, representative)
+
+    def collect_compact_validation_summaries(distributed_x, outputs, keep, sync_loss):
+        """Copy only small statistics and packed raster data from each replica."""
+        if keep != global_batch_size:
+            raise ValueError("Compact validation requires a full distributed batch.")
+        distributed_rates, distributed_voltage, distributed_traces, distributed_packed = outputs
+        sync_enabled = hasattr(sync_loss, "loss_from_sampled_traces")
+        per_trial = sync_loss._plan(keep)["per_trial"] if sync_enabled else 0
+        rates, voltage_losses, counts, sampled_traces = [], [], [], []
+        representative = None
+        completed = 0
+        local_outputs = zip(*(
+            strategy.experimental_local_results(value)
+            for value in (distributed_x, distributed_rates, distributed_voltage,
+                          distributed_traces, distributed_packed)
+        ))
+        for x_replica, rate_replica, voltage_replica, traces_replica, packed_replica in local_outputs:
+            count = min(keep - completed, real_batch_size)
+            if count <= 0:
+                break
+            rates.append(rate_replica.numpy())
+            voltage_losses.append(float(voltage_loss_from_source(voltage_replica[:count]).numpy()))
+            counts.append(count)
+            if sync_enabled:
+                sampled_traces.append(traces_replica[:count * per_trial].numpy())
+            if representative is None:
+                packed = packed_replica.numpy()
+                bits = np.bitwise_and(
+                    np.right_shift(packed[..., None], np.arange(31, dtype=np.int32)), 1
+                )
+                representative = (
+                    x_replica[:1].numpy(),
+                    bits.reshape(1, flags.seq_len, -1)[:, :, :network["n_nodes"]].astype(np.float32),
+                )
+            completed += count
+        sync_value = 0.0
+        if sync_enabled:
+            traces = tf.convert_to_tensor(np.concatenate(sampled_traces, axis=0))
+            sync_value = float(sync_loss.loss_from_sampled_traces(traces).numpy())
+        return (combine_replica_rates(rates, counts),
+                sample_weighted_mean(voltage_losses, counts), sync_value, representative)
+
+    def run_gray_validation(initial_state):
+        x = distributed_sample_probability_batch(
+            spontaneous_prob_base, per_replica_batch_size
+        )
+        if flags.use_online_voltage_loss:
+            outputs = compact_gray_step(
+                x, initial_state, validation_sample_plan(spont_sync_loss, global_batch_size)
+            )
+            rates, voltage, sync, representative = collect_compact_validation_summaries(
+                x, outputs, global_batch_size, spont_sync_loss
+            )
+        else:
+            z, v = distributed_validation_step(x, initial_state)
+            rates, voltage, sync, representative = collect_validation_summaries(
+                x, z, v, global_batch_size, spont_sync_loss
+            )
         return {
-            "spont_rates": spont_rates,
+            "spont_rates": rates,
             "spont_rate_loss": float(
                 validation_rate_loss_from_rates(
-                    spont_rates,
+                    rates,
                     spont_rate_regularizer,
                     annulus_spont_rate_regularizer
                     if annulus_mask is not None else None,
                 ).numpy()
             ),
-            "spont_voltage_loss": sample_weighted_mean(
-                spont_voltage_losses, retained_counts
-            ),
-            "spont_sync_loss": sample_weighted_mean(
-                spont_sync_losses, retained_counts
-            ),
+            "spont_voltage_loss": voltage,
+            "spont_sync_loss": sync,
             "representative": representative,
         }
 
-    def run_osi_dsi_validation_repeats(probability, angle, repeats, collect_spikes=False):
-        evoked_rates = []
-        evoked_voltage_losses = []
-        evoked_sync_losses = []
-        protocol_spikes = []
-        representative = None
-        completed = 0
-        retained_counts = []
-        protocol_mask = None if core_mask is None else np.asarray(core_mask, dtype=bool)
-
-        while completed < repeats:
-            keep = min(global_batch_size, repeats - completed)
-            x = distributed_sample_probability_batch(probability, per_replica_batch_size)
-            state = distributed_generate_gray_state()
-            z_evoked, v_evoked = distributed_validation_step(x, state)
-            x_local, z_evoked, v_evoked = collect_local_validation_outputs(x, z_evoked, v_evoked, keep)
-            z_evoked_np = z_evoked.numpy()
-            evoked_rates.append(trimmed_rates_hz(z_evoked_np))
-            evoked_voltage_losses.append(float(voltage_loss_from_source(v_evoked).numpy()))
-            evoked_sync_losses.append(
-                float(tf.cast(evoked_sync_loss(z_evoked, trim=True), tf.float32).numpy())
+    def run_osi_dsi_validation(probability, angle, initial_state):
+        x = distributed_sample_probability_batch(probability, per_replica_batch_size)
+        if flags.use_online_voltage_loss:
+            outputs = compact_evoked_step(
+                x, initial_state, validation_sample_plan(evoked_sync_loss, global_batch_size)
             )
-            if collect_spikes:
-                if protocol_mask is None:
-                    protocol_spikes.append(z_evoked_np.astype(np.float32))
-                else:
-                    protocol_spikes.append(z_evoked_np[:, :, protocol_mask].astype(np.float32))
-            if representative is None:
-                representative = (
-                    x_local[:1],
-                    z_evoked[:1],
-                    tf.constant([[float(angle)]], dtype=dtype),
-                )
-            retained_counts.append(keep)
-            completed += keep
-
-        evoked_rates = np.concatenate(evoked_rates, axis=0)
-        collected_protocol_spikes = None
-        if collect_spikes:
-            collected_protocol_spikes = np.concatenate(protocol_spikes, axis=0)
+            rates, voltage, sync, representative = collect_compact_validation_summaries(
+                x, outputs, global_batch_size, evoked_sync_loss
+            )
+        else:
+            z, v = distributed_validation_step(x, initial_state)
+            rates, voltage, sync, representative = collect_validation_summaries(
+                x, z, v, global_batch_size, evoked_sync_loss
+            )
+        representative = (
+            *representative, np.array([[float(angle)]], dtype=np.float32)
+        )
         return {
-            "evoked_rates": evoked_rates,
+            "evoked_rates": rates,
             "evoked_rate_loss": float(
                 validation_rate_loss_from_rates(
-                    evoked_rates,
+                    rates,
                     evoked_rate_regularizer,
                     annulus_evoked_rate_regularizer
                     if annulus_mask is not None else None,
                 ).numpy()
             ),
-            "evoked_voltage_loss": sample_weighted_mean(
-                evoked_voltage_losses, retained_counts
-            ),
-            "evoked_sync_loss": sample_weighted_mean(
-                evoked_sync_losses, retained_counts
-            ),
-            "protocol_spikes": collected_protocol_spikes,
+            "evoked_voltage_loss": voltage,
+            "evoked_sync_loss": sync,
             "representative": representative,
         }
 
@@ -1653,23 +1773,21 @@ def main(_):
         )
 
     def run_protocol_validation():
-        spont_result = run_gray_validation_repeats(protocol_n_trials)
+        initial_state = distributed_generate_gray_state()
+        spont_result = run_gray_validation(initial_state)
         evoked_rates_by_angle = []
-        evoked_spikes_by_angle = []
         evoked_rate_losses = []
         evoked_voltage_losses = []
         evoked_sync_losses = []
         representative_evoked = None
 
         for angle in protocol_angles:
-            result = run_osi_dsi_validation_repeats(
+            result = run_osi_dsi_validation(
                 osi_dsi_lgn_probabilities[int(angle)],
                 float(angle),
-                protocol_n_trials,
-                collect_spikes=True,
+                initial_state,
             )
             evoked_rates_by_angle.append(result["evoked_rates"])
-            evoked_spikes_by_angle.append(result["protocol_spikes"])
             evoked_rate_losses.append(result["evoked_rate_loss"])
             evoked_voltage_losses.append(result["evoked_voltage_loss"])
             evoked_sync_losses.append(result["evoked_sync_loss"])
@@ -1677,22 +1795,11 @@ def main(_):
                 x_rep, z_rep, y_rep = result["representative"]
                 representative_evoked = (x_rep, z_rep, y_rep)
 
-        evoked_rates = np.stack(evoked_rates_by_angle, axis=1)
-        protocol_spikes = np.stack(evoked_spikes_by_angle, axis=1)
+        evoked_rates = np.stack(evoked_rates_by_angle, axis=0)
         # `core_mask` is None when every neuron already lies inside the core.
         osi_mask = None if core_mask is None else np.asarray(core_mask, dtype=bool)
-        osi_rates = evoked_rates if osi_mask is None else evoked_rates[:, :, osi_mask]
-        osi_dsi_df = calculate_OSI_DSI(
-            osi_rates,
-            network,
-            session="drifting_gratings",
-            DG_angles=protocol_angles,
-            core_radius=flags.loss_core_radius if flags.loss_core_radius > 0 else None,
-            remove_zero_rate_neurons=False,
-            directory="",
-            save_df=False,
-            data_dir=flags.data_dir,
-        )
+        osi_rates = evoked_rates if osi_mask is None else evoked_rates[:, osi_mask]
+        osi, dsi = protocol_selectivity_from_rates(osi_rates, protocol_angles)
 
         cell_type_populations_ids = losses.get_population_neuron_ids(
             network,
@@ -1707,12 +1814,12 @@ def main(_):
         osi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
         dsi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
         if osi_mask is None:
-            osi_values[:] = osi_dsi_df["OSI"].to_numpy(dtype=np.float32)
-            dsi_values[:] = osi_dsi_df["DSI"].to_numpy(dtype=np.float32)
+            osi_values[:] = osi
+            dsi_values[:] = dsi
         else:
             selected_ids = np.flatnonzero(osi_mask)
-            osi_values[selected_ids] = osi_dsi_df["OSI"].to_numpy(dtype=np.float32)
-            dsi_values[selected_ids] = osi_dsi_df["DSI"].to_numpy(dtype=np.float32)
+            osi_values[selected_ids] = osi
+            dsi_values[selected_ids] = dsi
 
         osi_emd = equal_cell_type_emd(
             osi_values,
@@ -1763,37 +1870,9 @@ def main(_):
             y_rep,
             x_spont_rep,
             z_spont_rep,
-            protocol_spikes,
-            protocol_angles,
+            (osi, dsi),
+            (np.mean(evoked_rates, axis=0), spont_result["spont_rates"]),
         )
-
-    # def reset_state(new_state):
-    #     tf.nest.map_structure(lambda a, b: a.assign(b), state_variables, new_state)
-
-    # # @tf.function
-    # def distributed_reset_state(new_state):
-    #     strategy.run(reset_state, args=(new_state,))
-
-    # def get_next_chunknum(chunknum, seq_len, direction='up'):
-    #     # get the next chunk number (diviser) for seq_len.
-    #     if direction == 'up':
-    #         chunknum += 1
-    #         # check if it is a valid diviser
-    #         while seq_len % chunknum != 0:
-    #             chunknum += 1
-    #             if chunknum >= seq_len:
-    #                 print('Chunk number reached seq_len')
-    #                 return seq_len
-    #     elif direction == 'down':
-    #         chunknum -= 1
-    #         while seq_len % chunknum != 0:
-    #             chunknum -= 1
-    #             if chunknum <= 1:
-    #                 print('Chunk number reached 1')
-    #                 return 1
-    #     else:
-    #         raise ValueError(f"Invalid direction: {direction}")
-    #     return chunknum
 
     ############################ TRAINING #############################
 
@@ -1809,7 +1888,6 @@ def main(_):
                           write_outputs=_TRAINING_LAUNCH_PLAN.is_chief)
 
     protocol_angles = np.asarray(tuple(range(0, 360, 45)), dtype=np.int32)
-    protocol_n_trials = 10
     protocol_target_df = load_neuropixels_targets(flags.neuropixels_df)
 
     osi_dsi_lgn_probabilities = stim_dataset.load_or_compute_osi_dsi_lgn_probabilities(
@@ -2014,6 +2092,13 @@ def main(_):
         # tf.profiler.experimental.stop()
 
         ### VALIDATION AFTER EACH EPOCH
+        validation_started = time()
+        for gpu_id in range(len(tf.config.list_logical_devices("GPU"))):
+            memory = tf.config.experimental.get_memory_info(f"GPU:{gpu_id}")
+            print(
+                f"Validation start GPU {gpu_id}: current={memory['current'] / 2**30:.2f} GiB, "
+                f"peak={memory['peak'] / 2**30:.2f} GiB", flush=True
+            )
         (
             val_values,
             x_val,
@@ -2021,9 +2106,10 @@ def main(_):
             y_val,
             x_spont_val,
             v1_spikes_spont_val,
-            protocol_spikes,
-            protocol_angles_epoch,
+            protocol_selectivity,
+            protocol_rates,
         ) = run_protocol_validation()
+        print(f"Validation protocol wall time: {time() - validation_started:.2f}s", flush=True)
 
         train_values = list(read_train_metrics().numpy())
         metric_values = train_values + val_values
@@ -2036,9 +2122,10 @@ def main(_):
             verbose=True,
             x_spont=x_spont_val,
             v1_spikes_spont=v1_spikes_spont_val,
-            protocol_spikes=protocol_spikes,
-            protocol_angles=protocol_angles_epoch,
+            protocol_selectivity=protocol_selectivity,
+            protocol_rates=protocol_rates,
         )
+        print(f"Validation and callback wall time: {time() - validation_started:.2f}s", flush=True)
 
         if _TRAINING_LAUNCH_PLAN.worker_index is not None:
             distributed_stop = strategy.run(

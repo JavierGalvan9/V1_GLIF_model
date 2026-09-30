@@ -676,8 +676,17 @@ def restore_evaluation_checkpoint(
     current_epoch=0,
     result_name="OSI/DSI",
     runtime_cast_ignored_variables=(),
+    evaluate_untrained=False,
 ):
     """Restore a model checkpoint for evaluation-style scripts."""
+    if evaluate_untrained:
+        if flags.restore_from:
+            raise ValueError("--evaluate_untrained cannot be combined with --restore_from.")
+        logdir = os.path.join(logdir, "Initial_evaluation")
+        os.makedirs(logdir, exist_ok=True)
+        print(f'{result_name} results for untrained weights will be saved in: {logdir}\n')
+        return None, logdir, 0
+
     checkpoint_directory, checkpoint_source = resolve_checkpoint_directory(flags)
     checkpoint_model_dtype = infer_checkpoint_model_dtype(checkpoint_directory)
     checkpoint_dtype_mismatch = (
