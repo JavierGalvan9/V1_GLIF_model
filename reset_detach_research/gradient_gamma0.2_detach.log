@@ -1,0 +1,158 @@
+2026-08-31 19:57:36.392697: I tensorflow/core/util/port.cc:113] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-31 19:57:36.434792: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:9261] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-08-31 19:57:36.434844: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:607] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-08-31 19:57:36.436215: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1515] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+2026-08-31 19:57:36.443045: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2026-08-31 19:57:37.503975: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT
+INFO:tensorflow:Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA L40S, compute capability 8.9
+I0831 19:57:40.917350 139082552907584 device_compatibility_check.py:130] Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA L40S, compute capability 8.9
+2026-08-31 19:57:41.051243: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1929] Created device /job:localhost/replica:0/task:0/device:GPU:0 with 43516 MB memory:  -> device: 0, name: NVIDIA L40S, pci bus id: 0000:49:00.0, compute capability: 8.9
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:localhost/replica:0/task:0/device:GPU:0',)
+I0831 19:57:41.052627 139082552907584 mirrored_strategy.py:423] Using MirroredStrategy with devices ('/job:localhost/replica:0/task:0/device:GPU:0',)
+2026-08-31 19:57:47.104154: I external/local_xla/xla/service/service.cc:168] XLA service 0x7e7ae812de80 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2026-08-31 19:57:47.104191: I external/local_xla/xla/service/service.cc:176]   StreamExecutor device (0): NVIDIA L40S, Compute Capability 8.9
+2026-08-31 19:57:47.129142: I tensorflow/compiler/mlir/tensorflow/utils/dump_mlir_util.cc:269] disabling MLIR crash reproducer, set env var `MLIR_CRASH_REPRODUCER_DIRECTORY` to enable.
+2026-08-31 19:57:47.169544: I external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:454] Loaded cuDNN version 8907
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1788199067.251505 2768964 device_compiler.h:186] Compiled cluster using XLA!  This line is logged at most once for the lifetime of the process.
+2026-08-31 19:57:54.572142: W tensorflow/core/common_runtime/type_inference.cc:339] Type inference failed. This indicates an invalid graph that escaped type checking. Error message: INVALID_ARGUMENT: expected compatible input types, but input 1:
+type_id: TFT_OPTIONAL
+args {
+  type_id: TFT_PRODUCT
+  args {
+    type_id: TFT_TENSOR
+    args {
+      type_id: TFT_FLOAT
+    }
+  }
+}
+ is neither a subtype nor a supertype of the combined inputs preceding it:
+type_id: TFT_OPTIONAL
+args {
+  type_id: TFT_PRODUCT
+  args {
+    type_id: TFT_TENSOR
+    args {
+      type_id: TFT_BOOL
+    }
+  }
+}
+
+	for Tuple type infernce function 0
+	while inferring type of node 'cond_9/output/_524'
+2026-08-31 19:57:56.249714: W tensorflow/core/grappler/optimizers/loop_optimizer.cc:933] Skipping loop optimization for Merge node with control input: cond_9/branch_executed/_609
+[Sequential] pre-clip global norm: nan
+[Sequential] spontaneous= 0 grad_all_finite= 0 nonfinite_count= 2084519 max_abs= nan mean_abs= nan n_tensors= 2
+2026-08-31 19:57:59.678453: I tensorflow/core/framework/local_rendezvous.cc:421] Local rendezvous recv item cancelled. Key hash: 15513104660890253202
+2026-08-31 19:57:59.678489: I tensorflow/core/framework/local_rendezvous.cc:421] Local rendezvous recv item cancelled. Key hash: 15036628446529949825
+2026-08-31 19:57:59.678503: I tensorflow/core/framework/local_rendezvous.cc:421] Local rendezvous recv item cancelled. Key hash: 6046880952520877727
+2026-08-31 19:57:59.678512: I tensorflow/core/framework/local_rendezvous.cc:421] Local rendezvous recv item cancelled. Key hash: 1782603815571790153
+2026-08-31 19:57:59.678535: I tensorflow/core/framework/local_rendezvous.cc:421] Local rendezvous recv item cancelled. Key hash: 12675034237013445583
+Traceback (most recent call last):
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 2072, in <module>
+    absl.app.run(main)
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/site-packages/absl/app.py", line 316, in run
+    _run_main(main, args)
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/site-packages/absl/app.py", line 261, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 1694, in main
+    _, step_values = split_train_step(
+                     ^^^^^^^^^^^^^^^^^
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 1034, in split_train_step
+    distributed_train_step(
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/site-packages/tensorflow/python/util/traceback_utils.py", line 153, in error_handler
+    raise e.with_traceback(filtered_tb) from None
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/site-packages/tensorflow/python/eager/execute.py", line 53, in quick_execute
+    tensors = pywrap_tfe.TFE_Py_Execute(ctx._handle, device_name, op_name,
+  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tensorflow.python.framework.errors_impl.InvalidArgumentError: Graph execution error:
+
+Detected at node assert_equal_3/Assert/AssertGuard/Assert defined at (most recent call last):
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/threading.py", line 1002, in _bootstrap
+
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/threading.py", line 1045, in _bootstrap_inner
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 914, in train_step_sequential
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 916, in train_step_sequential
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 652, in _print_and_check_gradients
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 688, in _print_and_check_gradients
+
+Detected at node assert_equal_3/Assert/AssertGuard/Assert defined at (most recent call last):
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/threading.py", line 1002, in _bootstrap
+
+  File "/home/jgalvan/.conda/envs/neuro_tf2151/lib/python3.11/threading.py", line 1045, in _bootstrap_inner
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 914, in train_step_sequential
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 916, in train_step_sequential
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 652, in _print_and_check_gradients
+
+  File "/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/multi_training.py", line 688, in _print_and_check_gradients
+
+2 root error(s) found.
+  (0) INVALID_ARGUMENT:  assertion failed: [[Sequential] gradients contain NaN/Inf values.] [Condition x == y did not hold element-wise:] [x (All_2:0) = ] [0] [y (Const_15:0) = ] [1]
+	 [[{{node assert_equal_3/Assert/AssertGuard/Assert}}]]
+	 [[while_1/body/_895/gradient_tape/while_1/training_sequence_and_state_extractor/rsnn/while/while_1/training_sequence_and_state_extractor/rsnn/while_grad/LoopCond/_3425/_704]]
+  (1) INVALID_ARGUMENT:  assertion failed: [[Sequential] gradients contain NaN/Inf values.] [Condition x == y did not hold element-wise:] [x (All_2:0) = ] [0] [y (Const_15:0) = ] [1]
+	 [[{{node assert_equal_3/Assert/AssertGuard/Assert}}]]
+0 successful operations.
+0 derived errors ignored. [Op:__inference_distributed_train_step_14922]
+2026-08-31 19:58:00.527361: W tensorflow/core/kernels/data/generator_dataset_op.cc:108] Error occurred when finalizing GeneratorDataset iterator: FAILED_PRECONDITION: Python interpreter state is not initialized. The process may be terminated.
+	 [[{{node PyFunc}}]]
+
+ERROR conda.cli.main_run:execute(124): `conda run python multi_training.py --data_dir GLIF_network_nll_full --ckpt_dir /tmp/gamma_gradient_0.2 --benchmark_output /tmp/gamma_gradient_0.2.json --benchmark_warmup_steps 0 --benchmark_measure_steps 1 --n_epochs 1 --steps_per_epoch 1 --neurons 10000 --seq_len 100 --batch_size 2 --grating_batch_size 1 --gray_batch_size 1 --dtype float16 --gradient_checkpointing --gradient_checkpoint_chunk_size 25 --train_recurrent --train_noise --notrain_input --dampening_factor 0.2 --recurrent_dampening_factor 0.1 --voltage_gradient_dampening 0.0 --global_clipnorm 0.0 --debug_gradients --sync_cost 0 --osi_cost 0 --recurrent_weight_regularization 0 --seed 3000 --detach_reset --nodetach_asc_reset` failed. (See above for error)
+********************************************************************************
+gpu02
+********************************************************************************
+Memory growth enabled for device PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')
+- Num GPUs Available:  1 
+
+--- CUDA version:  12.2
+--- CUDNN version:  8
+--- TensorFlow version:  2.15.0
+--- CUDA Library path:  libcudart.so.13
+Reproducibility seed: 3000
+Mixed precision (float16) enabled!
+Per replica batch size: 2
+Sequential stimuli updates enabled (memory friendly).
+Model batch size: 2
+Global batch size: 2
+Stimulus batch sizes (per replica): grating=1, gray=1
+
+Training with current input: False
+Pseudo derivative gaussian: False
+> Looking for cached V1 model in GLIF_network_nll_full/tf_data/V1_network_tmp.pkl
+> Sucessfully restored V1 model from GLIF_network_nll_full/tf_data/V1_network_tmp.pkl
+Model files loading: 0.07 seconds
+
+Creating the V1 column...
+    > max_delay=3 ms (data max=3 ms)
+    > # Recurrent synapses: 2044519
+    > # LGN input synapses 4700990
+    > # BKG input synapses 40000
+Model built in 3.77 s
+
+Learning-rate schedule: none (constant lr=0.005)
+No checkpoint found in /tmp/gamma_gradient_0.2 or . Starting from scratch...
+
+Model variables stored in dictionary
+
+All neurons are in the core region. Core mask is set to None.
+Using custom neuropixels data file for FR loss: Neuropixels_data/OSI_DSI_neuropixels_v4.csv
+Using custom neuropixels data file for FR loss: Neuropixels_data/OSI_DSI_neuropixels_v4.csv
+Using custom neuropixels data file for OSI/DSI loss: Neuropixels_data/OSI_DSI_neuropixels_v4.csv
+Gradient checkpointing: segmented exact BPTT (4 chunks, chunk_size=25).
+Loaded cached spontaneous LGN firing rates.
+Loaded cached OSI/DSI LGN firing rates dataset.
+---------- Training started at  31-08-2026 19:57  ----------
+
+Benchmark mode: 0 warm-up + 1 measured updates.
+

@@ -1,0 +1,149 @@
+2026-08-31 20:15:12.833244: I tensorflow/core/util/port.cc:113] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-08-31 20:15:12.875410: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:9261] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-08-31 20:15:12.875460: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:607] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-08-31 20:15:12.876825: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1515] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+2026-08-31 20:15:12.883616: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX512F AVX512_VNNI AVX512_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2026-08-31 20:15:13.937413: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT
+INFO:tensorflow:Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA L40S, compute capability 8.9
+I0831 20:15:17.342963 140308381411136 device_compatibility_check.py:130] Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA L40S, compute capability 8.9
+2026-08-31 20:15:17.476542: I tensorflow/core/common_runtime/gpu/gpu_device.cc:1929] Created device /job:localhost/replica:0/task:0/device:GPU:0 with 43516 MB memory:  -> device: 0, name: NVIDIA L40S, pci bus id: 0000:49:00.0, compute capability: 8.9
+INFO:tensorflow:Using MirroredStrategy with devices ('/job:localhost/replica:0/task:0/device:GPU:0',)
+I0831 20:15:17.478049 140308381411136 mirrored_strategy.py:423] Using MirroredStrategy with devices ('/job:localhost/replica:0/task:0/device:GPU:0',)
+2026-08-31 20:15:22.109088: I external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:454] Loaded cuDNN version 8907
+2026-08-31 20:15:22.605841: I external/local_xla/xla/service/service.cc:168] XLA service 0x7f97d81280c0 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2026-08-31 20:15:22.605877: I external/local_xla/xla/service/service.cc:176]   StreamExecutor device (0): NVIDIA L40S, Compute Capability 8.9
+2026-08-31 20:15:22.612512: I tensorflow/compiler/mlir/tensorflow/utils/dump_mlir_util.cc:269] disabling MLIR crash reproducer, set env var `MLIR_CRASH_REPRODUCER_DIRECTORY` to enable.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1788200122.685911 2798890 device_compiler.h:186] Compiled cluster using XLA!  This line is logged at most once for the lifetime of the process.
+2026-08-31 20:15:35.568798: W tensorflow/core/common_runtime/type_inference.cc:339] Type inference failed. This indicates an invalid graph that escaped type checking. Error message: INVALID_ARGUMENT: expected compatible input types, but input 1:
+type_id: TFT_OPTIONAL
+args {
+  type_id: TFT_PRODUCT
+  args {
+    type_id: TFT_TENSOR
+    args {
+      type_id: TFT_FLOAT
+    }
+  }
+}
+ is neither a subtype nor a supertype of the combined inputs preceding it:
+type_id: TFT_OPTIONAL
+args {
+  type_id: TFT_PRODUCT
+  args {
+    type_id: TFT_TENSOR
+    args {
+      type_id: TFT_BOOL
+    }
+  }
+}
+
+	for Tuple type infernce function 0
+	while inferring type of node 'cond_9/output/_524'
+2026-08-31 20:15:37.186081: W tensorflow/core/grappler/optimizers/loop_optimizer.cc:933] Skipping loop optimization for Merge node with control input: cond_9/branch_executed/_609
+2026-08-31 20:15:46.038412: W tensorflow/core/grappler/optimizers/loop_optimizer.cc:933] Skipping loop optimization for Merge node with control input: cond_9/branch_executed/_609
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.509763 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.515666 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.519170 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.519707 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.520586 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.521063 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.521902 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.522372 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.523174 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+INFO:tensorflow:Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+I0831 20:15:48.523610 140308381411136 cross_device_ops.py:619] Reduce to /job:localhost/replica:0/task:0/device:CPU:0 then broadcast to ('/job:localhost/replica:0/task:0/device:CPU:0',).
+
+********************************************************************************
+gpu02
+********************************************************************************
+Memory growth enabled for device PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')
+- Num GPUs Available:  1 
+
+--- CUDA version:  12.2
+--- CUDNN version:  8
+--- TensorFlow version:  2.15.0
+--- CUDA Library path:  libcudart.so.13
+Reproducibility seed: 3001
+Mixed precision (float16) enabled!
+Per replica batch size: 2
+Sequential stimuli updates enabled (memory friendly).
+Model batch size: 2
+Global batch size: 2
+Stimulus batch sizes (per replica): grating=1, gray=1
+
+Training with current input: False
+Pseudo derivative gaussian: False
+> Looking for cached V1 model in GLIF_network_nll_full/tf_data/V1_network_tmp.pkl
+> Sucessfully restored V1 model from GLIF_network_nll_full/tf_data/V1_network_tmp.pkl
+Model files loading: 0.07 seconds
+
+Creating the V1 column...
+    > max_delay=3 ms (data max=3 ms)
+    > # Recurrent synapses: 2044519
+    > # LGN input synapses 4700990
+    > # BKG input synapses 40000
+Model built in 3.74 s
+
+Learning-rate schedule: none (constant lr=0.005)
+No checkpoint found in /tmp/seq500_25_detach_0p1_3001 or . Starting from scratch...
+
+Model variables stored in dictionary
+
+All neurons are in the core region. Core mask is set to None.
+Using custom neuropixels data file for FR loss: Neuropixels_data/OSI_DSI_neuropixels_v4.csv
+Using custom neuropixels data file for FR loss: Neuropixels_data/OSI_DSI_neuropixels_v4.csv
+Using custom neuropixels data file for OSI/DSI loss: Neuropixels_data/OSI_DSI_neuropixels_v4.csv
+Gradient checkpointing: segmented exact BPTT (20 chunks, chunk_size=25).
+Loaded cached spontaneous LGN firing rates.
+Creating OSI/DSI dataset...
+Angle 0 done.
+    LGN running time: 2.15s
+    TensorFlow GPU 0 Memory Usage: 0.49 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+Angle 45 done.
+    LGN running time: 0.02s
+    TensorFlow GPU 0 Memory Usage: 0.48 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+Angle 90 done.
+    LGN running time: 0.03s
+    TensorFlow GPU 0 Memory Usage: 0.48 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+Angle 135 done.
+    LGN running time: 0.03s
+    TensorFlow GPU 0 Memory Usage: 0.47 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+Angle 180 done.
+    LGN running time: 0.03s
+    TensorFlow GPU 0 Memory Usage: 0.46 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+Angle 225 done.
+    LGN running time: 0.03s
+    TensorFlow GPU 0 Memory Usage: 0.47 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+Angle 270 done.
+    LGN running time: 0.03s
+    TensorFlow GPU 0 Memory Usage: 0.45 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+Angle 315 done.
+    LGN running time: 0.03s
+    TensorFlow GPU 0 Memory Usage: 0.48 GiB, Peak Usage: 2.05 GiB
+    Total GPU 0 Memory Usage: Used: 0.00 GiB, Free: 95.01 GiB, Total: 95.59 GiB
+OSI/DSI dataset created and cached successfully!
+---------- Training started at  31-08-2026 20:15  ----------
+
+Benchmark mode: 1 warm-up + 24 measured updates.
+BENCHMARK_RESULT={"last_loss": 6.399862289428711, "loss_history": [6.685927391052246, 6.684607028961182, 6.673205375671387, 6.651266574859619, 6.636227130889893, 6.615276336669922, 6.595900535583496, 6.594509601593018, 6.581908226013184, 6.5674638748168945, 6.555570125579834, 6.543813705444336, 6.5328474044799805, 6.519650459289551, 6.505690574645996, 6.494531154632568, 6.482593536376953, 6.469338893890381, 6.463159084320068, 6.449207305908203, 6.436882495880127, 6.425347328186035, 6.41304349899292, 6.399862289428711], "mean_step_seconds": 1.4036747217178345, "measured_steps": 24, "median_step_seconds": 1.4022705554962158, "nvidia_smi_memory_mib": 3590.0, "online_voltage_loss": true, "tf_current_memory_mib": 569.996337890625, "tf_peak_memory_mib": 764.589111328125, "updates_per_second": 0.7124157645128693, "warmup_steps": 1}
+

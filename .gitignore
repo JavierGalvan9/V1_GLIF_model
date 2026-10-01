@@ -110,9 +110,9 @@ rolling_osi_emd_vs_crowd_osi_toy.ipynb
 .gemini/settings.json
 benchmarks/
 synaptic_current_optimization/
-tests/
-!tests/
-tests/*
+# tests/
+# !tests/
+# tests/*
 !tests/test_cuda_csr_external.py
 !tests/test_segmented_recompute.py
 !tests/test_cuda_csr_resources.py
@@ -135,19 +135,19 @@ distributed_training_investigation/
 !tests/test_distribution_strategy.py
 !tests/test_earth_movers_distance_regularizer.py
 !tests/test_training_orchestration.py
-tests/
+# tests/
 !tests/
 !tests/test_cuda_csr_recurrent.py
 !tests/test_cuda_csr_external.py
 !tests/test_cuda_csr_resources.py
 !tests/test_cuda_operator_cache.py
 !tests/test_cuda_glif_state.py
+!tests/test_batch_osi_emd_loss.py
 docs/research/spikingjelly_performance_optimizations.md
 .claude/skills/
 .mcp.json
 parallel_training_testing.py
 v1_model_utils/optimizers.py
-reset_detach_research/
 uint8_rec_ring_state_benchmark/
 profiling_analysis_20260902/
 wmma_recurrent_analysis_20260901/
@@ -165,4 +165,11 @@ Distributed_worker_logs/
 generic_kernel_optimization_20260915/
 profiling_analysis_20260915/
 recurrent_forward_latency_20260915/
-tests/*
+Experiments/
+.gitignore
+parallel_training_testing.py
+animations
+kernel_opt_20260920/
+Validation_profile_runs/
+ARTHUR_CODE_OPTIMIZATION_REVIEW.md
+VALIDATION_OPTIMIZATION_REPORT.md

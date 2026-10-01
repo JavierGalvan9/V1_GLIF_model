@@ -1,0 +1,12 @@
+{
+  "last_loss": 7.545202732086182,
+  "mean_step_seconds": 0.2446217801835802,
+  "measured_steps": 9,
+  "median_step_seconds": 0.2410285472869873,
+  "nvidia_smi_memory_mib": 1002.0,
+  "online_voltage_loss": true,
+  "tf_current_memory_mib": 313.7451171875,
+  "tf_peak_memory_mib": 388.4921875,
+  "updates_per_second": 4.087943433530468,
+  "warmup_steps": 1
+}
