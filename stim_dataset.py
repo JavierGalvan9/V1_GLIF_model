@@ -174,7 +174,7 @@ class DriftingGratingLGN:
     precision halves them but rounds the stimulus to about 5e-4, which moves
     the probabilities by up to 2e-6 (a float32 movie: 2e-8; the float16
     TensorFlow path: 3e-4).
-    The CUDA paths return float32 probabilities and draw the Bernoulli
+    All paths return float32 probabilities and draw the Bernoulli
     uniforms in float32 whatever `dtype` is: float16 uniforms have 1024 levels
     and bias the spike rate upwards. They return seeded spikes straight from
     the op; with ``return_probabilities`` the op returns the probabilities and
@@ -217,7 +217,7 @@ class DriftingGratingLGN:
                              and self.lgn.movie_kernel(bmtk_compat) is not None)
         self.backend = ('grating' if self.kernel is not None
                         else 'movie' if self.use_movie_op else 'tensorflow')
-        self.uniform_dtype = dtype if self.backend == 'tensorflow' else tf.float32
+        self.uniform_dtype = tf.float32
 
     def _as_batch(self, theta, phase):
         """One grating's orientation and phase as the CUDA op's batch of one."""
@@ -291,26 +291,30 @@ class DriftingGratingLGN:
             if current_input:
                 return tf.cast(probability * 1.3, self.dtype)
             return tf.random.uniform(tf.shape(probability), dtype=self.uniform_dtype) < probability
-        # Probability of having a spike before dt = 1 ms
-        probability = 1 - tf.exp(-self.firing_rates(theta, phase) / 1000.)
+        probability = self._tensorflow_probabilities(theta, phase)
         if current_input:
-            return probability * 1.3
+            return tf.cast(probability * 1.3, self.dtype)
         if spike_seed is None:
-            uniform = tf.random.uniform(tf.shape(probability), dtype=self.dtype)
+            uniform = tf.random.uniform(tf.shape(probability), dtype=self.uniform_dtype)
         else:
             uniform = tf.random.stateless_uniform(
-                tf.shape(probability), seed=spike_seed, dtype=self.dtype
+                tf.shape(probability), seed=spike_seed, dtype=self.uniform_dtype
             )
         return uniform < probability
 
+    def _tensorflow_probabilities(self, theta, phase):
+        """FP32 spike probabilities for a 1 ms bin, after filtering in `dtype`."""
+        rates = tf.cast(self.firing_rates(theta, phase), tf.float32)
+        return -tf.math.expm1(-rates / 1000.0)
+
     def batch_probabilities(self, theta, phase):
-        """Spike probabilities [batch, seq_len, n_input] of a batch of gratings (float32 from the CUDA ops)."""
+        """Float32 spike probabilities [batch, seq_len, n_input] of gratings."""
         if self.backend != 'tensorflow':
             return self._probabilities(theta[:, 0], phase)
         return tf.map_fn(
-            lambda sample: 1 - tf.exp(-self.firing_rates(*sample) / 1000.),
+            lambda sample: self._tensorflow_probabilities(*sample),
             (theta[:, 0], phase),
-            fn_output_signature=tf.TensorSpec((self.seq_len, self.n_input), self.dtype),
+            fn_output_signature=tf.TensorSpec((self.seq_len, self.n_input), tf.float32),
             parallel_iterations=1,
         )
 
