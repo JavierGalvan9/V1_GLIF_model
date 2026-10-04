@@ -41,11 +41,16 @@ that mirror them across that boundary.
 
 The forward is a scatter over the active `(batch, presynaptic row)` slots.
 `BuildActiveQueue` finds them on the device with an ordered stream compaction
-(`cub::DeviceSelect`), packing each as `batch << 21 | row`, and keeps the count
+(`cub::DeviceSelect`), storing each flat `batch * n_pre + row` index, and keeps the count
 on the device. The old host `tf.where` computed the same ordered list but copied
 its count to the host to size the output, so every forward waited on that round
-trip. Rows are limited to 2^21 and the batch to 2^11; the operator rejects
-anything larger. The same path runs at every firing rate and batch size.
+trip. The total `batch * n_pre` must fit a signed 32-bit index. The same queue
+representation works at every firing rate and batch size within that limit.
+
+With four basis columns and no repeated targets in a row, the forward prefers
+shared-memory target tiles. It checks the compiled kernel's static allocation
+and the device's opt-in shared-memory allowance first; devices that cannot fit
+the tile use the scatter kernel. Unexpected CUDA API errors are reported.
 
 A fixed 4,512-block grid consumes the queue, each block taking the next slots
 from an atomic ticket (about 1,024 edges of work per ticket: one LGN row, or
@@ -67,13 +72,24 @@ collectives. `csr_order.repeats_targets` decides this once when the
 connectivity is built, and the wrappers pass it as the `aggregate_runs`
 attribute. Four basis columns are unrolled; any other width loops.
 
+The four-basis recurrent path uses `TiledForwardKernel` with a connectivity
+table built on first use. Operators share this immutable table when the device,
+CSR buffers, buffer lengths, postsynaptic count, and tile size match. This keeps
+the separate gray and evoked validation graphs from retaining one table per
+unrolled chunk. A weak registry releases the table with its last operator;
+each operator keeps a strong reference for its warm path, avoiding registry
+lookups or synchronization per timestep. The initial table fill completes before
+publication so another CUDA stream can safely reuse it. CUDA kernel configuration
+remains per operator because it depends on the kernel's dtype and library.
+
 ## Compact pair-projected backward
 
 The backward projects each distinct `(postsynaptic neuron, synapse type)` pair
 onto the basis once rather than once per edge (1,675,972 pairs for 84,145,692
 edges in the 203,816-neuron network). One path serves every batch size, basis
 dimension and spike dtype. The batch is processed in slices of
-`min(32, next power of two)` samples; the projection is laid out
+`min(64, next power of two)` samples (FP16; FP32 caps the slice at 32); the
+projection is laid out
 `[pair, batch_stride]` with the stride a whole number of slices, padding
 samples project to zero, and the spike-gradient kernels run one grid row per
 slice. The backward is split into two halves:
@@ -83,21 +99,27 @@ slice. The backward is split into two halves:
   derive on the device from the largest finite `|current_grad|`. Without the
   scale these values sit near FP16's flush-to-zero floor. A power of two is
   exact in both directions, so the only error added is mantissa rounding, and
-  the row kernel divides it back out after its FP32 accumulation. Sixteen-bit
-  elements let a lane load eight samples of a 32-sample slice in one 16-byte
-  transaction. FP32 spikes keep an FP32 projection (four samples per load), so a
-  caller that chose FP32 keeps its precision. `BackwardRowPerWarpKernel` gives
-  each CSR row a warp, four warps per block, with no shared memory; out-of-range
-  lanes read an all-zero sentinel pair instead of branching. It stores the
-  result as `[pre, batch_stride]`, one contiguous line per row, and
-  `TransposeSpikeGradKernel` restores `[batch, pre]` and writes the zeros of
-  edgeless rows, so the output is never cleared first.
+  the row kernel divides it back out after its FP32 accumulation.
+  `PreprojectPairsKernel` gives each pair a thread that walks the batch, one
+  vector load per sample and one 32-byte store per 16 samples. Sixteen-bit
+  elements let a lane load eight samples in one 16-byte transaction, so at
+  batch 64 each edge reads its pair's whole 128-byte line in a single pass and
+  the edge descriptors are streamed once rather than once per 32-sample slice.
+  FP32 spikes keep an FP32 projection (four samples per load), so a caller that
+  chose FP32 keeps its precision. `BackwardRowTileKernel` gives each CSR row a
+  warp; a block of eight warps owns 32 consecutive rows, takes them from a
+  shared counter, and writes the tile out as `[batch, pre]` through shared
+  memory, including the zeros of edgeless rows, so the output is never cleared
+  first and no transpose pass is needed. Out-of-range lanes read an all-zero
+  sentinel pair instead of branching. The 64-sample slice keeps two partial
+  sums per lane so its sums are bitwise those of two 32-sample slices.
 - **Weight gradient (event driven, `event_weight_grad.cuh`).** The spikes are
   sparse, so `EventRowQueueKernel` queues each row that fired, one item per
-  1,024 edges so long rows spread over several blocks, and
-  `EventWeightGradKernel` rebuilds the projection in FP32 from `current_grad`
-  and the basis for the row's active samples only, which it compacts in
-  ascending order. Each edge has one writer and a fixed summation order, so
+  256 edges so long rows spread over several blocks, with a 64-bit mask of the
+  active samples when the batch is at most 64, and `EventWeightGradKernel`
+  rebuilds the projection in FP32 from `current_grad` and the basis for the
+  row's active samples only, in ascending order (compacted through shared
+  memory above 64 samples). Each edge has one writer and a fixed summation order, so
   there are no atomics and the result is deterministic. Rows that never fired
   get an exact zero, so a non-finite upstream gradient no longer reaches the
   weight gradient of silent rows. Mixed-precision loss scaling still sees it
@@ -214,7 +236,12 @@ for the visible GPUs.
 The operator dispatches four basis columns to an unrolled specialization and
 uses a runtime loop for every other positive basis dimension. The forward does
 not depend on the batch; the backward compiles one kernel set per slice width
-(1, 2, 4, 8, 16, 32) and covers any batch with them.
+(1, 2, 4, 8, 16, 32, 64) and covers any batch with them.
+The raw operators accept at most eight equal-shape spike-slot tensors. The
+public wrapper supports longer histories by concatenating them into one
+generic operand. If carried queue records are supplied for a longer history,
+it rebuilds the flattened queue and returns the newest slot's record; forward
+and gradient semantics are preserved, but the older records are not reused.
 Training defaults to `--acceleration=auto`. Use `--acceleration=cuda` to
 require the optimized kernels or `--acceleration=tensorflow` for the reference
 implementation.

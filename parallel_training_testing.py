@@ -190,6 +190,7 @@ parser.add_argument(
 )
 parser.add_argument('--current_input', default=False, action='store_true')
 parser.add_argument('--bmtk_compat_lgn', default=True, action='store_true')
+parser.add_argument('--lgn_backend', default='grating', choices=['grating', 'movie', 'tensorflow'])
 parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')
 parser.add_argument('--random_weights', default=False, action='store_true')
@@ -272,8 +273,8 @@ def main():
         "-c", str(cpu_count), "-m", "80", "-t", flags.walltime,
     ]
 
-    evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
-    # evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "80", "-c", "8", "-t", "3:00"]
+    # evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
+    evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "200", "-c", "8", "-t", "3:00"]
 
     # Define the training and evaluation script calls
     # training_script = "python multi_training.py "
@@ -310,16 +311,12 @@ def main():
     job_ids = []
     eval_job_ids = []
 
-    # Initial OSI/DSI test
-    _initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
-
-    if initial_benchmark_model:
-        _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
-    else:
-        _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1}"
-
-    # initial_evaluation_command = _initial_evaluation_command + [_initial_evaluation_script]
-    # eval_job_id = submit_job(initial_evaluation_command)
+    # initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
+    # if initial_benchmark_model:
+    #     _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
+    # else:
+    #     _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from '' --evaluate_untrained"
+    # eval_job_id = submit_job(initial_evaluation_command + [_initial_evaluation_script], print_only=flags.print_only)
     # eval_job_ids.append(eval_job_id)
 
     for i in range(flags.n_runs):

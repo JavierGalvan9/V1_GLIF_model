@@ -14,6 +14,7 @@ from v1_model_utils.cuda_csr_recurrent.build import (
 )
 from v1_model_utils.cuda_csr_recurrent.wrapper import (
     empty_like_currents,
+    empty_metadata,
     require_csr_ordered_weights,
 )
 from v1_model_utils.cuda_csr_resources import (
@@ -37,7 +38,7 @@ def _edge_index_tensor(order):
     permutation.
     """
     if DIRECT_CSR and not resource_mode_enabled():
-        return tf.zeros((0,), tf.uint32)
+        return empty_metadata(tf.uint32)
     return tf.constant(order, tf.uint32)
 
 
@@ -88,9 +89,9 @@ def _compact_pairs(post_ids, synapse_types, needed=True):
     """
     if not needed:
         return {
-            "pair_ids": tf.zeros((0,), tf.uint32),
-            "pair_posts": tf.zeros((0,), tf.uint32),
-            "pair_types": tf.zeros((0,), tf.uint8),
+            "pair_ids": empty_metadata(tf.uint32),
+            "pair_posts": empty_metadata(tf.uint32),
+            "pair_types": empty_metadata(tf.uint8),
             "n_pairs": 0,
         }
     unique_codes, pair_ids = csr_order.compact_pairs(post_ids, synapse_types)
@@ -343,7 +344,7 @@ def calculate_external_csr_currents(
             )
         else:
             currents = recurrent_ops.v1_csr_forward(
-                values,
+                [values],
                 master_weights,
                 post_ids,
                 synapse_types,
@@ -351,9 +352,10 @@ def calculate_external_csr_currents(
                 edge_ids,
                 basis_values,
                 initial_values,
+                [],  # no carried spike-history queue records
                 n_post=connectivity.n_post,
                 aggregate_runs=connectivity.repeats_targets,
-            )
+            ).currents
 
         def grad(upstream):
             if compute_activity_gradient:
@@ -442,14 +444,15 @@ def _calculate_resource_currents(
             )
         else:
             currents = ops.v1_csr_forward_resource(
-                values,
+                [values],
                 master_weights,
                 basis_values,
                 initial_values,
+                [],  # no carried spike-history queue records
                 n_post=connectivity.n_post,
                 resource_name=connectivity.resource_name,
                 aggregate_runs=connectivity.repeats_targets,
-            )
+            ).currents
 
         def grad(upstream):
             if compute_activity_gradient:

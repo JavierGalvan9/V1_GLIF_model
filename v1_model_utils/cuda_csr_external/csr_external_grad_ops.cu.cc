@@ -964,8 +964,14 @@ Status LaunchActivityBackward(
     }
   }
 #undef LAUNCH_COMPACT_ACTIVITY_LARGE
+  // Short, numerous rows benefit from the same projection and 64-thread
+  // row reduction as the specialized path, including non-power-of-two batches.
+  // Keep the direct fallback for small row counts (e.g. dense BKG), where
+  // projection and split-row reduction add more overhead than they save.
   if (std::is_same<T, Eigen::half>::value && pair_posts.NumElements() > 0 &&
-      ((kBasis == 0 && batch >= 3) || (kBasis == 4 && batch >= 32))) {
+      ((kBasis == 0 && batch >= 3) ||
+       (kBasis == 4 && (batch >= 32 ||
+                        (batch >= 3 && RowSplitCount(n_rows) == 1))))) {
     Tensor projected_tensor;
     const int64_t n_pairs = pair_posts.NumElements();
     TF_RETURN_IF_ERROR(context->allocate_temp(

@@ -271,7 +271,8 @@ def main(_):
             data_dir=flags.data_dir,
             bmtk_compat=flags.bmtk_compat_lgn,
             seed=flags.seed,
-            output_dtype=dtype,
+            output_dtype=tf.float32,  # sampled in float32 (generate_spontaneous_spikes)
+            lgn_backend=flags.lgn_backend,
         )
         # Handle the random seed for spontaneous spike generation and BKG noise.
         # Offset by run_session so different evaluation sessions of the SAME network
@@ -295,9 +296,10 @@ def main(_):
             data_dir=flags.data_dir,
             rotation=flags.rotation,
             seed=flags.seed,
-            output_dtype=dtype,
+            output_dtype=tf.float32,  # sampled in float32 (generate_spontaneous_spikes)
             angles=DG_angles,
             strategy=strategy,
+            lgn_backend=flags.lgn_backend,
         )
 
     # Both paths return one flat tuple: the sequence outputs followed by the
@@ -326,19 +328,21 @@ def main(_):
 
     # Generate spontaneous spikes efficiently
     @tf.function
-    def generate_spontaneous_spikes(spontaneous_prob):
-        # random_uniform = tf.random.uniform(tf.shape(spontaneous_prob), dtype=dtype)
+    def generate_spontaneous_spikes(probability, batch_size):
+        """Spikes [batch_size, *probability.shape]. The probabilities and uniforms are
+        float32 whatever `dtype` is: float16 uniforms take only 1024 values, so
+        P(u < p) would be ceil(1024 p) / 1024 (+14% spikes at spontaneous rates).
+        """
         random_uniform = tf.random.stateless_uniform(
-            tf.shape(spontaneous_prob),
+            tf.concat([[batch_size], tf.shape(probability)], axis=0),
             seed=seed_helper.next_spontaneous_seed(),
-            dtype=dtype,
+            dtype=tf.float32,
         )
-        return tf.less(random_uniform, spontaneous_prob)
+        return tf.less(random_uniform, tf.cast(probability, tf.float32))
 
     def generate_gray_state(batch_size):
         batch_size = tf.cast(batch_size, tf.int32)
-        prob = tf.tile(tf.expand_dims(spontaneous_prob, axis=0), [batch_size, 1, 1])
-        gray_spikes = tf.cast(generate_spontaneous_spikes(prob), dtype)
+        gray_spikes = tf.cast(generate_spontaneous_spikes(spontaneous_prob, batch_size), dtype)
         zero_state = rsnn_layer.cell.zero_state(batch_size, dtype=dtype)
         if state_model is None:
             return roll_out(gray_spikes, zero_state)[2]
@@ -399,7 +403,6 @@ def main(_):
         print(f'Running angle {angle}...')
         # load LGN firing rates for the given angle and calculate spiking probability
         lgn_prob = lgn_firing_probabilities_dict[angle]
-        lgn_prob = tf.tile(tf.expand_dims(lgn_prob, axis=0), [per_replica_batch_size, 1, 1])
 
         t0 = time()
         angle_spike_count = 0
@@ -409,7 +412,7 @@ def main(_):
             end_idx = min((iter_id + 1) * per_replica_batch_size, flags.n_trials_per_angle)
             iteration_length = end_idx - start_idx
 
-            lgn_spikes = generate_spontaneous_spikes(lgn_prob)
+            lgn_spikes = generate_spontaneous_spikes(lgn_prob, tf.constant(per_replica_batch_size, tf.int32))
             continuing_state = gray_state
 
             for chunk_id in range(num_chunks):
@@ -589,6 +592,10 @@ if __name__ == '__main__':
         'Surrogate derivative used for spike generation.',
     )
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
+    absl.app.flags.DEFINE_enum(
+        "lgn_backend", "grating", ["grating", "movie", "tensorflow"],
+        "LGN implementation: 'grating' (the exact drifting-grating CUDA op; other stimuli use the general CUDA movie op), 'movie' (the general CUDA movie op for every stimulus) or 'tensorflow' (the TensorFlow filters).",
+    )
     absl.app.flags.DEFINE_boolean("average_grad_for_cell_type", False, "")
     absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
     absl.app.flags.DEFINE_boolean("spontaneous_training", False, "")

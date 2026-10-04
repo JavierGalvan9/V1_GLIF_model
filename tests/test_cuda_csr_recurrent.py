@@ -487,3 +487,122 @@ def test_forward_handles_rows_beyond_the_old_queue_encoding():
     ).numpy()
     np.testing.assert_array_equal(currents[0], 0.0)
     np.testing.assert_array_equal(currents[1], 2.0)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
+def test_validation_graphs_share_forward_tile_memory(monkeypatch, resource_mode):
+    """Two unrolled validation graphs must not retain forty CSR tile tables."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    n_pre, n_post = 32768, 8192
+    indices = np.column_stack((
+        np.tile([0, 2048, 4096, 6144], n_pre),
+        np.repeat(np.arange(n_pre), 4),
+    ))
+    with tf.device("/GPU:0"):
+        connectivity = _connectivity(
+            indices, np.zeros(len(indices), np.int64), n_pre, n_post
+        )
+        weights = tf.Variable(tf.fill((len(indices),), 1.0 / n_pre))
+        basis = tf.ones((1, 4))
+        spikes = tf.ones((1, n_pre))
+
+        def make_rollout(chunks):
+            @tf.function
+            def rollout(activity):
+                for _ in range(chunks):
+                    currents = calculate_recurrent_csr_currents(
+                        activity, weights, basis, 0.1, connectivity
+                    )
+                    activity = activity + tf.reduce_sum(currents) * 1e-5
+                return tf.reduce_mean(activity)
+
+            return rollout
+
+        warmup = make_rollout(1)
+        warmup(spikes).numpy()
+        before = tf.config.experimental.get_memory_info("GPU:0")["current"]
+        gray, evoked = make_rollout(20), make_rollout(20)
+        for rollout in (gray, evoked):
+            np.testing.assert_allclose(
+                rollout(spikes).numpy(), (1.0 + 16e-5) ** 20, rtol=2e-5
+            )
+        after = tf.config.experimental.get_memory_info("GPU:0")["current"]
+        assert after - before < 8 * 2**20, (
+            f"Validation retained {(after - before) / 2**20:.2f} MiB of extra "
+            "GPU memory for unchanged connectivity"
+        )
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+def test_shared_forward_tables_survive_connectivity_changes(monkeypatch):
+    """Changing one operator's CSR must not mutate another operator's table."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", "0")
+    n_post = 8192
+    with tf.device("/GPU:0"):
+        connectivity = _connectivity(
+            np.array([[0, 0], [6144, 1]], np.int64),
+            np.zeros(2, np.int64), 2, n_post,
+        )
+        weights, basis = tf.Variable([1.0, 1.0]), tf.ones((1, 4))
+        changed_posts = tf.constant([6144, 0], tf.uint32)
+
+        @tf.function
+        def original(activity):
+            return calculate_recurrent_csr_currents(
+                activity, weights, basis, 0.1, connectivity
+            )
+
+        @tf.function
+        def changing(activity, posts):
+            return calculate_recurrent_csr_currents(
+                activity, weights, basis, 0.1,
+                dataclasses.replace(connectivity, post_ids=posts),
+            )
+
+        # FP16 and FP32 share metadata but configure distinct CUDA kernels.
+        for dtype in (tf.float32, tf.float16):
+            activity = tf.constant([[1.0, 2.0]], dtype)
+            expected = np.zeros((n_post, 4), np.float32)
+            expected[0], expected[6144] = 1.0, 2.0
+            changed_expected = np.zeros_like(expected)
+            changed_expected[0], changed_expected[6144] = 2.0, 1.0
+            np.testing.assert_array_equal(original(activity).numpy(), expected)
+            for posts, target in (
+                (connectivity.post_ids, expected),
+                (changed_posts, changed_expected),
+                (connectivity.post_ids, expected),
+            ):
+                np.testing.assert_array_equal(changing(activity, posts).numpy(), target)
+                np.testing.assert_array_equal(original(activity).numpy(), expected)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
+def test_shared_forward_tables_respect_output_size(monkeypatch, resource_mode):
+    """The same CSR can need masks or binary search for different output sizes."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    with tf.device("/GPU:0"):
+        connectivity = _connectivity(
+            np.array([[0, 0]], np.int64), np.zeros(1, np.int64), 1, 8192
+        )
+        weights, basis = tf.Variable([2.0]), tf.ones((1, 4))
+        activity = tf.ones((1, 1))
+        runs = []
+        def make_run(csr):
+            @tf.function
+            def run(spikes):
+                return calculate_recurrent_csr_currents(
+                    spikes, weights, basis, 0.1, csr
+                )
+
+            return run
+
+        # Above 64 tiles of the default 5,120 targets, the table has no masks.
+        for n_post in (8192, 327681):
+            run = make_run(dataclasses.replace(connectivity, n_post=n_post))
+            runs.append(run)
+            expected = np.zeros((n_post, 4), np.float32)
+            expected[0] = 2.0
+            np.testing.assert_array_equal(run(activity).numpy(), expected)
+        np.testing.assert_array_equal(runs[0](activity).numpy()[0], 2.0)

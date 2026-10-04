@@ -208,8 +208,14 @@ def sample_stateless_bernoulli_batch(
     batch_chunk_size=64,
     full_tensor_element_limit=np.iinfo(np.int32).max,
 ):
-    """Sample a batch without launching a random kernel above int32 size."""
-    probability = tf.cast(probability, dtype)
+    """Sample a batch without launching a random kernel above int32 size.
+
+    The probabilities and uniforms are float32 whatever `dtype` is: float16
+    uniforms take only 1024 values, so P(u < p) would be ceil(1024 p) / 1024
+    (+14% spikes at spontaneous LGN rates). `dtype` is the chunked path's
+    output dtype, as before.
+    """
+    probability = tf.cast(probability, tf.float32)
     sample_shape = probability.shape
     if sample_shape.rank is None or not sample_shape.is_fully_defined():
         raise ValueError("Bernoulli sampling requires a static per-sample shape.")
@@ -218,7 +224,7 @@ def sample_stateless_bernoulli_batch(
     elements_per_sample = sample_shape.num_elements()
     if batch_size * elements_per_sample <= full_tensor_element_limit:
         random_uniform = tf.random.stateless_uniform(
-            (batch_size, *sample_shape), seed=seed, dtype=dtype
+            (batch_size, *sample_shape), seed=seed, dtype=tf.float32
         )
         return random_uniform < probability
 
@@ -239,7 +245,7 @@ def sample_stateless_bernoulli_batch(
             key=key,
             counter=chunk_counter,
             alg=algorithm,
-            dtype=dtype,
+            dtype=tf.float32,
         )
         sampled_chunks.append(tf.cast(random_uniform < probability, dtype))
     return tf.concat(sampled_chunks, axis=0)
@@ -821,7 +827,8 @@ def main(_):
             data_dir=flags.data_dir,
             bmtk_compat=flags.bmtk_compat_lgn,
             seed=flags.seed,
-            output_dtype=dtype,
+            output_dtype=tf.float32,  # sampled in float32 (sample_stateless_bernoulli_batch)
+            lgn_backend=flags.lgn_backend,
         )
         # Handle the random seed for spontaneous spike generation and BKG noise.
         # Offset by run_session so successive training sessions of the SAME network
@@ -1349,6 +1356,7 @@ def main(_):
                 rotation=flags.rotation,
                 bmtk_compat=flags.bmtk_compat_lgn,
                 dtype=dtype,
+                lgn_backend=flags.lgn_backend,
             )
         grating_generators.append((device, tf.function(grating_lgn.batch_spikes)))
 
@@ -1379,6 +1387,8 @@ def main(_):
                 return_firing_rates=False,
                 dtype=dtype,
                 seed=pipeline_seed,
+                bmtk_compat=flags.bmtk_compat_lgn,
+                lgn_backend=flags.lgn_backend,
             )
                 .batch(batch_size)
                 .prefetch(tf.data.AUTOTUNE)
@@ -1394,8 +1404,8 @@ def main(_):
         train_data_set = strategy.distribute_datasets_from_function(get_gratings_dataset_fn())
 
     def sample_probability_batch(probability, batch_size, current_input=False):
-        probability = tf.cast(probability, dtype)
         if current_input:
+            probability = tf.cast(probability, dtype)
             return tf.broadcast_to(
                 probability * tf.cast(1.3, dtype),
                 (int(batch_size), *probability.shape),
@@ -1898,12 +1908,13 @@ def main(_):
         data_dir=flags.data_dir,
         rotation=flags.rotation,
         seed=flags.seed,
-        output_dtype=dtype,
+        output_dtype=tf.float32,  # sampled in float32 (sample_stateless_bernoulli_batch)
         angles=protocol_angles,
         strategy=strategy,
         bmtk_compat=flags.bmtk_compat_lgn,
         current_input=flags.current_input,
         cache_prefix="protocol_validation_lgn_probabilities",
+        lgn_backend=flags.lgn_backend,
     )
 
     callbacks.on_train_begin()
@@ -2377,6 +2388,10 @@ if __name__ == '__main__':
         "Surrogate derivative used for spike generation.",
     )
     absl.app.flags.DEFINE_boolean("bmtk_compat_lgn", True, "")
+    absl.app.flags.DEFINE_enum(
+        "lgn_backend", "grating", ["grating", "movie", "tensorflow"],
+        "LGN implementation: 'grating' (the exact drifting-grating CUDA op; other stimuli use the general CUDA movie op), 'movie' (the general CUDA movie op for every stimulus) or 'tensorflow' (the TensorFlow filters).",
+    )
     absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
     absl.app.flags.DEFINE_boolean("spontaneous_training", False, "")
     absl.app.flags.DEFINE_boolean('random_weights', False, '')

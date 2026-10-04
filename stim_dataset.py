@@ -6,6 +6,7 @@ import pickle as pkl
 from time import time
 import tensorflow as tf
 import lgn_model.lgn as lgn_module
+from v1_model_utils import cuda_lgn
 from v1_model_utils.callbacks import printgpu
 # from memory_profiler import profile
 # from pympler.asizeof import asizeof, asized
@@ -25,6 +26,23 @@ def _fold_in_seed(seed_pair, value):
     return tf.random.experimental.stateless_fold_in(
         seed_pair, tf.cast(value, tf.int32)
     )
+
+
+# Tags cached grating LGN probabilities with the implementation that made them:
+# "lgnv2" is the CUDA op (v1_model_utils.cuda_lgn), so caches the TensorFlow
+# path wrote before it are regenerated instead of silently loaded.
+GRATING_LGN_VERSION = "lgnv2"
+# DriftingGratingLGN's and the LGN generators' choice of LGN implementation.
+LGN_BACKENDS = ('grating', 'movie', 'tensorflow')
+
+
+def _stateless_bernoulli(probabilities, spike_seeds):
+    """Spikes [batch, ...]: each sample's float32 stateless uniforms (seed
+    spike_seeds[b]) below its float32 probabilities, as the CUDA LGN ops draw them."""
+    return tf.map_fn(
+        lambda sample: tf.random.stateless_uniform(
+            tf.shape(sample[0]), seed=sample[1], dtype=tf.float32) < sample[0],
+        (probabilities, spike_seeds), fn_output_signature=tf.bool, parallel_iterations=1)
 
 
 ### GENERAL FUNCTIONS ###
@@ -94,6 +112,33 @@ def make_drifting_grating_stimulus(row_size=80, col_size=120, moving_flag=True, 
         return tf.tile(data[0][tf.newaxis, ...], (image_duration, 1, 1))
 
 
+@tf.function(jit_compile=True)
+def drifting_grating_movies(theta, phase, duration, pre_delay, post_delay, row_size, col_size,
+                            cpd, temporal_f, contrast, dtype=tf.float32):
+    """Movies [batch, pre_delay + duration + post_delay, row_size, col_size], in
+    `dtype`, of the gratings make_drifting_grating_stimulus draws (theta, phase
+    [batch], in degrees), gray before and after.
+
+    The phase 2 pi temporal_f t grows with t, so a float32 sine of the whole
+    argument is off by about 1e-7, enough to move the LGN probabilities by
+    2e-7. The spatial and temporal angles are split (sin(a + b) = sin a cos b +
+    cos a sin b) and evaluated in float64, then rounded once to `dtype`; XLA
+    fuses the products into one pass, so only the `dtype` movie is ever stored.
+    """
+    theta_rad = np.pi * (180 - theta) / 180
+    phase_rad = np.pi * (180 - phase) / 180
+    rows = tf.range(row_size, dtype=tf.float64)
+    cols = tf.range(col_size, dtype=tf.float64)
+    xy = (cols[None, None, :] * tf.cos(theta_rad)[:, None, None]
+          + rows[None, :, None] * tf.sin(theta_rad)[:, None, None])
+    space = 2 * np.pi * cpd * xy  # [batch, rows, cols]
+    drift = (2 * np.pi * temporal_f * tf.range(duration, dtype=tf.float64)[None, :] / 1000
+             + phase_rad[:, None])  # [batch, duration]
+    movie = contrast * (tf.sin(space)[:, None] * tf.cos(drift)[:, :, None, None]
+                        + tf.cos(space)[:, None] * tf.sin(drift)[:, :, None, None])
+    return tf.pad(tf.cast(movie, dtype), ((0, 0), (pre_delay, post_delay), (0, 0), (0, 0)))
+
+
 def _grating_sample_seeds(base_seed, sample_index):
     """Orientation, phase and spike seeds of one sample of a seeded grating stream."""
     sample_seed = _fold_in_seed(base_seed, sample_index)
@@ -117,12 +162,32 @@ class DriftingGratingLGN:
     ``batch_spikes`` on every replica's own GPU. Built under a distribution
     strategy's scope, the LGN filters are replica-local, so no replica reads
     another GPU's copy.
+
+    ``lgn_backend`` (one of ``LGN_BACKENDS``):
+        'grating': the CUDA op of the exact grating factorization
+            (cuda_lgn.GratingLGNKernel), else the movie op, else TensorFlow.
+        'movie': the grating movie through the general CUDA movie op
+            (lgn_model.lgn.LGN.firing_rates), else TensorFlow.
+        'tensorflow': the movie through spatial_response and
+            firing_rates_from_spatial, in `dtype`.
+    The 'movie' backend's grating movies are in `dtype`: float16 under mixed
+    precision halves them but rounds the stimulus to about 5e-4, which moves
+    the probabilities by up to 2e-6 (a float32 movie: 2e-8; the float16
+    TensorFlow path: 3e-4).
+    The CUDA paths return float32 probabilities and draw the Bernoulli
+    uniforms in float32 whatever `dtype` is: float16 uniforms have 1024 levels
+    and bias the spike rate upwards. They return seeded spikes straight from
+    the op; with ``return_probabilities`` the op returns the probabilities and
+    TensorFlow compares them with the same float32 uniforms (the same spikes).
     """
 
     def __init__(self, seq_len, pre_delay, post_delay, n_input=17400,
                  data_dir='GLIF_network_nll', temporal_f=2, cpd=0.04, contrast=0.8,
                  row_size=80, col_size=120, rotation='cw', billeh_phase=False,
-                 bmtk_compat=True, dtype=tf.float32):
+                 bmtk_compat=True, dtype=tf.float32, lgn_backend='grating',
+                 return_probabilities=False):
+        if lgn_backend not in LGN_BACKENDS:
+            raise ValueError(f"lgn_backend must be one of {LGN_BACKENDS}, got {lgn_backend!r}")
         self.lgn = lgn_module.LGN(row_size=row_size, col_size=col_size, n_input=n_input,
                                   dtype=dtype, data_dir=data_dir)
         self.seq_len = seq_len
@@ -140,27 +205,92 @@ class DriftingGratingLGN:
         self.billeh_phase = billeh_phase
         self.bmtk_compat = bmtk_compat
         self.dtype = dtype
+        self.return_probabilities = return_probabilities
+        self.kernel = None
+        if lgn_backend == 'grating' and cuda_lgn.available(cuda_lgn.GRATING):
+            self.kernel = cuda_lgn.GratingLGNKernel(
+                self.lgn.host_constants, seq_len=seq_len, pre_delay=pre_delay,
+                post_delay=post_delay, temporal_f=temporal_f, cpd=cpd, contrast=contrast,
+                rows=row_size, cols=col_size, theta_sign=1 if rotation == "cw" else -1,
+                theta_offset=180 if billeh_phase else 0, bmtk_compat=bmtk_compat)
+        self.use_movie_op = (self.kernel is None and lgn_backend != 'tensorflow'
+                             and self.lgn.movie_kernel(bmtk_compat) is not None)
+        self.backend = ('grating' if self.kernel is not None
+                        else 'movie' if self.use_movie_op else 'tensorflow')
+        self.uniform_dtype = dtype if self.backend == 'tensorflow' else tf.float32
 
-    def firing_rates(self, theta, phase):
-        """LGN firing rates in Hz, [seq_len, n_input], for one grating."""
+    def _as_batch(self, theta, phase):
+        """One grating's orientation and phase as the CUDA op's batch of one."""
+        return tuple(tf.reshape(tf.cast(value, self.dtype), (1,)) for value in (theta, phase))
+
+    def movie(self, theta, phase, dtype):
+        """The grating movie [seq_len, row_size, col_size, 1], gray before and after."""
         mov_theta = theta if self.rotation == "cw" else -theta  # flip the sign for ccw
         if self.billeh_phase:
             mov_theta += 180
         # Ensure theta is a Tensor to avoid tf.function retracing on Python scalars.
-        mov_theta = tf.cast(mov_theta, self.dtype)
+        mov_theta = tf.cast(mov_theta, dtype)
         movie = make_drifting_grating_stimulus(
             row_size=self.row_size, col_size=self.col_size, moving_flag=True,
             image_duration=self.duration, cpd=self.cpd, temporal_f=self.temporal_f,
-            theta=mov_theta, phase=phase, contrast=self.contrast, dtype=self.dtype)
-        # Add an empty gray screen period before and after the movie
-        videos = movies_concat(
-            tf.expand_dims(movie, axis=-1), self.pre_delay, self.post_delay, dtype=self.dtype
-        )
-        spatial = self.lgn.spatial_response(videos, self.bmtk_compat)
+            theta=mov_theta, phase=tf.cast(phase, dtype), contrast=self.contrast, dtype=dtype)
+        return movies_concat(tf.expand_dims(movie, axis=-1), self.pre_delay, self.post_delay,
+                             dtype=dtype)
+
+    def _batch_movie(self, theta, phase):
+        """The movies [batch, seq_len, row_size, col_size] of a batch of gratings in
+        `dtype`: the same frames as `movie`, rounded once from float64."""
+        mov_theta = tf.cast(theta, tf.float64) * (1 if self.rotation == "cw" else -1)
+        if self.billeh_phase:
+            mov_theta += 180
+        return drifting_grating_movies(
+            mov_theta, tf.cast(phase, tf.float64), self.duration, self.pre_delay,
+            self.post_delay, self.row_size, self.col_size, self.cpd, self.temporal_f,
+            self.contrast, self.dtype)
+
+    def firing_rates(self, theta, phase):
+        """LGN firing rates in Hz, [seq_len, n_input], for one grating."""
+        if self.kernel is not None:
+            rates = self.kernel.probabilities(*self._as_batch(theta, phase), rates=True)
+            return tf.cast(rates[0], self.dtype)
+        if self.use_movie_op:
+            return tf.cast(self.lgn.firing_rates(self._batch_movie(*self._as_batch(theta, phase)),
+                                                 self.bmtk_compat)[0], self.dtype)
+        spatial = self.lgn.spatial_response(self.movie(theta, phase, self.dtype), self.bmtk_compat)
         return self.lgn.firing_rates_from_spatial(*spatial)
+
+    def _probabilities(self, theta, phase):
+        """float32 spike probabilities [batch, seq_len, n_input] from a CUDA op."""
+        if self.kernel is not None:
+            return self.kernel.probabilities(theta, phase)
+        return self.lgn.firing_rates(self._batch_movie(theta, phase), self.bmtk_compat,
+                                     output='probabilities')
+
+    def _cuda_spikes(self, theta, phase, spike_seeds):
+        """Seeded spikes [batch, seq_len, n_input] from a CUDA op."""
+        if self.return_probabilities:
+            return _stateless_bernoulli(self._probabilities(theta, phase), spike_seeds)
+        if self.kernel is not None:
+            return self.kernel.spikes(theta, phase, spike_seeds, self.uniform_dtype)
+        batch = theta.shape[0]
+        if batch is None:  # only known at run time: one movie for the whole batch
+            return self.lgn.firing_rates(self._batch_movie(theta, phase), self.bmtk_compat,
+                                         output='spikes', spike_seeds=spike_seeds)
+        # One chunk of movie at a time (MovieLGNKernel.spikes), not the whole batch's.
+        return self.lgn.movie_kernel(self.bmtk_compat).spikes(
+            lambda begin, end: self._batch_movie(theta[begin:end], phase[begin:end]),
+            spike_seeds, batch=batch)
 
     def spikes(self, theta, phase, spike_seed=None, current_input=False):
         """LGN spikes (or the scaled spike probability for current input)."""
+        if self.backend != 'tensorflow':
+            theta, phase = self._as_batch(theta, phase)
+            if spike_seed is not None and not current_input:
+                return self._cuda_spikes(theta, phase, tf.reshape(spike_seed, (1, 2)))[0]
+            probability = self._probabilities(theta, phase)[0]
+            if current_input:
+                return tf.cast(probability * 1.3, self.dtype)
+            return tf.random.uniform(tf.shape(probability), dtype=self.uniform_dtype) < probability
         # Probability of having a spike before dt = 1 ms
         probability = 1 - tf.exp(-self.firing_rates(theta, phase) / 1000.)
         if current_input:
@@ -173,12 +303,27 @@ class DriftingGratingLGN:
             )
         return uniform < probability
 
+    def batch_probabilities(self, theta, phase):
+        """Spike probabilities [batch, seq_len, n_input] of a batch of gratings (float32 from the CUDA ops)."""
+        if self.backend != 'tensorflow':
+            return self._probabilities(theta[:, 0], phase)
+        return tf.map_fn(
+            lambda sample: 1 - tf.exp(-self.firing_rates(*sample) / 1000.),
+            (theta[:, 0], phase),
+            fn_output_signature=tf.TensorSpec((self.seq_len, self.n_input), self.dtype),
+            parallel_iterations=1,
+        )
+
     def batch_spikes(self, theta, phase, spike_seeds):
         """Spikes [batch, seq_len, n_input] for a batch of seeded gratings.
 
-        One sample at a time, so the filtering intermediates - about 0.5 GB
-        per sample in float16 - never exist for the whole batch at once.
+        The CUDA ops compare each sample's float32 stateless uniforms with its
+        probabilities in registers. Without them, one sample at a time, so the
+        filtering intermediates - about 0.5 GB per sample in float16 - never
+        exist for the whole batch at once.
         """
+        if self.backend != 'tensorflow':
+            return self._cuda_spikes(theta[:, 0], phase, spike_seeds)
         return tf.map_fn(
             lambda sample: self.spikes(*sample),
             (theta[:, 0], phase, spike_seeds),
@@ -218,7 +363,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
                                      current_input=False, regular=False, n_input=17400, dt=1,
                                      data_dir='GLIF_network_nll',
                                      bmtk_compat=True, return_firing_rates=False, rotation='cw', billeh_phase=False,
-                                     dtype=tf.float32, seed=None):
+                                     dtype=tf.float32, seed=None, lgn_backend='grating'):
     """ make a drifting gratings stimulus for FR and OSI tuning.
 
     If `seed` is provided, orientation/phase/spike sampling is stateless and reproducible.
@@ -227,7 +372,7 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
         seq_len, pre_delay, post_delay, n_input=n_input, data_dir=data_dir,
         temporal_f=temporal_f, cpd=cpd, contrast=contrast, row_size=row_size,
         col_size=col_size, rotation=rotation, billeh_phase=billeh_phase,
-        bmtk_compat=bmtk_compat, dtype=dtype)
+        bmtk_compat=bmtk_compat, dtype=dtype, lgn_backend=lgn_backend)
     duration = grating.duration
     base_seed = _stateless_seed_pair(seed, salt=1001)
 
@@ -281,12 +426,30 @@ def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, c
     return data_set
 
 
+def _lgn_output(lgn, movie, bmtk_compat, return_firing_rates, current_input, spike_seed,
+                lgn_backend):
+    """One movie's [seq_len, n_input] LGN rates, scaled probability (current
+    input) or spikes, through LGN.firing_rates: float32 probabilities and
+    uniforms, from the CUDA movie op unless `lgn_backend` is 'tensorflow'."""
+    if lgn_backend not in LGN_BACKENDS:
+        raise ValueError(f"lgn_backend must be one of {LGN_BACKENDS}, got {lgn_backend!r}")
+    use_cuda = lgn_backend != 'tensorflow'
+    if return_firing_rates:
+        return lgn.firing_rates(movie, bmtk_compat, use_cuda=use_cuda)
+    if current_input:
+        return lgn.firing_rates(movie, bmtk_compat, output='probabilities', use_cuda=use_cuda) * 1.3
+    if spike_seed is None:  # unseeded: a fresh stateful seed per sample
+        spike_seed = tf.random.uniform((2,), maxval=np.iinfo(np.int32).max, dtype=tf.int32)
+    return lgn.firing_rates(movie, bmtk_compat, output='spikes', spike_seeds=spike_seed,
+                            use_cuda=use_cuda)
+
+
 ### GRAY SCREEN STIMULUS GENERATION ###
 def generate_gray_screen_stimulus(seq_len=600, row_size=80, col_size=120,
                                   current_input=False, n_input=17400, dt=1,
                                   data_dir='GLIF_network_nll',
                                   bmtk_compat=True, return_firing_rates=False,
-                                  dtype=tf.float32, seed=None):
+                                  dtype=tf.float32, seed=None, lgn_backend='grating'):
     """
     Generate gray screen (spontaneous activity) stimulus for LGN.
 
@@ -305,6 +468,7 @@ def generate_gray_screen_stimulus(seq_len=600, row_size=80, col_size=120,
         return_firing_rates: If True, return firing rates instead of spike samples
         dtype: TensorFlow data type
         seed: Optional integer seed for reproducible stateless spike sampling
+        lgn_backend: one of LGN_BACKENDS; 'tensorflow' skips the CUDA movie op
 
     Returns:
         TensorFlow dataset yielding gray screen LGN activity
@@ -320,37 +484,10 @@ def generate_gray_screen_stimulus(seq_len=600, row_size=80, col_size=120,
                 sample_seed = _fold_in_seed(base_seed, sample_idx)
                 spike_seed = _fold_in_seed(sample_seed, 0)
 
-            # Create a gray screen (all zeros)
+            # A gray screen (all zeros)
             gray_screen = tf.zeros((seq_len, row_size, col_size, 1), dtype=dtype)
-
-            # Process through LGN spatial filters
-            spatial = lgn.spatial_response(gray_screen, bmtk_compat)
-            del gray_screen
-
-            # Get firing rates from spatial response
-            firing_rates = lgn.firing_rates_from_spatial(*spatial)
-
-            if return_firing_rates:
-                yield firing_rates
-            else:
-                del spatial
-                # Sample spikes from firing rates
-                # Assuming dt = 1 ms
-                _p = 1 - tf.exp(-firing_rates / 1000.)  # Probability of spike in dt
-                del firing_rates
-
-                if current_input:
-                    _z = _p * 1.3
-                else:
-                    if spike_seed is None:
-                        _z = tf.random.uniform(tf.shape(_p), dtype=dtype) < _p
-                    else:
-                        _z = tf.random.stateless_uniform(
-                            tf.shape(_p), seed=spike_seed, dtype=dtype
-                        ) < _p
-                del _p
-
-                yield _z
+            yield _lgn_output(lgn, gray_screen, bmtk_compat, return_firing_rates,
+                              current_input, spike_seed, lgn_backend)
             sample_idx += 1
 
     if return_firing_rates:
@@ -385,6 +522,7 @@ def load_or_compute_spontaneous_lgn_probabilities(
     bmtk_compat=True,
     seed=None,
     output_dtype=tf.float32,
+    lgn_backend='grating',
 ):
     """Load cached gray-screen LGN spike probabilities or compute and cache them."""
     cache_dir = os.path.join(data_dir, "tf_data")
@@ -408,6 +546,7 @@ def load_or_compute_spontaneous_lgn_probabilities(
                     bmtk_compat=bmtk_compat,
                     dtype=tf.float32,
                     seed=seed,
+                    lgn_backend=lgn_backend,
                 )
             )
         )
@@ -437,6 +576,7 @@ def load_or_compute_osi_dsi_lgn_probabilities(
     bmtk_compat=True,
     current_input=False,
     cache_prefix="osi_dsi_lgn_probabilities",
+    lgn_backend='grating',
 ):
     """Load cached OSI/DSI LGN spike probabilities or compute and cache them."""
     if angles is None:
@@ -457,7 +597,7 @@ def load_or_compute_osi_dsi_lgn_probabilities(
     current_key = "current" if current_input else "spikes"
     cache_file = os.path.join(
         cache_dir,
-        f"{cache_prefix}_n_input_{n_input}_seqlen_{osi_seq_len}_"
+        f"{cache_prefix}_{GRATING_LGN_VERSION}_n_input_{n_input}_seqlen_{osi_seq_len}_"
         f"pre_{pre_delay}_post_{post_delay}_rotation_{rotation}_"
         f"seed_{seed}_{current_key}_angles_{angle_key}.pkl",
     )
@@ -480,6 +620,7 @@ def load_or_compute_osi_dsi_lgn_probabilities(
             rotation=rotation,
             dtype=tf.float32,
             seed=seed,
+            lgn_backend=lgn_backend,
         )
 
         osi_dsi_data_set = iter(lgn_firing_rates)
@@ -487,7 +628,7 @@ def load_or_compute_osi_dsi_lgn_probabilities(
         for angle in angles:
             t0 = time()
             angle_lgn_firing_rates = next(osi_dsi_data_set)
-            lgn_prob = 1 - tf.exp(-tf.cast(angle_lgn_firing_rates, tf.float32) / 1000.0)
+            lgn_prob = -tf.math.expm1(-tf.cast(angle_lgn_firing_rates, tf.float32) / 1000.0)
             lgn_firing_probabilities_dict[int(angle)] = lgn_prob.numpy().astype(np.float32)
             print(f"Angle {angle} done.")
             print(f"    LGN running time: {time() - t0:.2f}s")
@@ -581,6 +722,7 @@ def generate_natural_scenes_stimulus(
     experiment_id=501498760,
     dtype=tf.float32,
     seed=None,
+    lgn_backend='grating',
 ):
     """
     Generate LGN responses from random natural scenes in Allen Brain Observatory.
@@ -606,6 +748,7 @@ def generate_natural_scenes_stimulus(
         experiment_id: Brain Observatory ophys experiment id for scene loading.
         dtype: TensorFlow dtype for floating outputs.
         seed: Optional integer seed for reproducible scene/spike sampling.
+        lgn_backend: One of LGN_BACKENDS; 'tensorflow' skips the CUDA movie op.
 
     Returns:
         tf.data.Dataset yielding:
@@ -670,23 +813,10 @@ def generate_natural_scenes_stimulus(
             img = tf.gather(resized_scenes, scene_id)  # [row, col, 1], values in [0, 255]
             movie = tf.tile(img[None, ...], (image_duration, 1, 1, 1))
             videos = movies_concat(movie, pre_delay=pre_delay, post_delay=post_delay, dtype=dtype)
-
-            spatial = lgn.spatial_response(videos, bmtk_compat)
-            firing_rates = lgn.firing_rates_from_spatial(*spatial)
-
-            if return_firing_rates:
-                out = tf.cast(firing_rates, dtype)
-            else:
-                p_spike = 1 - tf.exp(-firing_rates / 1000.0)
-                if current_input:
-                    out = tf.cast(p_spike * 1.3, dtype)
-                else:
-                    if spike_seed is None:
-                        out = tf.random.uniform(tf.shape(p_spike), dtype=dtype) < p_spike
-                    else:
-                        out = tf.random.stateless_uniform(
-                            tf.shape(p_spike), seed=spike_seed, dtype=dtype
-                        ) < p_spike
+            out = _lgn_output(lgn, videos, bmtk_compat, return_firing_rates,
+                              current_input, spike_seed, lgn_backend)
+            if return_firing_rates or current_input:
+                out = tf.cast(out, dtype)
 
             if return_scene_id:
                 yield out, scene_id

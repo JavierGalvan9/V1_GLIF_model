@@ -223,7 +223,12 @@ def _assert_backends_match(tmp_path, dtype, **cell_options):
     candidate = _cell(tmp_path / "candidate", backend="cuda", dtype=dtype,
                       **cell_options)
     generator = tf.random.Generator.from_seed(713)
-    inputs = generator.uniform((3, reference.input_dim), dtype=reference.compute_dtype)
+    # The spike-input contract is binary; the TensorFlow reference treats
+    # every positive entry as one spike, while CUDA consumes its value.
+    inputs = tf.cast(
+        generator.uniform((3, reference.input_dim), dtype=reference.compute_dtype) > 0.5,
+        reference.compute_dtype,
+    )
     state = list(reference.zero_state(3))
     state[0] = tf.cast(generator.uniform(state[0].shape) > 0.7, reference.compute_dtype)
     state[1] = generator.uniform(state[1].shape, -0.2, 1.2, dtype=state[1].dtype)

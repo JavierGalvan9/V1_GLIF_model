@@ -64,3 +64,39 @@ def test_external_gradients_match_independent_reference(batch, n_basis):
     np.testing.assert_allclose(
         weight_grad.numpy(), expected_weight_grad, rtol=3e-3, atol=1e-2
     )
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("batch", [3, 5, 7, 9, 31, 33])
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
+def test_short_row_activity_gradient_matches_reference(batch, resource_mode, monkeypatch):
+    """Odd batches with many short rows must retain dense and empty-row gradients."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    rng = np.random.default_rng(20261003)
+    n_pre, n_post = 4609, 127
+    pre = np.repeat(np.arange(n_pre - 1), 2)
+    post = rng.integers(n_post, size=pre.size)
+    types = rng.integers(3, size=pre.size)
+    order = np.lexsort((np.arange(pre.size), types, post, pre))
+    pre, post, types = pre[order], post[order], types[order]
+    connectivity = build_csr_connectivity(
+        np.stack((post, pre), axis=1), types, n_pre=n_pre, n_post=n_post,
+        weights_csr_ordered=True, needs_activity_backward=True,
+    )
+    weights = rng.normal(0, 0.1, pre.size).astype(np.float32)
+    basis = rng.normal(0, 0.1, (3, 4)).astype(np.float32)
+    upstream = rng.normal(0, 0.1, (batch, n_post, 4)).astype(np.float16)
+    activity = tf.Variable((rng.random((batch, n_pre)) < 0.03).astype(np.float16))
+    with tf.GradientTape() as tape:
+        currents = calculate_external_csr_currents(
+            activity, tf.constant(weights), tf.constant(basis), connectivity,
+            compute_activity_gradient=True, compute_weight_gradient=False,
+        )
+        loss = tf.reduce_sum(currents * tf.reshape(upstream, currents.shape))
+    actual = tape.gradient(loss, activity).numpy()
+    expected = np.zeros((batch, n_pre), np.float32)
+    for sample in range(batch):
+        projections = np.sum(upstream[sample, post].astype(np.float32) * basis[types], axis=1)
+        np.add.at(expected[sample], pre, projections * weights)
+    np.testing.assert_allclose(actual, expected.astype(np.float16), rtol=3e-3, atol=2e-5)
+    np.testing.assert_array_equal(actual[:, -1], 0)

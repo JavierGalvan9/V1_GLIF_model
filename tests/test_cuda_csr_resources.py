@@ -336,7 +336,7 @@ def test_recurrent_backward_is_refused_without_the_projection(monkeypatch):
 
     with pytest.raises(tf.errors.InvalidArgumentError, match="pair projection"):
         load_ops().v1_csr_backward_resource(
-            tf.zeros((32, 3)),
+            [tf.zeros((32, 3))],
             tf.zeros((32 * 2, 4)),
             tf.zeros((4,)),
             tf.zeros((1, 4)),

@@ -7,10 +7,13 @@ import tensorflow as tf
 from v1_model_utils.cuda_csr_recurrent.wrapper import (
     build_csr_connectivity,
     calculate_recurrent_csr_currents,
+    spike_queue,
 )
 
 
-@pytest.mark.parametrize("batch,n_basis", ((32, 4), (32, 3), (33, 5)))
+@pytest.mark.parametrize(
+    "batch,n_basis", ((1, 4), (32, 4), (32, 3), (33, 5), (64, 4), (65, 4), (130, 3))
+)
 def test_pair_projection_matches_independent_reference(batch, n_basis):
     rng = np.random.default_rng(20260902)
     n_pre, n_post, n_types = 7, 11, 3
@@ -75,3 +78,48 @@ def test_pair_projection_matches_independent_reference(batch, n_basis):
     np.testing.assert_allclose(
         weight_grad.numpy(), expected_weight_grad, rtol=3e-3, atol=1e-2
     )
+
+
+@pytest.mark.parametrize("slots", (2, 3))
+@pytest.mark.parametrize("dtype", (np.float16, np.float32))
+@pytest.mark.parametrize("batch", (1, 64, 65))
+def test_carried_queue_records_give_the_same_currents(batch, dtype, slots):
+    """Carried slot records replace sweeps only: same currents, and the newest
+    slot's record is the one spike_queue builds.
+
+    Every target receives at most two edges, so each current is a sum of at
+    most two terms, whose value does not depend on the order the forward's
+    atomics add them in: the currents are exactly reproducible.
+    """
+    rng = np.random.default_rng(20261001)
+    width, n_post, n_types = 40, 200, 3
+    n_pre = slots * width
+    post = rng.permutation(np.repeat(np.arange(n_post), 2))[: 3 * n_pre]
+    pre = np.sort(rng.integers(0, n_pre, post.size))
+    synapse_types = rng.integers(0, n_types, pre.size)
+    order = np.lexsort((np.arange(pre.size), synapse_types, post, pre))
+    connectivity = build_csr_connectivity(
+        np.stack((post[order], pre[order]), axis=1), synapse_types[order],
+        n_pre=n_pre, n_post=n_post, weights_csr_ordered=True,
+    )
+    history = tuple(
+        tf.constant((rng.random((batch, width)) < 0.3).astype(dtype)) for _ in range(slots)
+    )
+    weights = tf.constant(rng.normal(size=pre.size).astype(np.float32))
+    basis = tf.constant(rng.normal(size=(n_types, 4)).astype(np.float32))
+    plain = calculate_recurrent_csr_currents(history, weights, basis, 0.3, connectivity)
+    carried, record = calculate_recurrent_csr_currents(
+        history, weights, basis, 0.3, connectivity,
+        queues=tuple(spike_queue(slot) for slot in history[1:]),
+    )
+    np.testing.assert_array_equal(carried.numpy().view(np.uint8), plain.numpy().view(np.uint8))
+    # A record: the active entries (room for batch * width), their count, the
+    # batch + 1 sample starts. The room past the count is unused.
+    capacity = batch * width
+
+    def valid(words):
+        count = int(words[capacity])
+        return words[:count], words[capacity:]
+
+    for got, want in zip(valid(record.numpy()), valid(spike_queue(history[0]).numpy())):
+        np.testing.assert_array_equal(got, want)

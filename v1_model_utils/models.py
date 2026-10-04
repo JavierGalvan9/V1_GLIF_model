@@ -1,13 +1,16 @@
 import contextlib
 import math
+from typing import NamedTuple
 import numpy as np
 import tensorflow as tf
 import os
 import pickle as pkl
 from .cuda_csr_recurrent import (
+    MAX_SPIKE_SLOTS,
     accumulate_recurrent_weight_gradient,
     build_csr_connectivity,
     calculate_recurrent_csr_currents,
+    spike_queue,
 )
 from .cuda_csr_external import (
     build_csr_connectivity as build_external_csr_connectivity,
@@ -50,6 +53,47 @@ def sample_poisson_counts(cdf_levels, shape, seed, dtype):
     uniform = tf.random.stateless_uniform(shape, seed=seed, dtype=tf.float64)
     counts = tf.searchsorted(cdf_levels, tf.reshape(uniform, [-1]), side="right")
     return tf.cast(tf.reshape(counts, shape), dtype)
+
+
+def sample_bkg_activity(cell, batch_size, noise_step):
+    """This step's [batch, n_bkg] Poisson counts of a V1Column's background sources.
+
+    The seed is [int32(cell.noise_seed) + replica_id * 1000003, int32(noise_step[0])].
+    With the CUDA current backend the counts come from the cuda_bkg_noise op,
+    bitwise equal to ``sample_poisson_counts`` with that seed but computed on
+    the device: the int64 seed variable is read by the kernel and the int32
+    step and replica id stay on the host, so no timestep copies anything
+    across PCIe. Otherwise, or when the op is unavailable, TensorFlow samples
+    them. Counts are small integers, exact in fp16, so the CUDA path returns the
+    compute dtype directly (int32 otherwise).
+
+    A module function reading only the cell attributes it needs, so a stand-in
+    cell (tests) works too.
+    """
+    replica_context = tf.distribute.get_replica_context()
+    if replica_context is None:
+        replica_id = tf.constant(0, dtype=tf.int32)
+    else:
+        replica_id = tf.cast(replica_context.replica_id_in_sync_group, tf.int32)
+    poisson_shape = tf.stack(
+        [tf.cast(batch_size, tf.int32), tf.cast(cell.bkg_input_dense_shape[1], tf.int32)],
+        axis=0,
+    )
+    cuda = cell._synaptic_current_backend == "cuda"
+    dtype = cell.compute_dtype if cuda else tf.int32
+    if cuda:
+        from . import cuda_bkg_noise
+
+        if cuda_bkg_noise.available():
+            return cuda_bkg_noise.bkg_poisson_counts(
+                cell.noise_seed, replica_id, noise_step, poisson_shape, cell.bkg_count_cdf, dtype
+            )
+    step_seed = tf.cast(tf.reshape(noise_step, (-1,))[0], tf.int32)
+    base_seed = tf.cast(cell.noise_seed, tf.int32)
+    noise_seed = tf.stack(
+        [base_seed + replica_id * tf.constant(1000003, dtype=tf.int32), step_seed], axis=0
+    )
+    return sample_poisson_counts(cell.bkg_count_cdf, poisson_shape, noise_seed, dtype)
 
 
 def _keras_op(name, tensorflow_op):
@@ -691,6 +735,17 @@ class ClipConstraint(tf.keras.constraints.Constraint):
 
     def __call__(self, w):
         return tf.clip_by_value(w, self._lower_limit, self._upper_limit)
+
+
+class SpikeHistory(NamedTuple):
+    """The loop form of the spike history with CUDA recurrent currents: the
+    delay slots, newest first, and the queue records of slots 1 to D - 1, which
+    the step's recurrent op takes instead of sweeping them
+    (calculate_recurrent_csr_currents' `queues`). The op builds only the
+    newest slot's record, which becomes the next step's slot-1 record."""
+
+    slots: tuple
+    queues: tuple
 
 
 class V1Column(tf.keras.layers.Layer):
@@ -1488,31 +1543,35 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
+    def _fused_bkg_inputs(self, batch_size, noise_step):
+        """The BKG activity and connectivity when the GLIF op gathers the BKG
+        current itself (update_glif_state's `bkg`), else None.
+
+        That needs the CUDA state and current backends, the fixed-four BKG
+        gather, per-tensor (not per-GPU resource) connectivity, no BKG activity
+        gradient, and no lr_scale applied after the sources are summed.
+        """
+        if self._state_backend != "cuda" or self._synaptic_current_backend != "cuda":
+            return None
+        from .cuda_csr_external.wrapper import uses_bkg_gather
+
+        connectivity = self.bkg_input_csr
+        if (self._scales_recurrent_inputs
+                or getattr(self, "_compute_bkg_activity_gradient", False)
+                or connectivity.resource_name is not None
+                or not uses_bkg_gather(connectivity, self.synaptic_basis_weights)):
+            return None
+        return dict(
+            activity=tf.stop_gradient(sample_bkg_activity(self, batch_size, noise_step)),
+            weights=tf.cast(self.bkg_input_weights, self.variable_dtype),
+            basis=tf.cast(self.synaptic_basis_weights, tf.float32),
+            connectivity=connectivity,
+            trainable=self.bkg_input_weights.trainable,
+        )
+
     def calculate_noise_current(self, batch_size, noise_step, initial=None):
         n_post_neurons = self.bkg_input_dense_shape[0]
-        step_seed = tf.cast(tf.reshape(noise_step, (-1,))[0], tf.int32)
-        base_seed = tf.cast(self.noise_seed, tf.int32)
-        replica_context = tf.distribute.get_replica_context()
-        if replica_context is None:
-            replica_id = tf.constant(0, dtype=tf.int32)
-        else:
-            replica_id = tf.cast(replica_context.replica_id_in_sync_group, tf.int32)
-        noise_seed = tf.stack(
-            [base_seed + replica_id * tf.constant(1000003, dtype=tf.int32), step_seed],
-            axis=0,
-        )
-        poisson_shape = tf.stack(
-            [tf.cast(batch_size, tf.int32), tf.cast(self.bkg_input_dense_shape[1], tf.int32)],
-            axis=0,
-        )
-        rest_of_brain = sample_poisson_counts(
-            self.bkg_count_cdf,
-            poisson_shape,
-            noise_seed,
-            # Counts are small integers, exact in fp16, so the CUDA path takes the
-            # compute dtype directly and saves a per-step cast kernel.
-            self.compute_dtype if self._synaptic_current_backend == "cuda" else tf.int32,
-        )
+        rest_of_brain = sample_bkg_activity(self, batch_size, noise_step)
 
         if self._synaptic_current_backend == "cuda":
             activity = rest_of_brain
@@ -1582,7 +1641,9 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
-    def calculate_i_rec_with_custom_grad(self, rec_z_buf, initial=None):
+    def calculate_i_rec_with_custom_grad(self, rec_z_buf, initial=None, queues=None):
+        """The recurrent currents; with `queues` (CUDA backend only),
+        `(currents, record)` as calculate_recurrent_csr_currents returns them."""
 
         # Calculate recurrent currents with the selected fused CUDA or reference
         # TensorFlow implementation.
@@ -1594,10 +1655,11 @@ class V1Column(tf.keras.layers.Layer):
                 self._recurrent_dampening,
                 self.recurrent_csr,
                 initial=initial,
+                queues=queues,
             )
         else:
             i_rec_flat = calculate_synaptic_currents(
-                rec_z_buf,
+                tf.concat(rec_z_buf, axis=1) if isinstance(rec_z_buf, tuple) else rec_z_buf,
                 self.recurrent_indices,
                 self.recurrent_weight_values,
                 tf.cast(self.recurrent_weight_values, self.compute_dtype),
@@ -1722,6 +1784,33 @@ class V1Column(tf.keras.layers.Layer):
             state_size += (1,)
         return state_size
 
+    # The spike history is one [batch, max_delay * n_neurons] state tensor,
+    # newest delay slot first, wherever the state is visible: zero_state,
+    # checkpoints, the states a rollout returns and takes. Inside the RNN loop
+    # it is carried instead as a tuple of max_delay [batch, n_neurons] slot
+    # tensors (the loop form), so shifting the history each step relabels
+    # tensors and copies nothing: the new spikes become the first slot and
+    # the oldest slot is dropped. `call` accepts either form and returns the
+    # form it was given; the loop converts once per rollout, at its ends.
+    def to_loop_state(self, state):
+        """Split the spike history into its delay slots (the loop form).
+
+        With CUDA recurrent currents the loop form is a SpikeHistory that also
+        carries the queue records of slots 1 to D - 1, built here once per
+        rollout; each step then sweeps only its newest slot.
+        """
+        state = tuple(state)
+        slots = tuple(tf.split(state[0], self.max_delay, axis=1))
+        if self._synaptic_current_backend == "cuda" and 1 < self.max_delay <= MAX_SPIKE_SLOTS:
+            slots = SpikeHistory(slots, tuple(spike_queue(slot) for slot in slots[1:]))
+        return (slots,) + state[1:]
+
+    def from_loop_state(self, state):
+        """Concatenate the delay slots back into the spike history tensor."""
+        state = tuple(state)
+        slots = state[0].slots if isinstance(state[0], SpikeHistory) else state[0]
+        return (tf.concat(slots, axis=1),) + state[1:]
+
     def zero_state(self, batch_size, dtype=tf.float32):
         # The spike and synaptic buffers follow compute_dtype to control VRAM;
         # the membrane and ASC state are float32 under any policy (see __init__).
@@ -1775,8 +1864,17 @@ class V1Column(tf.keras.layers.Layer):
 
         batch_size = tf.cast(tf.shape(inputs)[0], dtype=tf.int64)
 
-        # Extract the network variables from the state
+        # Extract the network variables from the state. The spike history comes
+        # as the tensor or as its delay slots (see to_loop_state); the step
+        # works on the slots, and the next history leaves in the form given.
         z_buf, v, r, asc, psc_rise, psc, noise_step = state[:7]
+        queues = None
+        if isinstance(z_buf, SpikeHistory):
+            z_buf, queues = z_buf.slots, tuple(z_buf.queues)
+        buffered = not isinstance(z_buf, (tuple, list))
+        z_slots = (
+            tuple(tf.split(z_buf, self.max_delay, axis=1)) if buffered else tuple(z_buf)
+        )
         # Afferent delay: the LGN frame that acts on this timestep was emitted
         # `_lgn_delay_steps - 1` steps ago. Newest frame first, as for z_buf.
         if self._lgn_delay_buffer_width:
@@ -1791,23 +1889,29 @@ class V1Column(tf.keras.layers.Layer):
             if self._track_voltage_penalty
             else None
         )
-        # Get previous spikes
-        prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
-
         # Accumulate every current source into one buffer. Each CSR operator
         # already scatters with atomics, so seeding it with the previous source's
         # output removes a full pass over a [batch * n_neurons, n_syn_basis]
         # tensor per source - the largest elementwise traffic in the step.
         if self._chain_current_sources:
-            rec_inputs = self.calculate_i_rec_with_custom_grad(z_buf)
+            rec_inputs = self.calculate_i_rec_with_custom_grad(z_slots, queues=queues)
+            if queues is not None:
+                rec_inputs, newest_queue = rec_inputs
             rec_inputs = self.calculate_input_current_from_spikes(
                 lgn_input, initial=rec_inputs
             )
-            rec_inputs = self.calculate_noise_current(
-                batch_size, noise_step, initial=rec_inputs
-            )
+            # The GLIF op gathers the BKG current itself when it can, saving a
+            # read and a write of the whole [batch * neurons, 4] current per step.
+            fused_bkg = self._fused_bkg_inputs(batch_size, noise_step)
+            if fused_bkg is None:
+                rec_inputs = self.calculate_noise_current(
+                    batch_size, noise_step, initial=rec_inputs
+                )
         else:
-            i_rec = self.calculate_i_rec_with_custom_grad(z_buf)
+            fused_bkg = None
+            i_rec = self.calculate_i_rec_with_custom_grad(z_slots, queues=queues)
+            if queues is not None:
+                i_rec, newest_queue = i_rec
             if self._current_input:
                 external_current = self.calculate_input_current_from_firing_probabilities(lgn_input)
             else:
@@ -1826,14 +1930,18 @@ class V1Column(tf.keras.layers.Layer):
         if self._state_backend == "cuda":
             from .cuda_glif_state import update_glif_state
 
-            # One fused op also thresholds the membrane, shifts the spike
-            # history and, when voltage sequences are returned, writes the
-            # compute-dtype copy of the membrane they expose.
-            new_z, exposed_v, transition_state = update_glif_state(
-                z_buf, v, r, asc, psc_rise, psc, rec_inputs, cell=self
+            # One fused op also thresholds the membrane and, when voltage
+            # sequences are returned, writes the compute-dtype copy of the
+            # membrane they expose; the adapter shifts the slots.
+            # The op also advances the online voltage penalty on the membrane
+            # still in registers (None when the cell does not track it).
+            new_z, exposed_v, transition_state, *advanced = update_glif_state(
+                z_slots, v, r, asc, psc_rise, psc, rec_inputs, cell=self,
+                penalty_acc=voltage_penalty, bkg=fused_bkg,
             )
+            new_voltage_penalty = advanced[0] if advanced else None
             (
-                new_z_buf,
+                new_z_slots,
                 new_v,
                 new_r,
                 new_asc,
@@ -1841,7 +1949,8 @@ class V1Column(tf.keras.layers.Layer):
                 new_psc,
             ) = transition_state
         else:
-            prev_z = z_buf[:, :self._n_neurons] # Shape: [batch_size, n_neurons]
+            new_voltage_penalty = None
+            prev_z = z_slots[0] # Shape: [batch_size, n_neurons]
             new_v, new_r, new_asc, new_psc_rise, new_psc = self._dense_update_impl(
                 batch_size, prev_z, v, r, asc, psc_rise, psc, rec_inputs
             )
@@ -1867,10 +1976,8 @@ class V1Column(tf.keras.layers.Layer):
                 self.compute_dtype,
             )
 
-            # Add current spikes to the buffer
-            new_z_buf = tf.concat(
-                [new_z, z_buf[:, :-self._n_neurons]], axis=1
-            )
+            # The spikes become the newest slot; the oldest one is dropped.
+            new_z_slots = (new_z,) + z_slots[:-1]
             # The float32 membrane stays in the state; the exposed voltage
             # sequence is stacked over time, so it keeps the compute dtype of
             # the spikes.
@@ -1902,6 +2009,10 @@ class V1Column(tf.keras.layers.Layer):
         else:
             outputs = visible_z
         new_noise_step = noise_step + 1
+        new_z_buf = tf.concat(new_z_slots, axis=1) if buffered else new_z_slots
+        if queues is not None:
+            # This step's newest slot is the next step's second one.
+            new_z_buf = SpikeHistory(new_z_slots, (newest_queue,) + queues[:-1])
         new_state = (new_z_buf, new_v, new_r, new_asc, new_psc_rise, new_psc, new_noise_step)
         if self._lgn_delay_buffer_width:
             new_state += (new_lgn_buf,)
@@ -1910,8 +2021,10 @@ class V1Column(tf.keras.layers.Layer):
             # whereas the neuron reduction naturally returns [batch].  Adding
             # those tensors directly broadcasts to [batch, batch] for batches
             # larger than one and violates the RNN loop's shape invariant.
-            penalty_step = self._voltage_penalty_mean_step(new_v)[:, None]
-            new_state += (voltage_penalty + penalty_step,)
+            if new_voltage_penalty is None:
+                penalty_step = self._voltage_penalty_mean_step(new_v)[:, None]
+                new_voltage_penalty = voltage_penalty + penalty_step
+            new_state += (new_voltage_penalty,)
 
         return outputs, new_state
 
@@ -2037,8 +2150,11 @@ class HeterogeneousStateRNN(tf.keras.layers.RNN):
         ANDs the two equal bounds on the GPU and copies the result back to the
         host every timestep, so the host cannot launch timestep t + 1 until
         timestep t has drained: 135 ms of a 2.73 s training step at 203,816
-        neurons (Experiments/forward_loop_host_gaps_20260928). Everything else
-        is Keras' own loop.
+        neurons (Experiments/forward_loop_host_gaps_20260928).
+
+        A cell with ``to_loop_state``/``from_loop_state`` (V1Column) carries
+        its state in that loop form between timesteps and converts at the ends
+        of the loop. Everything else is Keras' own loop.
         """
         if mask is not None or self.go_backwards or self.unroll:
             raise NotImplementedError(
@@ -2052,35 +2168,67 @@ class HeterogeneousStateRNN(tf.keras.layers.RNN):
         inputs = swap_batch_time(sequences)
         time_steps = inputs.shape[0] or tf.shape(inputs)[0]
         input_array = tf.TensorArray(inputs.dtype, size=time_steps).unstack(inputs)
+        loop_form = hasattr(self.cell, "to_loop_state")
+        states = (
+            self.cell.to_loop_state(initial_state) if loop_form else tuple(initial_state)
+        )
         # One traced call fixes the output structure; its result is unused and
         # pruned from the graph, as in Keras.
-        output_zero, _ = self.cell(inputs[0], tuple(initial_state), **cell_kwargs)
-        output_arrays = tuple(
-            tf.TensorArray(
-                output.dtype,
-                size=time_steps if self.return_sequences else 1,
-                element_shape=output.shape,
-            )
+        output_zero, _ = self.cell(inputs[0], states, **cell_kwargs)
+        # Sequences are pushed onto a TensorList rather than written at
+        # ``time``: the gradient of a write reads the upstream gradient at the
+        # recorded index, so TensorFlow stacks the int32 index for the backward
+        # pass and copies it to the host every timestep, and the host cannot
+        # launch the GLIF backward until the GPU has drained. The gradient of a
+        # push pops, which needs no index. The last-output array keeps index 0.
+        output_specs = [
+            (output.dtype, [-1 if size is None else size for size in output.shape])
             for output in tf.nest.flatten(output_zero)
-        )
-
-        def step(time, output_arrays, *states):
-            output, new_states = self.cell(input_array.read(time), states, **cell_kwargs)
-            index = time if self.return_sequences else 0
-            output_arrays = tuple(
-                array.write(index, value)
-                for array, value in zip(output_arrays, tf.nest.flatten(output))
+        ]
+        if self.return_sequences:
+            collections = tuple(
+                tf.raw_ops.EmptyTensorList(
+                    element_shape=shape, max_num_elements=-1, element_dtype=dtype
+                )
+                for dtype, shape in output_specs
             )
-            return (time + 1, output_arrays, *tf.nest.flatten(new_states))
+        else:
+            collections = tuple(
+                tf.TensorArray(dtype, size=1, element_shape=shape) for dtype, shape in output_specs
+            )
 
-        _, output_arrays, *states = tf.while_loop(
+        def step(time, collections, states):
+            output, new_states = self.cell(input_array.read(time), states, **cell_kwargs)
+            collections = tuple(
+                tf.raw_ops.TensorListPushBack(input_handle=collection, tensor=value)
+                if self.return_sequences
+                else collection.write(0, value)
+                for collection, value in zip(collections, tf.nest.flatten(output))
+            )
+            new_states = tf.nest.pack_sequence_as(states, tf.nest.flatten(new_states))
+            return (time + 1, collections, new_states)
+
+        _, collections, states = tf.while_loop(
             lambda time, *_: time < time_steps,
             step,
-            (tf.constant(0), output_arrays, *initial_state),
+            (tf.constant(0), collections, states),
             parallel_iterations=32,
             swap_memory=True,
         )
-        outputs = [swap_batch_time(array.stack()) for array in output_arrays]
+        states = list(self.cell.from_loop_state(states) if loop_form else states)
+        if self.return_sequences:
+            stacked = [
+                tf.raw_ops.TensorListStack(
+                    input_handle=collection,
+                    element_shape=shape,
+                    element_dtype=dtype,
+                    num_elements=inputs.shape[0] or -1,
+                )
+                for collection, (dtype, shape) in zip(collections, output_specs)
+            ]
+        else:
+            stacked = [collection.stack() for collection in collections]
+        outputs = [swap_batch_time(output) for output in stacked]
         last_output = [output[:, -1] for output in outputs]
         return (
             tf.nest.pack_sequence_as(output_zero, last_output),
@@ -2490,6 +2638,39 @@ class SegmentedRecomputeRunner:
             packed, width, dtype, self._PACKED_SPIKES_PER_WORD
         )
 
+    # TensorFlow has GPU TensorList kernels for no 8- or 16-bit integer, so a
+    # chunk checkpoint of such a state (the int8 refractory counter) would be
+    # staged through host memory: at batch 64, a 13 MB device->host->device
+    # round trip per chunk that stalls the chunk loops. The checkpoint stores it
+    # as the narrowest float that holds every value exactly instead (fp16 up to
+    # 2**11, fp32 up to 2**24); the loop-carried state keeps its own dtype.
+    _CHECKPOINT_FLOAT = {
+        tf.int8: tf.float16, tf.uint8: tf.float16,
+        tf.int16: tf.float32, tf.uint16: tf.float32,
+    }
+
+    def _checkpoint_dtype(self, index, dtype):
+        if self.pack_spike_checkpoints and index == 0:
+            return tf.int32
+        return self._CHECKPOINT_FLOAT.get(dtype, dtype)
+
+    def _encode_checkpoint(self, index, value):
+        if self.pack_spike_checkpoints and index == 0:
+            return self._pack_spikes(value)
+        if value.dtype in self._CHECKPOINT_FLOAT:
+            return tf.cast(value, self._CHECKPOINT_FLOAT[value.dtype])
+        return value
+
+    def _decode_checkpoint(self, index, value, like):
+        if self.pack_spike_checkpoints and index == 0:
+            width = like.shape[-1]
+            if width is None:
+                raise ValueError(
+                    "Packed spike checkpoints require a static spike-state width."
+                )
+            return self._unpack_spikes(value, width, like.dtype)
+        return tf.cast(value, like.dtype) if value.dtype != like.dtype else value
+
     def _run_chunk(self, inputs, *state):
         outputs = self.core_model([inputs, *state])
         return tuple(tf.nest.flatten(outputs))
@@ -2530,7 +2711,7 @@ class SegmentedRecomputeRunner:
         )
         state_arrays = tuple(
             tf.TensorArray(
-                dtype=(tf.int32 if self.pack_spike_checkpoints and index == 0 else value.dtype),
+                dtype=self._checkpoint_dtype(index, value.dtype),
                 size=self.n_chunks,
                 clear_after_read=True,
             )
@@ -2540,12 +2721,7 @@ class SegmentedRecomputeRunner:
         def run_full_chunk(chunk_index, arrays, states, history):
             chunk = self._slice_chunk(inputs, chunk_index, self.chunk_size, time_check)
             history = tuple(
-                array.write(
-                    chunk_index,
-                    self._pack_spikes(value)
-                    if self.pack_spike_checkpoints and index == 0
-                    else value,
-                )
+                array.write(chunk_index, self._encode_checkpoint(index, value))
                 for index, (array, value) in enumerate(zip(history, states))
             )
             flat_outputs = self._run_chunk(chunk, *states)
@@ -2569,12 +2745,7 @@ class SegmentedRecomputeRunner:
         if self.remainder_size:
             remainder_index = tf.constant(self.n_full_chunks)
             state_arrays = tuple(
-                array.write(
-                    remainder_index,
-                    self._pack_spikes(value)
-                    if self.pack_spike_checkpoints and index == 0
-                    else value,
-                )
+                array.write(remainder_index, self._encode_checkpoint(index, value))
                 for index, (array, value) in enumerate(zip(state_arrays, state))
             )
             chunk = self._slice_chunk(
@@ -2652,19 +2823,9 @@ class SegmentedRecomputeRunner:
             start = chunk_index * self.chunk_size
             chunk = self._slice_chunk(inputs, chunk_index, chunk_length)
             boundary_state = tuple(
-                array.read(chunk_index) for array in state_arrays
+                self._decode_checkpoint(index, array.read(chunk_index), like)
+                for index, (array, like) in enumerate(zip(state_arrays, final_state))
             )
-            if self.pack_spike_checkpoints:
-                spike_width = final_state[0].shape[-1]
-                if spike_width is None:
-                    raise ValueError(
-                        "Packed spike checkpoints require a static spike-state width."
-                    )
-                boundary_state = (
-                    self._unpack_spikes(
-                        boundary_state[0], spike_width, final_state[0].dtype
-                    ),
-                ) + boundary_state[1:]
             differentiable_state_indices = tuple(
                 index for index, value in enumerate(boundary_state)
                 if value.dtype.is_floating or value.dtype.is_complex

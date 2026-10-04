@@ -121,10 +121,12 @@ Status ValidateMetadata(const V1CsrResource& resource) {
   return OkStatus();
 }
 
+// `values` is the [batch, n_pre] shape of the activity (the spike slots side
+// by side for the recurrent ops).
 Status ValidateRuntimeInputs(const V1CsrResource& resource,
-                             const Tensor& values, const Tensor& weights,
+                             const TensorShape& values, const Tensor& weights,
                              const Tensor& basis, int n_post, int n_edges) {
-  if (!TensorShapeUtils::IsMatrix(values.shape()) ||
+  if (!TensorShapeUtils::IsMatrix(values) ||
       !TensorShapeUtils::IsMatrix(basis.shape())) {
     return errors::InvalidArgument("activity and basis must be rank two");
   }
@@ -199,22 +201,31 @@ class V1CsrForwardResourceOp : public OpKernel {
                                 DeviceResourceName(context, resource_name_),
                                 &resource));
     core::ScopedUnref resource_unref(resource);
-    const Tensor& spikes = context->input(0);
-    const Tensor& weights = context->input(1);
-    const Tensor& basis = context->input(2);
-    const Tensor& initial = context->input(3);
+    OpInputList spike_slots;
+    OP_REQUIRES_OK(context, context->input_list("spikes", &spike_slots));
+    SpikeMatrix<const T*> spikes;
+    OP_REQUIRES_OK(context, ReadSpikeSlots<T>(spike_slots, &spikes));
+    // The named inputs follow the spike list.
+    const int first = spike_slots.size() - 1;
+    const Tensor& weights = context->input(first + 1);
+    const Tensor& basis = context->input(first + 2);
+    const int initial_index = first + 3;
+    const Tensor& initial = context->input(initial_index);
+    QueueRecords carried;
+    unsigned int* newest;
+    OP_REQUIRES_OK(context, ReadQueueRecords<T>(context, spikes, initial_index + 1, &carried,
+                                                &newest));
     const Tensor& posts = resource->post_ids;
     const Tensor& types = resource->synapse_types;
     const Tensor& rows = resource->row_splits;
     const Tensor& edges = resource->edge_ids;
     OP_REQUIRES_OK(context, ValidateRuntimeInputs(
-                                *resource, spikes, weights, basis, n_post_,
+                                *resource, TensorShape({spikes.batch, spikes.n_pre()}),
+                                weights, basis, n_post_,
                                 resource->post_ids.NumElements()));
-    OP_REQUIRES(context, spikes.dims() == 2,
-                errors::InvalidArgument("spikes must be rank two"));
     Tensor* output;
     const TensorShape shape(
-        {spikes.dim_size(0) * n_post_, basis.dim_size(1)});
+        {spikes.batch * n_post_, basis.dim_size(1)});
     const bool accumulate = initial.NumElements() > 0;
     OP_REQUIRES(
         context, !accumulate || initial.shape() == shape,
@@ -226,7 +237,7 @@ class V1CsrForwardResourceOp : public OpKernel {
       // [batch * n_post, n_basis] tensor per current source, which is the
       // largest elementwise traffic in the step.
       OP_REQUIRES_OK(context,
-                     context->forward_input_or_allocate_output({3}, 0, shape,
+                     context->forward_input_or_allocate_output({initial_index}, 0, shape,
                                                                &output));
       if (output->flat<T>().data() != initial.flat<T>().data()) {
         cudaMemcpyAsync(output->flat<T>().data(), initial.flat<T>().data(),
@@ -234,20 +245,21 @@ class V1CsrForwardResourceOp : public OpKernel {
                         cudaMemcpyDeviceToDevice, device.stream());
       }
     } else {
+      // Left uninitialized: LaunchForward zeroes it or writes all of it.
       OP_REQUIRES_OK(context, context->allocate_output(0, shape, &output));
-      cudaMemsetAsync(output->flat<T>().data(), 0,
-                      output->NumElements() * sizeof(T), device.stream());
     }
     if (basis.dim_size(1) == 4) {
       OP_REQUIRES_OK(context, LaunchForward<T, W, 4>(
                                   context, spikes, weights, posts, types,
                                   rows, edges, basis, n_post_, aggregate_runs_,
-                                  output));
+                                  output, !accumulate,
+                                  &tile_segments_, carried, newest));
     } else {
       OP_REQUIRES_OK(context, LaunchForward<T, W, 0>(
                                   context, spikes, weights, posts, types,
                                   rows, edges, basis, n_post_, aggregate_runs_,
-                                  output));
+                                  output, !accumulate,
+                                  &tile_segments_, carried, newest));
     }
   }
 
@@ -255,6 +267,7 @@ class V1CsrForwardResourceOp : public OpKernel {
   int n_post_;
   string resource_name_;
   bool aggregate_runs_ = true;
+  ForwardTileCache tile_segments_;
 };
 
 template <typename T>
@@ -278,7 +291,7 @@ class BkgCsrForwardResourceOp : public OpKernel {
     const Tensor& basis = context->input(2);
     const Tensor& initial = context->input(3);
     OP_REQUIRES_OK(context, ValidateRuntimeInputs(
-                                *resource, activity, weights, basis, n_post_,
+                                *resource, activity.shape(), weights, basis, n_post_,
                                 resource->post_ids.NumElements()));
     OP_REQUIRES(context, basis.dim_size(1) == 4,
                 errors::InvalidArgument("basis must have four columns"));
@@ -336,29 +349,33 @@ class V1CsrBackwardResourceOp : public OpKernel {
                                 DeviceResourceName(context, resource_name_),
                                 &resource));
     core::ScopedUnref resource_unref(resource);
-    const Tensor& spikes = context->input(0);
-    const Tensor& current_grad = context->input(1);
-    const Tensor& weights = context->input(2);
-    const Tensor& basis = context->input(3);
-    const Tensor& dampening = context->input(4);
+    OpInputList spike_slots;
+    OP_REQUIRES_OK(context, context->input_list("spikes", &spike_slots));
+    SpikeMatrix<const T*> spikes;
+    OP_REQUIRES_OK(context, ReadSpikeSlots<T>(spike_slots, &spikes));
+    // The named inputs follow the spike list.
+    const int first = spike_slots.size() - 1;
+    const Tensor& current_grad = context->input(first + 1);
+    const Tensor& weights = context->input(first + 2);
+    const Tensor& basis = context->input(first + 3);
+    const Tensor& dampening = context->input(first + 4);
     const Tensor& posts = resource->post_ids;
     const Tensor& types = resource->synapse_types;
     const Tensor& rows = resource->row_splits;
     const Tensor& edges = resource->edge_ids;
     const Tensor& nonempty = resource->nonempty_rows;
     OP_REQUIRES_OK(context, ValidateRuntimeInputs(
-                                *resource, spikes, weights, basis, n_post_,
-                                n_edges_));
+                                *resource, TensorShape({spikes.batch, spikes.n_pre()}),
+                                weights, basis, n_post_, n_edges_));
     OP_REQUIRES(context,
                 TensorShapeUtils::IsMatrix(current_grad.shape()) &&
-                    current_grad.dim_size(0) == spikes.dim_size(0) * n_post_ &&
+                    current_grad.dim_size(0) == spikes.batch * n_post_ &&
                     current_grad.dim_size(1) == basis.dim_size(1),
                 errors::InvalidArgument("current_grad has an incompatible shape"));
     OP_REQUIRES(context, TensorShapeUtils::IsScalar(dampening.shape()),
                 errors::InvalidArgument("dampening must be scalar"));
-    Tensor* spike_grad;
-    OP_REQUIRES_OK(context,
-                   context->allocate_output(0, spikes.shape(), &spike_grad));
+    SpikeSlots<T*> spike_grad;
+    OP_REQUIRES_OK(context, AllocateSpikeGradients<T>(context, spike_slots, spikes, &spike_grad));
     // The same launcher as the tensor backend: unless it accumulates, it clears
     // what it does not write, and it needs the per-edge pair projection.
     OP_REQUIRES(
@@ -374,7 +391,7 @@ class V1CsrBackwardResourceOp : public OpKernel {
       nonempty, basis, dampening, resource->pair_ids, resource->pair_posts,     \
       resource->pair_types, n_post_, spike_grad, weight_grad, kAccumulate)
     OP_REQUIRES_OK(context, WithWeightGradBuffer<kAccumulate>(
-                                context, 5, n_edges_, [&](Tensor* weight_grad) {
+                                context, first + 5, n_edges_, [&](Tensor* weight_grad) {
                                   return basis.dim_size(1) == 4 ? LAUNCH_BACKWARD(4)
                                                                 : LAUNCH_BACKWARD(0);
                                 }));

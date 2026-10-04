@@ -24,6 +24,22 @@ _OPS = None
 _WEIGHT_GRADIENT_ACCUMULATOR = threading.local()
 
 
+def empty_metadata(dtype):
+    """An empty metadata field, placed on the GPU like the non-empty ones.
+
+    TensorFlow has no GPU kernel that fills a uint32 tensor, so
+    ``tf.zeros((0,), tf.uint32)`` is created on the host. A GPU op that reads
+    such a captured host tensor inside the timestep loop receives it through a
+    host-to-device copy every step, and even an empty copy completes only after
+    the GPU has run everything queued before it. The op, and all that depends
+    on it, is then launched only once the GPU has caught up, which held the
+    host in lockstep with the GPU through the whole backward loop. A constant
+    built from NumPy is placed on the default device, like every non-empty
+    field.
+    """
+    return tf.constant(np.zeros(0, tf.as_dtype(dtype).as_numpy_dtype))
+
+
 def _edge_index_tensor(order):
     """Upload the CSR-to-original permutation only when a kernel reads it.
 
@@ -34,7 +50,7 @@ def _edge_index_tensor(order):
     path keeps the real permutation.
     """
     if DIRECT_CSR and not resource_mode_enabled():
-        return tf.zeros((0,), tf.uint32)
+        return empty_metadata(tf.uint32)
     return tf.constant(order, tf.uint32)
 
 
@@ -239,6 +255,22 @@ def _weight_gradient_accumulator():
     return getattr(_WEIGHT_GRADIENT_ACCUMULATOR, "handle", None)
 
 
+# The most spike tensors one operator call takes (kMaxSpikeSlots in
+# event_weight_grad.cuh). A longer spike history is concatenated first.
+MAX_SPIKE_SLOTS = 8
+
+
+def spike_slots(spikes):
+    """The presynaptic matrix as the operators take it: a tuple of equal
+    [batch, width] tensors side by side (the recurrent spike history, one per
+    delay slot, newest first), or one tensor."""
+    if not isinstance(spikes, (tuple, list)):
+        return (spikes,)
+    if len(spikes) > MAX_SPIKE_SLOTS:
+        return (tf.concat(spikes, axis=1),)
+    return tuple(spikes)
+
+
 def empty_like_currents(values):
     """The sentinel `initial` value meaning "start from zero".
 
@@ -247,28 +279,59 @@ def empty_like_currents(values):
     return tf.zeros((0, 0), values.dtype)
 
 
+def spike_queue(slot):
+    """One [batch, width] spike slot's queue record (uint32), the form in which
+    calculate_recurrent_csr_currents carries a history's active entries."""
+    return _load_ops().v1_spike_queue(slot)
+
+
 def calculate_recurrent_csr_currents(
-    spikes, weights, basis, dampening, connectivity, initial=None
+    spikes, weights, basis, dampening, connectivity, initial=None, queues=None
 ):
     """Calculate currents plus spike and weight gradients.
 
-    ``initial`` accumulates this source's currents on top of another source's
-    output, which avoids materializing a separate tensor and adding it later.
-    Its gradient is the upstream gradient unchanged. The kernels take the
+    ``spikes`` is the [batch, n_pre] presynaptic matrix, or the recurrent spike
+    history as a tuple of its delay slots (newest first), whose concatenation
+    is that matrix; the slots then each get their own gradient, and the history
+    uses separate tensors for up to eight slots. Longer histories use the
+    generic concatenated path. ``initial`` accumulates this source's currents on
+    top of another source's output, which avoids materializing a separate
+    tensor and adding it later. Its gradient is the upstream gradient
+    unchanged. The kernels take the
     synaptic basis in FP32; pass the unrounded values, since casting an
     already-rounded FP16 basis back up recovers nothing.
+
+    ``queues`` carries a spike history's per-slot queue records (see
+    spike_queue) from step to step, so that only the newest slot is swept for
+    its active entries: the records of slots 1 to D - 1, which are the
+    previous step's records of slots 0 to D - 2. The result is then
+    ``(currents, record)``, with ``record`` the newest slot's, for the next
+    step's history. The currents are the same as without ``queues``.
     """
     require_csr_ordered_weights(connectivity, "recurrent connectivity")
     basis = tf.cast(basis, tf.float32)
+    history = tuple(spikes) if isinstance(spikes, (tuple, list)) else (spikes,)
+    if queues is not None and (len(history) < 2 or len(queues) != len(history) - 1):
+        raise ValueError("queues must hold one record per spike slot but the newest")
+    if len(history) > MAX_SPIKE_SLOTS and queues is not None:
+        # The raw ops carry at most eight pointers. Preserve the public queue
+        # contract while the generic path rebuilds the flattened activity queue.
+        currents = calculate_recurrent_csr_currents(
+            tf.concat(history, axis=1), weights, basis, dampening, connectivity,
+            initial=initial,
+        )
+        return currents, spike_queue(history[0])
+    slots = spike_slots(spikes)
+    queue_args = () if queues is None else tuple(queues)
     if connectivity.resource_name is not None:
         return _calculate_resource_currents(
-            spikes, weights, basis, dampening, connectivity, initial=initial
+            slots, weights, basis, dampening, connectivity, initial=initial,
+            queues=queues,
         )
     ops = _load_ops()
 
     @tf.custom_gradient
     def fused(
-        spike_values,
         weight_values,
         basis_values,
         post_ids,
@@ -281,8 +344,10 @@ def calculate_recurrent_csr_currents(
         pair_posts,
         pair_types,
         initial_values,
+        *rest,
     ):
-        currents = ops.v1_csr_forward(
+        spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        currents, record = ops.v1_csr_forward(
             spike_values,
             weight_values,
             post_ids,
@@ -291,11 +356,12 @@ def calculate_recurrent_csr_currents(
             edge_ids,
             basis_values,
             initial_values,
+            queue_values,
             n_post=connectivity.n_post,
             aggregate_runs=connectivity.repeats_targets,
         )
 
-        def grad(current_grad):
+        def grad(current_grad, *_record_grad):
             inputs = (
                 spike_values,
                 current_grad,
@@ -306,7 +372,7 @@ def calculate_recurrent_csr_currents(
                 edge_ids,
                 nonempty_rows,
                 basis_values,
-                tf.cast(dampening_value, spike_values.dtype),
+                tf.cast(dampening_value, spike_values[0].dtype),
                 pair_ids,
                 pair_posts,
                 pair_types,
@@ -314,26 +380,26 @@ def calculate_recurrent_csr_currents(
             sizes = {"n_post": connectivity.n_post, "n_edges": connectivity.n_edges}
             accumulator = _weight_gradient_accumulator()
             if accumulator is None:
-                spike_grad, weight_grad = ops.v1_csr_backward_pair_projected(
+                spike_grads, weight_grad = ops.v1_csr_backward_pair_projected(
                     *inputs, **sizes
                 )
                 weight_grad = tf.cast(weight_grad, weight_values.dtype)
             else:
-                spike_grad = ops.v1_csr_backward_pair_projected_accumulate(
+                spike_grads = ops.v1_csr_backward_pair_projected_accumulate(
                     *inputs, accumulator, **sizes
                 )
                 weight_grad = None
-            # The trailing gradient belongs to `initial`, which enters the
-            # output additively, so the upstream gradient passes straight
-            # through. With no accumulator the input is an empty sentinel, and
-            # its gradient has to stay unset rather than take the output shape.
+            # `initial` enters the output additively, so the upstream gradient
+            # passes straight through. With no accumulator the input is an
+            # empty sentinel, and its gradient has to stay unset rather than
+            # take the output shape.
             initial_grad = None if initial is None else current_grad
-            return (spike_grad, weight_grad) + (None,) * 10 + (initial_grad,)
+            return ((weight_grad,) + (None,) * 10 + (initial_grad, *spike_grads)
+                    + (None,) * len(queue_values))
 
-        return currents, grad
+        return (currents if queues is None else (currents, record)), grad
 
     return fused(
-        spikes,
         weights,
         basis,
         connectivity.post_ids,
@@ -341,40 +407,45 @@ def calculate_recurrent_csr_currents(
         connectivity.row_splits,
         connectivity.edge_ids,
         connectivity.nonempty_rows,
-        tf.cast(dampening, spikes.dtype),
+        tf.cast(dampening, slots[0].dtype),
         connectivity.pair_ids,
         connectivity.pair_posts,
         connectivity.pair_types,
-        empty_like_currents(spikes) if initial is None else initial,
+        empty_like_currents(slots[0]) if initial is None else initial,
+        *slots,
+        *queue_args,
     )
 
 
 def _calculate_resource_currents(
-    spikes, weights, basis, dampening, connectivity, initial=None
+    slots, weights, basis, dampening, connectivity, initial=None, queues=None
 ):
     ops = load_resource_ops()
+    queue_args = () if queues is None else tuple(queues)
 
     @tf.custom_gradient
     def fused(
-        spike_values, weight_values, basis_values, dampening_value, initial_values
+        weight_values, basis_values, dampening_value, initial_values, *rest
     ):
-        currents = ops.v1_csr_forward_resource(
+        spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        currents, record = ops.v1_csr_forward_resource(
             spike_values,
             weight_values,
             basis_values,
             initial_values,
+            queue_values,
             n_post=connectivity.n_post,
             resource_name=connectivity.resource_name,
             aggregate_runs=connectivity.repeats_targets,
         )
 
-        def grad(current_grad):
+        def grad(current_grad, *_record_grad):
             inputs = (
                 spike_values,
                 current_grad,
                 weight_values,
                 basis_values,
-                tf.cast(dampening_value, spike_values.dtype),
+                tf.cast(dampening_value, spike_values[0].dtype),
             )
             attributes = {
                 "n_post": connectivity.n_post,
@@ -383,12 +454,12 @@ def _calculate_resource_currents(
             }
             accumulator = _weight_gradient_accumulator()
             if accumulator is None:
-                spike_grad, weight_grad = ops.v1_csr_backward_resource(
+                spike_grads, weight_grad = ops.v1_csr_backward_resource(
                     *inputs, **attributes
                 )
                 weight_grad = tf.cast(weight_grad, weight_values.dtype)
             else:
-                spike_grad = ops.v1_csr_backward_accumulate_resource(
+                spike_grads = ops.v1_csr_backward_accumulate_resource(
                     *inputs, accumulator, **attributes
                 )
                 weight_grad = None
@@ -396,14 +467,16 @@ def _calculate_resource_currents(
             # passes straight through. With no accumulator the input is an
             # empty sentinel and its gradient has to stay unset.
             initial_grad = None if initial is None else current_grad
-            return spike_grad, weight_grad, None, None, initial_grad
+            return ((weight_grad, None, None, initial_grad, *spike_grads)
+                    + (None,) * len(queue_values))
 
-        return currents, grad
+        return (currents if queues is None else (currents, record)), grad
 
     return fused(
-        spikes,
         weights,
         basis,
-        tf.cast(dampening, spikes.dtype),
-        empty_like_currents(spikes) if initial is None else initial,
+        tf.cast(dampening, slots[0].dtype),
+        empty_like_currents(slots[0]) if initial is None else initial,
+        *slots,
+        *queue_args,
     )

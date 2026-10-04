@@ -7,6 +7,7 @@ import pandas as pd
 import h5py
 import tensorflow as tf
 import matplotlib.pyplot as plt
+from v1_model_utils import cuda_lgn
 from v1_model_utils.tf_utils import replica_local_constant
 # import pdb
 
@@ -469,6 +470,19 @@ class LGN(object):
             spatial_range_indices = [np.asarray(a, dtype=np.int32) for a in loaded['spatial_range_indices']]
             sorted_neuron_ids_indices = np.asarray(loaded['sorted_neuron_ids_indices'], dtype=np.int32)
 
+        # The float32 source constants, for the CUDA grating and movie kernels
+        # (v1_model_utils.cuda_lgn), which recompute their own float64 tables.
+        self.host_constants = dict(
+            x=x, y=y, non_dominant_x=non_dominant_x, non_dominant_y=non_dominant_y,
+            gaussian_filters=[gf[:, :, 0, 0] for gf in gaussian_filters],
+            spatial_range_indices=spatial_range_indices,
+            dom_temporal_kernels=dom_temporal_kernels,
+            non_dom_temporal_kernels=non_dom_temporal_kernels,
+            amplitude=amplitude, non_dom_amplitude=non_dom_amplitude,
+            spontaneous_firing_rates=spontaneous_firing_rates,
+            is_composite=is_composite.astype(bool),
+        )
+
         # Preprocess data tensors outside the loop if they don't change. What
         # spatial_response and firing_rates_from_spatial read is replica-local
         # (see tf_utils.replica_local_constant): built under a distribution
@@ -583,6 +597,68 @@ class LGN(object):
         self.composite_sort_indices = replica_local_constant(
             np.argsort(grouped_composite_ids), tf.int64
         )
+        self._movie_kernels = {}
+
+    def movie_kernel(self, bmtk_compat=True):
+        """The CUDA movie kernel (cuda_lgn.MovieLGNKernel) for `bmtk_compat`, or None
+        when the CUDA LGN ops are unavailable. Built on first use, eagerly (its
+        constants are replica-local variables): build it under the distribution
+        strategy's scope when it runs on several replicas."""
+        if bmtk_compat not in self._movie_kernels:
+            with tf.init_scope():
+                self._movie_kernels[bmtk_compat] = cuda_lgn.MovieLGNKernel(
+                    self.host_constants, rows=self.row_size, cols=self.col_size,
+                    bmtk_compat=bmtk_compat,
+                ) if cuda_lgn.available(cuda_lgn.MOVIE) else None
+        return self._movie_kernels[bmtk_compat]
+
+    def firing_rates(self, movie, bmtk_compat=True, output='rates', spike_seeds=None, use_cuda=True):
+        """The LGN response to a movie, in float32 whatever `dtype` is.
+
+        movie: [batch, time, rows, cols], or one sample [time, rows, cols, 1].
+        output: 'rates' (Hz), 'probabilities' (p = 1 - exp(-rate dt), dt = 1 ms)
+            or 'spikes' (bool: tf.random.stateless_uniform(seed, float32) < p, one
+            seed [2] per sample in `spike_seeds` [batch, 2], or [2] for one sample).
+        Returns [batch, time, n_input], or [time, n_input] for one sample. Uses the
+        CUDA movie op when available and `use_cuda`, else spatial_response and
+        firing_rates_from_spatial one sample at a time (in `dtype`).
+        """
+        if output not in ('rates', 'probabilities', 'spikes'):
+            raise ValueError(f"output must be 'rates', 'probabilities' or 'spikes', got {output!r}")
+        movie = tf.convert_to_tensor(movie)
+        single = movie.shape.rank == 4 and movie.shape[1:] == (self.row_size, self.col_size, 1)
+        if single:
+            movie = movie[None, ..., 0]
+            if spike_seeds is not None:
+                spike_seeds = tf.reshape(spike_seeds, (1, 2))
+        if output == 'spikes' and spike_seeds is None:
+            raise ValueError("output='spikes' needs spike_seeds")
+        kernel = self.movie_kernel(bmtk_compat) if use_cuda else None
+        if kernel is not None:
+            if output == 'spikes':
+                result = kernel.spikes(movie, spike_seeds)
+            else:
+                result = kernel.response(movie, output)
+        else:
+            def rates(sample):
+                spatial = self.spatial_response(sample[..., None], bmtk_compat)
+                return tf.cast(self.firing_rates_from_spatial(*spatial), tf.float32)
+
+            def probabilities(sample):
+                return -tf.math.expm1(-rates(sample) / 1000.0)
+
+            def spikes(sample):
+                sample, seed = sample
+                p = probabilities(sample)
+                return tf.random.stateless_uniform(tf.shape(p), seed=seed, dtype=tf.float32) < p
+
+            if output == 'spikes':
+                result = tf.map_fn(spikes, (movie, spike_seeds), fn_output_signature=tf.bool,
+                                   parallel_iterations=1)
+            else:
+                result = tf.map_fn(rates if output == 'rates' else probabilities, movie,
+                                   fn_output_signature=tf.float32, parallel_iterations=1)
+        return result[0] if single else result
 
     @tf.function
     def spatial_response(self, movie, bmtk_compat=True):

@@ -26,22 +26,32 @@ REGISTER_OP("InitializeV1CsrResource")
       return OkStatus();
     });
 
+// `spikes` as in V1CsrForward: N equal tensors side by side (one per delay
+// slot of the recurrent spike history), with one spike gradient per tensor.
+// `queues` and `queue`: see V1CsrForward.
 REGISTER_OP("V1CsrForwardResource")
     .Attr("T: {half, float}")
+    .Attr("N: int >= 1")
+    .Attr("carried: int >= 0 = 0")
     .Attr("n_post: int >= 1")
     .Attr("resource_name: string")
     .Attr("aggregate_runs: bool = true")
-    .Input("spikes: T")
+    .Input("spikes: N * T")
     .Input("weights: float")
     .Input("basis: float")
     // Currents to accumulate on top of, or an empty tensor to start from zero.
     .Input("initial: T")
+    .Input("queues: carried * uint32")
     .Output("currents: T")
+    .Output("queue: uint32")
     .SetShapeFn([](shape_inference::InferenceContext* context) {
+      context->set_output(1, context->Vector(context->UnknownDim()));
+      int slots;
+      TF_RETURN_IF_ERROR(context->GetAttr("N", &slots));
       shape_inference::ShapeHandle spikes;
       shape_inference::ShapeHandle basis;
       TF_RETURN_IF_ERROR(context->WithRank(context->input(0), 2, &spikes));
-      TF_RETURN_IF_ERROR(context->WithRank(context->input(2), 2, &basis));
+      TF_RETURN_IF_ERROR(context->WithRank(context->input(slots + 1), 2, &basis));
       int n_post;
       TF_RETURN_IF_ERROR(context->GetAttr("n_post", &n_post));
       shape_inference::DimensionHandle rows;
@@ -76,23 +86,28 @@ REGISTER_OP("BkgCsrForwardResource")
 
 REGISTER_OP("V1CsrBackwardResource")
     .Attr("T: {half, float}")
+    .Attr("N: int >= 1")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")
-    .Input("spikes: T")
+    .Input("spikes: N * T")
     .Input("current_grad: T")
     .Input("weights: float")
     .Input("basis: float")
     .Input("dampening: T")
-    .Output("spike_grad: T")
+    .Output("spike_grad: N * T")
     .Output("weight_grad: float")
     .SetShapeFn([](shape_inference::InferenceContext* context) {
-      shape_inference::ShapeHandle spikes;
-      TF_RETURN_IF_ERROR(context->WithRank(context->input(0), 2, &spikes));
+      int slots;
+      TF_RETURN_IF_ERROR(context->GetAttr("N", &slots));
+      for (int slot = 0; slot < slots; ++slot) {
+        shape_inference::ShapeHandle spikes;
+        TF_RETURN_IF_ERROR(context->WithRank(context->input(slot), 2, &spikes));
+        context->set_output(slot, spikes);
+      }
       int n_edges;
       TF_RETURN_IF_ERROR(context->GetAttr("n_edges", &n_edges));
-      context->set_output(0, spikes);
-      context->set_output(1, context->Vector(n_edges));
+      context->set_output(slots, context->Vector(n_edges));
       return OkStatus();
     });
 
@@ -101,21 +116,26 @@ REGISTER_OP("V1CsrBackwardResource")
 // V1CsrBackwardPairProjectedAccumulate.
 REGISTER_OP("V1CsrBackwardAccumulateResource")
     .Attr("T: {half, float}")
+    .Attr("N: int >= 1")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")
-    .Input("spikes: T")
+    .Input("spikes: N * T")
     .Input("current_grad: T")
     .Input("weights: float")
     .Input("basis: float")
     .Input("dampening: T")
     .Input("accumulator: resource")
-    .Output("spike_grad: T")
+    .Output("spike_grad: N * T")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* context) {
-      shape_inference::ShapeHandle spikes;
-      TF_RETURN_IF_ERROR(context->WithRank(context->input(0), 2, &spikes));
-      context->set_output(0, spikes);
+      int slots;
+      TF_RETURN_IF_ERROR(context->GetAttr("N", &slots));
+      for (int slot = 0; slot < slots; ++slot) {
+        shape_inference::ShapeHandle spikes;
+        TF_RETURN_IF_ERROR(context->WithRank(context->input(slot), 2, &spikes));
+        context->set_output(slot, spikes);
+      }
       return OkStatus();
     });
 

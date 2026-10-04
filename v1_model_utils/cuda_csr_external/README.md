@@ -9,8 +9,8 @@ calculate activity gradients and is the intended model configuration.
 The basis dimension follows the recurrent implementation: four basis values
 select the compile-time specialization, while every other positive dimension
 uses a dynamic-basis kernel. Backward has static batch variants for 1, 2, 4,
-8, 16, 32, 64, 128 and 256. Other batch sizes use a four-sample tiled runtime
-fallback. FP32 master-weight gradients retain the original checkpoint edge
+8, 16, 32, 64, 128 and 256. Other batch sizes use runtime fallbacks or
+generic pair-projected kernels. FP32 master-weight gradients retain the original checkpoint edge
 order; CSR identifiers are `uint32` and synapse types are `uint8`. Every
 operator takes the synaptic basis in FP32. The LGN forward goes through the
 recurrent `V1CsrForward`, so it gets the device-built active-row queue and the
@@ -75,3 +75,10 @@ output, so they accumulate into a float scratch that `CastActivityGradKernel`
 narrows; with one split the scratch is skipped.
 
 See `external_grad_analysis_20260905/REPORT.md` for its qualification.
+
+For FP16 activity gradients with four basis columns, batches 3–31 that lack a
+static specialization use the generic pair projection and 64-thread packed row
+reduction when `RowSplitCount` returns one. This avoids the 256-thread direct
+reduction on numerous short LGN rows. Inputs with fewer nonempty rows retain
+the direct fallback, avoiding extra projection, split-row accumulation and
+cast launches for small BKG batches. FP32 dispatch is unchanged.
