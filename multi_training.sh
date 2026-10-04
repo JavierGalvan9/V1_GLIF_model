@@ -1,4 +1,4 @@
-#! /bi	/bash
+#!/usr/bin/env bash
 
 # total_neurons = 296991
 # core_neurons = 65871
@@ -15,22 +15,48 @@
 # run -g 1 -m 24 -t 0:30 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 2 --grating_batch_size 1 --gray_batch_size 1 --neurons 40000 --seq_len 600 --n_epochs 3"
 # run -g 1 -m 60 -t 1:45 -o Out/training_core.out -e Error/training_core.err -j drif_train "python multi_training.py --batch_size 2 --grating_batch_size 1 --gray_batch_size 1 --neurons 65871 --train_recurrent --osi_loss_method 'crowd_osi' --osi_cost 2 --rate_cost 100 --voltage_cost 1 --learning_rate 0.1 --seq_len 600 --n_epochs 10 --steps_per_epoch 20"
 
+
+
+################################## 66k network ##################################
+
 # num_replicas=1
 # for osi_cost in 2; do #5 10 20 40; do # default is 20
-#     python parallel_training_testing.py --osi_loss_method 'crowd_osi' --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --data_dir 'GLIF_network_nll_core' --seq_len 500 --gradient_checkpointing --optimizer 'exp_adam' --learning_rate 0.01 --lr_schedule 'warmup_cosine' --lr_warmup_start_lr 0.003 --lr_warmup_target_lr 0.025 --lr_warmup_steps 50 --lr_cosine_min_lr 0.001 --lr_cosine_steps 950 --recurrent_dampening_factor 0.1 --n_gpus $num_replicas --batch_size 12 --grating_batch_size 6 --gray_batch_size 6 --dtype 'float16' --neurons 66652 --loss_core_radius 200 --plot_core_radius 200 --train_recurrent --train_noise --osi_cost $osi_cost --rate_cost 10000 --voltage_cost 1.5 --sync_cost 1 --recurrent_weight_regularization 1 --n_runs 1 --n_epochs 10 --steps_per_epoch 100
+#     python parallel_training_testing.py --osi_loss_method 'crowd_osi' --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --data_dir 'GLIF_network_nll_core' --seq_len 500 --gradient_checkpointing --optimizer 'exp_adam' --learning_rate 0.01 --lr_schedule 'warmup_cosine' --lr_warmup_start_lr 0.003 --lr_warmup_target_lr 0.025 --lr_warmup_steps 50 --lr_cosine_min_lr 0.001 --lr_cosine_steps 950 --recurrent_dampening_factor 0.1 --n_gpus $num_replicas --batch_size 256 --grating_batch_size 128 --gray_batch_size 128 --dtype 'float16' --neurons 66652 --loss_core_radius 200 --plot_core_radius 200 --train_recurrent --train_noise --osi_cost $osi_cost --rate_cost 10000 --voltage_cost 1.5 --sync_cost 1 --recurrent_weight_regularization 1 --n_runs 1 --n_epochs 10 --steps_per_epoch 100
 # done
+
+################################## 200k network ##################################
 
 # num_replicas=1
 # for osi_cost in 2; do #5 10 20 40; do # default is 20
 #     python parallel_training_testing.py --osi_loss_method 'crowd_osi' --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --data_dir 'GLIF_network_nll_full' --seq_len 500 --gradient_checkpointing --optimizer 'exp_adam' --learning_rate 0.01 --lr_schedule 'warmup_cosine' --lr_warmup_start_lr 0.003 --lr_warmup_target_lr 0.025 --lr_warmup_steps 50 --lr_cosine_min_lr 0.001 --lr_cosine_steps 950 --recurrent_dampening_factor 0.1 --n_gpus $num_replicas --batch_size 16 --grating_batch_size 8 --gray_batch_size 8 --dtype 'float16' --neurons 203816 --loss_core_radius 400 --plot_core_radius 400 --train_recurrent --train_noise --osi_cost $osi_cost --rate_cost 10000 --voltage_cost 1.5 --sync_cost 1 --recurrent_weight_regularization 1 --n_runs 1 --n_epochs 10 --steps_per_epoch 100 --restore_from '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_203816/b_7m02/Best_model'
 # done
 
+# batch_osi_emd
+
 num_replicas=1
-for osi_cost in 2; do #5 10 20 40; do # default is 20
+for osi_cost in 2; do #5 10 20 40; do # default is 2
     python parallel_training_testing.py --osi_loss_method 'crowd_osi' --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --data_dir 'GLIF_network_nll_full' --seq_len 500 --gradient_checkpointing --optimizer 'exp_adam' --learning_rate 0.01 --lr_schedule 'warmup_cosine' --lr_warmup_start_lr 0.003 --lr_warmup_target_lr 0.025 --lr_warmup_steps 50 --lr_cosine_min_lr 0.001 --lr_cosine_steps 950 --recurrent_dampening_factor 0.1 --n_gpus $num_replicas --batch_size 32 --grating_batch_size 16 --gray_batch_size 16 --dtype 'float16' --neurons 203816 --loss_core_radius 400 --plot_core_radius 400 --train_recurrent --train_noise --osi_cost $osi_cost --rate_cost 10000 --voltage_cost 1.5 --sync_cost 1 --recurrent_weight_regularization 1 --n_runs 1 --n_epochs 10 --steps_per_epoch 100
 done
 
-# run -g 1 -G 'rtxpro6000' -m 96 -c 4 -t 3:30 -o Out/range.out -e Error/range.err -j range "python osi_dsi_estimator.py --dtype 'float32' --track_core_only --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --n_trials_per_angle 10 --neurons 203816 --data_dir 'GLIF_network_nll_full' --seq_len 200 --loss_core_radius 400 --plot_core_radius 400 --reset_every_step --delays 0,0 --restore_from 'Best_model' --ckpt_dir '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_203816/b_qsvm' --run_session 1000 --train_noise --notrain_input --train_recurrent"
+################################## 400k network ##################################
+
+# num_replicas=1
+# for osi_cost in 2; do #5 10 20 40; do # default is 2
+#     python parallel_training_testing.py --osi_loss_method 'crowd_osi' --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --data_dir 'GLIF_network_nll_1M' --seq_len 500 --gradient_checkpointing --optimizer 'exp_adam' --learning_rate 0.01 --lr_schedule 'warmup_cosine' --lr_warmup_start_lr 0.003 --lr_warmup_target_lr 0.025 --lr_warmup_steps 50 --lr_cosine_min_lr 0.001 --lr_cosine_steps 950 --recurrent_dampening_factor 0.1 --n_gpus $num_replicas --batch_size 2 --grating_batch_size 1 --gray_batch_size 1 --dtype 'float16' --neurons 416038 --loss_core_radius 400 --plot_core_radius 400 --train_recurrent --train_noise --osi_cost $osi_cost --rate_cost 10000 --voltage_cost 1.5 --sync_cost 1 --recurrent_weight_regularization 1 --n_runs 1 --n_epochs 10 --steps_per_epoch 100
+# done
+
+################################## 1M network ##################################
+
+# num_replicas=1
+# for osi_cost in 2; do #5 10 20 40; do # default is 2
+#     python parallel_training_testing.py --osi_loss_method 'crowd_osi' --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --data_dir 'GLIF_network_nll_1M' --seq_len 500 --gradient_checkpointing --optimizer 'exp_adam' --learning_rate 0.01 --lr_schedule 'warmup_cosine' --lr_warmup_start_lr 0.003 --lr_warmup_target_lr 0.025 --lr_warmup_steps 50 --lr_cosine_min_lr 0.001 --lr_cosine_steps 950 --recurrent_dampening_factor 0.1 --n_gpus $num_replicas --batch_size 8 --grating_batch_size 4 --gray_batch_size 4 --dtype 'float16' --neurons 935980 --loss_core_radius 1200 --plot_core_radius 1200 --train_recurrent --train_noise --osi_cost $osi_cost --rate_cost 10000 --voltage_cost 1.5 --sync_cost 1 --recurrent_weight_regularization 1 --n_runs 1 --n_epochs 10 --steps_per_epoch 100
+# done
+
+
+
+
+# sim_name="b_1kc1"
+# run -g 1 -G 'rtxpro6000' -m 96 -c 2 -t 3:30 -o Out/$sim_name.out -e Error/$sim_name.err -j $sim_name "python osi_dsi_estimator.py --dtype 'float32' --track_core_only --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --n_trials_per_angle 10 --neurons 203816 --data_dir 'GLIF_network_nll_full' --seq_len 200 --loss_core_radius 400 --plot_core_radius 400 --reset_every_step --delays 0,0 --restore_from 'Best_model' --ckpt_dir '/home/jgalvan/Desktop/Neurocoding/V1_GLIF_model/Simulation_results/v1_203816/$sim_name' --run_session 1000 --train_noise --notrain_input --train_recurrent"
 
 # for voltage_gradient_dampening in 0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
 #     python parallel_training_testing.py --voltage_penalty_mode 'range' --neuropixels_df 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv' --data_dir 'GLIF_network_nll_full' --seq_len 500 --gradient_checkpointing --optimizer 'exp_adam' --learning_rate 0.01 --lr_schedule 'warmup_cosine' --lr_warmup_start_lr 0.003 --lr_warmup_target_lr 0.05 --lr_warmup_steps 50 --lr_cosine_min_lr 0.001 --lr_cosine_steps 950 --recurrent_dampening_factor 0.1 --voltage_gradient_dampening $voltage_gradient_dampening --n_gpus $num_replicas --batch_size 3 --dtype 'float16' --neurons 203816 --loss_core_radius 400 --plot_core_radius 400 --train_recurrent --train_noise --osi_cost 20 --rate_cost 10000 --voltage_cost 1.5 --sync_cost 1 --recurrent_weight_regularization 1 --n_runs 1 --n_epochs 10 --steps_per_epoch 100
