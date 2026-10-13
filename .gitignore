@@ -66,7 +66,6 @@ Loss_curves
 
 # multi_training.sh
 performance_data_simulations.sh
-# parallel_training_testing.py
 performance_statistics.csv
 voltage_loss_fp16_error_test.ipynb
 # mixed_precision_error_audit.ipynb
@@ -121,8 +120,6 @@ synaptic_current_optimization/
 !tests/test_training_orchestration.py
 lgn_optimization_work/
 uint8_rec_state_benchmark/
-parallel_training_testing.py
-v1_model_utils/models.py
 batch_vram_optimization_20260828/
 Benchmarks_metrics/
 distributed_training_investigation/
@@ -141,8 +138,6 @@ distributed_training_investigation/
 docs/research/spikingjelly_performance_optimizations.md
 .claude/skills/
 .mcp.json
-parallel_training_testing.py
-v1_model_utils/optimizers.py
 uint8_rec_ring_state_benchmark/
 profiling_analysis_20260902/
 wmma_recurrent_analysis_20260901/
@@ -162,7 +157,6 @@ profiling_analysis_20260915/
 recurrent_forward_latency_20260915/
 Experiments/
 .gitignore
-parallel_training_testing.py
 animations
 kernel_opt_20260920/
 Validation_profile_runs/
