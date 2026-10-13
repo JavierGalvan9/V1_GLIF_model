@@ -504,8 +504,11 @@ def restore_and_rebase(
     """Restore an original-order checkpoint into a possibly relabelled model."""
     if require_optimizer:
         status = checkpoint.restore(checkpoint_directory)
-        legacy_optimizer_restored = _restore_keras2_optimizer_slots(
-            checkpoint_directory, optimizer
+        # Only checkpoints written before the optimizer id was recorded can hold
+        # Keras 2 slots; Keras 3 uses the same key prefix for its own layout.
+        legacy_optimizer_restored = (
+            checkpoint_optimizer_identity(checkpoint_directory) is None
+            and _restore_keras2_optimizer_slots(checkpoint_directory, optimizer)
         )
         try:
             if legacy_optimizer_restored:
@@ -519,26 +522,34 @@ def restore_and_rebase(
                 "the current TensorFlow/Keras optimizer. Refusing to silently reset "
                 "requested training state."
             ) from error
+        if legacy_optimizer_restored:
+            _assert_model_restored(checkpoint_directory, model)
     else:
         # The optimizer state is deliberately discarded here (renewed optimizer,
-        # or evaluation), but the *model* must still restore completely. Restore
-        # through a model-only checkpoint so that expect_partial() only forgives
-        # the optimizer keys and every model variable can still be asserted: a
-        # plain expect_partial() on the combined checkpoint lets a full
-        # shape/name mismatch through and leaves the model at random init.
-        model_checkpoint = tf.train.Checkpoint(model=model)
-        status = model_checkpoint.restore(checkpoint_directory)
-        try:
-            status.assert_existing_objects_matched()
-        except AssertionError as error:
-            raise ValueError(
-                f"Restoring {checkpoint_directory} left model variables unmatched, "
-                "so the model would silently run from random initialization. This "
-                "usually means the checkpoint was written by a model built with "
-                "different shapes, names or flags."
-            ) from error
-        status.expect_partial()
+        # or evaluation), but the *model* must still restore completely.
+        _assert_model_restored(checkpoint_directory, model)
     rebase_checkpointed_layout(model, to_runtime=True, optimizer=optimizer)
+
+
+def _assert_model_restored(checkpoint_directory, model):
+    """Restore every model variable, or raise.
+
+    Restoring through a model-only checkpoint lets expect_partial() forgive the
+    optimizer keys while every model variable is still asserted: a plain
+    expect_partial() on the combined checkpoint lets a full shape/name mismatch
+    through and leaves the model at random init.
+    """
+    status = tf.train.Checkpoint(model=model).restore(checkpoint_directory)
+    try:
+        status.assert_existing_objects_matched()
+    except AssertionError as error:
+        raise ValueError(
+            f"Restoring {checkpoint_directory} left model variables unmatched, "
+            "so the model would silently run from random initialization. This "
+            "usually means the checkpoint was written by a model built with "
+            "different shapes, names or flags."
+        ) from error
+    status.expect_partial()
 
 
 def _restore_keras2_optimizer_slots(checkpoint_directory, optimizer):
@@ -689,16 +700,22 @@ def restore_evaluation_checkpoint(
 
     checkpoint_directory, checkpoint_source = resolve_checkpoint_directory(flags)
     checkpoint_model_dtype = infer_checkpoint_model_dtype(checkpoint_directory)
+    # Compare variable dtypes, not --dtype: mixed_float16 keeps float32
+    # variables, so its checkpoints restore directly into a float32 model and
+    # vice versa.
+    target_model_dtype = _variable_dtype_name(
+        tf.as_dtype(variable.dtype).name for variable in model.variables
+    )
     checkpoint_dtype_mismatch = (
         checkpoint_directory is not None
         and checkpoint_model_dtype is not None
-        and checkpoint_model_dtype != flags.dtype
+        and checkpoint_model_dtype != target_model_dtype
     )
 
     if checkpoint_dtype_mismatch:
         print(
-            f"Checkpoint model dtype '{checkpoint_model_dtype}' differs from requested "
-            f"evaluation dtype '{flags.dtype}'."
+            f"Checkpoint variable dtype '{checkpoint_model_dtype}' differs from the "
+            f"evaluation model's '{target_model_dtype}'."
         )
 
     if checkpoint_dtype_mismatch and not flags.restore_runtime_dtype_cast:
@@ -764,20 +781,24 @@ def infer_checkpoint_model_dtype(checkpoint_directory):
         print(f'Could not inspect checkpoint dtypes at {checkpoint_directory}: {e}')
         return None
 
-    model_dtype_names = set()
-    for tensor_name, raw_dtype in dtype_map.items():
-        if not tensor_name.startswith('model/'):
-            continue
-        dtype_name = _dtype_name_from_ckpt_dtype(raw_dtype)
-        if dtype_name in ('float16', 'float32'):
-            model_dtype_names.add(dtype_name)
+    return _variable_dtype_name(
+        _dtype_name_from_ckpt_dtype(raw_dtype)
+        for tensor_name, raw_dtype in dtype_map.items()
+        if tensor_name.startswith('model/')
+    )
 
+
+def _variable_dtype_name(dtype_names):
+    """The model dtype a set of variable dtypes stands for, or None."""
+    model_dtype_names = {
+        name for name in dtype_names if name in ('float16', 'float32')
+    }
     if len(model_dtype_names) == 1:
         return next(iter(model_dtype_names))
 
     if len(model_dtype_names) > 1:
         sorted_names = sorted(model_dtype_names)
-        print(f'Found mixed model dtypes in checkpoint: {sorted_names}')
+        print(f'Found mixed variable dtypes: {sorted_names}')
         # Mixed-precision checkpoints commonly contain float32 plus one low-precision
         # dtype. Prefer the low-precision dtype as the checkpoint model dtype.
         if 'float16' in model_dtype_names:

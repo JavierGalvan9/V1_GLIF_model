@@ -274,6 +274,87 @@ def test_fp16_forward_and_both_backward_modes_match_fp32_oracle():
             assert activity_grad is None
 
 
+def _lgn_like_fixture(batch_size, n_basis, n_pre, n_types=4):
+    """FP16-exact LGN-like input: rows of 65-280 edges (mean ~170, beyond the
+    64-edge chunk), each target hit twice, and ~30 edges per target."""
+    rng = np.random.default_rng(batch_size + 7 * n_basis + n_pre)
+    n_post = n_pre * 170 // 30
+    pre = np.repeat(np.arange(n_pre), 2 * rng.integers(33, 140, n_pre))
+    post = np.repeat(rng.integers(0, n_post, pre.size // 2), 2)
+    types = rng.integers(0, n_types, pre.size)
+    weights = rng.normal(size=pre.size).astype(np.float32)
+    indices, types, weights = _csr_sorted(np.stack((post, pre), axis=1), types, weights)
+    activity = (rng.random((batch_size, n_pre)) < 0.3) * rng.integers(1, 3, (batch_size, n_pre))
+    basis = rng.normal(size=(n_types, n_basis)).astype(np.float32)
+    upstream = rng.normal(size=(batch_size * n_post, n_basis)).astype(np.float16)
+    return indices, types, activity.astype(np.float16), weights, basis, upstream
+
+
+def _float64_reference(indices, types, activity, weights, basis, upstream):
+    """Currents and both gradients through sparse per-type weight matrices."""
+    from scipy import sparse
+
+    post, pre = indices.T
+    batch_size, n_pre = activity.shape
+    n_post = upstream.shape[0] // batch_size
+    activity = activity.astype(np.float64)
+    basis = basis.astype(np.float64)
+    projected = upstream.reshape(batch_size, n_post, -1).astype(np.float64) @ basis.T
+    currents = np.zeros((batch_size, n_post, basis.shape[1]))
+    activity_grad = np.zeros_like(activity)
+    for synapse_type, vector in enumerate(basis):
+        edges = types == synapse_type
+        matrix = sparse.csr_array(
+            (weights[edges].astype(np.float64), (post[edges], pre[edges])),
+            shape=(n_post, n_pre),
+        )
+        currents += (matrix @ activity.T).T[..., None] * vector
+        activity_grad += (matrix.T @ projected[..., synapse_type].T).T
+    weight_grad = sum(a[pre] * p[post, types] for a, p in zip(activity, projected))
+    return currents.reshape(-1, basis.shape[1]), activity_grad, weight_grad
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("n_pre", [40, 4600], ids=["row_split", "chunk_loop"])
+@pytest.mark.parametrize("sparse_activity", [True, False])
+@pytest.mark.parametrize("n_basis", [4, 5])
+@pytest.mark.parametrize("batch_size", [1, 3, 5, 32, 33, 64])
+def test_fp16_long_rows_match_float64_oracle(batch_size, n_basis, sparse_activity, n_pre):
+    # Under 4,512 rows each row is split across blocks; from there on one block
+    # loops over the row's 64-edge chunks. Together with the batches and bases
+    # this reaches the fp16 compact, packed, generic and direct kernels.
+    fixture = _lgn_like_fixture(batch_size, n_basis, n_pre)
+    indices, types, activity, weights, basis, upstream = fixture
+    connectivity = _connectivity(
+        indices, types, n_pre=n_pre, n_post=upstream.shape[0] // batch_size,
+        sparse_activity=sparse_activity,
+    )
+    assert connectivity.repeats_targets
+    activity_tensor = tf.constant(activity)
+    master_weights = tf.Variable(weights)
+    with tf.GradientTape() as tape:
+        tape.watch(activity_tensor)
+        currents = calculate_external_csr_currents(
+            activity_tensor, master_weights, basis, connectivity
+        )
+        loss = tf.reduce_sum(tf.cast(currents, tf.float32) * upstream.astype(np.float32))
+    activity_grad, weight_grad = tape.gradient(loss, (activity_tensor, master_weights))
+    expected = _float64_reference(*fixture)
+    currents, activity_grad = currents.numpy(), activity_grad.numpy()
+    # The inputs are fp16-exact. The forward sums each run of a repeated target
+    # in fp32 but adds it with an fp16 atomic, one rounding per run (~15 here,
+    # as in the LGN): measured <= 1.5e-3 of the largest current, the LGN figure
+    # in cuda_csr_recurrent/README.md. The backward accumulates in fp32, so the
+    # fp16 activity gradient only carries its final rounding (2**-11; 2**-10
+    # allows one more ulp) and the fp32 weight gradient fp32 round-off.
+    np.testing.assert_allclose(currents, expected[0], rtol=0,
+                               atol=4e-3 * np.abs(expected[0]).max())
+    np.testing.assert_allclose(activity_grad, expected[1], rtol=2**-10,
+                               atol=1e-5 * np.abs(expected[1]).max())
+    np.testing.assert_allclose(weight_grad.numpy(), expected[2], rtol=1e-5,
+                               atol=1e-6 * np.abs(expected[2]).max())
+
+
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize(
     ("activity_enabled", "weight_enabled"),

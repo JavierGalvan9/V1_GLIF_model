@@ -38,7 +38,7 @@ plt.rcParams['text.usetex'] = shutil.which('latex') is not None
 
 def compute_band_power(freqs, psd, band):
     idx = (freqs >= band[0]) & (freqs <= band[1])
-    return np.trapz(psd[idx], freqs[idx])
+    return np.trapezoid(psd[idx], freqs[idx])
 
 
 def bootstrap_relative_change(stim_trials, spont_trials, n_boot=1000):
@@ -197,7 +197,7 @@ def compare_band_power_bootstrap(stim_trials_list, spont_trials_list, bands, sav
     # fig.suptitle("Relative Change in Band Power with 95% CI and FDR-Corrected Significance (*q < 0.05)", fontsize=24)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     if save_path is not None:
-        plt.savefig(os.path.join(save_path, f'relative_band_power_comparison.png'),
+        plt.savefig(os.path.join(save_path, 'relative_band_power_comparison.png'),
                     dpi=300, bbox_inches='tight', transparent=False)
     plt.close()
 
@@ -378,7 +378,7 @@ def plot_absolute_band_power(stim_trials_list, spont_trials_list, bands, save_pa
     # fig.suptitle("Mean Band Power Across Conditions with SEM and FDR-Corrected Significance (* p < 0.05, ** p < 0.01, *** p < 0.001)", fontsize=22)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     if save_path is not None:
-        plt.savefig(os.path.join(save_path, f'absolute_band_power.png'),
+        plt.savefig(os.path.join(save_path, 'absolute_band_power.png'),
                     dpi=300, bbox_inches='tight', transparent=False)
     plt.close()
 

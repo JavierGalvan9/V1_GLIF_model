@@ -16,8 +16,8 @@ import other_v1_utils
 _V1_CACHE_VERSION = 2
 
 
-def _v1_cache_provenance(flags, n_neurons):
-    """Describe every input that can change a cached, ready-to-run V1 model."""
+def _v1_cache_config(flags, n_neurons):
+    """The flags that select which ready-to-run V1 model gets built."""
     config_names = (
         "seed", "n_input", "core_only", "connected_selection",
         "random_weights", "uniform_weights", "loss_core_radius",
@@ -25,6 +25,32 @@ def _v1_cache_provenance(flags, n_neurons):
     )
     config = {name: getattr(flags, name) for name in config_names}
     config["n_neurons"] = n_neurons
+    return config
+
+
+def _digest(payload):
+    serialized = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def v1_cache_path(flags, n_neurons, flag_str):
+    """One cache file per model configuration.
+
+    Runs that differ only in, e.g., their seed (an ensemble) then keep separate
+    files instead of rebuilding and overwriting a shared one. Changed source
+    files are caught by the provenance check and rebuilt in place.
+    """
+    key = _digest(
+        {"version": _V1_CACHE_VERSION, "config": _v1_cache_config(flags, n_neurons)}
+    )[:12]
+    return os.path.join(flags.data_dir, "tf_data", f"V1_network_{flag_str}_{key}.pkl")
+
+
+def _v1_cache_provenance(flags, n_neurons):
+    """Describe every input that can change a cached, ready-to-run V1 model."""
+    config = _v1_cache_config(flags, n_neurons)
 
     data_dir = os.path.abspath(os.fspath(flags.data_dir))
     source_paths = (
@@ -47,12 +73,9 @@ def _v1_cache_provenance(flags, n_neurons):
                 "mtime_ns": stat.st_mtime_ns,
             }
 
-    serialized = json.dumps(
-        {"version": _V1_CACHE_VERSION, "config": config, "sources": sources},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(serialized).hexdigest()
+    return _digest(
+        {"version": _V1_CACHE_VERSION, "config": config, "sources": sources}
+    )
 
 
 def sort_indices(indices, *arrays):
@@ -833,13 +856,16 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     
     # file_dir = os.path.split(__file__)[0]
     cache_dir = os.path.join(flags.data_dir, "tf_data")
-    cache_path = os.path.join(cache_dir, f"V1_network_{flag_str}.pkl")
+    cache_path = v1_cache_path(flags, n_neurons, flag_str)
+    # Caches written before the configuration key was added to the name.
+    legacy_path = os.path.join(cache_dir, f"V1_network_{flag_str}.pkl")
+    read_path = cache_path if os.path.exists(cache_path) else legacy_path
     provenance = _v1_cache_provenance(flags, n_neurons)
     print(f"> Looking for cached V1 model in {cache_path}")
-    
-    if os.path.exists(cache_path):
+
+    if os.path.exists(read_path):
         try:
-            with open(cache_path, "rb") as f:
+            with open(read_path, "rb") as f:
                 cached = pkl.load(f)
             if (
                 isinstance(cached, dict)
@@ -847,7 +873,9 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
                 and cached.get("provenance") == provenance
             ):
                 network, lgn_input, bkg_input = cached["payload"]
-                print(f"> Sucessfully restored V1 model from {cache_path}")
+                if read_path != cache_path:
+                    os.replace(read_path, cache_path)
+                print(f"> Sucessfully restored V1 model from {read_path}")
             else:
                 print(f"> Cached V1 model provenance does not match; rebuilding {cache_path}")
                 store = True
@@ -865,16 +893,21 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
         os.makedirs(cache_dir, exist_ok=True)
         provenance = _v1_cache_provenance(flags, n_neurons)
         temporary_path = f"{cache_path}.{os.getpid()}.tmp"
-        with open(temporary_path, "wb") as f:
-            pkl.dump(
-                {
-                    "version": _V1_CACHE_VERSION,
-                    "provenance": provenance,
-                    "payload": (network, lgn_input, bkg_input),
-                },
-                f,
-            )
-        os.replace(temporary_path, cache_path)
+        try:
+            with open(temporary_path, "wb") as f:
+                pkl.dump(
+                    {
+                        "version": _V1_CACHE_VERSION,
+                        "provenance": provenance,
+                        "payload": (network, lgn_input, bkg_input),
+                    },
+                    f,
+                )
+            os.replace(temporary_path, cache_path)
+        finally:
+            # A failed dump (e.g. a full disk) must not leave a multi-GB file.
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
         print(f"> Cached V1 model in {cache_path}")
 
     return network, lgn_input, bkg_input

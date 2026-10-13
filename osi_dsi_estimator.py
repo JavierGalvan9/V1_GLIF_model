@@ -180,6 +180,10 @@ def main(_):
                 ),
                 output_neuron_ids=output_neuron_ids if compact_output else None,
                 return_voltage_sequences=flags.track_voltage,
+                # Checkpoints locate the cell by its position among the model's
+                # layers, and the penalty state adds an input layer before it.
+                track_voltage_penalty=flags.use_online_voltage_loss,
+                voltage_penalty_mode=flags.voltage_penalty_mode,
                 neuron_layout=neuron_layout,
                 edge_orders=edge_orders,
                 lgn_row_order=lgn_row_order,
@@ -600,6 +604,11 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("reset_every_step", False, "")
     absl.app.flags.DEFINE_boolean("spontaneous_training", False, "")
     absl.app.flags.DEFINE_boolean("sequential_stimuli", False, "")
+    absl.app.flags.DEFINE_boolean(
+        "use_online_voltage_loss", True,
+        "Must match the training run: its voltage-penalty state shifts the "
+        "checkpointed layer positions, so a mismatch leaves the model unrestored.",
+    )
     absl.app.flags.DEFINE_boolean("debug_gradients", False, "")
     absl.app.flags.DEFINE_boolean("calculate_osi_dsi", True, "")
     absl.app.flags.DEFINE_boolean('random_weights', False, '')

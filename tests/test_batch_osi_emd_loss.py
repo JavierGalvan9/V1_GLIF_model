@@ -5,7 +5,9 @@ gratings samples in one training batch and matches the resulting distribution,
 per cell type, against the Neuropixels one. That only works if the per-neuron
 estimate is actually unbiased at realistic batch sizes, so these tests drive it
 with synthetic Poisson spikes whose tuning curves -- and therefore whose true
-OSI/DSI -- are known exactly by construction.
+OSI/DSI -- are known exactly by construction. The estimate is the real
+component of the selectivity vector anchored at each neuron's wired preferred
+angle, so noise averages out instead of adding a magnitude floor.
 """
 
 import unittest
@@ -100,7 +102,7 @@ def _sample(params, batch, seed, rate_scale=1.0):
 
 
 def _naive(rates, angles, harmonic):
-    """The uncorrected estimator, i.e. what the debiasing is measured against."""
+    """The per-neuron magnitude, i.e. the noise floor the signed estimate avoids."""
     theta = np.deg2rad(angles)[:, None]
     moment = (rates * np.exp(1j * harmonic * theta)).sum(axis=0)
     return np.abs(moment) / np.maximum(rates.sum(axis=0), 1e-12)
@@ -112,61 +114,41 @@ class BatchOsiEstimatorTest(unittest.TestCase):
         cls.params, cls.osi_true, cls.dsi_true = _population()
         cls.estimator = _estimator(cls.params[0])
 
-    def _estimate(self, batch, seed, **kwargs):
-        angles, rates = _sample(self.params, batch, seed, **kwargs)
-        return self.estimator.batch_osi_dsi_estimates(
+    def _components(self, rates, angles, estimator=None):
+        """Signed OSI/DSI components as NumPy arrays: osi, osi_imag, dsi, dsi_imag."""
+        estimator = self.estimator if estimator is None else estimator
+        outputs = estimator._batch_signed_osi_dsi_components(
             tf.constant(rates), tf.constant(angles)
-        ), angles, rates
+        )
+        return [tensor.numpy() for tensor in outputs[:4]]
 
-    def test_squared_estimate_is_unbiased(self):
-        """OSI^2 and DSI^2 are what the pairwise correction makes unbiased."""
+    def test_signed_estimate_is_nearly_unbiased(self):
+        """Anchored at the wired angle, the real component estimates OSI/DSI."""
         errors = []
         for seed in range(24):
             angles, rates = _sample(self.params, 56, 100 + seed)
-            osi_sq, dsi_sq, _, _ = self.estimator.batch_squared_osi_dsi_estimates(
-                tf.constant(rates), tf.constant(angles)
-            )
-            errors.append(
-                (
-                    np.mean(osi_sq.numpy() - self.osi_true ** 2),
-                    np.mean(dsi_sq.numpy() - self.dsi_true ** 2),
-                )
-            )
+            osi, _, dsi, _ = self._components(rates, angles)
+            errors.append((np.mean(osi - self.osi_true), np.mean(dsi - self.dsi_true)))
         osi_bias, dsi_bias = np.mean(errors, axis=0)
-        self.assertLess(abs(osi_bias), 0.015, f"OSI^2 bias {osi_bias:+.4f}")
-        self.assertLess(abs(dsi_bias), 0.015, f"DSI^2 bias {dsi_bias:+.4f}")
+        self.assertLess(abs(osi_bias), 0.015, f"OSI bias {osi_bias:+.4f}")
+        self.assertLess(abs(dsi_bias), 0.015, f"DSI bias {dsi_bias:+.4f}")
 
-    def test_debiasing_removes_the_untuned_noise_floor(self):
+    def test_signed_estimate_has_no_untuned_noise_floor(self):
         """An untuned neuron must not measure as selective at batch 56.
 
-        This is the whole reason the crowd_osi workaround existed: the naive
-        per-neuron estimate reads ~0.14 for cells whose true OSI is ~0.03.
+        The naive per-neuron magnitude reads ~0.14 for cells whose true OSI is
+        ~0.03; the signed component averages its noise out instead.
         """
         untuned = self.osi_true < 0.05
         self.assertGreater(untuned.sum(), 100)
-        debiased, naive = [], []
+        signed, naive = [], []
         for seed in range(24):
-            (osi, _, _, _), angles, rates = self._estimate(56, 200 + seed)
-            debiased.append(np.mean(osi.numpy()[untuned]))
+            angles, rates = _sample(self.params, 56, 200 + seed)
+            signed.append(np.mean(self._components(rates, angles)[0][untuned]))
             naive.append(np.mean(_naive(rates, angles, 2)[untuned]))
-        debiased, naive = np.mean(debiased), np.mean(naive)
         truth = self.osi_true[untuned].mean()
-        self.assertLess(debiased - truth, 0.5 * (naive - truth))
-        self.assertLess(debiased, 0.08)
-
-    def test_bias_shrinks_with_batch_size(self):
-        bias = {}
-        for batch in (32, 128, 512):
-            errors = []
-            for seed in range(12):
-                angles, rates = _sample(self.params, batch, 300 + seed)
-                osi_sq, _, _, _ = self.estimator.batch_squared_osi_dsi_estimates(
-                    tf.constant(rates), tf.constant(angles)
-                )
-                errors.append(np.mean(osi_sq.numpy() - self.osi_true ** 2))
-            bias[batch] = abs(np.mean(errors))
-        self.assertLess(bias[128], bias[32])
-        self.assertLess(bias[512], bias[128])
+        self.assertLess(abs(np.mean(signed) - truth), 0.01)
+        self.assertGreater(np.mean(naive) - truth, 0.05)
 
     def test_matches_the_eight_angle_protocol_estimator(self):
         """Same definition as `calculate_OSI_DSI`, which validation reports."""
@@ -177,94 +159,64 @@ class BatchOsiEstimatorTest(unittest.TestCase):
         osi_8 = np.abs((curve * np.exp(2j * theta)).sum(axis=0)) / denominator
         dsi_8 = np.abs((curve * np.exp(1j * theta)).sum(axis=0)) / denominator
 
-        (osi, dsi, _, _), _, _ = self._estimate(4096, 7)
+        angles, rates = _sample(self.params, 4096, 7)
+        osi, _, dsi, _ = self._components(rates, angles)
         for estimated, reference, name in (
-            (osi.numpy(), osi_8, "OSI"),
-            (dsi.numpy(), dsi_8, "DSI"),
+            (osi, osi_8, "OSI"),
+            (dsi, dsi_8, "DSI"),
         ):
             self.assertGreater(np.corrcoef(estimated, reference)[0, 1], 0.99, name)
             self.assertLess(np.mean(np.abs(estimated - reference)), 0.03, name)
 
     def test_normalizer_does_not_change_the_estimate(self):
-        """`normalizer` is ignored: the estimate must be bit-identical with it.
-
-        Selectivity is a per-neuron ratio, so the divide would cancel out of
-        both the numerator and denominator.
-        """
-        (osi_plain, dsi_plain, _, _), angles, rates = self._estimate(56, 5)
-        normalizer = tf.constant(
-            np.maximum(rates.mean(axis=0), 1e-4).astype(np.float32)
+        """`normalizer` is ignored: selectivity is a per-neuron ratio."""
+        angles, rates = _sample(self.params, 56, 5)
+        normalizer = tf.constant(np.maximum(rates.mean(axis=0), 1e-4))
+        plain = self.estimator._batch_signed_osi_dsi_components(
+            tf.constant(rates), tf.constant(angles)
         )
-        osi_scaled, dsi_scaled, _, _ = self.estimator.batch_osi_dsi_estimates(
+        normalized = self.estimator._batch_signed_osi_dsi_components(
             tf.constant(rates), tf.constant(angles), normalizer=normalizer
         )
-        np.testing.assert_array_equal(osi_plain.numpy(), osi_scaled.numpy())
-        np.testing.assert_array_equal(dsi_plain.numpy(), dsi_scaled.numpy())
+        for expected, actual in zip(plain, normalized):
+            np.testing.assert_array_equal(expected.numpy(), actual.numpy())
 
-    def test_estimate_is_invariant_to_overall_rate_scaling(self):
-        """OSI is a ratio: multiplying every rate by a constant changes nothing.
+    def test_estimate_is_invariant_to_rate_scaling(self):
+        """Overall and per-neuron rate scales cancel from each neuron's ratio."""
+        angles, rates = _sample(self.params, 56, 5)
+        plain = self._components(rates, angles)
+        scale = np.random.default_rng(4).uniform(0.25, 4.0, rates.shape[1])
+        for scaled_rates in (rates * 7.0, rates * scale[None, :].astype(np.float32)):
+            for expected, actual in zip(plain, self._components(scaled_rates, angles)):
+                np.testing.assert_allclose(actual, expected, atol=1e-5)
 
-        Both the pairwise numerator and its denominator scale quadratically.
-        """
-        (osi_plain, dsi_plain, _, _), angles, rates = self._estimate(56, 5)
-        osi_scaled, dsi_scaled, _, _ = self.estimator.batch_osi_dsi_estimates(
-            tf.constant(rates * 7.0), tf.constant(angles)
-        )
-        np.testing.assert_allclose(
-            osi_plain.numpy(), osi_scaled.numpy(), atol=1e-4
-        )
-        np.testing.assert_allclose(
-            dsi_plain.numpy(), dsi_scaled.numpy(), atol=1e-4
-        )
-
-    def test_estimate_is_invariant_to_per_neuron_rate_scaling(self):
-        """Each neuron's independent rate scale cancels from its ratio."""
-        (osi_plain, _, _, _), angles, rates = self._estimate(56, 5)
-        rng = np.random.default_rng(4)
-        scale = rng.uniform(0.25, 4.0, rates.shape[1]).astype(np.float32)
-        osi_scaled, _, _, _ = self.estimator.batch_osi_dsi_estimates(
-            tf.constant(rates * scale[None, :]), tf.constant(angles)
-        )
-        np.testing.assert_allclose(
-            osi_plain.numpy(), osi_scaled.numpy(), atol=1e-5
-        )
-
-    def test_orthogonal_power_tracks_preferred_angle_drift(self):
-        """The alignment term must read the offset between actual and wired angle."""
+    def test_imaginary_component_tracks_preferred_angle_drift(self):
+        """The alignment term reads the offset between actual and wired angle."""
         strong = self.osi_true > 0.3
+        angles, rates = _sample(self.params, 4096, 13)
         for offset in (0.0, 10.0, 30.0, 45.0):
-            estimator = _estimator(self.params[0] + offset)
-            angles, rates = _sample(self.params, 4096, 13)
-            _, _, orthogonal, _ = estimator.batch_osi_dsi_estimates(
-                tf.constant(rates), tf.constant(angles)
+            osi, osi_imag, _, _ = self._components(
+                rates, angles, _estimator(self.params[0] + offset)
             )
-            expected = np.mean(
-                self.osi_true[strong] * abs(np.sin(2 * np.deg2rad(offset)))
+            phase = 2 * np.deg2rad(offset)
+            truth = self.osi_true[strong]
+            self.assertAlmostEqual(
+                float(np.mean(osi_imag[strong])), -np.mean(truth) * np.sin(phase),
+                delta=0.01, msg=f"offset {offset} deg",
             )
             self.assertAlmostEqual(
-                float(np.mean(orthogonal.numpy()[strong])), expected, delta=0.01,
-                msg=f"offset {offset} deg",
+                float(np.mean(osi[strong])), np.mean(truth) * np.cos(phase),
+                delta=0.01, msg=f"offset {offset} deg",
             )
 
-    def test_orthogonal_power_has_no_firing_rate_floor(self):
-        """Scaling all rates must not change the alignment term.
-
-        Its uncorrected form `mean((B/T)^2)` has a noise floor proportional to
-        1/rate, which would let the optimiser lower the OSI loss just by firing
-        more. The pairwise correction is what removes that.
-        """
-        aligned = _estimator(self.params[0])
+    def test_alignment_term_has_no_firing_rate_floor(self):
+        """Firing more must not lower the alignment penalty of aligned cells."""
         values = []
         for rate_scale in (0.5, 4.0):
             per_scale = []
             for seed in range(8):
-                angles, rates = _sample(
-                    self.params, 56, 600 + seed, rate_scale=rate_scale
-                )
-                _, _, orthogonal_sq, _ = aligned.batch_squared_osi_dsi_estimates(
-                    tf.constant(rates), tf.constant(angles)
-                )
-                per_scale.append(np.mean(orthogonal_sq.numpy()))
+                angles, rates = _sample(self.params, 56, 600 + seed, rate_scale=rate_scale)
+                per_scale.append(np.mean(self._components(rates, angles)[1]))
             values.append(np.mean(per_scale))
         self.assertLess(abs(values[0] - values[1]), 0.01, f"{values}")
 
@@ -273,36 +225,32 @@ class BatchOsiEstimatorTest(unittest.TestCase):
         rates[:, :50] = 0.0                       # never fires
         rates[:, 50:100] = 0.0
         rates[0, 50:100] = 1.0 / WINDOW_MS        # one spike, in one trial
-        osi, dsi, orthogonal, _ = self.estimator.batch_osi_dsi_estimates(
-            tf.constant(rates), tf.constant(angles)
-        )
-        for tensor in (osi, dsi, orthogonal):
-            values = tensor.numpy()
+        for values in self._components(rates, angles):
             self.assertTrue(np.all(np.isfinite(values)))
-            self.assertLess(values[:100].max(), 1e-3)
+            self.assertEqual(np.abs(values[:50]).max(), 0.0)
 
-    def test_gradients_are_finite_and_reach_weakly_tuned_neurons(self):
+    def test_loss_gradients_are_finite_and_skip_silent_neurons(self):
+        """A silent neuron's components divide by epsilon; the loss masks it."""
+        n_neurons = 300
         angles, rates = _sample(self.params, 56, 23)
+        rates = rates[:, :n_neurons]
         rates[:, :50] = 0.0
+        loss = _single_type_loss(0.0)
+        loss._tuning_angles = tf.constant(self.params[0][:n_neurons], dtype=tf.float32)
+        loss._emd_group_indices = tf.ragged.constant([np.arange(n_neurons)], dtype=tf.int32)
+        loss._osi_empirical_distributions = tf.ragged.constant(
+            [np.linspace(0.0, 0.8, 20)], dtype=tf.float32
+        )
+        loss._dsi_empirical_distributions = tf.ragged.constant(
+            [np.linspace(0.0, 0.5, 20)], dtype=tf.float32
+        )
         variable = tf.Variable(rates)
         with tf.GradientTape() as tape:
-            osi_sq, dsi_sq, orthogonal_sq, _ = (
-                self.estimator.batch_squared_osi_dsi_estimates(
-                    variable, tf.constant(angles)
-                )
-            )
-            loss = (
-                tf.reduce_mean(osi_sq)
-                + tf.reduce_mean(dsi_sq)
-                + tf.reduce_mean(orthogonal_sq)
-            )
-        gradient = tape.gradient(loss, variable).numpy()
+            value = loss.batch_osi_emd_loss_from_rates(variable, tf.constant(angles))
+        gradient = tape.gradient(value, variable).numpy()
         self.assertTrue(np.all(np.isfinite(gradient)))
         self.assertEqual(np.abs(gradient[:, :50]).max(), 0.0)
-        # Working in squared space is what keeps every live neuron differentiable;
-        # clipping a negative OSI^2 before the sqrt would zero a quarter of them.
-        live = np.abs(gradient[:, 100:]).max(axis=0)
-        self.assertEqual(np.count_nonzero(live == 0.0), 0)
+        self.assertEqual(np.count_nonzero(np.abs(gradient[:, 50:]).max(axis=0) == 0.0), 0)
 
     def test_recovers_selectivity_from_binary_spike_trains(self):
         """The real entry point takes [batch, time, neurons] spikes."""
@@ -321,12 +269,10 @@ class BatchOsiEstimatorTest(unittest.TestCase):
         rates = estimator.rates_per_sample_from_spikes(
             tf.constant(spikes), trim=False
         )
-        osi, dsi, _, _ = estimator.batch_osi_dsi_estimates(
-            rates, tf.constant(angles)
-        )
-        self.assertGreater(np.corrcoef(osi.numpy(), osi_true)[0, 1], 0.7)
-        self.assertGreater(np.corrcoef(dsi.numpy(), dsi_true)[0, 1], 0.7)
-        self.assertLess(abs(np.mean(osi.numpy() - osi_true)), 0.06)
+        osi, _, dsi, _ = self._components(rates.numpy(), angles, estimator)
+        self.assertGreater(np.corrcoef(osi, osi_true)[0, 1], 0.7)
+        self.assertGreater(np.corrcoef(dsi, dsi_true)[0, 1], 0.7)
+        self.assertLess(abs(np.mean(osi - osi_true)), 0.06)
 
     def test_loss_rejects_ninety_degree_orientation_reversal(self):
         """Linear EMD must retain the sign of the aligned component."""

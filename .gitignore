@@ -119,16 +119,11 @@ synaptic_current_optimization/
 !tests/test_distribution_strategy.py
 !tests/test_earth_movers_distance_regularizer.py
 !tests/test_training_orchestration.py
-tests/test_segmented_recompute.py
-tests/test_cuda_csr_external.py
 lgn_optimization_work/
 uint8_rec_state_benchmark/
 parallel_training_testing.py
 v1_model_utils/models.py
-test_inference_mode.py
 batch_vram_optimization_20260828/
-test_large_tensor_reductions.py
-test_multi_training_batch_sizes.py
 Benchmarks_metrics/
 distributed_training_investigation/
 !tests/test_cuda_csr_resources.py

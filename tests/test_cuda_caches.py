@@ -79,3 +79,18 @@ def test_caller_settings_win(tmp_path):
         assert os.environ["XLA_FLAGS"] == (
             "--xla_gpu_dump_autotune_results_to=/somewhere/else"
         )
+
+
+def test_incomplete_results_are_dropped_instead_of_loaded(tmp_path):
+    """XLA fails every later jit_compile on a file it cannot parse."""
+    results = tmp_path / "xla_autotune" / "gpu.txtpb"
+    results.parent.mkdir(parents=True)
+    for contents in ("", 'version: 3\nresults {\n  device: "CUDA'):
+        results.write_text(contents)
+        with mock.patch.dict(os.environ, _clean_env(tmp_path), clear=True), \
+                mock.patch.object(cuda_caches, "_visible_gpu_key", return_value="gpu"):
+            cuda_caches.configure_cuda_caches()
+            assert os.environ["XLA_FLAGS"] == (
+                f"--xla_gpu_dump_autotune_results_to={results}"
+            )
+        assert not results.exists()

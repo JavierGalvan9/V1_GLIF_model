@@ -9,7 +9,8 @@ calculate activity gradients and is the intended model configuration.
 The basis dimension follows the recurrent implementation: four basis values
 select the compile-time specialization, while every other positive dimension
 uses a dynamic-basis kernel. Backward has static batch variants for 1, 2, 4,
-8, 16, 32, 64, 128 and 256. Other batch sizes use runtime fallbacks or
+8, 16, 32, 64, 128 and 256, and for 512 when there are at least 1,024 rows.
+Other batch sizes use runtime fallbacks or
 generic pair-projected kernels. FP32 master-weight gradients retain the original checkpoint edge
 order; CSR identifiers are `uint32` and synapse types are `uint8`. Every
 operator takes the synaptic basis in FP32. The LGN forward goes through the

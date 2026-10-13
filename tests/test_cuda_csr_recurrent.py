@@ -1,4 +1,5 @@
 import dataclasses
+import functools
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ from v1_model_utils.cuda_csr_recurrent import (
     accumulate_recurrent_weight_gradient,
     build_csr_connectivity,
     calculate_recurrent_csr_currents,
+    spike_queue,
 )
 
 
@@ -161,10 +163,10 @@ def test_compact_pairs_describe_every_csr_edge():
     np.testing.assert_array_equal(pair_types[pair_ids], csr_types)
 
 
-def _dense_fixture(batch, n_basis, seed):
+def _dense_fixture(batch, n_basis, seed, n_pre=48):
     """Several hundred edges per row, so a slicing or reduction error cannot hide."""
     rng = np.random.default_rng(seed)
-    n_pre, n_post, n_types, n_edges = 48, 96, 7, 6000
+    n_post, n_types, n_edges = 96, 7, 6000
     indices = np.stack(
         (rng.integers(0, n_post, n_edges), rng.integers(0, n_pre, n_edges)), axis=1
     ).astype(np.int64)
@@ -179,7 +181,7 @@ def _dense_fixture(batch, n_basis, seed):
 
 
 def _relative_error(got, want):
-    got = np.asarray(got, np.float64)
+    got, want = np.asarray(got, np.float64), np.asarray(want, np.float64)
     return np.linalg.norm(got - want) / np.linalg.norm(want)
 
 
@@ -329,6 +331,28 @@ def test_initial_must_match_the_output_shape():
         ).numpy()
 
 
+def test_edge_arrays_of_the_wrong_length_are_rejected():
+    """The kernels index edge arrays unchecked: a short weight vector would
+    read (and its gradient write) out of bounds instead of failing."""
+    indices, synapse_types, spikes, weights, basis, _ = _fixture(2, 4)
+    connectivity = _connectivity(indices, synapse_types, n_pre=4, n_post=3)
+    with pytest.raises(tf.errors.InvalidArgumentError, match="one entry per edge"):
+        calculate_recurrent_csr_currents(
+            tf.constant(spikes), tf.Variable(weights[:-1]), tf.constant(basis),
+            0.37, connectivity,
+        ).numpy()
+
+
+def test_basis_must_cover_every_synapse_type():
+    indices, synapse_types, spikes, weights, basis, _ = _fixture(2, 4)
+    connectivity = _connectivity(indices, synapse_types, n_pre=4, n_post=3)
+    with pytest.raises(ValueError, match="synapse types"):
+        calculate_recurrent_csr_currents(
+            tf.constant(spikes), tf.Variable(weights), tf.constant(basis[:2]),
+            0.37, connectivity,
+        )
+
+
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize("use_initial", [False, True])
 def test_graph_mode_gradients_with_and_without_an_accumulator(use_initial):
@@ -360,9 +384,11 @@ def test_graph_mode_gradients_with_and_without_an_accumulator(use_initial):
 
 
 def _float64_forward(indices, synapse_types, spikes, weights, basis, n_post):
+    edge_vectors = np.asarray(weights, np.float64)[:, None] * basis[synapse_types]
     currents = np.zeros((spikes.shape[0], n_post, basis.shape[1]))
-    for (post, pre), synapse_type, weight in zip(indices, synapse_types, weights):
-        currents[:, post] += np.outer(spikes[:, pre], weight * basis[synapse_type])
+    for row, drive in zip(currents, np.asarray(spikes, np.float64)[:, indices[:, 1]]):
+        for column, values in enumerate((drive[:, None] * edge_vectors).T):
+            row[:, column] = np.bincount(indices[:, 0], values, minlength=n_post)
     return currents.reshape(-1, basis.shape[1])
 
 
@@ -606,3 +632,192 @@ def test_shared_forward_tables_respect_output_size(monkeypatch, resource_mode):
             expected[0] = 2.0
             np.testing.assert_array_equal(run(activity).numpy(), expected)
         np.testing.assert_array_equal(runs[0](activity).numpy()[0], 2.0)
+
+
+@functools.lru_cache(maxsize=None)
+def _unique_edges(n_pre, n_post, n_edges, n_types=5):
+    """Random distinct (post, pre) edges in CSR order, with their weights."""
+    rng = np.random.default_rng(n_post)
+    flat = np.unique(rng.integers(0, n_pre * n_post, n_edges))
+    indices = np.stack((flat % n_post, flat // n_post), axis=1)
+    synapse_types = rng.integers(0, n_types, flat.size)
+    weights = rng.normal(size=flat.size).astype(np.float32)
+    return _csr_sorted(indices, synapse_types, weights)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("use_initial", [False, True])
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("batch", [1, 5, 33])
+@pytest.mark.parametrize("n_post, n_edges", [(12_000, 400_000), (330_000, 1_500_000)])
+def test_tiled_forward_matches_float64(n_post, n_edges, batch, dtype, use_initial):
+    """Targets spanning 3 tiles (masked table) and over 64 (binary search).
+
+    The last sample of a batch never fires, so its rows hold exactly `initial`.
+    """
+    n_pre = 4000
+    indices, synapse_types, weights = _unique_edges(n_pre, n_post, n_edges)
+    connectivity = _connectivity(indices, synapse_types, n_pre, n_post)
+    rng = np.random.default_rng(batch)
+    spikes = (rng.random((batch, n_pre)) < 0.2).astype(dtype.as_numpy_dtype)
+    if batch > 1:
+        spikes[-1] = 0.0
+    basis = rng.normal(size=(5, 4)).astype(np.float32)
+    seed = rng.normal(size=(batch * n_post, 4)).astype(dtype.as_numpy_dtype)
+    currents = calculate_recurrent_csr_currents(
+        tf.constant(spikes), tf.Variable(weights), tf.constant(basis), 0.37,
+        connectivity, initial=tf.constant(seed) if use_initial else None,
+    ).numpy()
+    seed = seed if use_initial else np.zeros_like(seed)
+    expected = _float64_forward(indices, synapse_types, spikes, weights, basis, n_post)
+    assert _relative_error(currents, expected + seed) < (
+        2e-3 if dtype == tf.float16 else 1e-6
+    )
+    if batch > 1:
+        np.testing.assert_array_equal(currents[-n_post:], seed[-n_post:])
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("n_post, n_edges", [(12_000, 400_000), (330_000, 1_500_000)])
+def test_silent_batch_writes_every_output(n_post, n_edges, dtype):
+    """With no active entry no edge is swept; the output must still be zeroed,
+    not left as whatever the allocator hands back (pre-filled with junk here)."""
+    n_pre, batch = 4000, 5
+    indices, synapse_types, weights = _unique_edges(n_pre, n_post, n_edges)
+    connectivity = _connectivity(indices, synapse_types, n_pre, n_post)
+    junk = tf.fill((batch * n_post, 4), tf.constant(7.0, dtype))
+    del junk
+    currents = calculate_recurrent_csr_currents(
+        tf.zeros((batch, n_pre), dtype), tf.Variable(weights), tf.ones((5, 4)), 0.37,
+        connectivity,
+    )
+    np.testing.assert_array_equal(currents.numpy(), 0.0)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("batch", [1, 5, 32])
+@pytest.mark.parametrize("n_slots", range(2, 8))
+def test_spike_slots_match_the_concatenated_history(n_slots, batch, dtype):
+    """A history passed as its delay slots is the concatenated op, slot by slot.
+
+    Each slot gets its own share of the spike gradient, and the in-place weight
+    gradient accumulator sees the same gradient as the single-slot call.
+    """
+    (indices, synapse_types, spikes, weights, basis, upstream,
+     n_pre, n_post) = _dense_fixture(batch, 4, 77 * n_slots + batch, n_pre=48 * n_slots)
+    connectivity = _connectivity(indices, synapse_types, n_pre, n_post)
+    master = tf.Variable(weights)
+
+    def gradients(history):
+        with tf.GradientTape() as tape:
+            tape.watch(history)
+            currents = calculate_recurrent_csr_currents(
+                history, master, tf.constant(basis), 0.5, connectivity
+            )
+            loss = tf.reduce_sum(tf.cast(currents, tf.float32) * upstream)
+        return (currents, *tape.gradient(loss, (history, master)))
+
+    history = tf.constant(spikes, dtype)
+    slots = tuple(tf.split(history, n_slots, axis=1))
+    currents, spike_grad, weight_grad = gradients(history)
+    slot_currents, slot_grads, slot_weight_grad = gradients(slots)
+    assert len(slot_grads) == n_slots
+    # Atomics make neither path bitwise reproducible; FP16 rounds each partial sum.
+    tolerance = 2e-3 if dtype == tf.float16 else 1e-6
+    assert _relative_error(slot_currents, currents.numpy()) < tolerance
+    assert _relative_error(tf.concat(slot_grads, axis=1), spike_grad.numpy()) < tolerance
+    assert _relative_error(slot_weight_grad, weight_grad.numpy()) < 1e-6
+
+    offset = np.random.default_rng(n_slots).normal(size=weights.shape).astype(np.float32)
+    accumulator = tf.Variable(offset)
+    with accumulate_recurrent_weight_gradient(accumulator.handle):
+        _, accumulated_grads, no_weight_grad = gradients(slots)
+    assert no_weight_grad is None
+    assert _relative_error(tf.concat(accumulated_grads, axis=1), spike_grad.numpy()) < tolerance
+    assert _relative_error(accumulator.numpy() - offset, weight_grad.numpy()) < 1e-6
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+def test_carried_queue_records_match_sweeping_every_slot(dtype, resource_mode, monkeypatch):
+    """Carry records step to step as the model loop does: each step's returned
+    record becomes the next step's queue of slot 1, and the oldest is dropped."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    n_slots, width, n_post, batch, steps = 3, 2000, 12_000, 3, 10
+    indices, synapse_types, weights = _unique_edges(n_slots * width, n_post, 80_000)
+    connectivity = _connectivity(indices, synapse_types, n_slots * width, n_post)
+    master = tf.Variable(weights)
+    basis = tf.constant(np.random.default_rng(0).normal(size=(5, 4)), tf.float32)
+    rng = np.random.default_rng(1)
+    sequence = tf.constant(
+        (rng.random((steps + n_slots, batch, width)) < 0.2).astype(dtype.as_numpy_dtype)
+    )
+
+    @tf.function
+    def rollout(carry):
+        slots = tuple(sequence[n_slots - 1 - slot] for slot in range(n_slots))
+        queues = tuple(spike_queue(slot) for slot in slots[1:])
+        outputs = tf.TensorArray(dtype, size=steps)
+        for step in tf.range(steps):
+            if carry:
+                currents, record = calculate_recurrent_csr_currents(
+                    slots, master, basis, 0.5, connectivity, queues=queues
+                )
+                queues = (record,) + queues[:-1]
+            else:
+                currents = calculate_recurrent_csr_currents(
+                    slots, master, basis, 0.5, connectivity
+                )
+            outputs = outputs.write(step, currents)
+            slots = (sequence[step + n_slots],) + slots[:-1]
+        return outputs.stack()
+
+    carried, swept = rollout(True).numpy(), rollout(False).numpy()
+    assert np.any(swept != 0.0)
+    # Atomics reorder the sums between runs, so match to round-off, not bitwise.
+    assert _relative_error(carried, swept) < (1e-3 if dtype == tf.float16 else 1e-6)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+def test_empty_batch_with_slots_and_queues(dtype):
+    indices, synapse_types, _, weights, basis, _ = _fixture(1, 4)
+    connectivity = _connectivity(indices, synapse_types, n_pre=4, n_post=3)
+    slots = (tf.zeros((0, 2), dtype), tf.zeros((0, 2), dtype))
+    master = tf.Variable(weights)
+    with tf.GradientTape() as tape:
+        tape.watch(slots)
+        currents, record = calculate_recurrent_csr_currents(
+            slots, master, tf.constant(basis), 0.5, connectivity,
+            queues=(spike_queue(slots[1]),),
+        )
+        loss = tf.reduce_sum(tf.cast(currents, tf.float32))
+    slot_grads, weight_grad = tape.gradient(loss, (slots, master))
+    assert currents.shape == (0, 4)
+    assert record.dtype == tf.uint32
+    assert [grad.shape for grad in slot_grads] == [(0, 2), (0, 2)]
+    np.testing.assert_array_equal(weight_grad.numpy(), 0.0)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("use_initial", [False, True])
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+def test_connectivity_without_edges(dtype, use_initial):
+    connectivity = _connectivity(np.zeros((0, 2), np.int64), np.zeros(0, np.int64), 10, 7)
+    spikes = tf.ones((3, 10), dtype)
+    master = tf.Variable(np.zeros(0, np.float32))
+    seed = tf.constant(np.random.default_rng(0).normal(size=(21, 4)), dtype)
+    with tf.GradientTape() as tape:
+        tape.watch(spikes)
+        currents = calculate_recurrent_csr_currents(
+            spikes, master, tf.ones((1, 4)), 0.5, connectivity,
+            initial=seed if use_initial else None,
+        )
+        loss = tf.reduce_sum(tf.cast(currents, tf.float32))
+    spike_grad, weight_grad = tape.gradient(loss, (spikes, master))
+    np.testing.assert_array_equal(currents.numpy(), seed.numpy() if use_initial else 0.0)
+    np.testing.assert_array_equal(spike_grad.numpy(), np.zeros((3, 10)))
+    assert weight_grad.shape == (0,)

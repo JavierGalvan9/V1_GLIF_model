@@ -93,7 +93,15 @@ def test_keys_too_wide_to_pack_fall_back_to_lexsort():
     assert csr_order._packed_key(keys) is None
     np.testing.assert_array_equal(csr_order.edge_order(keys), _reference_order(keys))
     assert csr_order.is_identity_order(keys) is False
-    assert csr_order.is_identity_order(tuple(np.sort(k) for k in (wide,))) is True
+
+    sorted_keys = tuple(key[csr_order.edge_order(keys)] for key in keys)
+    assert csr_order._packed_key(sorted_keys) is None
+    assert csr_order.is_identity_order(sorted_keys) is True
+    # With the wide leading key tied, only the second key decides the order.
+    tied = (np.full(4, 2**62), np.array([3, 1, 2, 0]))
+    assert csr_order._packed_key(tied) is None
+    assert csr_order.is_identity_order(tied) is False
+    assert csr_order.is_identity_order((tied[0], np.sort(tied[1]))) is True
 
 
 def test_negative_keys_fall_back_to_lexsort():

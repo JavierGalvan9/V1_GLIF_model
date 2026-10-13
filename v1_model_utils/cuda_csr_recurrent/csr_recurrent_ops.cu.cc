@@ -235,12 +235,6 @@ Status SelectNonzero(OpKernelContext* context, const T* values, int64_t count,
   return OkStatus();
 }
 
-// The queue of active (batch, row) slots of the concatenated [batch, n_pre]
-// matrix, in its row-major order. With several slot tensors, a single
-// compaction over the concatenated index would locate every element's tensor
-// with two divisions, which made the sweep compute-bound (132 us against 50 at
-// B = 64); each tensor is compacted with the plain streaming select instead,
-// and the few active entries are merged into the concatenated order.
 // Builds the queue record (see QueueRecordWords) of one [batch, width] slot.
 template <typename T>
 Status BuildQueueRecord(OpKernelContext* context, const T* slot, int64_t batch,
@@ -253,6 +247,12 @@ Status BuildQueueRecord(OpKernelContext* context, const T* slot, int64_t batch,
                          record + capacity + 1);
 }
 
+// The queue of active (batch, row) slots of the concatenated [batch, n_pre]
+// matrix, in its row-major order. With several slot tensors, a single
+// compaction over the concatenated index would locate every element's tensor
+// with two divisions, which made the sweep compute-bound (132 us against 50 at
+// B = 64); each tensor is compacted with the plain streaming select instead,
+// and the few active entries are merged into the concatenated order.
 // With several slots, `carried.record[d]` is slot d's record when the caller
 // has it (null otherwise) and `newest` receives slot 0's (null: a temporary).
 template <typename T>
@@ -325,8 +325,9 @@ __device__ __forceinline__ void RunSuffixSums(float (&values)[kValues], unsigned
 // repeated narrow read-modify-writes, so it is also more accurate. LGN rows
 // average 1.42 edges per target (one per synapse type), which is where this
 // pays. Recurrent rows never repeat a target (the connectivity says so, see
-// csr_order.repeats_targets), so they take a plain one-thread-per-edge scatter
-// with no warp collectives.
+// csr_order.repeats_targets), so they need no warp collectives: with four basis
+// columns they take TiledForwardKernel below, otherwise this kernel's plain
+// one-thread-per-edge scatter.
 //
 // Aggregation relies on the CSR invariant that postsynaptic ids ascend within a
 // row, so a run occupies consecutive lanes. Its loop is warp-uniform (every
@@ -390,8 +391,9 @@ __global__ void ForwardKernel(
     for (uint32 base = start + warp * 32; base < end; base += warps * 32) {
       const uint32 csr = base + lane;
       const bool valid = csr < end;
-      // Invalid lanes take a post no real edge can have, so they form their own
-      // singleton run and never merge with a live one.
+      // Invalid lanes take a post no real edge can have, so they never merge
+      // with a live run (they share one run of their own, whose leader the
+      // `valid` test below excludes).
       const unsigned int post = valid ? post_ids[csr] : 0xffffffffu;
       const float weighted = valid ? spike * AsFloat(weights[V1_EDGE_INDEX(csr)]) : 0.0f;
       const int type = valid ? synapse_types[csr] : 0;
@@ -1542,6 +1544,25 @@ Status AllocateSpikeGradients(OpKernelContext* context, const OpInputList& spike
   return OkStatus();
 }
 
+// The kernels index the edge-aligned arrays by CSR position without bounds
+// checks, so a length mismatch would read (and, for the weight gradient,
+// write) out of bounds instead of failing. Direct-CSR kernels never read
+// `edge_ids`, which the wrapper then passes empty.
+static Status ValidateEdgeArrays(const Tensor& weights, const Tensor& post_ids,
+                                 const Tensor& synapse_types, const Tensor& edge_ids) {
+  const int64_t n_edges = post_ids.NumElements();
+  const bool edge_ids_valid =
+      edge_ids.NumElements() == n_edges || (V1_DIRECT_CSR && edge_ids.NumElements() == 0);
+  if (weights.NumElements() != n_edges || synapse_types.NumElements() != n_edges ||
+      !edge_ids_valid) {
+    return errors::InvalidArgument(
+        "weights, post_ids, synapse_types and edge_ids must have one entry per "
+        "edge; got ", weights.NumElements(), ", ", n_edges, ", ",
+        synapse_types.NumElements(), " and ", edge_ids.NumElements());
+  }
+  return OkStatus();
+}
+
 template <typename T, typename W>
 class V1CsrForwardOp : public OpKernel {
  public:
@@ -1569,6 +1590,7 @@ class V1CsrForwardOp : public OpKernel {
                 errors::InvalidArgument("basis must be [n_types,n_basis], n_basis > 0"));
     OP_REQUIRES(context, row_splits.NumElements() == spikes.n_pre() + 1,
                 errors::InvalidArgument("row_splits does not match spike width"));
+    OP_REQUIRES_OK(context, ValidateEdgeArrays(weights, post_ids, synapse_types, edge_ids));
     QueueRecords carried;
     unsigned int* newest;
     OP_REQUIRES_OK(context, ReadQueueRecords<T>(context, spikes, initial_index + 1, &carried,
@@ -1658,6 +1680,9 @@ class V1CsrBackwardPairProjectedOp : public OpKernel {
                 errors::InvalidArgument("current_grad has an incompatible shape"));
     OP_REQUIRES(context, dampening.NumElements() == 1,
                 errors::InvalidArgument("dampening must be scalar"));
+    OP_REQUIRES_OK(context, ValidateEdgeArrays(weights, post_ids, synapse_types, edge_ids));
+    OP_REQUIRES(context, n_edges_ == post_ids.NumElements(),
+                errors::InvalidArgument("n_edges does not match post_ids"));
     OP_REQUIRES(context, pair_ids.NumElements() == post_ids.NumElements(),
                 errors::InvalidArgument("pair_ids must align with CSR edges"));
     OP_REQUIRES(context, pair_posts.NumElements() == pair_types.NumElements(),

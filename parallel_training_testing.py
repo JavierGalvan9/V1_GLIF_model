@@ -105,7 +105,7 @@ parser.add_argument('--batch_emd_alignment_weight', default=1.0, type=float)
 
 parser.add_argument('--dampening_factor', default=0.1, type=float)
 parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
-parser.add_argument('--global_clipnorm', default=0.0, type=float)
+parser.add_argument('--global_clipnorm', default=0.0, type=float, help='Per-replica gradient norm limit (applied before the cross-replica sum); <= 0 disables.')
 parser.add_argument('--voltage_gradient_dampening', default=0.0, type=float)
 parser.add_argument('--detach_reset', dest='detach_reset', action='store_true')
 parser.add_argument('--nodetach_reset', dest='detach_reset', action='store_false')
@@ -311,13 +311,13 @@ def main():
     job_ids = []
     eval_job_ids = []
 
-    # initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
-    # if initial_benchmark_model:
-    #     _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir}  --run_session {-1} --restore_from {initial_benchmark_model}"
-    # else:
-    #     _initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from '' --evaluate_untrained"
-    # eval_job_id = submit_job(initial_evaluation_command + [_initial_evaluation_script], print_only=flags.print_only)
-    # eval_job_ids.append(eval_job_id)
+    initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
+    if initial_benchmark_model:
+        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from {initial_benchmark_model}"
+    else:
+        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from '' --evaluate_untrained"
+    eval_job_id = submit_job(initial_evaluation_command + [initial_evaluation_script], print_only=flags.print_only)
+    eval_job_ids.append(eval_job_id)
 
     for i in range(flags.n_runs):
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...

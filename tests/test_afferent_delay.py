@@ -10,7 +10,8 @@ from v1_model_utils import cuda_csr_recurrent, spatial_layout
 from v1_model_utils.models import V1Column
 
 
-def _cell(tmp_path, lgn_delay, track_voltage_penalty=False):
+def _cell(tmp_path, lgn_delay, track_voltage_penalty=False,
+          acceleration="tensorflow", row_order=None):
     tf.keras.mixed_precision.set_global_policy("float32")
     tf_data = tmp_path / "tf_data"
     tf_data.mkdir(parents=True, exist_ok=True)
@@ -40,13 +41,15 @@ def _cell(tmp_path, lgn_delay, track_voltage_penalty=False):
         },
     }
     external = {
-        "n_inputs": 2,
-        "indices": np.array([[0, 0], [1, 1]], np.int32),
-        "weights": np.array([0.1, 0.2], np.float32),
-        "delays": np.full(2, lgn_delay, np.float32),
-        "syn_ids": np.zeros(2, np.uint8),
+        "n_inputs": 3,
+        "indices": np.array([[0, 0], [1, 1], [2, 2]], np.int32),
+        "weights": np.array([0.1, 0.2, 0.3], np.float32),
+        "delays": np.full(3, lgn_delay, np.float32),
+        "syn_ids": np.zeros(3, np.uint8),
     }
-    bkg = dict(external, delays=np.ones(2, np.float32))
+    bkg = dict(external, delays=np.ones(3, np.float32))
+    if row_order is not None:
+        external = spatial_layout.apply_lgn_row_order(row_order, external)
     edge_orders = None
     if cuda_csr_recurrent.DIRECT_CSR:
         network, external, bkg, edge_orders = spatial_layout.apply_csr_edge_order(
@@ -56,7 +59,8 @@ def _cell(tmp_path, lgn_delay, track_voltage_penalty=False):
         network, external, bkg,
         edge_orders=edge_orders,
         batch_size=1,
-        acceleration="tensorflow",
+        acceleration=acceleration,
+        lgn_row_order=row_order,
         train_recurrent=False, train_input=False, train_noise=False,
         bkg_firing_rate=0.0,
         track_voltage_penalty=track_voltage_penalty,
@@ -67,10 +71,8 @@ def _psc_trace(cell, spike_times, n_steps=6):
     state = cell.zero_state(1)
     trace = []
     for step in range(n_steps):
-        spikes = tf.constant(
-            [[1.0, 1.0]] if step in spike_times else [[0.0, 0.0]],
-            dtype=cell.compute_dtype,
-        )
+        spikes = tf.fill((1, cell.input_dim), float(step in spike_times))
+        spikes = tf.cast(spikes, cell.compute_dtype)
         _, state = cell(spikes, state)
         trace.append(float(tf.reduce_sum(tf.abs(state[4]))))
     return np.array(trace)
@@ -113,3 +115,48 @@ def test_voltage_penalty_reset_leaves_the_delay_buffer_alone(tmp_path):
     assert float(tf.reduce_sum(reset[lgn_index])) == float(cell.input_dim), (
         "the LGN delay buffer was cleared by the voltage-penalty reset"
     )
+
+
+# A three-cycle is not its own inverse, so a gather in the wrong direction shows.
+CYCLE = spatial_layout.LgnRowOrder(
+    mode=spatial_layout.LGN_RETINOTOPIC,
+    new_to_old=np.array([2, 0, 1], np.uint32),
+    old_to_new=np.array([1, 2, 0], np.uint32),
+)
+# Canonical stream in which each LGN unit fires on its own steps, so swapped
+# buffer frames or permuted rows move PSC between neurons or timesteps.
+STREAM = np.zeros((10, 3), np.float32)
+STREAM[[0, 3], 0] = STREAM[1, 1] = STREAM[[2, 3], 2] = 1.0
+
+
+def _neuron_psc_traces(cell):
+    """Per-neuron |PSC rise| after each step of STREAM, [steps, n_neurons]."""
+    state = cell.zero_state(1)
+    traces = []
+    for frame in STREAM:
+        _, state = cell(tf.constant(frame[None], cell.compute_dtype), state)
+        traces.append(np.abs(np.reshape(state[4], (cell._n_neurons, -1))).sum(-1))
+    return np.array(traces)
+
+
+@pytest.mark.parametrize("acceleration", [
+    "tensorflow",
+    pytest.param("cuda", marks=pytest.mark.skipif(
+        not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")),
+])
+@pytest.mark.parametrize("row_order", [None, CYCLE], ids=["identity", "cycle"])
+@pytest.mark.parametrize("lgn_delay", [3.0, 4.0])
+def test_multi_frame_delay_keeps_frame_order_and_rows(
+    tmp_path, acceleration, row_order, lgn_delay
+):
+    # Delays of 3-4 steps buffer 2-3 frames newest first; the cell must read
+    # the oldest one and only then gather it from canonical into runtime rows.
+    reference = _neuron_psc_traces(_cell(tmp_path / "ref", lgn_delay=1.0))
+    cell = _cell(tmp_path / "delayed", lgn_delay, acceleration=acceleration,
+                 row_order=row_order)
+    shift = int(lgn_delay) - 1
+    assert cell._lgn_delay_steps == shift + 1
+    delayed = _neuron_psc_traces(cell)
+    assert np.all(reference[:-shift, :3].max(axis=0) > 0), "every unit must drive"
+    np.testing.assert_array_equal(delayed[:shift], 0.0)
+    np.testing.assert_allclose(delayed[shift:], reference[:-shift], rtol=1e-5, atol=1e-7)

@@ -805,7 +805,9 @@ class V1Column(tf.keras.layers.Layer):
         edge_orders=None,
         lgn_row_order=None,
     ):
-        super().__init__(autocast=False)
+        # An explicit name keeps variable paths stable (`v1_column/...`) when a
+        # process builds several models, e.g. the runtime dtype-cast restore.
+        super().__init__(name="v1_column", autocast=False)
         # Disable Keras layer autocast so tensors keep explicit dtypes. The
         # neuron dynamics are split by precision rather than following the
         # policy wholesale: the membrane and ASC state and every propagator
@@ -2504,13 +2506,16 @@ def _normalize_v1_rnn_outputs(rsnn_layer, outputs):
         if flat:
             flat[0] = _keras_op("cast", tf.cast)(flat[0], cell._output_spike_dtype)
         return tuple(flat)
-    state_count = len(tf.nest.flatten(cell.state_size))
+    return_state = getattr(rsnn_layer, "return_state", True)
+    state_count = len(tf.nest.flatten(cell.state_size)) if return_state else 0
     if len(flat) != state_count + 1:
         return tuple(flat)
     packed = flat[0]
     width = cell._n_neurons if cell._output_neuron_ids is None else cell._output_neuron_ids.shape[0]
     spikes, voltage = packed[..., :width], packed[..., width:]
     spikes = _keras_op("cast", tf.cast)(spikes, cell._output_spike_dtype)
+    if not return_state:
+        return (spikes, voltage)
     return ((spikes, voltage), *flat[1:])
 
 

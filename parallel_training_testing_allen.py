@@ -3,6 +3,7 @@ import json
 import os
 import re
 import argparse
+import shlex
 # import numpy as np
 # import tensorflow as tf
 # import tensorflow as tf
@@ -66,7 +67,9 @@ parser.add_argument('--plot_core_radius', default=400.0, type=float)
 
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=75, type=int)
-parser.add_argument('--batch_size', default=1, type=int)
+parser.add_argument('--batch_size', default=2, type=int)
+parser.add_argument('--grating_batch_size', default=1, type=int)
+parser.add_argument('--gray_batch_size', default=1, type=int)
 parser.add_argument('--neurons', default=0, type=int)
 parser.add_argument('--steps_per_epoch', default=25, type=int)
 parser.add_argument('--val_steps', default=1, type=int)
@@ -214,15 +217,14 @@ def main():
         # if value != parser.get_default(name) and name in ['learning_rate', 'rate_cost', 'voltage_cost', 'osi_cost', 'temporal_f', 'n_input', 'seq_len']:
         # if value != parser.get_default(name):
         if name not in ['seed', 'print_only']:
-            if isinstance(value, bool) and not value:
-                training_script += f"--no{name} "
-                evaluation_script += f"--no{name} "
-            elif isinstance(value, bool) and value:
-                training_script += f"--{name} "
-                evaluation_script += f"--{name} "
+            if isinstance(value, bool):
+                argument = f"--{name} " if value else f"--no{name} "
             else:
-                training_script += f"--{name} {value} "
-                evaluation_script += f"--{name} {value} "
+                argument = f"--{name} {shlex.quote(str(value))} "
+            training_script += argument
+            # osi_dsi_estimator.py does not define the training batch splits.
+            if name not in ('grating_batch_size', 'gray_batch_size'):
+                evaluation_script += argument
 
     job_ids = []
     eval_job_ids = []

@@ -43,9 +43,12 @@ backend and must not drift:
   in the same widths the tensor operators take (uint32 indices, uint8 synapse
   types), so the included kernel sources compile unchanged.
 
-A connectivity declared without a backward (`needs_backward=False`, the LGN and
-BKG inputs) uploads an empty pair projection. Initialization accepts that; the
-backward operators refuse to run without it.
+A sparse connectivity built without an activity gradient
+(`needs_activity_backward=False`, the LGN input by default) uploads an empty
+pair projection: its weight gradient is event-driven and does not read it, and
+initialization accepts it. The background input is built with
+`sparse_activity=False`, so it always uploads the projection that its dense
+weight-gradient kernel needs.
 
 Missing or stale libraries are built automatically under a per-architecture
 lock. They may also be prebuilt explicitly:

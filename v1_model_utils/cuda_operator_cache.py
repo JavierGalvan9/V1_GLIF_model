@@ -294,7 +294,10 @@ def ensure_artifact(
         )
         if stale:
             try:
-                subprocess.run(command, check=True)
+                # `-m v1_model_utils...` must resolve from any working directory.
+                subprocess.run(
+                    command, check=True, cwd=Path(__file__).resolve().parent.parent
+                )
             except subprocess.CalledProcessError as error:
                 raise RuntimeError(
                     f"Failed to build CUDA operator for sm_{architecture}: "

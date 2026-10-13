@@ -179,7 +179,9 @@ def test_empty_batches_and_frame_size(lgn):
 
 @requires_op
 @pytest.mark.skipif(not cuda_lgn.available(cuda_lgn.GRATING), reason="CUDA grating op unavailable")
-def test_drifting_grating_backends_agree(strict_float32):
+@pytest.mark.parametrize("billeh_phase", [False, True])
+@pytest.mark.parametrize("rotation", ["cw", "ccw"])  # "cw" is the training default
+def test_drifting_grating_backends_agree(strict_float32, rotation, billeh_phase):
     """The grating op, the movie op and the TensorFlow filters give the same grating
     probabilities, and the CUDA paths the same spikes with or without return_probabilities."""
     from stim_dataset import DriftingGratingLGN
@@ -189,8 +191,8 @@ def test_drifting_grating_backends_agree(strict_float32):
     seeds = tf.constant([[1, 2], [3, 4]], tf.int32)
 
     def grating(backend, **kwargs):
-        return DriftingGratingLGN(120, 20, 10, n_input=17400, data_dir=DATA_DIR, rotation="ccw",
-                                  lgn_backend=backend, **kwargs)
+        return DriftingGratingLGN(120, 20, 10, n_input=17400, data_dir=DATA_DIR, rotation=rotation,
+                                  billeh_phase=billeh_phase, lgn_backend=backend, **kwargs)
 
     paths = {backend: grating(backend) for backend in ("grating", "movie", "tensorflow")}
     assert {backend: path.backend for backend, path in paths.items()} == {
@@ -245,3 +247,55 @@ def test_chunked_movie_spikes_match_whole_batch(lgn):
     tf.debugging.assert_equal(chunked, whole)
     with pytest.raises(ValueError, match="batch size"):
         kernel.spikes(lambda begin, end: movie[begin:end], seeds)
+
+
+def _unit_subset(host_constants, keep):
+    """The LGN host constants restricted to the units ``keep`` (sorted)."""
+    remap = np.full(len(host_constants["is_composite"]), -1)
+    remap[keep] = np.arange(keep.size)
+    subset = {}
+    for key, value in host_constants.items():
+        if key == "gaussian_filters":
+            subset[key] = value
+        elif key == "spatial_range_indices":
+            subset[key] = [remap[units][remap[units] >= 0] for units in value]
+        elif key in ("dom_temporal_kernels", "non_dom_temporal_kernels"):
+            subset[key] = np.asarray(value)[:, keep]
+        else:
+            subset[key] = np.asarray(value)[keep]
+    return subset
+
+
+@requires_op
+@pytest.mark.skipif(not cuda_lgn.available(cuda_lgn.GRATING), reason="CUDA grating op unavailable")
+def test_grating_op_unaligned_units_and_long_sequence(lgn):
+    """17,397 units (not a multiple of 4: the scalar, non-vectorized path) over
+    1,000 steps match the full op's columns bitwise, and the movie op and the
+    TensorFlow filters as in test_drifting_grating_backends_agree."""
+    from stim_dataset import drifting_grating_movies
+
+    keep = np.sort(np.random.default_rng(0).choice(17400, 17397, replace=False))
+    subset = _unit_subset(lgn.host_constants, keep)
+    assert subset["is_composite"].any() and not subset["is_composite"].all()
+    options = dict(seq_len=1000, pre_delay=50, post_delay=150, temporal_f=2, cpd=0.04,
+                   contrast=0.8, rows=80, cols=120, theta_sign=1, theta_offset=0)
+    theta = tf.constant([0.0, 33.0, 91.0, 200.0, 359.0])
+    phase = tf.constant([5.0, 100.0, 250.0, 0.0, 77.0])
+    seeds = tf.constant([[i, 7] for i in range(5)], tf.int32)
+    full = cuda_lgn.GratingLGNKernel(lgn.host_constants, **options).probabilities(theta, phase)
+    unaligned = cuda_lgn.GratingLGNKernel(subset, **options)
+    probabilities = unaligned.probabilities(theta, phase)
+    tf.debugging.assert_equal(probabilities, tf.gather(full, keep, axis=-1))
+    for dtype in (tf.float32, tf.float16):  # float16 uniforms are read unvectorized too
+        uniforms = tf.stack([tf.random.stateless_uniform((1000, keep.size), seed=s, dtype=dtype)
+                             for s in seeds])
+        tf.debugging.assert_equal(unaligned.spikes(theta, phase, seeds, dtype=dtype),
+                                  tf.cast(uniforms, tf.float32) < probabilities)
+    movie = drifting_grating_movies(tf.cast(theta, tf.float64), tf.cast(phase, tf.float64),
+                                    800, 50, 150, 80, 120, 0.04, 2, 0.8, tf.float32)
+    movie_probabilities = cuda_lgn.MovieLGNKernel(subset, rows=80, cols=120).response(
+        movie, "probabilities")
+    tf.debugging.assert_near(movie_probabilities, probabilities, atol=1e-7, rtol=0)
+    reference = lgn.firing_rates(movie[:1], use_cuda=False, output="probabilities")
+    tf.debugging.assert_near(tf.gather(reference, keep, axis=-1), probabilities[:1],
+                             atol=1e-5, rtol=0)

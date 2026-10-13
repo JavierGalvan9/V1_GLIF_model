@@ -1032,8 +1032,10 @@ def main(_):
         # # update state_variables with the new model state
         # new_state = tuple(_out[1:])
         # tf.nest.map_structure(lambda a, b: a.assign(b), initial_state, new_state)
+        # Both substeps' gradients are summed into one update, so the weight
+        # regularizer joins only the gray-screen substep that closes the step.
         regularizers_loss = tf.constant(0.0, dtype=tf.float32)
-        if flags.train_recurrent and flags.recurrent_weight_regularization > 0:
+        if spontaneous and flags.train_recurrent and flags.recurrent_weight_regularization > 0:
             regularizers_loss += tf.cast(
                 rec_weight_regularizer(
                     rsnn_layer.cell.recurrent_weight_values), tf.float32
@@ -2271,7 +2273,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float(
         "global_clipnorm",
         0.0,
-        "Clip the unscaled global gradient norm; values <= 0 disable clipping.",
+        "Clip the unscaled global gradient norm of each replica's local "
+        "gradient, before the cross-replica sum (so N GPUs allow up to N times "
+        "this norm); values <= 0 disable clipping.",
     )
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
     absl.app.flags.DEFINE_float('gauss_std', .3, '')

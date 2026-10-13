@@ -526,12 +526,14 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
     if (bkg_activity.NumElements()) {
       OP_REQUIRES(c, basis == kBasis && bkg_activity.dims() == 2 &&
                      bkg_activity.dim_size(0) == v.dim_size(0) &&
+                     c->input(21).NumElements() == 4 * neurons &&
                      c->input(22).NumElements() == 4 * neurons &&
                      c->input(23).NumElements() == 4 * neurons &&
                      c->input(24).NumElements() == 4 * neurons &&
                      c->input(25).dims() == 2 && c->input(25).dim_size(1) == 4,
                   errors::InvalidArgument("the fused BKG gather needs four bases, [batch, n_bkg] "
-                                          "activity and four incoming edges per neuron"));
+                                          "activity and four incoming edges (and weights) "
+                                          "per neuron"));
       bkg = Bkg{bkg_activity.flat<T>().data(), static_cast<int>(bkg_activity.dim_size(1)),
                 c->input(21).flat<float>().data(), c->input(22).flat<uint32>().data(),
                 c->input(23).flat<uint32>().data(), c->input(24).flat<uint8>().data(),

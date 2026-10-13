@@ -6,7 +6,7 @@ import tempfile
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TRAINING_SCRIPT = os.path.join(REPO_ROOT, "multi_training_single_gpu_split.py")
+TRAINING_SCRIPT = os.path.join(REPO_ROOT, "multi_training.py")
 
 
 def resolve_data_dir():
@@ -44,8 +44,8 @@ def main():
         command = [
             python_bin,
             TRAINING_SCRIPT,
-            "--neurons", "10",
-            "--batch_size", "1",
+            "--neurons", "1000",
+            "--batch_size", "2",
             "--steps_per_epoch", "1",
             "--n_epochs", "1",
             "--seq_len", "500",

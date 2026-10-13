@@ -67,8 +67,8 @@ same postsynaptic neuron within a warp, in FP32 registers, before a single lane
 issues the atomic (a `half2` one for FP16 currents and an even basis width).
 That removes atomics and roundings, and relies on posts ascending within a CSR
 row, which `build_csr_connectivity` guarantees. Recurrent rows never repeat a
-target, so they take a plain one-thread-per-edge scatter with no warp
-collectives. `csr_order.repeats_targets` decides this once when the
+target, so they need no warp collectives: with four basis columns they take
+`TiledForwardKernel` (below), otherwise a plain one-thread-per-edge scatter. `csr_order.repeats_targets` decides this once when the
 connectivity is built, and the wrappers pass it as the `aggregate_runs`
 attribute. Four basis columns are unrolled; any other width loops.
 
@@ -153,7 +153,7 @@ synaptic path per timestep went from 3.886 ms to 2.437 ms, and a real training
 update from 3.557 s to 2.800 s. Against an FP64 reference the 25-step
 accumulated weight gradient went from 2.09e-4 to 5.4e-8, LGN currents from
 5.14e-3 to 1.45e-3, and recurrent currents from 3.33e-4 to 2.52e-4 (the FP16
-store floor is 2.07e-4). See `kernel_opt_20260920/OPTIMIZATION_REPORT.md` for the
+store floor is 2.07e-4). See `Experiments/kernel_opt_20260920/OPTIMIZATION_REPORT.md` for the
 measurements, the ablations and the variants that were rejected.
 
 ## Neuron layout
@@ -172,20 +172,18 @@ curve, cutting the distinct 128-byte sectors a CSR row's warp requests by about
 Background input gains nothing either way: with about 100 active rows it is
 launch-bound.
 
-The two end-to-end figures differ by much more than the forward kernels do,
-for two reasons. At batch 32 the layout *costs* the recurrent backward 4.4% -
-the batch-lane kernel reads `projected[pair_ids[csr] * 32 + lane]`, and pair
-ids inherit the `(post, type)` ordering, which Morton slightly widens - and
-that almost exactly cancels the forward gain. At batch 64
-`pair_projection_applies` gates that kernel off, so the penalty disappears and
-the warp-per-row backward that replaces it benefits from the layout as well:
-the forwards account for only about a sixth of the 15.6%.
+The two end-to-end figures differ by much more than the forward kernels do.
+They were measured when the recurrent backward still had a batch-lane kernel
+for batch 32 and below, which read `projected[pair_ids[csr] * 32 + lane]`:
+pair ids inherit the `(post, type)` ordering, which Morton slightly widens, so
+at batch 32 the layout cost that backward 4.4% and almost exactly cancelled the
+forward gain. At batch 64 the warp-per-row backward ran instead and benefited
+from the layout as well; the forwards accounted for only about a sixth of the
+15.6%. Every batch size now runs that single sliced backward.
 
 The layout depends on CSR-ordered weights: with the `edge_ids` indirection still
 in place it makes the weight gather about 5x more scattered and costs 16% end to
-end. See `Benchmarks_metrics/morton_forward_layout_20260901/` and
-`Benchmarks_metrics/batch64_layout_20260902/` for the measurements and the
-calibration against a profiled training step.
+end.
 
 ## LGN row order
 
@@ -213,9 +211,7 @@ performance and reuse-distance proxies do not.
 
 It is implemented rather than skipped because the ordering also shapes the
 projection gather that the packed backward kernel spends most of its time on,
-which does not depend on the batch. See
-`Benchmarks_metrics/batch64_layout_20260902/` and
-`Benchmarks_metrics/lgn_row_order_20260902/`.
+which does not depend on the batch.
 
 Build it in the project environment:
 
@@ -229,9 +225,10 @@ environment. Do not load a separate system CUDA toolkit before building.
 
 The default architecture is detected from the visible GPU. Set `V1_CUDA_ARCH`
 or pass `--architecture` to prebuild for another compute capability. Builds are
-cached under their CUDA ABI and architecture directory (for example,
-`sm86/cuda_csr_recurrent/_csr_recurrent_ops.so`), and runtime loading selects the exact match
-for the visible GPUs.
+cached under `~/.cache/v1_glif/cuda` (or `V1_CUDA_CACHE_DIR`), keyed by the
+TensorFlow/CUDA runtime and the architecture (for example,
+`tf-2.21.0_cuda-12.5.1_<hash>/sm86/cuda_csr_recurrent/_csr_recurrent_ops.so`),
+and runtime loading selects the exact match for the visible GPUs.
 
 The operator dispatches four basis columns to an unrolled specialization and
 uses a runtime loop for every other positive basis dimension. The forward does

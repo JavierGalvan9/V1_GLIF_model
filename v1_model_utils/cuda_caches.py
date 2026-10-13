@@ -63,6 +63,23 @@ def _visible_gpu_key():
     ).strip("-") for name in unique)[:120]
 
 
+def _complete_autotune_results(path):
+    """Whether `path` holds a whole autotune dump.
+
+    XLA rejects a file it cannot parse and fails every later `jit_compile`, so
+    an empty or truncated dump (a killed job, a full disk) must not be loaded.
+    A complete dump opens with its `version:` field and, once it holds any
+    `results` entry, ends with that entry's closing `}`.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return text.lstrip().startswith("version:") and (
+        "results" not in text or text.rstrip().endswith("}")
+    )
+
+
 def configure_cuda_caches():
     """Pin GPU enumeration order and persist CUDA/XLA compilation artifacts.
 
@@ -94,6 +111,9 @@ def configure_cuda_caches():
     # GPU only writes; every later run both loads and refreshes it.
     flags = [xla_flags] if xla_flags else []
     if results.is_file():
-        flags.append(f"{_LOAD_FLAG}={results}")
+        if _complete_autotune_results(results):
+            flags.append(f"{_LOAD_FLAG}={results}")
+        else:
+            results.unlink(missing_ok=True)
     flags.append(f"{_DUMP_FLAG}={results}")
     os.environ["XLA_FLAGS"] = " ".join(flags)

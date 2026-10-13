@@ -554,7 +554,7 @@ def load_or_compute_spontaneous_lgn_probabilities(
                 )
             )
         )
-        probs = 1 - tf.exp(-tf.cast(rates, tf.float32) / 1000.0)
+        probs = -tf.math.expm1(-tf.cast(rates, tf.float32) / 1000.0)
         os.makedirs(cache_dir, exist_ok=True)
         with open(cache_file, "wb") as f:
             pkl.dump(probs.numpy().astype(np.float32), f)

@@ -1,22 +1,14 @@
-import pickle
 import unittest
 
 import numpy as np
 import tensorflow as tf
 
+from tests.network_fixtures import load_network
 from v1_model_utils import loss_functions, models
 
-
-def _cached_triple(path):
-    """Return the cached ``(network, lgn, bkg)`` triple from either cache format.
-
-    ``load_sparse`` wraps the payload in a versioned dict; older caches on disk
-    are the bare triple.
-    """
-    with open(path, "rb") as handle:
-        cached = pickle.load(handle)
-    return cached["payload"] if isinstance(cached, dict) else cached
-
+# LGN spikes reach the membrane after a 2-timestep afferent delay, so shorter
+# rollouts leave every voltage at rest and the comparisons below vacuous.
+STEPS = 12
 
 
 class OnlineVoltageLossTest(unittest.TestCase):
@@ -24,9 +16,7 @@ class OnlineVoltageLossTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.network, cls.lgn_input, cls.bkg_input = _cached_triple(
-            "GLIF_network_nll_full/tf_data/V1_network_v1_10.pkl"
-        )
+        cls.network, cls.lgn_input, cls.bkg_input = load_network(10)
 
     def _cell(self, *, online, penalty_mode):
         return models.V1Column(
@@ -49,7 +39,7 @@ class OnlineVoltageLossTest(unittest.TestCase):
 
     def test_online_loss_matches_legacy_loss_and_gradients(self):
         inputs = tf.cast(
-            tf.random.stateless_uniform((1, 4, self.lgn_input["n_inputs"]), (1, 2)) < 0.01,
+            tf.random.stateless_uniform((1, STEPS, self.lgn_input["n_inputs"]), (1, 2)) < 0.05,
             tf.float32,
         )
         for penalty_mode in ("range", "threshold"):
@@ -73,11 +63,12 @@ class OnlineVoltageLossTest(unittest.TestCase):
                 with tf.GradientTape() as online_tape:
                     online_out = self._run(online, inputs)
                     online_z = online_out[0]
-                    online_loss = tf.reduce_mean(online_out[-1]) / 4.0
+                    online_loss = tf.reduce_mean(online_out[-1]) / STEPS
                 online_gradients = online_tape.gradient(
                     online_loss, online.trainable_variables
                 )
 
+                self.assertGreater(float(legacy_loss), 0.0)
                 np.testing.assert_array_equal(online_z.numpy(), legacy_z.numpy())
                 np.testing.assert_allclose(
                     online_out[2].numpy(), legacy_out[2].numpy(), rtol=2e-5, atol=2e-6
@@ -133,7 +124,7 @@ class OnlineVoltageLossTest(unittest.TestCase):
 
     def test_reset_voltage_penalty_preserves_warm_neural_state(self):
         cell = self._cell(online=True, penalty_mode="range")
-        warm_inputs = tf.ones((1, 3, self.lgn_input["n_inputs"]), tf.float32)
+        warm_inputs = tf.ones((1, STEPS, self.lgn_input["n_inputs"]), tf.float32)
         warm_outputs = self._run(cell, warm_inputs)
         warm_state = tuple(warm_outputs[1:])
 
@@ -148,11 +139,11 @@ class OnlineVoltageLossTest(unittest.TestCase):
 
     def test_warm_started_online_loss_and_gradients_match_legacy(self):
         warm_inputs = tf.cast(
-            tf.random.stateless_uniform((1, 3, self.lgn_input["n_inputs"]), (5, 6)) < 0.01,
+            tf.random.stateless_uniform((1, STEPS, self.lgn_input["n_inputs"]), (5, 6)) < 0.05,
             tf.float32,
         )
         stimulus_inputs = tf.cast(
-            tf.random.stateless_uniform((1, 4, self.lgn_input["n_inputs"]), (7, 8)) < 0.01,
+            tf.random.stateless_uniform((1, STEPS, self.lgn_input["n_inputs"]), (7, 8)) < 0.05,
             tf.float32,
         )
         legacy = self._cell(online=False, penalty_mode="range")
@@ -176,9 +167,10 @@ class OnlineVoltageLossTest(unittest.TestCase):
         with tf.GradientTape() as online_tape:
             online_out = self._run(online, stimulus_inputs, online_warm_state)
             online_z = online_out[0]
-            online_loss = tf.reduce_mean(online_out[-1]) / 4.0
+            online_loss = tf.reduce_mean(online_out[-1]) / STEPS
         online_gradients = online_tape.gradient(online_loss, online.trainable_variables)
 
+        self.assertGreater(float(legacy_loss), 0.0)
         np.testing.assert_array_equal(online_z.numpy(), legacy_z.numpy())
         np.testing.assert_allclose(online_loss.numpy(), legacy_loss.numpy(), rtol=2e-5, atol=2e-6)
         for expected, actual in zip(legacy_gradients, online_gradients):

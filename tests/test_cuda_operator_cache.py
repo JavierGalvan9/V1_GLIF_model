@@ -68,8 +68,10 @@ class EnsureArtifactTest(unittest.TestCase):
             directory = Path(temporary) / "operator"
             directory.mkdir()
 
-            def build(command, check):
+            def build(command, check, cwd):
                 self.assertTrue(check)
+                # `-m v1_model_utils...` must not depend on the caller's cwd.
+                self.assertTrue((Path(cwd) / "v1_model_utils").is_dir())
                 self.assertEqual(command[-2:], ["--stem", "spike_history_ops"])
                 output = cuda_operator_cache.artifact_path(
                     directory, "spike_history_ops", "89"

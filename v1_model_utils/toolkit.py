@@ -1,5 +1,3 @@
-import os
-import json
 import numpy as np
 import random
 import string
@@ -56,8 +54,11 @@ def do_inset_colorbar(_ax, _p, _label, loc='right'):
 
 
 def get_random_identifier(prefix='', length=4):
+    # Unseeded on purpose: training seeds `random` before naming its run, which
+    # would give every run with the same seed the same results directory.
+    generator = random.SystemRandom()
     random_identifier = ''.join(
-        random.choice(string.ascii_lowercase + string.digits) for _ in range(length))
+        generator.choice(string.ascii_lowercase + string.digits) for _ in range(length))
     sim_name = prefix + random_identifier
     return sim_name
 

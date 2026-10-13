@@ -5,34 +5,16 @@ inputs and mapping the relabelled outputs back must reproduce the canonical
 result up to floating-point summation order.
 """
 
-import os
-import pickle as pkl
 
 import numpy as np
 import pytest
 import tensorflow as tf
 
+from tests.network_fixtures import load_network
 from v1_model_utils import cuda_csr_recurrent, models, spatial_layout
 
 
-NETWORK_PICKLE = os.path.join(
-    "GLIF_network_nll_full", "tf_data", "V1_network_v1_1000.pkl"
-)
 BATCH = 2
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(NETWORK_PICKLE), reason="cached 1000-neuron network required"
-)
-
-
-def _load():
-    """Return the cached triple from either cache format.
-
-    ``load_sparse`` wraps the payload in a versioned dict; older caches on disk
-    are the bare triple.
-    """
-    with open(NETWORK_PICKLE, "rb") as stream:
-        cached = pkl.load(stream)
-    return cached["payload"] if isinstance(cached, dict) else cached
 
 
 def _prepare(network, lgn_input, bkg_input, layout):
@@ -97,7 +79,7 @@ def _run(network, lgn_input, bkg_input, layout, acceleration, lgn_spikes):
     ),
 )
 def test_morton_layout_reproduces_canonical_dynamics(acceleration):
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     n_input = int(lgn_input["n_inputs"])
 
     rng = np.random.default_rng(5)
@@ -140,7 +122,7 @@ def test_checkpoint_translation_round_trips_weights_and_optimizer_slots():
     """
     if not cuda_csr_recurrent.DIRECT_CSR:
         pytest.skip("edge translation only applies with DIRECT_CSR")
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     layout = spatial_layout.build_layout(network, spatial_layout.CANONICAL)
     prepared_net, prepared_lgn, prepared_bkg, edge_orders = _prepare(
         network, lgn_input, bkg_input, layout
@@ -197,7 +179,7 @@ def test_a_restore_keeps_each_neuron_its_own_coefficients():
     therefore still carry that type's coefficients after the restore half of
     the translation.
     """
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     layout = spatial_layout.build_layout(network, spatial_layout.MORTON)
     network, lgn_input, bkg_input, edge_orders = _prepare(
         network, lgn_input, bkg_input, layout

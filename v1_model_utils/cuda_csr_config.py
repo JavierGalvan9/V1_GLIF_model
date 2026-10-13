@@ -14,7 +14,7 @@ def architecture_kernel_flags(architecture):
     two different kernels from one source file - which is how the resource
     backend lost the packed backward specialization and ran a third slower.
     """
-    architecture = int(str(architecture).lower().removeprefix("sm_").replace(".", ""))
-    # The packed backward specialization is qualified on SM120 only; older
-    # architectures keep the batch-lane path until they are measured.
-    return (f"-DV1_PACKED_BACKWARD={int(architecture >= 120)}",)
+    # No kernel specializes by architecture at present (every architecture runs
+    # the same backward); add any such flag here and nowhere else.
+    del architecture
+    return ()

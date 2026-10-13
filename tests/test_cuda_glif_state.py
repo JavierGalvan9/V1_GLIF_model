@@ -86,6 +86,10 @@ def _cell(
         )
     else:
         bkg = external
+    column_options = {
+        "train_recurrent": False, "train_input": False, "train_noise": False,
+        **column_options,
+    }
     return V1Column(
         network,
         external,
@@ -95,9 +99,6 @@ def _cell(
         hard_reset=hard_reset,
         pseudo_gauss=pseudo_gauss,
         acceleration=backend,
-        train_recurrent=False,
-        train_input=False,
-        train_noise=False,
         voltage_gradient_dampening=0.5,
         detach_reset=detach_reset,
         detach_asc_reset=detach_asc_reset,
@@ -184,8 +185,22 @@ def test_cuda_glif_generic_basis_forward_and_gradients(basis_dim, dtype):
 @pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
 @pytest.mark.parametrize("hard_reset", [False, True])
 @pytest.mark.parametrize("t_ref", [3, 1])
-def test_cuda_matches_tensorflow_outputs_and_gradients(tmp_path, dtype, hard_reset, t_ref):
-    _assert_backends_match(tmp_path, dtype, hard_reset=hard_reset, t_ref=t_ref)
+@pytest.mark.parametrize("heterogeneous", [False, True], ids=["one-type", "two-types"])
+def test_cuda_matches_tensorflow_outputs_and_gradients(
+    tmp_path, dtype, hard_reset, t_ref, heterogeneous
+):
+    # With two cell types a kernel reading another neuron's constants differs.
+    _assert_backends_match(tmp_path, dtype, hard_reset=hard_reset, t_ref=t_ref,
+                           heterogeneous=heterogeneous)
+
+
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+def test_cuda_matches_tensorflow_with_int16_refractory_counters(tmp_path, dtype):
+    """Refractory periods beyond 127 steps switch the counter to int16."""
+    assert _cell(tmp_path / "probe", backend="tensorflow", dtype=dtype,
+                 t_ref=200)._refractory_state_dtype == tf.int16
+    _assert_backends_match(tmp_path, dtype, t_ref=200, heterogeneous=True,
+                           max_refractory=300)
 
 
 @pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
@@ -197,8 +212,10 @@ def test_cuda_matches_tensorflow_outputs_and_gradients(tmp_path, dtype, hard_res
         {"return_voltage_sequences": False, "track_voltage_penalty": True},
         {"output_neuron_ids": np.array([1, 4, 6])},
         {"recurrent_delays": (1, 1)},
+        {"integration_scheme": "euler", "heterogeneous": True},
     ],
-    ids=["voltage-sequences", "online-voltage-penalty", "output-subset", "one-delay-slot"],
+    ids=["voltage-sequences", "online-voltage-penalty", "output-subset", "one-delay-slot",
+         "euler"],
 )
 def test_fused_step_matches_tensorflow_for_every_surrogate_and_output(
     tmp_path, dtype, surrogate_gradient, options
@@ -208,14 +225,15 @@ def test_fused_step_matches_tensorflow_for_every_surrogate_and_output(
     Each surrogate is evaluated inside the fused backward; the exposed voltage
     is written by the forward only when voltage sequences are returned; the
     online penalty sends a voltage gradient that bypasses the exposed sequence;
-    and a single delay slot leaves no older history to shift.
+    a single delay slot leaves no older history to shift; and the euler
+    scheme only swaps the propagator constants the kernel reads.
     """
     _assert_backends_match(
         tmp_path, dtype, surrogate_gradient=surrogate_gradient, **options
     )
 
 
-def _assert_backends_match(tmp_path, dtype, **cell_options):
+def _assert_backends_match(tmp_path, dtype, max_refractory=4, **cell_options):
     if not tf.config.list_physical_devices("GPU"):
         pytest.skip("requires CUDA")
     reference = _cell(tmp_path / "reference", backend="tensorflow", dtype=dtype,
@@ -232,7 +250,7 @@ def _assert_backends_match(tmp_path, dtype, **cell_options):
     state = list(reference.zero_state(3))
     state[0] = tf.cast(generator.uniform(state[0].shape) > 0.7, reference.compute_dtype)
     state[1] = generator.uniform(state[1].shape, -0.2, 1.2, dtype=state[1].dtype)
-    state[2] = tf.cast(generator.uniform(state[2].shape, 0, 4, dtype=tf.int32), reference._refractory_state_dtype)
+    state[2] = tf.cast(generator.uniform(state[2].shape, 0, max_refractory, dtype=tf.int32), reference._refractory_state_dtype)
     for index in (3, 4, 5):
         state[index] = generator.uniform(state[index].shape, -0.2, 0.2, dtype=state[index].dtype)
     expected = _run(reference, inputs, tuple(state))
@@ -462,7 +480,12 @@ def test_every_replica_reads_the_cell_constants_from_its_own_gpu(tmp_path):
     devices = [device.name for device in tf.config.list_logical_devices("GPU")[:2]]
     strategy = tf.distribute.MirroredStrategy(devices)
     with strategy.scope():
-        cell = _cell(tmp_path, backend="tensorflow", dtype=tf.float32)
+        # The sign masks only exist on trainable weights.
+        cell = _cell(
+            tmp_path, backend="tensorflow", dtype=tf.float32,
+            train_recurrent=True, train_recurrent_per_type=False,
+            train_input=True, train_noise=True,
+        )
     names = list(cell._neuron_constants) + [
         "v_th", "v_reset", "synaptic_basis_weights", "_dt", "_gauss_std",
         "_dampening_factor", "bkg_count_cdf",

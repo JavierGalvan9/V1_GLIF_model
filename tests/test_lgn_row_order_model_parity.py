@@ -11,35 +11,16 @@ timestep of input leaves the membrane at rest, so a voltage comparison passes
 whatever the permutation and proves nothing.
 """
 
-import os
-import pickle as pkl
 
 import numpy as np
 import pytest
 import tensorflow as tf
 
+from tests.network_fixtures import load_network
 from v1_model_utils import cuda_csr_recurrent, models, spatial_layout
 
-NETWORK_PICKLE = os.path.join(
-    "GLIF_network_nll_full", "tf_data", "V1_network_v1_1000.pkl"
-)
 BATCH = 2
 MAX_DELAY = 3
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(NETWORK_PICKLE),
-    reason="cached 1000-neuron network required",
-)
-
-
-def _load():
-    """Return the cached triple from either cache format.
-
-    ``load_sparse`` wraps the payload in a versioned dict; older caches on disk
-    are the bare triple.
-    """
-    with open(NETWORK_PICKLE, "rb") as stream:
-        cached = pkl.load(stream)
-    return cached["payload"] if isinstance(cached, dict) else cached
 
 
 def _prepare(network, lgn_input, bkg_input, layout):
@@ -110,7 +91,7 @@ def _stream(n_input, density=0.5, seed=5):
 
 
 def test_retinotopic_rows_reproduce_original_currents():
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     stream = _stream(int(lgn_input["n_inputs"]))
 
     reference, _, _ = _build(
@@ -130,7 +111,7 @@ def test_retinotopic_rows_reproduce_original_currents():
 
 def test_a_reversed_gather_changes_the_result():
     """Guard the guard: the parity test above must be capable of failing."""
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     stream = _stream(int(lgn_input["n_inputs"]))
 
     reference, _, _ = _build(
@@ -149,7 +130,7 @@ def test_a_reversed_gather_changes_the_result():
 
 def test_omitting_the_gather_changes_the_result():
     """And an unpermuted stream must not silently look correct either."""
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     stream = _stream(int(lgn_input["n_inputs"]))
 
     reference, _, _ = _build(
@@ -174,7 +155,7 @@ def test_checkpoint_keeps_lgn_row_ids_canonical():
     """
     if not cuda_csr_recurrent.DIRECT_CSR:
         pytest.skip("edge translation only applies with DIRECT_CSR")
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     cell, row_order, edge_orders = _build(
         network, lgn_input, bkg_input, spatial_layout.LGN_RETINOTOPIC,
         "tensorflow",
@@ -199,7 +180,7 @@ def test_checkpoint_keeps_lgn_row_ids_canonical():
 
 
 def test_identity_order_leaves_the_stream_alone():
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     cell, row_order, _ = _build(
         network, lgn_input, bkg_input, spatial_layout.LGN_ORIGINAL, "tensorflow"
     )
@@ -225,7 +206,7 @@ def test_gradient_flows_back_through_the_permutation():
     not differentiable in the stream, so this property only exists on the CUDA
     backend with ``compute_lgn_activity_gradient``.
     """
-    network, lgn_input, bkg_input = _load()
+    network, lgn_input, bkg_input = load_network(1000)
     stream = _stream(int(lgn_input["n_inputs"]))
 
     def activity_gradient(row_mode):

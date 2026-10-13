@@ -1,20 +1,10 @@
-import os
-import pickle
 import unittest
 
 import numpy as np
 import tensorflow as tf
 
+from tests.network_fixtures import load_network
 from v1_model_utils import models
-
-
-NETWORK = os.path.join("GLIF_network_nll_full", "tf_data", "V1_network_v1_1000.pkl")
-
-
-def _cached_triple(path):
-    with open(path, "rb") as handle:
-        cached = pickle.load(handle)
-    return cached["payload"] if isinstance(cached, dict) else cached
 
 
 def _loop_condition_ops(layer, inputs):
@@ -45,13 +35,12 @@ class RnnLoopConditionTest(unittest.TestCase):
         self.assertIn("Less", ops)
 
 
-@unittest.skipUnless(os.path.exists(NETWORK), f"needs the cached network {NETWORK}")
 class RnnLoopEquivalenceTest(unittest.TestCase):
     """The repository loop reproduces Keras' loop bit for bit on the CPU."""
 
     @classmethod
     def setUpClass(cls):
-        cls.network, cls.lgn_input, cls.bkg_input = _cached_triple(NETWORK)
+        cls.network, cls.lgn_input, cls.bkg_input = load_network(1000)
 
     def _rnn(self, return_sequences):
         cell = models.V1Column(
@@ -65,6 +54,12 @@ class RnnLoopEquivalenceTest(unittest.TestCase):
         )
 
     def test_outputs_states_and_gradients_match_keras(self):
+        # GPU kernels fuse the two loop graphs differently (1-ulp drift), so
+        # the bitwise contract is a CPU one.
+        with tf.device("/CPU:0"):
+            self._assert_loops_match()
+
+    def _assert_loops_match(self):
         inputs = tf.cast(
             tf.random.stateless_uniform((2, 6, self.lgn_input["n_inputs"]), (3, 4)) < 0.05,
             tf.float32,

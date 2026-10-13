@@ -84,6 +84,8 @@ class CsrConnectivity:
     n_pairs: int = 0
     # Whether some row sends two edges to one target; see csr_order.repeats_targets.
     repeats_targets: bool = True
+    # One more than the largest synapse type: the basis rows the kernels read.
+    n_synapse_types: int = 0
 
 
 def _compact_pairs(post_ids, synapse_types):
@@ -219,6 +221,7 @@ def build_csr_connectivity(
         edge_order=order,
         weights_csr_ordered=bool(weights_csr_ordered),
         repeats_targets=csr_order.repeats_targets(ordered_posts, row_splits),
+        n_synapse_types=int(synapse_types.max()) + 1 if synapse_types.size else 0,
         **pairs,
     )
     if resource_mode_enabled():
@@ -310,6 +313,12 @@ def calculate_recurrent_csr_currents(
     """
     require_csr_ordered_weights(connectivity, "recurrent connectivity")
     basis = tf.cast(basis, tf.float32)
+    # The kernels read basis[type] unchecked for every edge.
+    if basis.shape[0] is not None and basis.shape[0] < connectivity.n_synapse_types:
+        raise ValueError(
+            f"basis has {basis.shape[0]} rows but the connectivity uses "
+            f"{connectivity.n_synapse_types} synapse types"
+        )
     history = tuple(spikes) if isinstance(spikes, (tuple, list)) else (spikes,)
     if queues is not None and (len(history) < 2 or len(queues) != len(history) - 1):
         raise ValueError("queues must hold one record per spike slot but the newest")

@@ -143,7 +143,8 @@ def create_optimizer(flags, learning_rate, trainable_variables, mixed_precision_
     # the optimizer. Keras 3 also gives every optimizer a `scale_loss` method,
     # so the train step cannot tell a wrapped optimizer from a bare one and has
     # to hand clipping over for both. The optimizer all-reduces after clipping,
-    # which is where the train step used to clip.
+    # which is where the train step used to clip, so the norm is that of each
+    # replica's local gradient, not of their sum.
     optimizer_clips = _uses_keras_3() and getattr(flags, "global_clipnorm", 0) > 0
     optimizer_kwargs = {}
     if optimizer_clips:

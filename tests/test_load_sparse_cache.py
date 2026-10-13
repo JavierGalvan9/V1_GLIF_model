@@ -1,6 +1,8 @@
+import os
 from types import SimpleNamespace
 
 import h5py
+import pytest
 import numpy as np
 
 from v1_model_utils import load_sparse
@@ -138,3 +140,54 @@ def test_cached_load_v1_invalidates_payload_when_source_changes(tmp_path, monkey
 
     assert result[0]["source"] == b"second and changed"
     assert calls == [b"first", b"second and changed"]
+
+
+def test_failed_cache_dump_leaves_no_temporary_file(tmp_path, monkeypatch):
+    (tmp_path / "tf_data").mkdir()
+    (tmp_path / "network").mkdir()
+    monkeypatch.setattr(load_sparse, "load_v1", lambda flags, n_neurons: ({}, {}, {}))
+
+    def full_disk(payload, handle):
+        handle.write(b"partial")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(load_sparse.pkl, "dump", full_disk)
+    with pytest.raises(OSError):
+        load_sparse.cached_load_v1(_flags(tmp_path, 1), 2, flag_str="shared")
+    assert list((tmp_path / "tf_data").iterdir()) == []
+
+
+def test_alternating_seeds_reuse_their_own_caches(tmp_path, monkeypatch):
+    (tmp_path / "tf_data").mkdir()
+    (tmp_path / "network").mkdir()
+    calls = []
+
+    def fake_load(flags, n_neurons):
+        calls.append(flags.seed)
+        return {"seed": flags.seed}, {}, {}
+
+    monkeypatch.setattr(load_sparse, "load_v1", fake_load)
+    for seed in (1, 2, 1, 2):
+        result = load_sparse.cached_load_v1(_flags(tmp_path, seed), 2, flag_str="shared")
+        assert result[0]["seed"] == seed
+    assert calls == [1, 2]
+
+
+def test_matching_legacy_cache_is_renamed_instead_of_rebuilt(tmp_path, monkeypatch):
+    (tmp_path / "tf_data").mkdir()
+    (tmp_path / "network").mkdir()
+    flags = _flags(tmp_path, 1)
+    legacy = tmp_path / "tf_data" / "V1_network_shared.pkl"
+    with open(legacy, "wb") as handle:
+        load_sparse.pkl.dump({
+            "version": load_sparse._V1_CACHE_VERSION,
+            "provenance": load_sparse._v1_cache_provenance(flags, 2),
+            "payload": ({"legacy": True}, {}, {}),
+        }, handle)
+    monkeypatch.setattr(load_sparse, "load_v1", lambda *args, **kwargs: pytest.fail("rebuilt"))
+
+    result = load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+
+    assert result[0] == {"legacy": True}
+    assert not legacy.exists()
+    assert os.path.exists(load_sparse.v1_cache_path(flags, 2, "shared"))

@@ -3,6 +3,8 @@ import unittest
 import numpy as np
 import tensorflow as tf
 
+from tests.network_fixtures import load_network
+from v1_model_utils import models
 from v1_model_utils.models import (
     ClassificationReadoutLayer,
     FiringRateMetricLayer,
@@ -112,6 +114,23 @@ class SequenceOnlyModelTests(unittest.TestCase):
                 for gradient in gradients
             )
         )
+
+class CreateModelOutputTests(unittest.TestCase):
+    def test_readout_sees_spikes_whether_or_not_the_state_is_returned(self):
+        """Keras 3 packs spikes and voltages into one sequence; the readout
+        must receive only the spike half in both RNN output layouts."""
+        network, lgn_input, bkg_input = load_network(10)
+        for return_state in (False, True):
+            with self.subTest(return_state=return_state):
+                model = models.create_model(
+                    network, lgn_input, bkg_input, seq_len=4,
+                    n_input=lgn_input["n_inputs"], n_output=1, down_sample=2,
+                    batch_size=1, return_state=return_state,
+                    acceleration="tensorflow",
+                )
+                kernel = model.get_layer("projection_v1").kernel
+                self.assertEqual(tuple(kernel.shape), (network["n_nodes"], 1))
+
 
 if __name__ == "__main__":
     unittest.main()

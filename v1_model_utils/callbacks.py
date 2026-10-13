@@ -1221,6 +1221,7 @@ class Callbacks:
         self.write_outputs = bool(write_outputs)
         self._validation_plot_process = None
         self._validation_plot_log = None
+        self.diverged = False
         self._plot_timing = {}
         self.strategy = strategy
         self.metrics_keys = metrics_keys
@@ -1368,6 +1369,13 @@ class Callbacks:
 
         print(f"\nTraining statistics saved to {stats_file}")
 
+        if self.diverged:
+            # Fail the job so that dependent sessions and evaluations do not
+            # start, and keep the last finite intermediate checkpoint.
+            raise RuntimeError(
+                f"Training diverged at epoch {self.epoch}; the intermediate "
+                "checkpoint was not overwritten."
+            )
         if self.flags.n_runs > 1:
             self.save_intermediate_checkpoint()
 
@@ -1430,6 +1438,7 @@ class Callbacks:
             non_finite_keys = [k for k, v in zip(self.metrics_keys, metric_values) if not np.isfinite(v)]
             print(f"[ Divergence detected at epoch {self.epoch}: non-finite metrics {non_finite_keys} "
                   f"-- stopping training without updating the best checkpoint ]")
+            self.diverged = True
             return True
 
         # # save latest model every 10 epochs
@@ -1560,10 +1569,10 @@ class Callbacks:
         if process is None:
             return
         self._validation_plot_process = None
+        # Plots are diagnostics: a failed worker must not abort training or
+        # skip the end-of-run saves that follow this call.
         if process.wait() != 0:
-            raise RuntimeError(
-                f"Validation plots failed; see {self._validation_plot_log}"
-            )
+            print(f"Validation plots failed; see {self._validation_plot_log}")
 
     def on_step_start(self):
         self.step += 1
