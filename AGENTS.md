@@ -36,6 +36,62 @@ Re-read files before editing
 - Split large tasks into parallel agents
 - Read large files in chunks (never assume full context)
 
+## Multi-agent workflow
+
+Use the main Opus session as orchestrator.
+
+### Delegation
+
+- Trivial tasks: handle directly without subagents.
+- Clarification: the orchestrator resolves all open questions with the user before delegating; subagents cannot ask the user.
+- Codebase exploration: delegate to `Explore` (Haiku, CodeGraph-first).
+- Planning: delegate implementation plans to ECC's `planner` (Opus) at `high` effort; do not use the built-in Plan agent.
+- Architecture decisions (module boundaries, interfaces): ECC's `architect`, only when explicitly needed — never alongside `planner` for the same task.
+- Implementation: delegate to `implementer` (Opus, `medium`).
+- Complex debugging: keep in the Opus orchestrator.
+- Python reviews: ECC's `python-reviewer`.
+- ML/training-pipeline reviews (data, training reproducibility, evaluation): ECC's `mle-reviewer`.
+- Profiling and optimization: the orchestrator profiles and ranks optimizations itself, following `Experiments/PROFILING_AND_OPTIMIZATION_GUIDE.md`.
+  - Kernel design tracks (new CUDA kernels, fusions, accuracy-critical numerics): `implementer` with a `high` effort override.
+  - Mechanical tracks (harness scripts, re-applying patches, stage-2 ports to other configurations): `implementer` as defined (Opus, `medium`).
+
+### Complex tasks
+
+1. Establish requirements and acceptance criteria.
+2. Explore the codebase if necessary.
+3. Create an implementation plan.
+4. Delegate independent, bounded coding tasks to `implementer`.
+5. Run relevant tests and review results.
+6. Resolve integration issues and summarize changes.
+
+Parallelize only independent tasks.
+Avoid concurrent edits to the same files.
+
+### Parallel worktrees
+
+- Profiling and optimization sessions use the guide's frozen copies (`baseline/`, `work_<track>/`, `snap_*`), never git worktrees.
+- Run parallel `implementer` agents with worktree isolation (`isolation: "worktree"`) so each edits its own checkout; the orchestrator merges the results.
+- Worktrees start from the last commit: before launching parallel implementers, ask the user to commit or stash uncommitted changes the tasks depend on.
+- Worktrees lack the git-ignored data: symlink the live data directories into each new worktree (`for d in GLIF_network_nll_full Neuropixels_data Synchronization_data synaptic_data; do ln -s $REPO/$d $WT/$d; done`), as the guide's frozen copies do. Never copy the data. Delete any `V1_network_<run>.pkl` a run writes through the symlink into the live `tf_data/`.
+- Use ECC's `/multi-workflow` (tmux/worktree orchestration) only when workers need independent terminals or separate build/test runs.
+- Worktrees share the CUDA op cache path: set a distinct `V1_CUDA_CACHE_DIR` per worktree before building or testing CUDA ops.
+- Pin `CUDA_VISIBLE_DEVICES` per worktree so parallel GPU tests do not collide.
+
+### Skill priorities
+
+- Matt Pocock is the preferred source for TDD, debugging, requirements and general code review.
+- ECC provides specialized agents for planning, ML and language-specific analysis.
+- Do not run equivalent workflows from both systems.
+- Respect user-invoked skills; do not invoke them automatically when they require explicit selection.
+
+### Efficiency
+
+- Avoid subagents for simple changes.
+- Avoid redundant exploration and review.
+- Provide subagents with focused tasks and relevant paths.
+- Run tests appropriate to the change, not every possible test.
+- Escalate uncertain design choices before implementation.
+
 ## Search Safety
 - Do not rely on a single search
 - Check: function calls, types, strings, imports, tests
