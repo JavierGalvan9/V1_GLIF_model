@@ -9,6 +9,7 @@ import numpy as np
 import tensorflow as tf
 
 from v1_model_utils import csr_order
+from .canonical_projection import canonical_pairs
 from v1_model_utils.cuda_operator_cache import ensure_artifact
 from v1_model_utils.cuda_csr_recurrent.build import build_flags_for, DIRECT_CSR
 from v1_model_utils.cuda_csr_resources import (
@@ -88,7 +89,7 @@ class CsrConnectivity:
     n_synapse_types: int = 0
 
 
-def _compact_pairs(post_ids, synapse_types):
+def _compact_pairs(post_ids, synapse_types, basis=None):
     """Describe each distinct (postsynaptic neuron, synapse type) pair once.
 
     The backward pass projects the upstream gradient onto the synaptic basis per
@@ -97,12 +98,18 @@ def _compact_pairs(post_ids, synapse_types):
     all of the redundant projection work.
     """
     unique_codes, pair_ids = csr_order.compact_pairs(post_ids, synapse_types)
-    return {
-        "pair_ids": tf.constant(pair_ids.astype(np.uint32), tf.uint32),
-        "pair_posts": tf.constant((unique_codes >> 8).astype(np.uint32), tf.uint32),
-        "pair_types": tf.constant((unique_codes & 0xFF).astype(np.uint8), tf.uint8),
+    metadata = {
+        "pair_ids": pair_ids.astype(np.uint32),
+        "pair_posts": (unique_codes >> 8).astype(np.uint32),
+        "pair_types": (unique_codes & 0xFF).astype(np.uint8),
         "n_pairs": int(unique_codes.size),
     }
+    if basis is not None:
+        metadata = canonical_pairs(
+            metadata["pair_posts"], metadata["pair_types"], metadata["pair_ids"], basis
+        )
+    return {key: value if key == "n_pairs" else tf.constant(value)
+            for key, value in metadata.items()}
 
 
 def to_csr_order(values, connectivity):
@@ -163,14 +170,16 @@ def require_csr_ordered_weights(connectivity, name):
 
 
 def build_csr_connectivity(
-    indices, synapse_types, n_pre, n_post, weights_csr_ordered=False
+    indices, synapse_types, n_pre, n_post, weights_csr_ordered=False, basis=None
 ):
     """Build compact pre-CSR metadata while preserving external edge order.
 
     Set ``weights_csr_ordered`` when the caller's edges are already in this
     operator's CSR order; the derived permutation is then asserted to be the
     identity, so a mismatch surfaces here rather than as silently mispaired
-    weights.
+    weights. Optional ``basis`` must be the immutable FP32 basis used by this
+    connectivity; it shares only bitwise-identical projection rows. Omitting it
+    keeps the baseline metadata and supports callers with mutable bases.
     """
     indices = np.asarray(indices)
     synapse_types = np.asarray(synapse_types)
@@ -208,7 +217,7 @@ def build_csr_connectivity(
     row_splits[0] = 0
     row_splits[1:] = np.cumsum(counts, dtype=np.uint64).astype(np.uint32)
     nonempty_rows = np.flatnonzero(counts).astype(np.uint32)
-    pairs = _compact_pairs(ordered_posts, ordered_types)
+    pairs = _compact_pairs(ordered_posts, ordered_types, basis=basis)
     connectivity = CsrConnectivity(
         post_ids=tf.constant(ordered_posts, tf.uint32),
         synapse_types=tf.constant(ordered_types, tf.uint8),

@@ -1072,6 +1072,7 @@ class V1Column(tf.keras.layers.Layer):
                 n_pre=self.recurrent_dense_shape[1],
                 n_post=self.recurrent_dense_shape[0],
                 weights_csr_ordered=self._weights_csr_ordered,
+                basis=synaptic_basis_weights,
             )
         else:
             self.recurrent_indices = tf.Variable(
