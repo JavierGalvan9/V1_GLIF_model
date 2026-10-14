@@ -14,6 +14,7 @@ import os
 import sys
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
 import other_v1_utils
+from v1_model_utils.tf_utils import replica_local_constant
 
 
 def as_tensor(value):
@@ -571,30 +572,44 @@ def _grouped_emd(values, group_order, sorted_initial_values, group_slices, n_gro
     back through the argsort. Caching that permutation in the forward turns the
     whole backward into one gather and one scatter, instead of differentiating
     through ``n_groups`` sorts and the group gather.
+
+    TensorFlow runs int32 element-wise ops, concats, slices and reshapes on the
+    host, so every index tensor here is either int64 or produced by a GPU-only
+    op (cast, gather, top_k): ``group_order`` arrives as uint32 (or int64 when
+    the count exceeds the int32 range) and is cast once to a column of gather
+    indices on the device.
     """
+
+    index_dtype = tf.int64 if group_order.dtype == tf.int64 or (
+        group_order.shape[0] > np.iinfo(np.int32).max) else tf.int32
+    # A [n, 1] column serves both the flat gather and scatter_nd, whose indices
+    # need a trailing axis that an int32 reshape would build on the host.
+    group_index = tf.cast(tf.reshape(group_order, [-1, 1]), index_dtype)
 
     @tf.custom_gradient
     def emd(x):
-        grouped_x = tf.gather(x, group_order)
+        grouped_x = tf.reshape(tf.gather(x, group_index), [-1])
         group_losses, positions, sensitivities = [], [], []
         for start, end in group_slices:
             x_i = grouped_x[start:end]
-            order = tf.argsort(x_i)
+            # tf.argsort(x_i), spelled out: TopKV2 has no int64 GPU kernel, so
+            # widen its int32 indices with a device cast before the offset.
+            order = tf.math.top_k(-x_i, end - start).indices
             deviation = tf.gather(x_i, order) - sorted_initial_values[start:end]
             group_losses.append(tf.reduce_mean(tf.abs(deviation)))
-            positions.append(order + start)
+            positions.append(tf.cast(order, tf.int64) + start)
             sensitivities.append(
                 tf.sign(deviation) / float((end - start) * n_groups)
             )
         reg_loss = tf.reduce_mean(tf.stack(group_losses))
         # Compose the two permutations once so the backward is a single scatter
         # straight into the caller's edge order.
-        targets = tf.gather(group_order, tf.concat(positions, axis=0))
+        targets = tf.gather(group_index, tf.concat(positions, axis=0))
         derivative = tf.concat(sensitivities, axis=0)
 
         def grad(upstream):
             return tf.scatter_nd(
-                targets[:, tf.newaxis], derivative * upstream, tf.shape(x)
+                targets, derivative * upstream, tf.shape(x, out_type=index_dtype)
             )
 
         return reg_loss, grad
@@ -642,7 +657,9 @@ class EarthMoversDistanceRegularizer(Layer):
                 order_np, row_splits_np = _build_group_order_numpy(group_ids_np, n_groups)
                 sorted_initial_flat_np = _sort_initial_values_by_group_numpy(initial_value_np, order_np, row_splits_np)
 
-        index_dtype = tf.int32 if order_np.size <= np.iinfo(np.int32).max else tf.int64
+        # uint32 keeps the 84 M-entry index on the GPU (int32 variables live in
+        # host memory and would cross PCIe on every read).
+        index_dtype = tf.uint32 if order_np.size <= np.iinfo(np.uint32).max else tf.int64
         self._n_groups = n_groups
         self.num_unique = tf.constant(n_groups, dtype=tf.int32)
         # Static group boundaries: they turn the per-group work into an
@@ -652,11 +669,8 @@ class EarthMoversDistanceRegularizer(Layer):
             (int(row_splits_np[i]), int(row_splits_np[i + 1]))
             for i in range(n_groups)
         )
-        self._group_order = tf.Variable(
-            order_np,
-            dtype=index_dtype,
-            trainable=False,
-            name="emd_group_order",
+        self._group_order = replica_local_constant(
+            order_np, dtype=index_dtype, name="emd_group_order"
         )
         self._sorted_initial_values = tf.Variable(
             sorted_initial_flat_np,
