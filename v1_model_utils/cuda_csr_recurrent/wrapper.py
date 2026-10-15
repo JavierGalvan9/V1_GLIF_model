@@ -297,6 +297,40 @@ def spike_queue(slot):
     return _load_ops().v1_spike_queue(slot)
 
 
+def recurrent_backward(
+    connectivity, spike_values, current_grad, weight_values, basis_values, dampening_value,
+    post_ids, synapse_types, row_splits, edge_ids, nonempty_rows, pair_ids, pair_posts,
+    pair_types,
+):
+    """The recurrent spike gradients (one per slot) and weight gradient (None
+    when an accumulator takes it, see accumulate_recurrent_weight_gradient)."""
+    ops = _load_ops()
+    inputs = (
+        spike_values,
+        current_grad,
+        weight_values,
+        post_ids,
+        synapse_types,
+        row_splits,
+        edge_ids,
+        nonempty_rows,
+        basis_values,
+        tf.cast(dampening_value, spike_values[0].dtype),
+        pair_ids,
+        pair_posts,
+        pair_types,
+    )
+    sizes = {"n_post": connectivity.n_post, "n_edges": connectivity.n_edges}
+    accumulator = _weight_gradient_accumulator()
+    if accumulator is None:
+        spike_grads, weight_grad = ops.v1_csr_backward_pair_projected(*inputs, **sizes)
+        return spike_grads, tf.cast(weight_grad, weight_values.dtype)
+    spike_grads = ops.v1_csr_backward_pair_projected_accumulate(
+        *inputs, accumulator, **sizes
+    )
+    return spike_grads, None
+
+
 def calculate_recurrent_csr_currents(
     spikes, weights, basis, dampening, connectivity, initial=None, queues=None
 ):
@@ -380,33 +414,11 @@ def calculate_recurrent_csr_currents(
         )
 
         def grad(current_grad, *_record_grad):
-            inputs = (
-                spike_values,
-                current_grad,
-                weight_values,
-                post_ids,
-                synapse_types,
-                row_splits,
-                edge_ids,
-                nonempty_rows,
-                basis_values,
-                tf.cast(dampening_value, spike_values[0].dtype),
-                pair_ids,
-                pair_posts,
-                pair_types,
+            spike_grads, weight_grad = recurrent_backward(
+                connectivity, spike_values, current_grad, weight_values, basis_values,
+                dampening_value, post_ids, synapse_types, row_splits, edge_ids,
+                nonempty_rows, pair_ids, pair_posts, pair_types,
             )
-            sizes = {"n_post": connectivity.n_post, "n_edges": connectivity.n_edges}
-            accumulator = _weight_gradient_accumulator()
-            if accumulator is None:
-                spike_grads, weight_grad = ops.v1_csr_backward_pair_projected(
-                    *inputs, **sizes
-                )
-                weight_grad = tf.cast(weight_grad, weight_values.dtype)
-            else:
-                spike_grads = ops.v1_csr_backward_pair_projected_accumulate(
-                    *inputs, accumulator, **sizes
-                )
-                weight_grad = None
             # `initial` enters the output additively, so the upstream gradient
             # passes straight through. With no accumulator the input is an
             # empty sentinel, and its gradient has to stay unset rather than
@@ -435,6 +447,33 @@ def calculate_recurrent_csr_currents(
     )
 
 
+def resource_recurrent_backward(
+    connectivity, spike_values, current_grad, weight_values, basis_values, dampening_value
+):
+    """recurrent_backward with the connectivity read from its GPU-local resource."""
+    ops = load_resource_ops()
+    inputs = (
+        spike_values,
+        current_grad,
+        weight_values,
+        basis_values,
+        tf.cast(dampening_value, spike_values[0].dtype),
+    )
+    attributes = {
+        "n_post": connectivity.n_post,
+        "n_edges": connectivity.n_edges,
+        "resource_name": connectivity.resource_name,
+    }
+    accumulator = _weight_gradient_accumulator()
+    if accumulator is None:
+        spike_grads, weight_grad = ops.v1_csr_backward_resource(*inputs, **attributes)
+        return spike_grads, tf.cast(weight_grad, weight_values.dtype)
+    spike_grads = ops.v1_csr_backward_accumulate_resource(
+        *inputs, accumulator, **attributes
+    )
+    return spike_grads, None
+
+
 def _calculate_resource_currents(
     slots, weights, basis, dampening, connectivity, initial=None, queues=None
 ):
@@ -458,29 +497,10 @@ def _calculate_resource_currents(
         )
 
         def grad(current_grad, *_record_grad):
-            inputs = (
-                spike_values,
-                current_grad,
-                weight_values,
-                basis_values,
-                tf.cast(dampening_value, spike_values[0].dtype),
+            spike_grads, weight_grad = resource_recurrent_backward(
+                connectivity, spike_values, current_grad, weight_values, basis_values,
+                dampening_value,
             )
-            attributes = {
-                "n_post": connectivity.n_post,
-                "n_edges": connectivity.n_edges,
-                "resource_name": connectivity.resource_name,
-            }
-            accumulator = _weight_gradient_accumulator()
-            if accumulator is None:
-                spike_grads, weight_grad = ops.v1_csr_backward_resource(
-                    *inputs, **attributes
-                )
-                weight_grad = tf.cast(weight_grad, weight_values.dtype)
-            else:
-                spike_grads = ops.v1_csr_backward_accumulate_resource(
-                    *inputs, accumulator, **attributes
-                )
-                weight_grad = None
             # `initial` enters the output additively, so the upstream gradient
             # passes straight through. With no accumulator the input is an
             # empty sentinel and its gradient has to stay unset.

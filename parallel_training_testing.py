@@ -311,13 +311,13 @@ def main():
     job_ids = []
     eval_job_ids = []
 
-    initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
-    if initial_benchmark_model:
-        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from {initial_benchmark_model}"
-    else:
-        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from '' --evaluate_untrained"
-    eval_job_id = submit_job(initial_evaluation_command + [initial_evaluation_script], print_only=flags.print_only)
-    eval_job_ids.append(eval_job_id)
+    # initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
+    # if initial_benchmark_model:
+    #     initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from {initial_benchmark_model}"
+    # else:
+    #     initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from '' --evaluate_untrained"
+    # eval_job_id = submit_job(initial_evaluation_command + [initial_evaluation_script], print_only=flags.print_only)
+    # eval_job_ids.append(eval_job_id)
 
     for i in range(flags.n_runs):
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...

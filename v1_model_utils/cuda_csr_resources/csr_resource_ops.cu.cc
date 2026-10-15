@@ -270,6 +270,74 @@ class V1CsrForwardResourceOp : public OpKernel {
   ForwardTileCache tile_segments_;
 };
 
+// V1CsrForwardFused reading the recurrent and external connectivities from
+// their resources: the same FusedForward, so the same kernels and gate.
+template <typename T, typename W>
+class V1CsrForwardFusedResourceOp : public OpKernel {
+ public:
+  explicit V1CsrForwardFusedResourceOp(OpKernelConstruction* context) : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("resource_name", &resource_name_));
+    OP_REQUIRES_OK(context,
+                   context->GetAttr("external_resource_name", &external_resource_name_));
+    OP_REQUIRES_OK(context, context->GetAttr("aggregate_runs", &aggregate_runs_));
+    OP_REQUIRES_OK(context,
+                   context->GetAttr("external_aggregate_runs", &external_aggregate_runs_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    V1CsrResource* resource = nullptr;
+    OP_REQUIRES_OK(context, context->resource_manager()->Lookup(
+                                "distributed_connectivity",
+                                DeviceResourceName(context, resource_name_), &resource));
+    core::ScopedUnref resource_unref(resource);
+    V1CsrResource* external = nullptr;
+    OP_REQUIRES_OK(context,
+                   context->resource_manager()->Lookup(
+                       "distributed_connectivity",
+                       DeviceResourceName(context, external_resource_name_), &external));
+    core::ScopedUnref external_unref(external);
+    OpInputList spike_slots;
+    OP_REQUIRES_OK(context, context->input_list("spikes", &spike_slots));
+    SpikeMatrix<const T*> spikes;
+    OP_REQUIRES_OK(context, ReadSpikeSlots<T>(spike_slots, &spikes));
+    // The named inputs follow the spike list; the queue records come last.
+    const int first = spike_slots.size() - 1;
+    const Tensor& weights = context->input(first + 1);
+    const Tensor& basis = context->input(first + 2);
+    const Tensor& activity = context->input(first + 3);
+    const Tensor& external_weights = context->input(first + 4);
+    OP_REQUIRES_OK(context, ValidateRuntimeInputs(
+                                *resource, TensorShape({spikes.batch, spikes.n_pre()}),
+                                weights, basis, n_post_, resource->post_ids.NumElements()));
+    OP_REQUIRES_OK(context, ValidateRuntimeInputs(*external, activity.shape(), external_weights,
+                                                  basis, n_post_,
+                                                  external->post_ids.NumElements()));
+    const ForwardCsr recurrent_csr{weights,
+                                   resource->post_ids,
+                                   resource->synapse_types,
+                                   resource->row_splits,
+                                   resource->edge_ids,
+                                   aggregate_runs_};
+    const ForwardCsr external_csr{external_weights,
+                                  external->post_ids,
+                                  external->synapse_types,
+                                  external->row_splits,
+                                  external->edge_ids,
+                                  external_aggregate_runs_};
+    OP_REQUIRES_OK(context, fused_.Compute(context, spikes, recurrent_csr, activity,
+                                           external_csr, basis, first + 5, n_post_));
+  }
+
+ private:
+  int n_post_;
+  string resource_name_;
+  string external_resource_name_;
+  bool aggregate_runs_ = false;
+  bool external_aggregate_runs_ = true;
+  FusedForward<T, W> fused_;
+};
+
 template <typename T>
 class BkgCsrForwardResourceOp : public OpKernel {
  public:
@@ -570,6 +638,11 @@ class ExternalCsrActivityBackwardResourceOp : public OpKernel {
           .Device(DEVICE_GPU)                                              \
           .TypeConstraint<T>("T"),                                       \
       V1CsrForwardResourceOp<T, float>);                                   \
+  REGISTER_KERNEL_BUILDER(                                                 \
+      Name("V1CsrForwardFusedResource")                                  \
+          .Device(DEVICE_GPU)                                              \
+          .TypeConstraint<T>("T"),                                       \
+      V1CsrForwardFusedResourceOp<T, float>);                              \
   REGISTER_KERNEL_BUILDER(                                                 \
       Name("V1CsrBackwardResource")                                      \
           .Device(DEVICE_GPU)                                              \

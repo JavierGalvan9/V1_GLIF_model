@@ -23,7 +23,10 @@ tests and benchmarks. Single-replica training keeps the tensor-backed
 operators.
 
 The library provides recurrent forward/backward (including the in-place
-accumulating backward, see `cuda_csr_recurrent/README.md`), the background
+accumulating backward, see `cuda_csr_recurrent/README.md`), the model's fused
+recurrent + LGN forward (`V1CsrForwardFusedResource`, which takes both resource
+names and runs the same `FusedForward` and tile sweep as the tensor
+`V1CsrForwardFused`, so replicated runs keep the single-rounding step), the background
 input's fixed-four forward gather (`BkgCsrForwardResource`, reading the
 incoming CSR stored in the resource), and the external weight-only and
 activity backward operations. Two contracts are shared with the tensor

@@ -15,7 +15,28 @@ generic pair-projected kernels. FP32 master-weight gradients retain the original
 order; CSR identifiers are `uint32` and synapse types are `uint8`. Every
 operator takes the synaptic basis in FP32. The LGN forward goes through the
 recurrent `V1CsrForward`, so it gets the device-built active-row queue and the
-warp-aggregated scatter described in `cuda_csr_recurrent/README.md`.
+tile sweep (four basis columns) or warp-aggregated scatter described in
+`cuda_csr_recurrent/README.md`.
+
+## The model's recurrent + LGN step
+
+`calculate_recurrent_and_external_currents` returns the recurrent currents of a
+spike history plus the LGN's, as the two chained calls would. Where `fusable`
+holds, one operator computes both:
+
+- `V1CsrForwardFused` for tensor connectivities;
+- `V1CsrForwardFusedResource` when both live in GPU-local resources
+  (`V1_CSR_RESOURCE_MODE=1`, which multi-GPU `MirroredStrategy` runs set).
+
+`fusable` needs carried queue records, at most `MAX_SPIKE_SLOTS` slots, one
+dtype, both connectivities held the same way, a recurrent CSR that never
+repeats targets, an LGN that does, and no BKG gather. With four basis columns
+and three slots, the operator sums both sources in one FP32 tile sweep at
+every batch, in FP16 and FP32. Otherwise it runs the two forwards in sequence.
+The custom gradient calls the same backward operators as the chained calls,
+with the same upstream gradient, so the gradients are bitwise equal.
+`V1Column.call` uses this function for the CUDA backend's carried spike
+history.
 
 Build both required libraries in the configured environment:
 

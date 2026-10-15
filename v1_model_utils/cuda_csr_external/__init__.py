@@ -5,6 +5,8 @@ from .wrapper import (
     SPECIALIZED_BATCH_SIZES,
     build_csr_connectivity,
     calculate_external_csr_currents,
+    calculate_recurrent_and_external_currents,
+    fusable,
     kernel_variant,
     uses_bkg_gather,
 )
@@ -14,6 +16,8 @@ __all__ = (
     "SPECIALIZED_BATCH_SIZES",
     "build_csr_connectivity",
     "calculate_external_csr_currents",
+    "calculate_recurrent_and_external_currents",
+    "fusable",
     "kernel_variant",
     "uses_bkg_gather",
 )

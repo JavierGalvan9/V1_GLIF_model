@@ -55,6 +55,53 @@ REGISTER_OP("V1CsrForward")
       return OkStatus();
     });
 
+// The recurrent history's currents plus an external input's, in one output:
+// what V1CsrForward(external, initial = V1CsrForward(spikes)) returns, with the
+// same `queues`/`queue` contract for the history. The model uses it for the
+// recurrent and LGN currents of one step: with four basis columns and three
+// delay slots with carried records it sums both in one FP32 tile sweep and
+// rounds once, at every batch; otherwise it runs the two forwards in sequence.
+// V1CsrForwardFusedResource (cuda_csr_resources) is the same op reading both
+// connectivities from GPU-local resources.
+REGISTER_OP("V1CsrForwardFused")
+    .Attr("T: {half, float}")
+    .Attr("N: int >= 1")
+    .Attr("carried: int >= 0 = 0")
+    .Attr("n_post: int >= 1")
+    .Attr("aggregate_runs: bool = false")
+    .Attr("external_aggregate_runs: bool = true")
+    .Input("spikes: N * T")
+    .Input("weights: float")
+    .Input("post_ids: uint32")
+    .Input("synapse_types: uint8")
+    .Input("row_splits: uint32")
+    .Input("edge_ids: uint32")
+    .Input("basis: float")
+    .Input("activity: T")
+    .Input("external_weights: float")
+    .Input("external_post_ids: uint32")
+    .Input("external_synapse_types: uint8")
+    .Input("external_row_splits: uint32")
+    .Input("external_edge_ids: uint32")
+    .Input("queues: carried * uint32")
+    .Output("currents: T")
+    .Output("queue: uint32")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(1, c->Vector(c->UnknownDim()));
+      int slots;
+      TF_RETURN_IF_ERROR(c->GetAttr("N", &slots));
+      shape_inference::ShapeHandle spikes;
+      shape_inference::ShapeHandle basis;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 2, &spikes));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(slots + 5), 2, &basis));
+      int n_post;
+      TF_RETURN_IF_ERROR(c->GetAttr("n_post", &n_post));
+      shape_inference::DimensionHandle rows;
+      TF_RETURN_IF_ERROR(c->Multiply(c->Dim(spikes, 0), n_post, &rows));
+      c->set_output(0, c->Matrix(rows, c->Dim(basis, 1)));
+      return OkStatus();
+    });
+
 // One [batch, width] spike slot's queue record, as V1CsrForward's `queue`
 // output holds it: the start of a carried history.
 REGISTER_OP("V1SpikeQueue")

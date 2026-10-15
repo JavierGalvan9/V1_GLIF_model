@@ -45,14 +45,14 @@ Use the main Opus session as orchestrator.
 - Trivial tasks: handle directly without subagents.
 - Clarification: the orchestrator resolves all open questions with the user before delegating; subagents cannot ask the user.
 - Codebase exploration: delegate to `Explore` (Haiku, CodeGraph-first).
-- Planning: delegate implementation plans to ECC's `ecc:planner` (Opus) at `high` effort; do not use the built-in Plan agent.
+- Planning: delegate implementation plans to ECC's `ecc:planner` (Opus) at `medium` effort; do not use the built-in Plan agent.
 - Architecture decisions (module boundaries, interfaces): ECC's `ecc:architect`, only when explicitly needed — never alongside `ecc:planner` for the same task.
 - Implementation: delegate to `implementer` (Opus, `medium`).
 - Complex debugging: keep in the Opus orchestrator.
 - Python reviews: ECC's `ecc:python-reviewer`.
 - ML/training-pipeline reviews (data, training reproducibility, evaluation): ECC's `ecc:mle-reviewer`.
 - Profiling and optimization: the orchestrator profiles and ranks optimizations itself, following `Experiments/PROFILING_AND_OPTIMIZATION_GUIDE.md`.
-  - Kernel design tracks (new CUDA kernels, fusions, accuracy-critical numerics): `implementer` with a `high` effort override.
+  - Kernel design tracks (new CUDA kernels, fusions, accuracy-critical numerics): `implementer` with a `medium` effort override.
   - Mechanical tracks (harness scripts, re-applying patches, stage-2 ports to other configurations): `implementer` as defined (Opus, `medium`).
 
 ### Complex tasks

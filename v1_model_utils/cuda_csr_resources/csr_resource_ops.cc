@@ -61,6 +61,44 @@ REGISTER_OP("V1CsrForwardResource")
       return OkStatus();
     });
 
+// V1CsrForwardFused (cuda_csr_recurrent) with both connectivities read from
+// their resources: the recurrent history's currents (`resource_name`, with the
+// same `queues`/`queue` contract) plus the external input's
+// (`external_resource_name`), summed by one tile sweep where its gate allows.
+REGISTER_OP("V1CsrForwardFusedResource")
+    .Attr("T: {half, float}")
+    .Attr("N: int >= 1")
+    .Attr("carried: int >= 0 = 0")
+    .Attr("n_post: int >= 1")
+    .Attr("resource_name: string")
+    .Attr("external_resource_name: string")
+    .Attr("aggregate_runs: bool = false")
+    .Attr("external_aggregate_runs: bool = true")
+    .Input("spikes: N * T")
+    .Input("weights: float")
+    .Input("basis: float")
+    .Input("activity: T")
+    .Input("external_weights: float")
+    .Input("queues: carried * uint32")
+    .Output("currents: T")
+    .Output("queue: uint32")
+    .SetShapeFn([](shape_inference::InferenceContext* context) {
+      context->set_output(1, context->Vector(context->UnknownDim()));
+      int slots;
+      TF_RETURN_IF_ERROR(context->GetAttr("N", &slots));
+      shape_inference::ShapeHandle spikes;
+      shape_inference::ShapeHandle basis;
+      TF_RETURN_IF_ERROR(context->WithRank(context->input(0), 2, &spikes));
+      TF_RETURN_IF_ERROR(context->WithRank(context->input(slots + 1), 2, &basis));
+      int n_post;
+      TF_RETURN_IF_ERROR(context->GetAttr("n_post", &n_post));
+      shape_inference::DimensionHandle rows;
+      TF_RETURN_IF_ERROR(
+          context->Multiply(context->Dim(spikes, 0), n_post, &rows));
+      context->set_output(0, context->Matrix(rows, context->Dim(basis, 1)));
+      return OkStatus();
+    });
+
 // BkgCsrForward reading its incoming CSR from the resource: one thread per
 // (post, batch) sums the four incoming edges, with no atomics.
 REGISTER_OP("BkgCsrForwardResource")

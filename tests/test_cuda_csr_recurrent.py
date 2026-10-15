@@ -821,3 +821,168 @@ def test_connectivity_without_edges(dtype, use_initial):
     np.testing.assert_array_equal(currents.numpy(), seed.numpy() if use_initial else 0.0)
     np.testing.assert_array_equal(spike_grad.numpy(), np.zeros((3, 10)))
     assert weight_grad.shape == (0,)
+
+
+# The tile sweep (CsrTileSweepKernel) serves FP16 and FP32 forwards with four
+# basis columns of rows that repeat targets (the LGN) in one tensor, at every
+# batch: narrow tiles while the wide grid is at most half the SMs, wide ones
+# otherwise (SweepTargets). The three-slot recurrent history uses it only fused
+# with the LGN (tests/test_cuda_csr_external.py).
+SWEEP_BATCH = 64
+
+
+def _lgn_like_edges(n_pre, n_post, targets_per_row, seed):
+    """Rows sending one to four synapse types to each target, as LGN rows do, and
+    one long run per row that crosses warps; tile-edge targets are included."""
+    rng = np.random.default_rng(seed)
+    edges = []
+    for pre in range(n_pre):
+        targets = np.unique(np.concatenate((
+            rng.integers(0, n_post, targets_per_row), [5119, 5120, n_post - 1])))
+        repeats = rng.integers(1, 5, targets.size)
+        repeats[rng.integers(0, targets.size)] = 70
+        posts = np.repeat(targets, repeats)
+        edges.append(np.stack((posts, np.full_like(posts, pre)), axis=1))
+    indices = np.concatenate(edges).astype(np.int64)
+    synapse_types = rng.integers(0, 5, indices.shape[0]).astype(np.int64)
+    weights = rng.normal(size=indices.shape[0]).astype(np.float32)
+    return _csr_sorted(indices, synapse_types, weights)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("batch", [1, SWEEP_BATCH])
+@pytest.mark.parametrize("use_initial", [False, True])
+@pytest.mark.parametrize("n_post, targets_per_row", [(12_000, 1500), (330_000, 2500)])
+def test_tile_sweep_lgn_matches_float64(n_post, targets_per_row, use_initial, batch):
+    """The FP16 sweep of target-repeating rows (narrow tiles at batch 1, wide at
+    64; masked table at 3 wide tiles, binary search above 64) is at least as
+    accurate as the global-atomic scatter, which the same rows split into two
+    slots select on the same samples; a silent sample's rows hold exactly
+    `initial`."""
+    n_pre = 300
+    indices, synapse_types, weights = _lgn_like_edges(n_pre, n_post, targets_per_row, n_post)
+    connectivity = _connectivity(indices, synapse_types, n_pre, n_post)
+    assert connectivity.repeats_targets
+    rng = np.random.default_rng(3)
+    spikes = (rng.random((batch, n_pre)) < 0.3).astype(np.float16)
+    silent = batch // 2
+    spikes[silent] = 0.0
+    basis = rng.normal(size=(5, 4)).astype(np.float32)
+    seed = rng.normal(size=(batch * n_post, 4)).astype(np.float16)
+    if not use_initial:
+        seed[:] = 0.0
+    expected = _float64_forward(indices, synapse_types, spikes, weights, basis, n_post) + seed
+    errors = []
+    for values in (tf.constant(spikes), tuple(tf.split(tf.constant(spikes), 2, axis=1))):
+        currents = calculate_recurrent_csr_currents(
+            values, tf.Variable(weights), tf.constant(basis), 0.37, connectivity,
+            initial=tf.constant(seed) if use_initial else None,
+        ).numpy()
+        np.testing.assert_array_equal(currents[silent * n_post:(silent + 1) * n_post],
+                                      seed[silent * n_post:(silent + 1) * n_post])
+        error = np.abs(currents.astype(np.float64) - expected)
+        errors.append((error.max(), error.mean()))
+    (sweep_max, sweep_mean), (atomic_max, atomic_mean) = errors
+    assert sweep_max <= atomic_max and sweep_mean <= atomic_mean, errors
+
+
+def _two_contribution_history(width, n_post, n_slots, seed):
+    """A history CSR and spikes in which every target receives at most two
+    contributions per sample: row r feeds targets r % G + k G, and a sample fires
+    at most two rows of a class G, so every FP32 summation order agrees."""
+    rng = np.random.default_rng(seed)
+    classes = 97
+    n_pre = n_slots * width
+    posts = np.arange(0, n_post - classes, classes)
+    indices = np.concatenate([
+        np.stack((posts + pre % classes, np.full_like(posts, pre)), axis=1)
+        for pre in range(n_pre)]).astype(np.int64)
+    synapse_types = rng.integers(0, 5, indices.shape[0]).astype(np.int64)
+    weights = rng.normal(size=indices.shape[0]).astype(np.float32)
+    spikes = np.zeros((SWEEP_BATCH, n_pre), np.float16)
+    for sample in range(SWEEP_BATCH):
+        for group in range(classes):
+            rows = np.arange(group, n_pre, classes)
+            spikes[sample, rng.choice(rows, size=rng.integers(0, 3), replace=False)] = 1.0
+    return _csr_sorted(indices, synapse_types, weights) + (spikes,)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
+@pytest.mark.parametrize("use_initial", [False, True])
+@pytest.mark.parametrize("n_post", [12_000, 330_000])
+def test_tile_sweep_records_bitwise_twoedge(n_post, use_initial, resource_mode, monkeypatch):
+    """Three slots of a batch-64 FP16 history with carried queue records (the
+    newest built by BuildMissingRecords) and without (the merged queue) give the
+    same currents bit for bit when no target receives more than two
+    contributions, and the returned record is the newest slot's."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    n_slots, width = 3, 1500
+    indices, synapse_types, weights, spikes = _two_contribution_history(
+        width, n_post, n_slots, n_post)
+    connectivity = _connectivity(indices, synapse_types, n_slots * width, n_post)
+    assert not connectivity.repeats_targets
+    slots = tuple(tf.split(tf.constant(spikes), n_slots, axis=1))
+    basis = tf.constant(np.random.default_rng(1).normal(size=(5, 4)), tf.float32)
+    initial = tf.constant(np.random.default_rng(2).normal(
+        size=(SWEEP_BATCH * n_post, 4)).astype(np.float16)) if use_initial else None
+    master = tf.Variable(weights)
+    swept, record = calculate_recurrent_csr_currents(
+        slots, master, basis, 0.5, connectivity, initial=initial,
+        queues=tuple(spike_queue(slot) for slot in slots[1:]))
+    merged = calculate_recurrent_csr_currents(
+        slots, master, basis, 0.5, connectivity, initial=initial)
+    assert np.any(merged.numpy() != (0.0 if initial is None else initial.numpy()))
+    np.testing.assert_array_equal(swept.numpy(), merged.numpy())
+    # A record is its active entries, then their count and the sample starts;
+    # the slack after the entries is never read.
+    capacity = SWEEP_BATCH * width
+    for got, want in ((record.numpy(), spike_queue(slots[0]).numpy()),):
+        count = int(want[capacity])
+        np.testing.assert_array_equal(got[:count], want[:count])
+        np.testing.assert_array_equal(got[capacity:], want[capacity:])
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
+def test_tile_sweep_graphs_share_tile_memory(monkeypatch, resource_mode):
+    """Batch-64 validation graphs reach the sweep's tables through the shared
+    registry too, rather than each operator keeping its own."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    n_pre, n_post = 32768, 8192
+    indices = np.column_stack((
+        np.tile([0, 0, 2048, 4096, 6144], n_pre),
+        np.repeat(np.arange(n_pre), 5),
+    ))
+    with tf.device("/GPU:0"):
+        connectivity = _connectivity(
+            indices, np.zeros(len(indices), np.int64), n_pre, n_post
+        )
+        assert connectivity.repeats_targets
+        weights = tf.Variable(tf.fill((len(indices),), 1.0 / n_pre))
+        spikes = tf.ones((SWEEP_BATCH, n_pre), tf.float16)
+
+        def make_rollout(chunks):
+            @tf.function
+            def rollout(activity):
+                total = tf.zeros((), tf.float32)
+                for _ in range(chunks):
+                    currents = calculate_recurrent_csr_currents(
+                        activity, weights, tf.ones((1, 4)), 0.1, connectivity
+                    )
+                    total += tf.reduce_sum(tf.cast(currents, tf.float32))
+                return total
+
+            return rollout
+
+        make_rollout(1)(spikes).numpy()
+        before = tf.config.experimental.get_memory_info("GPU:0")["current"]
+        for rollout in (make_rollout(20), make_rollout(20)):
+            # 5 edges x 4 basis columns per row, each 1 / n_pre, per sample.
+            np.testing.assert_allclose(rollout(spikes).numpy(), 20 * SWEEP_BATCH * 20,
+                                       rtol=1e-3)
+        after = tf.config.experimental.get_memory_info("GPU:0")["current"]
+        assert after - before < 8 * 2**20, (
+            f"Validation retained {(after - before) / 2**20:.2f} MiB of extra "
+            "GPU memory for unchanged connectivity"
+        )

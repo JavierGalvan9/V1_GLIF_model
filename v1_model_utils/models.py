@@ -15,6 +15,7 @@ from .cuda_csr_recurrent import (
 from .cuda_csr_external import (
     build_csr_connectivity as build_external_csr_connectivity,
     calculate_external_csr_currents,
+    calculate_recurrent_and_external_currents,
 )
 from . import spatial_layout
 from .glif_propagators import membrane_coefficients
@@ -748,6 +749,20 @@ class SpikeHistory(NamedTuple):
     queues: tuple
 
 
+def _lgn_activity(cell, x_t):
+    """The CUDA LGN operators' activity and whether to differentiate it.
+
+    LGN inputs are 0/1 spikes: Keras casts the bool batch to the compute dtype
+    once at the model input, so a floating x_t is used as-is and is its own
+    straight-through activity gradient.
+    """
+    activity = tf.cast(x_t, dtype=cell.compute_dtype)
+    compute_activity_gradient = getattr(cell, "_compute_lgn_activity_gradient", False)
+    if not (compute_activity_gradient and x_t.dtype.is_floating):
+        activity = tf.stop_gradient(activity)
+    return activity, compute_activity_gradient
+
+
 class V1Column(tf.keras.layers.Layer):
     @tf.__internal__.tracking.no_automatic_dependency_tracking
     def _bind_constant(self, name, value, dtype=None):
@@ -1478,6 +1493,26 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
+    def calculate_recurrent_and_input_currents(self, rec_z_buf, queues, x_t):
+        """``(currents, record)``: calculate_i_rec_with_custom_grad(rec_z_buf,
+        queues=queues) with calculate_input_current_from_spikes(x_t) accumulated
+        on top, in one CUDA operator for tensor and resource (replicated)
+        connectivities alike (calculate_recurrent_and_external_currents)."""
+        activity, compute_activity_gradient = _lgn_activity(self, x_t)
+        return calculate_recurrent_and_external_currents(
+            rec_z_buf,
+            tf.cast(self.recurrent_weight_values, self.variable_dtype),
+            self.synaptic_basis_weights,
+            self._recurrent_dampening,
+            self.recurrent_csr,
+            queues,
+            activity,
+            tf.cast(self.input_weight_values, self.variable_dtype),
+            self.input_csr,
+            compute_activity_gradient=compute_activity_gradient,
+            compute_weight_gradient=self.input_weight_values.trainable,
+        )
+
     def calculate_input_current_from_spikes(self, x_t, initial=None):
         """
         Calculate the input current from the LGN neurons, given the spikes at time t (x_t).
@@ -1486,15 +1521,7 @@ class V1Column(tf.keras.layers.Layer):
         returning a separate tensor for a later add.
         """
         if self._synaptic_current_backend == "cuda":
-            # LGN inputs are 0/1 spikes: Keras casts the bool batch to the compute
-            # dtype once at the model input, so a floating x_t is used as-is and
-            # is its own straight-through activity gradient.
-            activity = tf.cast(x_t, dtype=self.compute_dtype)
-            compute_activity_gradient = getattr(
-                self, "_compute_lgn_activity_gradient", False
-            )
-            if not (compute_activity_gradient and x_t.dtype.is_floating):
-                activity = tf.stop_gradient(activity)
+            activity, compute_activity_gradient = _lgn_activity(self, x_t)
             return calculate_external_csr_currents(
                 activity,
                 tf.cast(self.input_weight_values, self.variable_dtype),
@@ -1897,12 +1924,16 @@ class V1Column(tf.keras.layers.Layer):
         # output removes a full pass over a [batch * n_neurons, n_syn_basis]
         # tensor per source - the largest elementwise traffic in the step.
         if self._chain_current_sources:
-            rec_inputs = self.calculate_i_rec_with_custom_grad(z_slots, queues=queues)
             if queues is not None:
-                rec_inputs, newest_queue = rec_inputs
-            rec_inputs = self.calculate_input_current_from_spikes(
-                lgn_input, initial=rec_inputs
-            )
+                # The carried queue records exist only on the CUDA backend.
+                rec_inputs, newest_queue = self.calculate_recurrent_and_input_currents(
+                    z_slots, queues, lgn_input
+                )
+            else:
+                rec_inputs = self.calculate_i_rec_with_custom_grad(z_slots)
+                rec_inputs = self.calculate_input_current_from_spikes(
+                    lgn_input, initial=rec_inputs
+                )
             # The GLIF op gathers the BKG current itself when it can, saving a
             # read and a write of the whole [batch * neurons, 4] current per step.
             fused_bkg = self._fused_bkg_inputs(batch_size, noise_step)

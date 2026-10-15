@@ -247,14 +247,39 @@ Status BuildQueueRecord(OpKernelContext* context, const T* slot, int64_t batch,
                          record + capacity + 1);
 }
 
+// Every slot's queue record: `carried.record[d]` is slot d's when the caller
+// has it (null otherwise), `newest` receives slot 0's (null: a temporary), and
+// the other missing ones are built into `scratch`, which must outlive their use.
+template <typename T>
+Status BuildMissingRecords(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
+                           const QueueRecords& carried, unsigned int* newest,
+                           QueueRecords* records, Tensor* scratch) {
+  const SpikeSlots<const T*>& slots = spikes.slots;
+  const int64_t words = QueueRecordWords(spikes.batch, slots.width);
+  int missing = 0;
+  for (int slot = 0; slot < slots.count; ++slot) {
+    missing += carried.record[slot] == nullptr && !(slot == 0 && newest != nullptr);
+  }
+  unsigned int* next = nullptr;
+  if (missing) TF_RETURN_IF_ERROR(AllocateQueueWords(context, missing * words, scratch, &next));
+  *records = carried;
+  for (int slot = 0; slot < slots.count; ++slot) {
+    if (records->record[slot] != nullptr) continue;
+    unsigned int* record = slot == 0 && newest != nullptr ? newest : next;
+    if (record == next) next += words;
+    TF_RETURN_IF_ERROR(BuildQueueRecord<T>(context, slots.slot[slot], spikes.batch,
+                                           slots.width, record));
+    records->record[slot] = record;
+  }
+  return OkStatus();
+}
+
 // The queue of active (batch, row) slots of the concatenated [batch, n_pre]
 // matrix, in its row-major order. With several slot tensors, a single
 // compaction over the concatenated index would locate every element's tensor
 // with two divisions, which made the sweep compute-bound (132 us against 50 at
 // B = 64); each tensor is compacted with the plain streaming select instead,
 // and the few active entries are merged into the concatenated order.
-// With several slots, `carried.record[d]` is slot d's record when the caller
-// has it (null otherwise) and `newest` receives slot 0's (null: a temporary).
 template <typename T>
 Status BuildActiveQueue(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
                         unsigned int* queue, unsigned int* queue_count,
@@ -263,23 +288,9 @@ Status BuildActiveQueue(OpKernelContext* context, const SpikeMatrix<const T*>& s
   if (slots.count == 1) {
     return SelectNonzero<T>(context, slots.slot[0], spikes.NumElements(), queue, queue_count);
   }
-  const int64_t words = QueueRecordWords(spikes.batch, slots.width);
-  int missing = 0;
-  for (int slot = 0; slot < slots.count; ++slot) {
-    missing += carried.record[slot] == nullptr && !(slot == 0 && newest != nullptr);
-  }
+  QueueRecords records;
   Tensor scratch;
-  unsigned int* next = nullptr;
-  if (missing) TF_RETURN_IF_ERROR(AllocateQueueWords(context, missing * words, &scratch, &next));
-  QueueRecords records = carried;
-  for (int slot = 0; slot < slots.count; ++slot) {
-    if (records.record[slot] != nullptr) continue;
-    unsigned int* record = slot == 0 && newest != nullptr ? newest : next;
-    if (record == next) next += words;
-    TF_RETURN_IF_ERROR(BuildQueueRecord<T>(context, slots.slot[slot], spikes.batch,
-                                           slots.width, record));
-    records.record[slot] = record;
-  }
+  TF_RETURN_IF_ERROR(BuildMissingRecords<T>(context, spikes, carried, newest, &records, &scratch));
   return GpuLaunchKernel(MergeSlotQueuesKernel, 64, 256, 0,
                          context->eigen_device<GPUDevice>().stream(), slots.count,
                          slots.width, slots.by_width, records, spikes.batch * slots.width,
@@ -522,6 +533,13 @@ struct ForwardTileCache {
   // kernel and leave the other's launch invalid.
   bool kernel_checked = false;
   bool kernel_available = false;
+  // The same for each tile shape of CsrTileSweepKernel (SweepShape), which
+  // keep their own tables because their tile sizes need not be kTileTargets.
+  struct Sweep {
+    std::shared_ptr<const ForwardTileSegments> segments;
+    bool checked = false;
+    bool available = false;
+  } sweep[2];
 };
 
 // Warp per row: count (kFill = false) or write (kFill = true) the row's tile
@@ -637,12 +655,12 @@ inline bool MatchesTileSegments(const ForwardTileSegments& segments,
 // its table and source tensors. Each operator keeps a strong reference, so the
 // warmed timestep never takes the registry lock, allocates, or synchronizes.
 // A registry per tile size also separates libraries built with different tuning.
+// `held` is the operator's reference for this tile size.
 template <int kTargets>
 inline Status EnsureTileSegments(OpKernelContext* context, const Tensor& post_ids,
                                  const Tensor& row_splits, int n_post,
-                                 ForwardTileCache* cache) {
-  if (cache->segments &&
-      MatchesTileSegments(*cache->segments, context, post_ids, row_splits, n_post)) {
+                                 std::shared_ptr<const ForwardTileSegments>* held) {
+  if (*held && MatchesTileSegments(**held, context, post_ids, row_splits, n_post)) {
     return OkStatus();
   }
   struct Registry {
@@ -657,7 +675,7 @@ inline Status EnsureTileSegments(OpKernelContext* context, const Tensor& post_id
       it = registry.tables.erase(it);
     } else {
       if (MatchesTileSegments(*table, context, post_ids, row_splits, n_post)) {
-        cache->segments = std::move(table);
+        *held = std::move(table);
         return OkStatus();
       }
       ++it;
@@ -667,8 +685,75 @@ inline Status EnsureTileSegments(OpKernelContext* context, const Tensor& post_id
   TF_RETURN_IF_ERROR(BuildTileSegments<kTargets>(
       context, post_ids, row_splits, n_post, table.get()));
   registry.tables.emplace_back(table);
-  cache->segments = std::move(table);
+  *held = std::move(table);
   return OkStatus();
+}
+
+// Row `row`'s segment in `tile`, if it has one: [*start, *stop) in CSR order.
+// The mask names the row's tiles (the segment's rank is a popcount); without
+// masks (more than 64 tiles) the row's sorted tiles are binary-searched.
+__device__ __forceinline__ bool FindTileSegment(
+    unsigned int row, unsigned int tile, const unsigned int* segment_splits,
+    const unsigned int* segment_starts, const unsigned int* segment_tiles,
+    const unsigned long long* segment_masks, const uint32* row_splits, uint32* start,
+    uint32* stop) {
+  unsigned int low = segment_splits[row];
+  unsigned int last = 0;
+  bool found;
+  if (segment_masks != nullptr) {
+    const unsigned long long mask = segment_masks[row];
+    found = (mask >> tile) & 1;
+    low += __popcll(mask & ((1ull << tile) - 1));
+    last = segment_splits[row + 1];
+  } else {
+    unsigned int high = segment_splits[row + 1];
+    last = high;
+    while (low < high) {
+      const unsigned int middle = (low + high) >> 1;
+      if (segment_tiles[middle] < tile) low = middle + 1; else high = middle;
+    }
+    found = low < last && segment_tiles[low] == tile;
+  }
+  if (found) {
+    *start = segment_starts[low];
+    *stop = low + 1 < last ? segment_starts[low + 1] : row_splits[row + 1];
+  }
+  return found;
+}
+
+// Writes a tile's FP32 sums once, as T(initial + sum) in accumulate mode,
+// else T(sum); `kStride` is the block size.
+template <typename T, int kStride>
+__device__ __forceinline__ void WriteTileSums(const ::float4* sums, int targets,
+                                              bool accumulate, bool aligned, T* output) {
+  for (int target = threadIdx.x; target < targets; target += kStride) {
+    const ::float4 sum = sums[target];
+    if constexpr (std::is_same<T, Eigen::half>::value) {
+      float values[4] = {sum.x, sum.y, sum.z, sum.w};
+      __half2* pairs = reinterpret_cast<__half2*>(output + target * 4);
+      if (aligned) {   // 8-byte aligned row: one vector load and store
+        ::uint2 packed = {0, 0};
+        if (accumulate) packed = *reinterpret_cast<const ::uint2*>(pairs);
+        __half2* halves = reinterpret_cast<__half2*>(&packed);
+        const float2 low = __half22float2(halves[0]);
+        const float2 high = __half22float2(halves[1]);
+        halves[0] = __floats2half2_rn(values[0] + low.x, values[1] + low.y);
+        halves[1] = __floats2half2_rn(values[2] + high.x, values[3] + high.y);
+        *reinterpret_cast<::uint2*>(pairs) = packed;
+      } else {
+        for (int index = 0; index < 4; ++index) {
+          const float start = accumulate ? AsFloat(output[target * 4 + index]) : 0.0f;
+          output[target * 4 + index] = FromFloat<T>(start + values[index]);
+        }
+      }
+    } else {
+      float* row = output + target * 4;
+      const float values[4] = {sum.x, sum.y, sum.z, sum.w};
+      for (int index = 0; index < 4; ++index) {
+        row[index] = (accumulate ? row[index] : 0.0f) + values[index];
+      }
+    }
+  }
 }
 
 template <typename T, typename W>
@@ -701,34 +786,16 @@ __global__ void __launch_bounds__(kTileThreads) TiledForwardKernel(
   bool touched = false;
   __syncthreads();
   for (unsigned int base = begin; base < end; base += kTileThreads) {
-    // One thread per active row: binary-search the row's segment in this tile.
+    // One thread per active row: find the row's segment in this tile.
     const unsigned int index = base + threadIdx.x;
     int item = -1;
     uint32 length = 0;
     if (index < end) {
       const unsigned int slot = queue[index];
       const unsigned int row = slot - sample_first;
-      unsigned int low = segment_splits[row];
-      unsigned int last = 0;
-      bool found;
-      if (segment_masks != nullptr) {
-        // The mask names the row's tiles; the segment's rank is a popcount.
-        const unsigned long long mask = segment_masks[row];
-        found = (mask >> tile) & 1;
-        low += __popcll(mask & ((1ull << tile) - 1));
-        last = segment_splits[row + 1];
-      } else {
-        unsigned int high = segment_splits[row + 1];
-        last = high;
-        while (low < high) {
-          const unsigned int middle = (low + high) >> 1;
-          if (segment_tiles[middle] < tile) low = middle + 1; else high = middle;
-        }
-        found = low < last && segment_tiles[low] == tile;
-      }
-      if (found) {
-        const uint32 start = segment_starts[low];
-        const uint32 stop = low + 1 < last ? segment_starts[low + 1] : row_splits[row + 1];
+      uint32 start, stop;
+      if (FindTileSegment(row, tile, segment_splits, segment_starts, segment_tiles,
+                          segment_masks, row_splits, &start, &stop)) {
         item = atomicAdd(&items, 1);
         item_start[item] = start;
         item_spike[item] = AsFloat(spikes.At(sample, row));
@@ -771,63 +838,34 @@ __global__ void __launch_bounds__(kTileThreads) TiledForwardKernel(
   }
   // With `initial` in place and nothing added, the tile is already right.
   if (accumulate && !touched) return;
-  T* output = currents + (sample * n_post + first_target) * 4;
-  for (int target = threadIdx.x; target < targets; target += kTileThreads) {
-    const ::float4 sum = sums[target];
-    if constexpr (std::is_same<T, Eigen::half>::value) {
-      float values[4] = {sum.x, sum.y, sum.z, sum.w};
-      __half2* pairs = reinterpret_cast<__half2*>(output + target * 4);
-      if (aligned) {   // 8-byte aligned row: one vector load and store
-        ::uint2 packed = {0, 0};
-        if (accumulate) packed = *reinterpret_cast<const ::uint2*>(pairs);
-        __half2* halves = reinterpret_cast<__half2*>(&packed);
-        const float2 low = __half22float2(halves[0]);
-        const float2 high = __half22float2(halves[1]);
-        halves[0] = __floats2half2_rn(values[0] + low.x, values[1] + low.y);
-        halves[1] = __floats2half2_rn(values[2] + high.x, values[3] + high.y);
-        *reinterpret_cast<::uint2*>(pairs) = packed;
-      } else {
-        for (int index = 0; index < 4; ++index) {
-          const float start = accumulate ? AsFloat(output[target * 4 + index]) : 0.0f;
-          output[target * 4 + index] = FromFloat<T>(start + values[index]);
-        }
-      }
-    } else {
-      float* row = output + target * 4;
-      const float values[4] = {sum.x, sum.y, sum.z, sum.w};
-      for (int index = 0; index < 4; ++index) {
-        row[index] = (accumulate ? row[index] : 0.0f) + values[index];
-      }
-    }
-  }
+  WriteTileSums<T, kTileThreads>(sums, targets, accumulate, aligned,
+                                 currents + (sample * n_post + first_target) * 4);
 }
 
-// Check the kernel's actual static allocation as well as the device's opt-in
-// dynamic allowance before selecting the tiled path. Unsupported resources
-// use scatter; API failures unrelated to resource limits remain visible.
-template <typename T, typename W>
-Status TiledForwardAvailable(ForwardTileCache* cache, bool* available) {
-  mutex_lock lock(cache->mu);
-  if (!cache->kernel_checked) {
+// Check a tile kernel's actual static allocation as well as the device's
+// opt-in dynamic allowance before selecting it, once per operator (`checked`,
+// `available` live in the operator's ForwardTileCache, under its lock).
+// Unsupported resources fall back; API failures unrelated to resource limits
+// remain visible.
+inline Status ConfigureTileKernel(const void* kernel, int threads, size_t shared,
+                                  bool* checked, bool* available) {
+  if (!*checked) {
     int ordinal;
     cudaFuncAttributes attributes;
     int shared_limit;
     cudaError_t status = cudaGetDevice(&ordinal);
-    if (status == cudaSuccess)
-      status = cudaFuncGetAttributes(&attributes, TiledForwardKernel<T, W>);
+    if (status == cudaSuccess) status = cudaFuncGetAttributes(&attributes, kernel);
     if (status == cudaSuccess)
       status = cudaDeviceGetAttribute(&shared_limit,
                                       cudaDevAttrMaxSharedMemoryPerBlockOptin, ordinal);
     if (status != cudaSuccess)
       return errors::Internal("checking tiled forward resources failed: ",
                               cudaGetErrorString(status));
-    constexpr size_t kShared = kTileTargets * sizeof(::float4);
-    cache->kernel_available =
-        kTileThreads <= attributes.maxThreadsPerBlock &&
-        attributes.sharedSizeBytes + kShared <= static_cast<size_t>(shared_limit);
-    if (cache->kernel_available) {
-      status = cudaFuncSetAttribute(TiledForwardKernel<T, W>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+    *available = threads <= attributes.maxThreadsPerBlock &&
+                 attributes.sharedSizeBytes + shared <= static_cast<size_t>(shared_limit);
+    if (*available) {
+      status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(shared));
       if (status == cudaErrorInvalidValue || status == cudaErrorNotSupported) {
         // GpuLaunchKernel checks the thread's last CUDA error. Clear only the
         // configuration error being handled; report any different pending error.
@@ -835,16 +873,594 @@ Status TiledForwardAvailable(ForwardTileCache* cache, bool* available) {
         if (pending != cudaSuccess && pending != status)
           return errors::Internal("configuring tiled forward left another CUDA error: ",
                                   cudaGetErrorString(pending));
-        cache->kernel_available = false;
+        *available = false;
       } else if (status != cudaSuccess) {
         return errors::Internal("configuring the tiled forward failed: ",
                                 cudaGetErrorString(status));
       }
     }
-    cache->kernel_checked = true;
+    *checked = true;
   }
+  return OkStatus();
+}
+
+template <typename T, typename W>
+Status TiledForwardAvailable(ForwardTileCache* cache, bool* available) {
+  mutex_lock lock(cache->mu);
+  TF_RETURN_IF_ERROR(ConfigureTileKernel(
+      reinterpret_cast<const void*>(TiledForwardKernel<T, W>), kTileThreads,
+      kTileTargets * sizeof(::float4), &cache->kernel_checked, &cache->kernel_available));
   *available = cache->kernel_available;
   return OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Tile sweep (four basis columns): the LGN forward (rows that repeat targets,
+// one slot), alone or fused with the recurrent forward over three delay slots
+// with carried queue records (V1CsrForwardFused). SweepTargets is its gate.
+//
+// One block per (tile, sample), numbered tile-major so that the blocks resident
+// at once share a few tiles across samples: a row segment active in several
+// samples is then read from L2 after its first sample. A batch too small to
+// fill the device with wide tiles takes narrow ones (SweepTargets). As in
+// TiledForwardKernel
+// the block accumulates its tile in FP32 shared memory and writes it once,
+// rounded once. Differences:
+// - The active rows come straight from the slots' queue records (the newest
+//   built here, the others carried), in the merged queue's order (slot, then
+//   column), so no merged queue, merge kernel or sample-start pass is needed.
+// - Target-repeating rows (the LGN) are walked in block rounds, the recurrent
+//   rows in independent warp batches (SweepBlockRounds, SweepWarpBatches).
+// - kAggregate (rows that repeat a target): lanes of one step hold consecutive
+//   edges, so a run of edges to one target sits in consecutive lanes; the runs
+//   are found from neighbour comparisons, summed in registers (a segmented
+//   suffix scan stopped at the longest run) and added by their lowest lane.
+// - Each target's four sums are updated by one 16-byte shared compare-and-swap
+//   (SharedAddQuad): shared FP32 atomicAdd is itself a CAS loop per float here.
+// The order of the FP32 additions follows the shared atomics, as before.
+// ---------------------------------------------------------------------------
+
+#ifndef V1_SWEEP_TARGETS
+#define V1_SWEEP_TARGETS 5120
+#endif
+#ifndef V1_SWEEP_THREADS
+#define V1_SWEEP_THREADS 1024
+#endif
+// Edges per lane per walk step: the LGN's long rows lose to contention with
+// longer steps; the recurrent warp batches gain from loads in flight.
+#ifndef V1_SWEEP_LGN_EDGES
+#define V1_SWEEP_LGN_EDGES 1
+#endif
+#ifndef V1_SWEEP_REC_EDGES
+#define V1_SWEEP_REC_EDGES 4
+#endif
+// The narrow tile, for grids of wide tiles smaller than one block per SM:
+// at batch 1 on the 203,816-neuron network (40 wide tiles) it is 31 % faster
+// at 4/20 Hz, but already at 320 wide blocks (batch 8) 54 % slower, its blocks
+// each looking up every active row of their sample for a quarter of the edges.
+#ifndef V1_SWEEP_SMALL_TARGETS
+#define V1_SWEEP_SMALL_TARGETS 1280
+#endif
+constexpr int kSweepTargets = V1_SWEEP_TARGETS;
+constexpr int kSweepSmallTargets = V1_SWEEP_SMALL_TARGETS;
+constexpr int kSweepThreads = V1_SWEEP_THREADS;
+constexpr int kSweepWarps = kSweepThreads / 32;
+// The aggregation key packs (item, target in tile) into 32 bits.
+static_assert(kSweepTargets <= 8192 && kSweepSmallTargets <= kSweepTargets &&
+                  kSweepThreads <= 1024 && kSweepThreads % 32 == 0,
+              "tile sweep shape");
+// A tile shape's slot in ForwardTileCache::sweep.
+template <int kTargets>
+constexpr int kSweepShape = kTargets == kSweepTargets ? 0 : 1;
+// The recurrent history's three delay slots (the most a sweep reads).
+constexpr int kSweepSlots = 3;
+
+// Adds `value` to the four FP32 sums of one shared target. Shared FP32
+// atomicAdd is a compare-and-swap loop per float on this hardware; sm_90+ has a
+// native 16-byte shared CAS, so one loop updates the target. Each component is
+// still `old + value`, rounded (and flushed) as the scalar atomics do.
+__device__ __forceinline__ void SharedAddQuad(::float4* address, const float (&value)[4]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  using Word = unsigned __int128;
+  Word* word = reinterpret_cast<Word*>(address);
+  ::float4 old = *address;
+  for (;;) {
+    const ::float4 sum = {old.x + value[0], old.y + value[1], old.z + value[2],
+                          old.w + value[3]};
+    const Word seen = atomicCAS(word, *reinterpret_cast<const Word*>(&old),
+                                *reinterpret_cast<const Word*>(&sum));
+    if (seen == *reinterpret_cast<const Word*>(&old)) return;
+    old = *reinterpret_cast<const ::float4*>(&seen);
+  }
+#else
+  float* sum = reinterpret_cast<float*>(address);
+  for (int index = 0; index < 4; ++index) atomicAdd(sum + index, value[index]);
+#endif
+}
+
+// One connectivity as the sweep reads it: the CSR, its weights and its tile
+// segment table.
+template <typename W>
+struct SweepCsr {
+  const unsigned int* segment_splits;
+  const unsigned int* segment_starts;
+  const unsigned int* segment_tiles;
+  const unsigned long long* segment_masks;   // null above 64 tiles
+  const uint32* row_splits;
+  const W* weights;
+  const uint32* post_ids;
+  const uint8* synapse_types;
+};
+
+// The active rows of a [batch, slots * width] presynaptic matrix: slot d's
+// queue record (QueueRecordWords) lists its active flat indices
+// sample * width + column, then their count and the sample starts.
+template <typename T>
+struct SweepRows {
+  SpikeSlots<const T*> spikes;
+  QueueRecords records;
+  int slots;
+  unsigned int width;
+  int64_t capacity;   // batch * width
+};
+
+// A block's view of its sample's active rows, in the merged queue's order
+// (slot, then column): index i < count of them is entry first[d] + i - prefix[d]
+// of record d.
+template <typename T>
+struct SampleRows {
+  unsigned int first[kSweepSlots];
+  unsigned int prefix[kSweepSlots + 1];
+
+  __device__ __forceinline__ SampleRows(const SweepRows<T>& rows, int64_t sample) {
+    prefix[0] = 0;
+#pragma unroll
+    for (int d = 0; d < kSweepSlots; ++d) {
+      const unsigned int* starts =
+          d < rows.slots ? rows.records.record[d] + rows.capacity + 1 : nullptr;
+      first[d] = d < rows.slots ? starts[sample] : 0;
+      prefix[d + 1] = prefix[d] + (d < rows.slots ? starts[sample + 1] - first[d] : 0);
+    }
+  }
+
+  __device__ __forceinline__ unsigned int count() const { return prefix[kSweepSlots]; }
+
+  // Row `index`'s segment in `tile`, if it has one, and its spike.
+  template <typename W>
+  __device__ __forceinline__ bool Find(const SweepRows<T>& rows, const SweepCsr<W>& csr,
+                                       int64_t sample, unsigned int index, unsigned int tile,
+                                       uint32* start, uint32* stop, float* spike) const {
+    const unsigned int* entries = rows.records.record[0];
+    const T* values = rows.spikes.slot[0];
+    unsigned int slot = 0, at = first[0] + index;
+#pragma unroll
+    for (int d = 1; d < kSweepSlots; ++d) {
+      if (d < rows.slots && index >= prefix[d]) {
+        slot = d;
+        entries = rows.records.record[d];
+        values = rows.spikes.slot[d];
+        at = first[d] + index - prefix[d];
+      }
+    }
+    const unsigned int entry = entries[at];
+    const unsigned int row =
+        slot * rows.width + (entry - static_cast<unsigned int>(sample * rows.width));
+    const bool found = FindTileSegment(row, tile, csr.segment_splits, csr.segment_starts,
+                                       csr.segment_tiles, csr.segment_masks, csr.row_splits,
+                                       start, stop);
+    if (found) *spike = AsFloat(values[entry]);
+    return found;
+  }
+};
+
+// One step group of an edge walk: each lane's kEdges edges (csr, spike, valid)
+// are loaded, weighted and added to the shared tile. With kAggregate a step's
+// run of edges to one target (equal key | post in consecutive lanes) is summed
+// first and its lowest lane adds it.
+template <int kEdges, bool kAggregate, typename W>
+__device__ __forceinline__ void SweepSteps(const bool (&valid)[kEdges],
+                                           const uint32 (&csr)[kEdges],
+                                           const float (&spike)[kEdges],
+                                           const unsigned int (&keys)[kEdges], int lane,
+                                           int first_target, const SweepCsr<W>& graph,
+                                           const float* basis, ::float4* sums) {
+  float weight[kEdges];
+  uint32 post[kEdges];
+  int type[kEdges];
+#pragma unroll
+  for (int step = 0; step < kEdges; ++step) {
+    if (valid[step]) {
+      weight[step] = AsFloat(__ldg(&graph.weights[V1_EDGE_INDEX(csr[step])]));
+      post[step] = __ldg(&graph.post_ids[csr[step]]) - first_target;
+      type[step] = __ldg(&graph.synapse_types[csr[step]]);
+    } else {
+      weight[step] = 0.0f;
+      post[step] = 0;
+      type[step] = 0;
+    }
+  }
+#pragma unroll
+  for (int step = 0; step < kEdges; ++step) {
+    if constexpr (!kAggregate) {
+      if (!valid[step]) continue;
+    }
+    const float weighted = valid[step] ? spike[step] * weight[step] : 0.0f;
+    const ::float4 bv = LoadBasis4(basis, type[step]);
+    float value[4] = {weighted * bv.x, weighted * bv.y, weighted * bv.z, weighted * bv.w};
+    bool leader = valid[step];
+    if constexpr (kAggregate) {
+      // Invalid lanes share a key no edge has; the `valid` test drops their run.
+      const unsigned int key = valid[step] ? keys[step] | post[step] : 0xffffffffu;
+      // Every lane must reach the shuffle, so it is not short-circuited.
+      const unsigned int below = __shfl_up_sync(0xffffffffu, key, 1);
+      const bool head = lane == 0 || key != below;
+      const unsigned int heads = __ballot_sync(0xffffffffu, head);
+      if (heads != 0xffffffffu) {
+        const unsigned int upto = (2u << lane) - 1;   // lanes <= this one
+        const int run_start = 31 - __clz(heads & upto);
+        const unsigned int later = heads & ~upto;
+        const int next = later ? __ffs(later) - 1 : 32;
+        const unsigned int group =
+            (next == 32 ? 0xffffffffu : (1u << next) - 1) & ~((1u << run_start) - 1);
+        // Rounds at offsets beyond the longest run add nothing, so stop there:
+        // the sums are those of RunSuffixSums.
+        const int longest = __reduce_max_sync(0xffffffffu, head ? next - lane : 0);
+#pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+          if (offset >= longest) break;
+          const int source = lane + offset;
+          const bool take = source < 32 && ((group >> source) & 1u);
+#pragma unroll
+          for (int index = 0; index < 4; ++index) {
+            const float other = __shfl_down_sync(0xffffffffu, value[index], offset);
+            if (take) value[index] += other;
+          }
+        }
+      }
+      leader = valid[step] && head;
+    }
+    if (leader) SharedAddQuad(sums + post[step], value);
+  }
+}
+
+// Shared item lists of the walks: the block's round (block rounds) or one per
+// warp (warp batches), each [start, offset (exclusive prefix of lengths), spike].
+struct SweepItems {
+  uint32 start[kSweepThreads];
+  uint32 offset[kSweepThreads + kSweepWarps];
+  float spike[kSweepThreads];
+};
+
+// Block rounds (rows that repeat targets: the LGN, ~5,500-edge rows, a few
+// hundred per sample). One thread per active row per round finds its segment;
+// one block scan of packed (count, length) pairs compacts them in row order;
+// each warp then walks chunks of 32 * kEdges consecutive edges of the round's
+// concatenated segments (first owner binary-searched, then advanced linearly).
+// The whole block shares the walk, which balances the long, uneven segments.
+template <int kEdges, bool kAggregate, typename T, typename W, typename Scan>
+__device__ __forceinline__ bool SweepBlockRounds(
+    const SweepRows<T>& rows, const SweepCsr<W>& graph, int64_t sample, unsigned int tile,
+    int first_target, const float* basis, ::float4* sums, SweepItems& items,
+    typename Scan::TempStorage& scan_storage) {
+  const SampleRows<T> sample_rows(rows, sample);
+  const int lane = threadIdx.x & 31;
+  bool touched = false;
+  for (unsigned int base = 0; base < sample_rows.count(); base += kSweepThreads) {
+    const unsigned int index = base + threadIdx.x;
+    uint32 start = 0, stop = 0;
+    float spike = 0.0f;
+    const bool found = index < sample_rows.count() &&
+                       sample_rows.Find(rows, graph, sample, index, tile, &start, &stop, &spike);
+    unsigned long long packed =
+        found ? (1ull << 32) | static_cast<unsigned long long>(stop - start) : 0ull;
+    unsigned long long round;
+    Scan(scan_storage).ExclusiveSum(packed, packed, round);
+    const int count = static_cast<int>(round >> 32);
+    const uint32 total = static_cast<uint32>(round);
+    if (found) {
+      const int item = static_cast<int>(packed >> 32);
+      items.start[item] = start;
+      items.offset[item] = static_cast<uint32>(packed);
+      items.spike[item] = spike;
+    }
+    if (threadIdx.x == 0) items.offset[count] = total;
+    __syncthreads();
+    touched = touched || count > 0;
+    constexpr uint32 kChunk = 32 * kEdges;
+    for (uint32 chunk = (threadIdx.x >> 5) * kChunk; chunk < total;
+         chunk += kSweepWarps * kChunk) {
+      int owner = 0;
+      int high = count;
+      while (high - owner > 1) {
+        const int middle = (owner + high) >> 1;
+        if (items.offset[middle] <= chunk) owner = middle; else high = middle;
+      }
+      bool valid[kEdges];
+      uint32 csr[kEdges];
+      float spikes[kEdges];
+      unsigned int keys[kEdges];
+#pragma unroll
+      for (int step = 0; step < kEdges; ++step) {
+        const uint32 edge = chunk + step * 32 + lane;
+        valid[step] = edge < total;
+        if (valid[step]) {
+          while (items.offset[owner + 1] <= edge) ++owner;
+          csr[step] = items.start[owner] + (edge - items.offset[owner]);
+          spikes[step] = items.spike[owner];
+        }
+        keys[step] = static_cast<unsigned int>(owner) << 13;
+      }
+      SweepSteps<kEdges, kAggregate>(valid, csr, spikes, keys, lane, first_target, graph,
+                                     basis, sums);
+    }
+    __syncthreads();
+  }
+  return touched;
+}
+
+// Warp batches (rows that never repeat a target: the recurrent history,
+// ~140-edge rows, thousands per sample, ~11 edges per tile segment). Each warp
+// claims a batch of active rows at a time, finds their segments, compacts them
+// into its own item list and walks their concatenated edges alone, so no block
+// barrier separates the lookups of one batch from the walk of another: the
+// warps' dependent loads overlap. A batch is 4 to 32 rows, sized for about
+// eight batches per warp: the walk of one batch is serial in its warp, so fewer
+// rows per sample need smaller batches to keep every warp busy (32-row batches
+// measured 8 % slower at 0.7 Hz, 4-row ones 23 % slower at 4 Hz). Returns
+// whether this warp added anything.
+template <int kEdges, typename T, typename W>
+__device__ __forceinline__ bool SweepWarpBatches(
+    const SweepRows<T>& rows, const SweepCsr<W>& graph, int64_t sample, unsigned int tile,
+    int first_target, const float* basis, ::float4* sums, SweepItems& items,
+    unsigned int* next_batch) {
+  const SampleRows<T> sample_rows(rows, sample);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  uint32* starts = items.start + warp * 32;
+  uint32* offsets = items.offset + warp * 33;
+  float* spikes_of = items.spike + warp * 32;
+  const unsigned int share = sample_rows.count() / (kSweepWarps * 8);
+  const unsigned int batch_rows = share >= 32 ? 32 : (share >= 16 ? 16 : (share >= 8 ? 8 : 4));
+  bool touched = false;
+  for (;;) {
+    unsigned int base = 0;
+    if (lane == 0) base = atomicAdd(next_batch, batch_rows);
+    base = __shfl_sync(0xffffffffu, base, 0);
+    if (base >= sample_rows.count()) break;
+    const unsigned int index = base + lane;
+    uint32 start = 0, stop = 0;
+    float spike = 0.0f;
+    const bool found = lane < batch_rows && index < sample_rows.count() &&
+                       sample_rows.Find(rows, graph, sample, index, tile, &start, &stop, &spike);
+    // Exclusive prefix of the lengths in lane order (zero for rows without a
+    // segment here), and each found row's rank among the found ones.
+    const uint32 length = found ? stop - start : 0;
+    uint32 prefix = length;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+      const uint32 other = __shfl_up_sync(0xffffffffu, prefix, offset);
+      if (lane >= offset) prefix += other;
+    }
+    const uint32 total = __shfl_sync(0xffffffffu, prefix, 31);
+    const unsigned int found_lanes = __ballot_sync(0xffffffffu, found);
+    if (found) {
+      const int item = __popc(found_lanes & ((1u << lane) - 1));
+      starts[item] = start;
+      offsets[item] = prefix - length;
+      spikes_of[item] = spike;
+    }
+    if (lane == 0) offsets[__popc(found_lanes)] = total;
+    __syncwarp();
+    touched = touched || total > 0;
+    int owner = 0;
+    for (uint32 chunk = 0; chunk < total; chunk += 32 * kEdges) {
+      bool valid[kEdges];
+      uint32 csr[kEdges];
+      float spikes[kEdges];
+      unsigned int keys[kEdges];
+#pragma unroll
+      for (int step = 0; step < kEdges; ++step) {
+        const uint32 edge = chunk + step * 32 + lane;
+        valid[step] = edge < total;
+        if (valid[step]) {
+          while (offsets[owner + 1] <= edge) ++owner;
+          csr[step] = starts[owner] + (edge - offsets[owner]);
+          spikes[step] = spikes_of[owner];
+        }
+        keys[step] = 0;
+      }
+      SweepSteps<kEdges, false>(valid, csr, spikes, keys, lane, first_target, graph, basis,
+                                sums);
+    }
+    __syncwarp();   // the next batch overwrites this warp's items
+  }
+  return touched;
+}
+
+// What one sweep accumulates: the target-repeating external input (block
+// rounds), or that and the recurrent history (warp batches) into one tile. The
+// recurrent history alone keeps TiledForwardKernel: its sweep was 20 % faster
+// at 4 Hz, but its reordered FP32 sums moved the mean errors by ~1e-9 relative
+// outside the baseline's run-to-run envelope.
+enum SweepMode { kSweepExternal, kSweepFused };
+
+// One block per (tile of kTargets, sample), numbered tile-major so that the
+// blocks resident at once share a few tiles across samples. (Repeating the
+// batch-64 order slice by slice above 64 samples measured 1-2 % slower.) The
+// block zeroes its FP32 tile, accumulates its rows and writes the tile once,
+// rounded once. kSweepFused adds both sources before that single rounding,
+// where the two-operator chain rounds the recurrent currents to T and the
+// external ones onto them.
+template <typename T, typename W, SweepMode kMode, int kTargets>
+__global__ void __launch_bounds__(kSweepThreads) CsrTileSweepKernel(
+    int n_post, int batch, bool accumulate, bool aligned,
+    SweepRows<T> recurrent_rows, SweepCsr<W> recurrent_graph, SweepRows<T> external_rows,
+    SweepCsr<W> external_graph, const float* basis, T* currents) {
+  extern __shared__ ::float4 sums[];   // [kTargets]
+  __shared__ SweepItems items;
+  // Warp scans: their storage is one word per warp, where raking would need
+  // one per thread and leave too little room next to a 5,120-target tile.
+  using Scan = cub::BlockScan<unsigned long long, kSweepThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+  __shared__ typename Scan::TempStorage scan_storage;
+  __shared__ unsigned int next_batch;
+  const unsigned int tile = blockIdx.x / batch;
+  const int64_t sample = blockIdx.x % batch;
+  const int first_target = tile * kTargets;
+  const int targets = min(kTargets, n_post - first_target);
+  for (int target = threadIdx.x; target < targets; target += kSweepThreads) {
+    sums[target] = ::float4{0, 0, 0, 0};
+  }
+  if (threadIdx.x == 0) next_batch = 0;
+  __syncthreads();
+  bool touched = false;
+  if constexpr (kMode == kSweepFused) {
+    touched = SweepWarpBatches<V1_SWEEP_REC_EDGES>(recurrent_rows, recurrent_graph, sample,
+                                                   tile, first_target, basis, sums, items,
+                                                   &next_batch);
+    __syncthreads();   // the walks share `items`
+  }
+  touched |= SweepBlockRounds<V1_SWEEP_LGN_EDGES, true, T, W, Scan>(
+      external_rows, external_graph, sample, tile, first_target, basis, sums, items,
+      scan_storage);
+  // Also completes every warp's atomics. With `initial` in place and nothing
+  // added, the tile is already right.
+  if (!__syncthreads_or(touched) && accumulate) return;
+  WriteTileSums<T, kSweepThreads>(sums, targets, accumulate, aligned,
+                                  currents + (sample * n_post + first_target) * 4);
+}
+
+// The one gate of the sweep, which returns its tile width (0: no sweep) for
+// `spikes`: the LGN's single slot (kSweepExternal; V1CsrForward) or the
+// recurrent history's three slots with slots 1 and 2's records carried and
+// slot 0's requested (kSweepFused, with the LGN in FusedForward). Four basis
+// columns are checked by the caller at compile time. Every batch and both
+// precisions are served: in FP16 the single rounding is far more accurate than
+// the frozen paths' atomics; in FP32 the sums came out 3-7 % farther from fp64
+// on average than theirs, a cost the production decision accepted
+// (tracks/prod/NOTES.md). The tile width is a pure performance choice: the
+// narrow tile serves grids of at most one wide-tile block per two SMs
+// (`multiprocessors`), its blocks each looking up every active row of their
+// sample for a quarter of the edges, which repays only there. Everything else
+// takes the frozen paths, including a matrix too large for 32-bit queue
+// indices, which LaunchForward then refuses.
+template <typename T>
+int SweepTargets(SweepMode mode, const SpikeMatrix<const T*>& spikes, int n_post,
+                 const QueueRecords& carried, const unsigned int* newest,
+                 int multiprocessors) {
+  if (n_post <= 0 || spikes.NumElements() == 0 || spikes.NumElements() > kQueueMaxSlots) {
+    return 0;
+  }
+  const int count = spikes.slots.count;
+  const bool served = mode == kSweepExternal
+                          ? count == 1
+                          : count == kSweepSlots && newest != nullptr &&
+                                carried.record[1] != nullptr && carried.record[2] != nullptr;
+  if (!served) return 0;
+  const int64_t wide_blocks = spikes.batch * ((n_post + kSweepTargets - 1) / kSweepTargets);
+  if (2 * wide_blocks <= multiprocessors) return kSweepSmallTargets;
+  return wide_blocks <= std::numeric_limits<int>::max() ? kSweepTargets : 0;
+}
+
+// Calls launch(std::integral_constant<int, kTargets>) for the tile width
+// `targets` that SweepTargets chose.
+template <typename Launch>
+Status WithSweepTargets(int targets, Launch&& launch) {
+  if (targets == kSweepSmallTargets) {
+    return launch(std::integral_constant<int, kSweepSmallTargets>{});
+  }
+  return launch(std::integral_constant<int, kSweepTargets>{});
+}
+
+// Whether the device can run sweep `kernel` with kTargets of shared sums,
+// checked once per operator and recorded in `cache` (its sweep flags).
+template <int kTargets>
+Status SweepKernelAvailable(const void* kernel, ForwardTileCache* cache, bool* available) {
+  mutex_lock lock(cache->mu);
+  ForwardTileCache::Sweep& sweep = cache->sweep[kSweepShape<kTargets>];
+  TF_RETURN_IF_ERROR(ConfigureTileKernel(kernel, kSweepThreads, kTargets * sizeof(::float4),
+                                         &sweep.checked, &sweep.available));
+  *available = sweep.available;
+  return OkStatus();
+}
+
+// The connectivity's sweep view, building or reusing its table under the
+// operator's lock.
+template <typename W, int kTargets>
+Status PrepareSweepCsr(OpKernelContext* context, const Tensor& weights,
+                       const Tensor& post_ids, const Tensor& synapse_types,
+                       const Tensor& row_splits, int n_post, ForwardTileCache* cache,
+                       SweepCsr<W>* graph) {
+  mutex_lock lock(cache->mu);
+  std::shared_ptr<const ForwardTileSegments>& held =
+      cache->sweep[kSweepShape<kTargets>].segments;
+  TF_RETURN_IF_ERROR(EnsureTileSegments<kTargets>(context, post_ids, row_splits, n_post, &held));
+  const ForwardTileSegments& table = *held;
+  const auto words = [](const Tensor& tensor) {
+    return reinterpret_cast<const unsigned int*>(tensor.flat<int32>().data());
+  };
+  *graph = SweepCsr<W>{
+      words(table.segment_splits), words(table.segment_starts), words(table.segment_tiles),
+      table.segment_masks.NumElements() > 0
+          ? reinterpret_cast<const unsigned long long*>(table.segment_masks.flat<int32>().data())
+          : nullptr,
+      row_splits.flat<uint32>().data(), weights.flat<W>().data(),
+      post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data()};
+  return OkStatus();
+}
+
+// The rows of `spikes` with every slot's queue record (missing ones built into
+// `scratch`, which must outlive the launch).
+template <typename T>
+Status PrepareSweepRows(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
+                        const QueueRecords& carried, unsigned int* newest, Tensor* scratch,
+                        SweepRows<T>* rows) {
+  rows->spikes = spikes.slots;
+  rows->slots = spikes.slots.count;
+  rows->width = spikes.slots.width;
+  rows->capacity = spikes.batch * spikes.slots.width;
+  return BuildMissingRecords<T>(context, spikes, carried, newest, &rows->records, scratch);
+}
+
+// Launches CsrTileSweepKernel; *launched is false when the device cannot run
+// it, and the caller falls back.
+template <typename T, typename W, SweepMode kMode, int kTargets>
+Status LaunchSweepKernel(OpKernelContext* context, int64_t batch, int n_post,
+                         const Tensor& basis, Tensor* output, bool accumulate,
+                         const SweepRows<T>& recurrent_rows, const SweepCsr<W>& recurrent_graph,
+                         const SweepRows<T>& external_rows, const SweepCsr<W>& external_graph) {
+  const int tiles = (n_post + kTargets - 1) / kTargets;
+  const bool aligned = reinterpret_cast<uintptr_t>(output->flat<T>().data()) % 8 == 0;
+  return GpuLaunchKernel(CsrTileSweepKernel<T, W, kMode, kTargets>,
+                         static_cast<int>(batch * tiles), kSweepThreads,
+                         kTargets * sizeof(::float4),
+                         context->eigen_device<GPUDevice>().stream(), n_post,
+                         static_cast<int>(batch), accumulate, aligned, recurrent_rows,
+                         recurrent_graph, external_rows, external_graph,
+                         basis.flat<float>().data(), output->flat<T>().data());
+}
+
+// Launches CsrTileSweepKernel for the external source alone; *launched is
+// false when the device cannot run it, and the caller falls back.
+template <typename T, typename W, int kTargets>
+Status LaunchTileSweep(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
+                       const Tensor& weights, const Tensor& post_ids,
+                       const Tensor& synapse_types, const Tensor& row_splits,
+                       const Tensor& basis, int n_post, Tensor* output, bool zero_output,
+                       ForwardTileCache* cache, const QueueRecords& carried,
+                       unsigned int* newest, bool* launched) {
+  TF_RETURN_IF_ERROR(SweepKernelAvailable<kTargets>(
+      reinterpret_cast<const void*>(CsrTileSweepKernel<T, W, kSweepExternal, kTargets>), cache,
+      launched));
+  if (!*launched) return OkStatus();
+  SweepCsr<W> graph;
+  TF_RETURN_IF_ERROR(PrepareSweepCsr<W, kTargets>(context, weights, post_ids, synapse_types,
+                                                  row_splits, n_post, cache, &graph));
+  SweepRows<T> rows;
+  Tensor scratch;
+  TF_RETURN_IF_ERROR(PrepareSweepRows<T>(context, spikes, carried, newest, &scratch, &rows));
+  return LaunchSweepKernel<T, W, kSweepExternal, kTargets>(
+      context, spikes.batch, n_post, basis, output, !zero_output, SweepRows<T>{}, SweepCsr<W>{},
+      rows, graph);
 }
 
 template <typename T, typename W, int kBasis>
@@ -866,6 +1482,22 @@ Status LaunchForward(OpKernelContext* context, const SpikeMatrix<const T*>& spik
   const int64_t slots = spikes.NumElements();
   const int n_basis = basis.dim_size(1);
   auto device = context->eigen_device<GPUDevice>();
+  if constexpr (kBasis == 4 && !V1_FORWARD_FLOAT_ACCUM) {
+    const int sweep_targets =
+        aggregate_runs && tile_segments != nullptr
+            ? SweepTargets<T>(kSweepExternal, spikes, n_post, carried, newest_record,
+                              device.getNumGpuMultiProcessors())
+            : 0;
+    if (sweep_targets > 0) {
+      bool launched;
+      TF_RETURN_IF_ERROR(WithSweepTargets(sweep_targets, [&](auto shape) {
+        return LaunchTileSweep<T, W, decltype(shape)::value>(
+            context, spikes, weights, post_ids, synapse_types, row_splits, basis, n_post,
+            output, zero_output, tile_segments, carried, newest_record, &launched);
+      }));
+      if (launched) return OkStatus();
+    }
+  }
   // The tiled kernel writes every output element itself; everything else
   // accumulates onto zeroed (or `initial`-seeded) currents.
   const int tiles = (n_post + kTileTargets - 1) / kTileTargets;
@@ -890,7 +1522,7 @@ Status LaunchForward(OpKernelContext* context, const SpikeMatrix<const T*>& spik
   if (tiled) {
     mutex_lock lock(tile_segments->mu);
     TF_RETURN_IF_ERROR(EnsureTileSegments<kTileTargets>(context, post_ids, row_splits, n_post,
-                                          tile_segments));
+                                          &tile_segments->segments));
     const auto& segments = *tile_segments->segments;
     Tensor starts_tensor;
     unsigned int* sample_starts;
@@ -1641,6 +2273,161 @@ class V1CsrForwardOp : public OpKernel {
   ForwardTileCache tile_segments_;
 };
 
+// One connectivity as a forward reads it, from the op's inputs or from a
+// GPU-local resource (cuda_csr_resources).
+struct ForwardCsr {
+  const Tensor& weights;
+  const Tensor& post_ids;
+  const Tensor& synapse_types;
+  const Tensor& row_splits;
+  const Tensor& edge_ids;
+  bool aggregate_runs;
+};
+
+// The recurrent history's currents plus an external input's (the LGN's), as
+// V1CsrForward(external, initial = V1CsrForward(history)) computes them, for
+// V1CsrForwardFused and V1CsrForwardFusedResource, which validate their own
+// connectivities first. Where SweepTargets accepts the configuration one tile
+// sweep accumulates both sources in FP32 and rounds once, saving the external
+// pass's read and rewrite of the currents; otherwise the two forwards run in
+// sequence, as the two operators would. Each op owns one: the tables and kernel
+// flags live here, never in a static (both libraries compile this source).
+template <typename T, typename W>
+class FusedForward {
+ public:
+  // Allocates the currents (output 0) and the newest queue record (output 1,
+  // from the carried records at input `queues`) and launches.
+  Status Compute(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
+                 const ForwardCsr& recurrent, const Tensor& activity,
+                 const ForwardCsr& external, const Tensor& basis, int queues, int n_post) {
+    if (!(activity.dims() == 2 && activity.dim_size(0) == spikes.batch &&
+          activity.NumElements() <= kQueueMaxSlots)) {
+      return errors::InvalidArgument(
+          "activity must be [batch, n_external] with the spikes' batch");
+    }
+    QueueRecords carried;
+    unsigned int* newest;
+    TF_RETURN_IF_ERROR(ReadQueueRecords<T>(context, spikes, queues, &carried, &newest));
+    Tensor* output;
+    TF_RETURN_IF_ERROR(context->allocate_output(
+        0, TensorShape({spikes.batch * n_post, basis.dim_size(1)}), &output));
+    const SpikeMatrix<const T*> external_spikes =
+        SingleSlot<T>(activity.flat<T>().data(), activity.dim_size(0), activity.dim_size(1));
+    return basis.dim_size(1) == 4
+               ? Launch<4>(context, spikes, recurrent, external_spikes, external, basis,
+                           n_post, carried, newest, output)
+               : Launch<0>(context, spikes, recurrent, external_spikes, external, basis,
+                           n_post, carried, newest, output);
+  }
+
+ private:
+  template <int kBasis>
+  Status Launch(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
+                const ForwardCsr& recurrent, const SpikeMatrix<const T*>& activity,
+                const ForwardCsr& external, const Tensor& basis, int n_post,
+                const QueueRecords& carried, unsigned int* newest, Tensor* output) {
+    if constexpr (kBasis == 4 && !V1_FORWARD_FLOAT_ACCUM) {
+      // The external input is one slot of the history's batch (validated).
+      const int targets =
+          !recurrent.aggregate_runs && external.aggregate_runs && activity.NumElements() > 0
+              ? SweepTargets<T>(kSweepFused, spikes, n_post, carried, newest,
+                                context->eigen_device<GPUDevice>().getNumGpuMultiProcessors())
+              : 0;
+      if (targets > 0) {
+        bool available;
+        bool launched = false;
+        TF_RETURN_IF_ERROR(WithSweepTargets(targets, [&](auto shape) {
+          constexpr int kTargets = decltype(shape)::value;
+          TF_RETURN_IF_ERROR(SweepKernelAvailable<kTargets>(
+              reinterpret_cast<const void*>(CsrTileSweepKernel<T, W, kSweepFused, kTargets>),
+              &fused_, &available));
+          if (!available) return OkStatus();
+          SweepCsr<W> graph, external_graph;
+          TF_RETURN_IF_ERROR(PrepareSweepCsr<W, kTargets>(
+              context, recurrent.weights, recurrent.post_ids, recurrent.synapse_types,
+              recurrent.row_splits, n_post, &recurrent_, &graph));
+          TF_RETURN_IF_ERROR(PrepareSweepCsr<W, kTargets>(
+              context, external.weights, external.post_ids, external.synapse_types,
+              external.row_splits, n_post, &external_, &external_graph));
+          SweepRows<T> rows, external_rows;
+          Tensor scratch, external_scratch;
+          TF_RETURN_IF_ERROR(
+              PrepareSweepRows<T>(context, spikes, carried, newest, &scratch, &rows));
+          TF_RETURN_IF_ERROR(PrepareSweepRows<T>(context, activity, QueueRecords{}, nullptr,
+                                                 &external_scratch, &external_rows));
+          launched = true;
+          return LaunchSweepKernel<T, W, kSweepFused, kTargets>(
+              context, spikes.batch, n_post, basis, output, false, rows, graph,
+              external_rows, external_graph);
+        }));
+        if (launched) return OkStatus();
+      }
+    }
+    TF_RETURN_IF_ERROR(LaunchForward<T, W, kBasis>(
+        context, spikes, recurrent.weights, recurrent.post_ids, recurrent.synapse_types,
+        recurrent.row_splits, recurrent.edge_ids, basis, n_post, recurrent.aggregate_runs,
+        output, true, &recurrent_, carried, newest));
+    return LaunchForward<T, W, kBasis>(
+        context, activity, external.weights, external.post_ids, external.synapse_types,
+        external.row_splits, external.edge_ids, basis, n_post, external.aggregate_runs,
+        output, false, &external_);
+  }
+
+  // Each connectivity's tables and kernel flags, and the fused kernel's flags.
+  ForwardTileCache recurrent_;
+  ForwardTileCache external_;
+  ForwardTileCache fused_;
+};
+
+// FusedForward over connectivities passed as tensors.
+template <typename T, typename W>
+class V1CsrForwardFusedOp : public OpKernel {
+ public:
+  explicit V1CsrForwardFusedOp(OpKernelConstruction* context) : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("aggregate_runs", &aggregate_runs_));
+    OP_REQUIRES_OK(context,
+                   context->GetAttr("external_aggregate_runs", &external_aggregate_runs_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    OpInputList spike_slots;
+    OP_REQUIRES_OK(context, context->input_list("spikes", &spike_slots));
+    SpikeMatrix<const T*> spikes;
+    OP_REQUIRES_OK(context, ReadSpikeSlots<T>(spike_slots, &spikes));
+    // The named inputs follow the spike list; the queue records come last.
+    const int first = spike_slots.size() - 1;
+    const ForwardCsr recurrent{context->input(first + 1), context->input(first + 2),
+                               context->input(first + 3), context->input(first + 4),
+                               context->input(first + 5), aggregate_runs_};
+    const Tensor& basis = context->input(first + 6);
+    const Tensor& activity = context->input(first + 7);
+    const ForwardCsr external{context->input(first + 8), context->input(first + 9),
+                              context->input(first + 10), context->input(first + 11),
+                              context->input(first + 12), external_aggregate_runs_};
+    OP_REQUIRES(context, basis.dims() == 2 && basis.dim_size(1) > 0,
+                errors::InvalidArgument("basis must be [n_types,n_basis], n_basis > 0"));
+    OP_REQUIRES(context, recurrent.row_splits.NumElements() == spikes.n_pre() + 1,
+                errors::InvalidArgument("row_splits does not match spike width"));
+    OP_REQUIRES_OK(context, ValidateEdgeArrays(recurrent.weights, recurrent.post_ids,
+                                               recurrent.synapse_types, recurrent.edge_ids));
+    OP_REQUIRES(context,
+                activity.dims() == 2 &&
+                    external.row_splits.NumElements() == activity.dim_size(1) + 1,
+                errors::InvalidArgument("external_row_splits does not match activity width"));
+    OP_REQUIRES_OK(context, ValidateEdgeArrays(external.weights, external.post_ids,
+                                               external.synapse_types, external.edge_ids));
+    OP_REQUIRES_OK(context, fused_.Compute(context, spikes, recurrent, activity, external,
+                                           basis, first + 13, n_post_));
+  }
+
+ private:
+  int n_post_;
+  bool aggregate_runs_ = false;
+  bool external_aggregate_runs_ = true;
+  FusedForward<T, W> fused_;
+};
+
 template <typename T, typename W, bool kAccumulate = false>
 class V1CsrBackwardPairProjectedOp : public OpKernel {
  public:
@@ -1737,6 +2524,9 @@ class V1SpikeQueueOp : public OpKernel {
   REGISTER_KERNEL_BUILDER(                                                 \
       Name("V1CsrForward").Device(DEVICE_GPU).TypeConstraint<T>("T"),       \
       V1CsrForwardOp<T, float>);                                           \
+  REGISTER_KERNEL_BUILDER(                                                 \
+      Name("V1CsrForwardFused").Device(DEVICE_GPU).TypeConstraint<T>("T"),  \
+      V1CsrForwardFusedOp<T, float>);                                      \
   REGISTER_KERNEL_BUILDER(                                                 \
       Name("V1SpikeQueue").Device(DEVICE_GPU).TypeConstraint<T>("T"),       \
       V1SpikeQueueOp<T>);                                                  \

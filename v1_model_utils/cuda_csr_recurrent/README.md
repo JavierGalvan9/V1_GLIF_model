@@ -82,6 +82,57 @@ lookups or synchronization per timestep. The initial table fill completes before
 publication so another CUDA stream can safely reuse it. CUDA kernel configuration
 remains per operator because it depends on the kernel's dtype and library.
 
+## Tile sweep: the LGN and the fused recurrent + LGN step
+
+With four basis columns, `CsrTileSweepKernel` serves two forwards. Each block
+owns one tile of postsynaptic targets of one sample, accumulates it in FP32
+shared memory (one 16-byte compare-and-swap per target and contribution) and
+writes it once, rounded once:
+
+- **The LGN alone** (`V1CsrForward` with one slot of rows that repeat targets,
+  `aggregate_runs`): runs of edges to one target are summed in registers first.
+- **The model's step** (`V1CsrForwardFused`, and `V1CsrForwardFusedResource` in
+  `cuda_csr_resources`): the recurrent history's three delay slots, with the
+  queue records of slots 1 and 2 carried, plus the LGN, summed into one tile
+  before the single rounding. This skips the LGN pass's read and rewrite of the
+  currents and the merged active-row queue. The active rows come straight from
+  the slots' records. `cuda_csr_external.calculate_recurrent_and_external_currents`
+  calls it (see `fusable`), and its gradient calls the same backward operators
+  as the two chained ones, so the gradients are bitwise equal to theirs.
+
+`SweepTargets` is the single gate. The routing is:
+
+| configuration (four basis columns unless noted) | forward |
+|---|---|
+| LGN alone: one slot of target-repeating rows, FP16 or FP32, any batch | LGN sweep |
+| recurrent history of three slots with carried records + LGN, FP16 or FP32, any batch, tensor or resource connectivities | fused sweep |
+| fused op with other slot counts or without carried records | recurrent `TiledForwardKernel`, then the LGN sweep accumulating onto it |
+| recurrent history alone | `TiledForwardKernel` (the frozen path) |
+| other basis widths | `ForwardKernel` for both sources, in sequence |
+| a wide grid of more than 2^31 - 1 blocks | the frozen paths |
+
+The tile width is purely a performance choice. The narrow tile (1,280 targets)
+is used when the wide grid (5,120 targets) is at most one block per two SMs: at
+batch 1-2 on the 203,816-neuron network, or 1-6 on the 66,652-neuron one. Its
+blocks each look up every active row of their sample for a quarter of the
+edges, which repays only there. The wide tile is used everywhere else.
+
+Accuracy against fp64:
+
+- **FP16.** The single rounding is far more accurate than the atomic paths. The
+  maximum relative error of the fused step is about half an FP16 ulp (4.9e-4),
+  against 2.5-4.9e-2 for the chain.
+- **FP32.** Both paths round once to FP32. The sweep's shared-memory order puts
+  its sums 3-7 % farther from fp64 on average than the atomic kernels'. This
+  cost was accepted for production in 2026-10
+  (`Experiments/kernel_opt_20261013/tracks/prod/NOTES.md`).
+
+The sweep's tables (one per connectivity and tile width) go through the same
+weak registry as `TiledForwardKernel`'s. Its kernel flags (`ForwardTileCache`,
+held by `FusedForward` or the forward op) are kept per operator, never in a
+static, because both this library and the resource library compile this
+source.
+
 ## Compact pair-projected backward
 
 The backward projects each distinct `(postsynaptic neuron, synapse type)` pair

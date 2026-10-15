@@ -13,9 +13,14 @@ from v1_model_utils.cuda_csr_recurrent.build import (
     build_flags_for as recurrent_build_flags_for,
 )
 from v1_model_utils.cuda_csr_recurrent.wrapper import (
+    MAX_SPIKE_SLOTS,
+    calculate_recurrent_csr_currents,
     empty_like_currents,
     empty_metadata,
+    recurrent_backward,
     require_csr_ordered_weights,
+    resource_recurrent_backward,
+    spike_slots,
 )
 from v1_model_utils.cuda_csr_resources import (
     initialize_resource,
@@ -274,6 +279,49 @@ def _load_ops():
     return _RECURRENT_OPS, _OPS
 
 
+def external_backward(
+    connectivity, values, upstream, master_weights, basis_values, post_ids, synapse_types,
+    row_splits, edge_ids, nonempty_rows, pair_ids, pair_posts, pair_types, *,
+    compute_activity_gradient, compute_weight_gradient,
+):
+    """The external activity and weight gradients; a disabled one is None."""
+    _, external_ops = _load_ops()
+    activity_grad = weight_grad = None
+    if compute_activity_gradient:
+        activity_grad = external_ops.external_csr_activity_backward(
+            upstream,
+            master_weights,
+            post_ids,
+            synapse_types,
+            row_splits,
+            edge_ids,
+            nonempty_rows,
+            basis_values,
+            pair_ids,
+            pair_posts,
+            pair_types,
+            n_post=connectivity.n_post,
+        )
+    if compute_weight_gradient:
+        weight_grad = external_ops.external_csr_weight_backward(
+            values,
+            upstream,
+            post_ids,
+            synapse_types,
+            row_splits,
+            edge_ids,
+            nonempty_rows,
+            basis_values,
+            pair_ids,
+            pair_posts,
+            pair_types,
+            sparse_activity=connectivity.sparse_activity,
+            n_post=connectivity.n_post,
+            n_edges=connectivity.n_edges,
+        )
+    return activity_grad, weight_grad
+
+
 def calculate_external_csr_currents(
     activity,
     weights,
@@ -358,42 +406,12 @@ def calculate_external_csr_currents(
             ).currents
 
         def grad(upstream):
-            if compute_activity_gradient:
-                activity_grad = external_ops.external_csr_activity_backward(
-                    upstream,
-                    master_weights,
-                    post_ids,
-                    synapse_types,
-                    row_splits,
-                    edge_ids,
-                    nonempty_rows,
-                    basis_values,
-                    pair_ids,
-                    pair_posts,
-                    pair_types,
-                    n_post=connectivity.n_post,
-                )
-            else:
-                activity_grad = None
-            if compute_weight_gradient:
-                weight_grad = external_ops.external_csr_weight_backward(
-                    values,
-                    upstream,
-                    post_ids,
-                    synapse_types,
-                    row_splits,
-                    edge_ids,
-                    nonempty_rows,
-                    basis_values,
-                    pair_ids,
-                    pair_posts,
-                    pair_types,
-                    sparse_activity=connectivity.sparse_activity,
-                    n_post=connectivity.n_post,
-                    n_edges=connectivity.n_edges,
-                )
-            else:
-                weight_grad = None
+            activity_grad, weight_grad = external_backward(
+                connectivity, values, upstream, master_weights, basis_values, post_ids,
+                synapse_types, row_splits, edge_ids, nonempty_rows, pair_ids, pair_posts,
+                pair_types, compute_activity_gradient=compute_activity_gradient,
+                compute_weight_gradient=compute_weight_gradient,
+            )
             # `initial` enters additively, so its gradient is the upstream
             # one - unless there is no accumulator, in which case the input is
             # an empty sentinel whose gradient must stay unset.
@@ -417,6 +435,35 @@ def calculate_external_csr_currents(
         connectivity.pair_posts,
         connectivity.pair_types,
     )
+
+
+def resource_external_backward(
+    connectivity, values, upstream, master_weights, basis_values, *,
+    compute_activity_gradient, compute_weight_gradient,
+):
+    """external_backward with the connectivity read from its GPU-local resource."""
+    ops = load_resource_ops()
+    activity_grad = weight_grad = None
+    if compute_activity_gradient:
+        activity_grad = ops.external_csr_activity_backward_resource(
+            upstream,
+            master_weights,
+            basis_values,
+            n_post=connectivity.n_post,
+            resource_name=connectivity.resource_name,
+        )
+    if compute_weight_gradient:
+        weight_grad = ops.external_csr_weight_backward_resource(
+            values,
+            upstream,
+            basis_values,
+            sparse_activity=connectivity.sparse_activity,
+            n_post=connectivity.n_post,
+            n_edges=connectivity.n_edges,
+            resource_name=connectivity.resource_name,
+        )
+        weight_grad = tf.cast(weight_grad, master_weights.dtype)
+    return activity_grad, weight_grad
 
 
 def _calculate_resource_currents(
@@ -455,29 +502,11 @@ def _calculate_resource_currents(
             ).currents
 
         def grad(upstream):
-            if compute_activity_gradient:
-                activity_grad = ops.external_csr_activity_backward_resource(
-                    upstream,
-                    master_weights,
-                    basis_values,
-                    n_post=connectivity.n_post,
-                    resource_name=connectivity.resource_name,
-                )
-            else:
-                activity_grad = None
-            if compute_weight_gradient:
-                weight_grad = ops.external_csr_weight_backward_resource(
-                    values,
-                    upstream,
-                    basis_values,
-                    sparse_activity=connectivity.sparse_activity,
-                    n_post=connectivity.n_post,
-                    n_edges=connectivity.n_edges,
-                    resource_name=connectivity.resource_name,
-                )
-                weight_grad = tf.cast(weight_grad, master_weights.dtype)
-            else:
-                weight_grad = None
+            activity_grad, weight_grad = resource_external_backward(
+                connectivity, values, upstream, master_weights, basis_values,
+                compute_activity_gradient=compute_activity_gradient,
+                compute_weight_gradient=compute_weight_gradient,
+            )
             # `initial` is accumulated into the output, so its gradient is the
             # upstream gradient unchanged; an absent accumulator keeps None.
             initial_grad = None if initial is None else upstream
@@ -488,4 +517,201 @@ def _calculate_resource_currents(
     return fused(
         activity, weights, basis,
         empty_like_currents(activity) if initial is None else initial,
+    )
+
+
+def fusable(spikes, basis, connectivity, queues, activity, external_connectivity):
+    """Whether calculate_recurrent_and_external_currents takes the fused operator:
+    a recurrent history of at most MAX_SPIKE_SLOTS slots with carried queue
+    records plus a target-repeating external input such as the LGN, of one
+    dtype, both connectivities held the same way (tensors, or GPU-local
+    resources in replicated runs). The operator
+    decides at run time (its gate, SweepTargets, sees the batch) whether one
+    tile sweep sums both sources, which it does for four basis columns and three
+    delay slots at every batch and precision; otherwise it runs the two forwards
+    in sequence, as the two operators would."""
+    slots = tuple(spikes) if isinstance(spikes, (tuple, list)) else (spikes,)
+    activity = tf.convert_to_tensor(activity)
+    return (
+        queues is not None
+        and len(slots) <= MAX_SPIKE_SLOTS
+        and slots[0].dtype == activity.dtype
+        and (connectivity.resource_name is None)
+        == (external_connectivity.resource_name is None)
+        and not connectivity.repeats_targets
+        and external_connectivity.repeats_targets
+        and not uses_bkg_gather(external_connectivity, basis)
+    )
+
+
+def calculate_recurrent_and_external_currents(
+    spikes,
+    weights,
+    basis,
+    dampening,
+    connectivity,
+    queues,
+    activity,
+    external_weights,
+    external_connectivity,
+    *,
+    compute_activity_gradient=True,
+    compute_weight_gradient=True,
+):
+    """``(currents, record)``: the recurrent currents of a spike history plus an
+    external input's (``record`` is None without ``queues``), as
+
+        currents, record = calculate_recurrent_csr_currents(spikes, ..., queues=queues)
+        currents = calculate_external_csr_currents(activity, ..., initial=currents)
+
+    compute them. Where `fusable` holds, one operator computes both
+    (V1CsrForwardFused, or V1CsrForwardFusedResource on GPU-local resources): on
+    the configurations its tile sweep serves it accumulates them in FP32 and
+    rounds once, skipping the external pass's read and rewrite of the currents.
+    The gradients come from the same backward operators. Otherwise this makes
+    exactly those two calls."""
+    if not fusable(spikes, basis, connectivity, queues, activity, external_connectivity):
+        currents = calculate_recurrent_csr_currents(
+            spikes, weights, basis, dampening, connectivity, queues=queues
+        )
+        currents, record = currents if queues is not None else (currents, None)
+        currents = calculate_external_csr_currents(
+            activity, external_weights, basis, external_connectivity,
+            compute_activity_gradient=compute_activity_gradient,
+            compute_weight_gradient=compute_weight_gradient, initial=currents,
+        )
+        return currents, record
+    require_csr_ordered_weights(connectivity, "recurrent connectivity")
+    require_csr_ordered_weights(external_connectivity, "external connectivity")
+    basis = tf.cast(basis, tf.float32)
+    if basis.shape[0] is not None and basis.shape[0] < connectivity.n_synapse_types:
+        raise ValueError(
+            f"basis has {basis.shape[0]} rows but the connectivity uses "
+            f"{connectivity.n_synapse_types} synapse types"
+        )
+    slots = spike_slots(spikes)
+    if connectivity.resource_name is not None:
+        return _calculate_resource_recurrent_and_external_currents(
+            slots, weights, basis, dampening, connectivity, queues, activity,
+            external_weights, external_connectivity,
+            compute_activity_gradient=compute_activity_gradient,
+            compute_weight_gradient=compute_weight_gradient,
+        )
+    recurrent_ops, _ = _load_ops()
+
+    @tf.custom_gradient
+    def fused(
+        weight_values, basis_values, post_ids, synapse_types, row_splits, edge_ids,
+        nonempty_rows, dampening_value, pair_ids, pair_posts, pair_types,
+        values, master_weights, external_post_ids, external_synapse_types,
+        external_row_splits, external_edge_ids, external_nonempty_rows,
+        external_pair_ids, external_pair_posts, external_pair_types,
+        *rest,
+    ):
+        spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        currents, record = recurrent_ops.v1_csr_forward_fused(
+            spike_values, weight_values, post_ids, synapse_types, row_splits, edge_ids,
+            basis_values, values, master_weights, external_post_ids,
+            external_synapse_types, external_row_splits, external_edge_ids, queue_values,
+            n_post=connectivity.n_post,
+            aggregate_runs=connectivity.repeats_targets,
+            external_aggregate_runs=external_connectivity.repeats_targets,
+        )
+
+        def grad(upstream, *_record_grad):
+            # The external pass takes the recurrent currents as `initial`, which
+            # passes the upstream gradient through unchanged, so both backward
+            # operators see the same upstream as in the two-operator chain.
+            spike_grads, weight_grad = recurrent_backward(
+                connectivity, spike_values, upstream, weight_values, basis_values,
+                dampening_value, post_ids, synapse_types, row_splits, edge_ids,
+                nonempty_rows, pair_ids, pair_posts, pair_types,
+            )
+            activity_grad, external_weight_grad = external_backward(
+                external_connectivity, values, upstream, master_weights, basis_values,
+                external_post_ids, external_synapse_types, external_row_splits,
+                external_edge_ids, external_nonempty_rows, external_pair_ids,
+                external_pair_posts, external_pair_types,
+                compute_activity_gradient=compute_activity_gradient,
+                compute_weight_gradient=compute_weight_gradient,
+            )
+            return ((weight_grad,) + (None,) * 10 + (activity_grad, external_weight_grad)
+                    + (None,) * 8 + tuple(spike_grads) + (None,) * len(queue_values))
+
+        return (currents, record), grad
+
+    return fused(
+        weights,
+        basis,
+        connectivity.post_ids,
+        connectivity.synapse_types,
+        connectivity.row_splits,
+        connectivity.edge_ids,
+        connectivity.nonempty_rows,
+        tf.cast(dampening, slots[0].dtype),
+        connectivity.pair_ids,
+        connectivity.pair_posts,
+        connectivity.pair_types,
+        tf.convert_to_tensor(activity),
+        tf.convert_to_tensor(external_weights, tf.float32),
+        external_connectivity.post_ids,
+        external_connectivity.synapse_types,
+        external_connectivity.row_splits,
+        external_connectivity.edge_ids,
+        external_connectivity.nonempty_rows,
+        external_connectivity.pair_ids,
+        external_connectivity.pair_posts,
+        external_connectivity.pair_types,
+        *slots,
+        *queues,
+    )
+
+
+def _calculate_resource_recurrent_and_external_currents(
+    slots, weights, basis, dampening, connectivity, queues, activity, external_weights,
+    external_connectivity, *, compute_activity_gradient, compute_weight_gradient,
+):
+    """calculate_recurrent_and_external_currents with both connectivities in
+    GPU-local resources (V1CsrForwardFusedResource)."""
+    ops = load_resource_ops()
+
+    @tf.custom_gradient
+    def fused(
+        weight_values, basis_values, dampening_value, values, master_weights, *rest
+    ):
+        spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        currents, record = ops.v1_csr_forward_fused_resource(
+            spike_values, weight_values, basis_values, values, master_weights, queue_values,
+            n_post=connectivity.n_post,
+            resource_name=connectivity.resource_name,
+            external_resource_name=external_connectivity.resource_name,
+            aggregate_runs=connectivity.repeats_targets,
+            external_aggregate_runs=external_connectivity.repeats_targets,
+        )
+
+        def grad(upstream, *_record_grad):
+            # As in the tensor version: both backward operators see the upstream
+            # gradient of the two-operator chain.
+            spike_grads, weight_grad = resource_recurrent_backward(
+                connectivity, spike_values, upstream, weight_values, basis_values,
+                dampening_value,
+            )
+            activity_grad, external_weight_grad = resource_external_backward(
+                external_connectivity, values, upstream, master_weights, basis_values,
+                compute_activity_gradient=compute_activity_gradient,
+                compute_weight_gradient=compute_weight_gradient,
+            )
+            return ((weight_grad, None, None, activity_grad, external_weight_grad)
+                    + tuple(spike_grads) + (None,) * len(queue_values))
+
+        return (currents, record), grad
+
+    return fused(
+        weights,
+        basis,
+        tf.cast(dampening, slots[0].dtype),
+        tf.convert_to_tensor(activity),
+        tf.convert_to_tensor(external_weights, tf.float32),
+        *slots,
+        *queues,
     )
