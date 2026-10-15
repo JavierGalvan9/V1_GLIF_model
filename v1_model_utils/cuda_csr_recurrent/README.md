@@ -115,12 +115,18 @@ slice. The backward is split into two halves:
   sums per lane so its sums are bitwise those of two 32-sample slices.
 - **Weight gradient (event driven, `event_weight_grad.cuh`).** The spikes are
   sparse, so `EventRowQueueKernel` queues each row that fired, one item per
-  256 edges so long rows spread over several blocks, with a 64-bit mask of the
-  active samples when the batch is at most 64, and `EventWeightGradKernel`
-  rebuilds the projection in FP32 from `current_grad` and the basis for the
-  row's active samples only, in ascending order (compacted through shared
-  memory above 64 samples). Each edge has one writer and a fixed summation order, so
-  there are no atomics and the result is deterministic. Rows that never fired
+  256 edges so long rows spread over several warps, with a bit mask of the
+  row's active samples: in the item up to 64 samples, otherwise
+  `ceil(batch / 32)` words per row in the queue scratch (`[row, word]`, so a
+  warp reads a row's mask from one sector). `EventWeightGradWarpKernel` gives
+  each item one warp, eight items per block, and rebuilds the projection in
+  FP32 from `current_grad` and the basis for the row's active samples only,
+  in ascending order; each lane loads its edges' weight gradient up front and
+  walks the samples outermost so that its gathers are independent. Above 64
+  samples a lane loads one mask word and the warp walks the non-zero words in
+  order.
+  Each edge has one writer and a fixed summation order, so there are no
+  atomics and the result is deterministic. Rows that never fired
   get an exact zero, so a non-finite upstream gradient no longer reaches the
   weight gradient of silent rows. Mixed-precision loss scaling still sees it
   through the spike gradient and the firing rows. The external operator uses the

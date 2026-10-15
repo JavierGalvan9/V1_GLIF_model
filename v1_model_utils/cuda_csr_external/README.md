@@ -44,10 +44,11 @@ The connectivity's `sparse_activity` flag chooses between two kernels:
 
 - **Sparse activity (LGN, the default): event driven.** The kernel pair in
   `cuda_csr_recurrent/event_weight_grad.cuh`, shared with the recurrent
-  operator, visits only presynaptic rows with an active sample, one block per
-  1,024 edges, and rebuilds each edge's projection in FP32 from the upstream
-  gradient for just the active samples. It serves every batch size and basis
-  dimension, writes each edge exactly once and is deterministic. At 20 Hz it is
+  operator, visits only presynaptic rows with an active sample, one warp per
+  256 edges, and rebuilds each edge's projection in FP32 from the upstream
+  gradient for just the active samples. It serves
+  every batch size and basis dimension, writes each edge exactly once and is
+  deterministic. At 20 Hz it is
   1.5-3.4x faster than the pair-projected kernel on LGN, and it does not read
   the per-edge pair projection, so a sparse connectivity builds that only when
   an activity gradient is requested (`needs_activity_backward`): 365 MiB of

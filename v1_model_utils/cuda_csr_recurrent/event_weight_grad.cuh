@@ -8,18 +8,18 @@
 // upstream gradient no longer reaches the weight gradient of edges whose row
 // never fired; everything else is exact in finite arithmetic.
 //
-// Pass 1 (EventRowQueueKernel): one thread per presynaptic row scans the batch,
-// and every active row appends one (row, chunk, batch mask) item per
-// `kEventChunk` edges, with one atomic per warp. Chunking spreads long rows
-// (recurrent rows reach ~3k edges; the 100 BKG rows ~8k each) over many blocks.
+// Pass 1 (EventRowQueueKernel): one thread per presynaptic row scans the batch
+// into a bit mask of its active samples, and every active row appends one
+// (row, chunk, mask) item per `kEventChunk` edges, with one atomic per warp.
+// Chunking spreads long rows (recurrent rows reach ~3k edges; the 100 BKG rows
+// ~8k each) over many warps. Up to 64 samples the mask travels in the item;
+// a larger batch stores it once per row, as ceil(batch / 32) words.
 //
-// Pass 2 (EventWeightGradKernel): one block per item; each thread owns
-// `kEventChunk / kEventThreads` edges and rebuilds their projections in FP32
-// from `current_grad` and the basis for just the row's active samples, in
-// ascending batch order. Up to 64 samples those come from the item's 64-bit mask; a
-// larger batch is compacted through shared memory, 256 samples per pass. Each
-// edge has one writer and a fixed summation order, so the result is
-// deterministic and needs no atomics.
+// Pass 2 (EventWeightGradWarpKernel) gives each item one warp, so a block works
+// on eight items at once, and rebuilds each edge's projections in FP32 from
+// `current_grad` and the basis for just the row's active samples, in ascending
+// batch order. Each edge has one writer and a fixed summation order, so the
+// result is deterministic and needs no atomics.
 //
 // Needs `V1_EDGE_INDEX`, which the including file defines to match its weight
 // layout. The resource library includes both operator sources into one
@@ -134,12 +134,14 @@ Status ReadSpikeSlots(const Tensors& tensors, SpikeMatrix<const T*>* matrix) {
 
 constexpr int kEventThreads = 256;
 constexpr int kEventChunk = kEventThreads;
-// Fixed consumer grid (188 SMs x 24 resident blocks on the RTX PRO 6000). Each
-// block strides the queue and reads its length on the device, so no launch
-// waits for the host to learn a count.
+// Fixed consumer grid (188 SMs x 24 blocks on the RTX PRO 6000). Fewer are
+// resident at once, so later blocks start as earlier ones finish; for the event
+// weight gradient this times the same as 2256 to 18048 blocks, and faster than
+// a grid of only the resident blocks. Each block strides the queue and reads its
+// length on the device, so no launch waits for the host to learn a count.
 constexpr int kEventBlocks = 4512;
 // Batches up to this size carry their active samples as a bit mask in the queue
-// item (two words), so pass 2 needs no shared-memory compaction and no barrier.
+// item (two words); a larger batch keeps one mask per row in the queue scratch.
 constexpr int kEventMaskSamples = 64;
 
 // `words` of scratch for a device-built queue. Allocated as int32, not uint32:
@@ -153,10 +155,13 @@ inline Status AllocateQueueWords(OpKernelContext* context, int64_t words, Tensor
   return OkStatus();
 }
 
+// `row_masks` is null when the batch fits the item mask; otherwise word w of
+// row `pre`'s mask, samples 32w to 32w + 31, is row_masks[pre * mask_words + w],
+// so pass 2 reads a row's mask (up to 256 samples) from one 32-byte sector.
 template <typename T>
 __global__ __launch_bounds__(kEventThreads) void EventRowQueueKernel(
     int64_t n_pre, int64_t batch, SpikeSlots<const T*> slots, const uint32* row_splits,
-    unsigned int* queue, unsigned int* queue_count) {
+    unsigned int* row_masks, int mask_words, unsigned int* queue, unsigned int* queue_count) {
   const int lane = threadIdx.x & 31;
   const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   unsigned int chunks = 0;
@@ -184,17 +189,21 @@ __global__ __launch_bounds__(kEventThreads) void EventRowQueueKernel(
       }
       active = (mask | mask_high) != 0;
     } else {
-      // Eight independent loads per step keep the scan throughput-bound; an
-      // early exit after every sample would chain each load on the previous one.
-      constexpr int kGroup = 8;
-      for (int64_t first = 0; first < batch && !active; first += kGroup) {
+      // Every sample, 32 independent loads per mask word. An early exit at the
+      // first active sample would save almost no traffic: a warp's rows share
+      // each sample's sectors, so they are read while any of its rows scans.
+      for (int word = 0; word < mask_words; ++word) {
+        unsigned int bits = 0;
 #pragma unroll
-        for (int k = 0; k < kGroup; ++k) {
-          const int64_t sample = first + k;
+        for (int bit = 0; bit < 32; ++bit) {
+          const int64_t sample = word * 32 + bit;
           if (sample < batch) {
-            active |= static_cast<float>(activity[sample * stride]) != 0.0f;
+            bits |= static_cast<unsigned int>(static_cast<float>(activity[sample * stride]) !=
+                                              0.0f) << bit;
           }
         }
+        row_masks[row * mask_words + word] = bits;
+        active |= bits != 0;
       }
     }
     if (active) {
@@ -262,86 +271,94 @@ __device__ __forceinline__ float EdgeProjection(const T* grad, const float* type
   }
 }
 
-template <typename T, int kBasis>
-__global__ __launch_bounds__(kEventThreads) void EventWeightGradKernel(
-    int64_t n_pre, int n_post, int n_basis, int64_t batch, SpikeSlots<const T*> slots,
-    const T* current_grad, const float* basis, const uint32* post_ids,
-    const uint8* synapse_types, const uint32* row_splits, const uint32* edge_ids,
-    const unsigned int* queue, const unsigned int* queue_count, float* weight_grad) {
-  constexpr int kEdgesPerThread = kEventChunk / kEventThreads;
+// Pass 2: one warp per queue item, lane l owning edges l, l + 32, ... of the
+// item's chunk. One block per item left most of its threads idle on the typical
+// ~60-edge row and serialized each item's chain of dependent loads (queue
+// entry, row extent, edge, gradient, weight gradient); eight items per block
+// overlap those chains. Each lane loads its edges' current weight gradient up
+// front, and walks the samples outermost so that the gathers of its edges are
+// independent. Up to kEventMaskSamples the samples come from the item's 64-bit
+// mask; with kRowMasks from the row's mask words, one word per lane and 32 words
+// per pass, the warp visiting the non-zero words in order. Per edge: sum +=
+// activity * EdgeProjection over the active samples in ascending order, then
+// one write of old + sum.
+template <typename T, int kBasis, bool kRowMasks>
+__global__ __launch_bounds__(kEventThreads) void EventWeightGradWarpKernel(
+    int n_post, int n_basis, SpikeSlots<const T*> slots, const T* current_grad,
+    const float* basis, const uint32* post_ids, const uint8* synapse_types,
+    const uint32* row_splits, const uint32* edge_ids, const unsigned int* row_masks,
+    int mask_words, const unsigned int* queue, const unsigned int* queue_count,
+    float* weight_grad) {
+  constexpr int kLaneEdges = kEventChunk / 32;
   constexpr int kWarps = kEventThreads / 32;
-  __shared__ int active_sample[kEventThreads];
-  __shared__ float active_value[kEventThreads];
-  __shared__ int warp_active[kWarps];
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
   const int64_t sample_stride = static_cast<int64_t>(n_post) * n_basis;
   const unsigned int total = *queue_count;
-  for (unsigned int item = blockIdx.x; item < total; item += gridDim.x) {
+  for (unsigned int item = blockIdx.x * kWarps + (threadIdx.x >> 5); item < total;
+       item += gridDim.x * kWarps) {
     const ::uint4 entry = reinterpret_cast<const ::uint4*>(queue)[item];
-    const int64_t pre = entry.x;
     // activity[sample * stride] is (sample, pre).
     const T* activity = slots.Row(entry.x);
     const int64_t stride = slots.width;
-    const uint32 start = row_splits[pre] + entry.y * kEventChunk;
-    const uint32 end = min(static_cast<uint32>(start + kEventChunk), row_splits[pre + 1]);
-    float sum[kEdgesPerThread] = {};
-    // Each pass covers up to kEventThreads samples. Up to kEventMaskSamples the
-    // item's mask lists them; beyond that they are compacted through shared
-    // memory.
-    const unsigned long long item_mask =
-        (static_cast<unsigned long long>(entry.w) << 32) | entry.z;
-    for (int64_t first = 0; first < batch; first += kEventThreads) {
-      int count = 0;
-      if (batch > kEventMaskSamples) {
-        const int64_t sample = first + threadIdx.x;
-        const float value =
-            sample < batch ? static_cast<float>(activity[sample * stride]) : 0.0f;
-        const unsigned int ballot = __ballot_sync(0xffffffffu, value != 0.0f);
-        if (lane == 0) warp_active[warp] = __popc(ballot);
-        __syncthreads();
-        int offset = 0;
+    const uint32 chunk_start = row_splits[entry.x] + entry.y * kEventChunk;
+    const uint32 end = min(static_cast<uint32>(chunk_start + kEventChunk),
+                           row_splits[entry.x + 1]);
+    const uint32 start = chunk_start + lane;
+    uint32 post[kLaneEdges];
+    uint32 type[kLaneEdges];
+    float old[kLaneEdges];
+    float sum[kLaneEdges];
 #pragma unroll
-        for (int other = 0; other < kWarps; ++other) {
-          offset += other < warp ? warp_active[other] : 0;
-          count += warp_active[other];
+    for (int k = 0; k < kLaneEdges; ++k) {
+      const uint32 csr = start + k * 32;
+      const bool own = csr < end;
+      post[k] = own ? post_ids[csr] : 0;
+      type[k] = own ? synapse_types[csr] : 0;
+      old[k] = own ? weight_grad[V1_EDGE_INDEX(csr)] : 0.0f;
+      sum[k] = 0.0f;
+    }
+    const auto add_sample = [&](int sample) {
+      const float value = static_cast<float>(activity[sample * stride]);
+#pragma unroll
+      for (int k = 0; k < kLaneEdges; ++k) {
+        if (start + k * 32 < end) {
+          const float* type_basis = basis + static_cast<int64_t>(type[k]) * n_basis;
+          const ::float4 bv = kBasis == 4 ? *reinterpret_cast<const ::float4*>(type_basis)
+                                          : ::make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+          const T* grad_row = current_grad + static_cast<int64_t>(post[k]) * n_basis;
+          sum[k] += value * EdgeProjection<T, kBasis>(grad_row + sample * sample_stride,
+                                                      type_basis, bv, n_basis);
         }
-        if (value != 0.0f) {
-          const int slot = offset + __popc(ballot & ((1u << lane) - 1));
-          active_sample[slot] = static_cast<int>(sample);
-          active_value[slot] = value;
-        }
-        __syncthreads();
       }
-#pragma unroll
-      for (int k = 0; k < kEdgesPerThread; ++k) {
-        const uint32 csr = start + threadIdx.x + k * kEventThreads;
-        if (csr >= end) continue;
-        const float* type_basis = basis + static_cast<int64_t>(synapse_types[csr]) * n_basis;
-        const ::float4 bv = kBasis == 4 ? *reinterpret_cast<const ::float4*>(type_basis)
-                                        : ::make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        const T* grad_row = current_grad + static_cast<int64_t>(post_ids[csr]) * n_basis;
-        if (batch <= kEventMaskSamples) {
-          for (unsigned long long bits = item_mask; bits; bits &= bits - 1) {
-            const int sample = __ffsll(bits) - 1;
-            sum[k] += static_cast<float>(activity[sample * stride]) *
-                      EdgeProjection<T, kBasis>(grad_row + sample * sample_stride, type_basis,
-                                                bv, n_basis);
-          }
-        } else {
-          for (int index = 0; index < count; ++index) {
-            sum[k] += active_value[index] *
-                      EdgeProjection<T, kBasis>(grad_row + active_sample[index] * sample_stride,
-                                                type_basis, bv, n_basis);
+    };
+    if constexpr (kRowMasks) {
+      for (int first_word = 0; first_word < mask_words; first_word += 32) {
+        const int own_word = first_word + lane;
+        const unsigned int word =
+            own_word < mask_words
+                ? row_masks[static_cast<int64_t>(entry.x) * mask_words + own_word]
+                : 0u;
+        for (unsigned int words = __ballot_sync(0xffffffffu, word != 0); words;
+             words &= words - 1) {
+          const int index = __ffs(words) - 1;
+          const int first_sample = (first_word + index) * 32;
+          for (unsigned int bits = __shfl_sync(0xffffffffu, word, index); bits;
+               bits &= bits - 1) {
+            add_sample(first_sample + __ffs(bits) - 1);
           }
         }
       }
-      if (batch > kEventMaskSamples) __syncthreads();   // the next pass overwrites the list
+    } else {
+      const unsigned long long item_mask =
+          (static_cast<unsigned long long>(entry.w) << 32) | entry.z;
+      for (unsigned long long bits = item_mask; bits; bits &= bits - 1) {
+        add_sample(__ffsll(bits) - 1);
+      }
     }
 #pragma unroll
-    for (int k = 0; k < kEdgesPerThread; ++k) {
-      const uint32 csr = start + threadIdx.x + k * kEventThreads;
-      if (csr < end) weight_grad[V1_EDGE_INDEX(csr)] += sum[k];
+    for (int k = 0; k < kLaneEdges; ++k) {
+      const uint32 csr = start + k * 32;
+      if (csr < end) weight_grad[V1_EDGE_INDEX(csr)] = old[k] + sum[k];
     }
   }
 }
@@ -363,25 +380,32 @@ Status LaunchEventWeightGrad(OpKernelContext* context, const SpikeMatrix<const T
   const int64_t n_pre = activity.n_pre();
   if (batch == 0 || n_pre == 0 || weight_grad->NumElements() == 0) return OkStatus();
   // Every active row yields ceil(edges / kEventChunk) items, so the queue holds
-  // at most one item per row plus one per full chunk.
+  // at most one item per row plus one per full chunk. Above kEventMaskSamples
+  // the row masks follow the queue, and the count comes last.
   const int64_t capacity = n_pre + post_ids.NumElements() / kEventChunk + 1;
+  const bool item_masks = batch <= kEventMaskSamples;
+  const int mask_words = item_masks ? 2 : static_cast<int>((batch + 31) / 32);
+  const int64_t row_mask_words = item_masks ? 0 : n_pre * mask_words;
   Tensor queue_tensor;
   unsigned int* queue;
-  TF_RETURN_IF_ERROR(AllocateQueueWords(context, 4 * capacity + 1, &queue_tensor, &queue));
-  unsigned int* queue_count = queue + 4 * capacity;
+  TF_RETURN_IF_ERROR(AllocateQueueWords(context, 4 * capacity + row_mask_words + 1,
+                                        &queue_tensor, &queue));
+  unsigned int* row_masks = item_masks ? nullptr : queue + 4 * capacity;
+  unsigned int* queue_count = queue + 4 * capacity + row_mask_words;
   cudaMemsetAsync(queue_count, 0, sizeof(unsigned int), device.stream());
   TF_RETURN_IF_ERROR(GpuLaunchKernel(
       EventRowQueueKernel<T>, static_cast<int>((n_pre + kEventThreads - 1) / kEventThreads),
       kEventThreads, 0, device.stream(), n_pre, batch, activity.slots,
-      row_splits.flat<uint32>().data(), queue, queue_count));
+      row_splits.flat<uint32>().data(), row_masks, mask_words, queue, queue_count));
+  const auto pass2 = item_masks ? EventWeightGradWarpKernel<T, kBasis, false>
+                                : EventWeightGradWarpKernel<T, kBasis, true>;
   return GpuLaunchKernel(
-      EventWeightGradKernel<T, kBasis>, kEventBlocks, kEventThreads, 0, device.stream(),
-      n_pre, n_post, static_cast<int>(basis.dim_size(1)), batch,
-      activity.slots, current_grad.flat<T>().data(),
-      basis.flat<float>().data(), post_ids.flat<uint32>().data(),
-      synapse_types.flat<uint8>().data(), row_splits.flat<uint32>().data(),
-      edge_ids.flat<uint32>().data(), queue, queue_count,
-      weight_grad->flat<float>().data());
+      pass2, kEventBlocks, kEventThreads, 0, device.stream(),
+      n_post, static_cast<int>(basis.dim_size(1)), activity.slots,
+      current_grad.flat<T>().data(), basis.flat<float>().data(),
+      post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(),
+      row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(), row_masks, mask_words,
+      queue, queue_count, weight_grad->flat<float>().data());
 }
 
 // The same for one [batch, n_pre] activity tensor.
