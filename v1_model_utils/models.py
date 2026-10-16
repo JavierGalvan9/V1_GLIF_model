@@ -488,21 +488,6 @@ def exp_convolve(tensor, decay=0.8, reverse=False, initializer=None, axis=0):
     filtered = tf.transpose(filtered, perm)
     return filtered
 
-def straight_through_dampen(x, dampening):
-    """
-    Keep the forward value unchanged while scaling the backward pass by (1 - dampening).
-
-    We use this on the membrane self-loop after detaching the reset term. That targets
-    the long voltage chain directly without weakening the synaptic/current gradients.
-    """
-    dtype = x.dtype
-    dampening = tf.cast(dampening, dtype)
-    zero = tf.cast(0.0, dtype)
-    one = tf.cast(1.0, dtype)
-    dampening = tf.clip_by_value(dampening, zero, one)
-    return x * (one - dampening) + tf.stop_gradient(x * dampening)
-
-
 def _validate_inputs(indices, n_source_neurons):
     n_source_neurons = int(n_source_neurons)
     if n_source_neurons <= 0:
@@ -785,10 +770,9 @@ class V1Column(tf.keras.layers.Layer):
         lgn_input,
         bkg_input,
         dt=1.0,
-        gauss_std=0.5,
-        dampening_factor=0.3,
-        recurrent_dampening_factor=0.5,
-        voltage_gradient_dampening=0.5,
+        gauss_std=0.28,
+        dampening_factor=0.05,
+        recurrent_dampening_factor=1.0,
         detach_reset=True,
         detach_asc_reset=False,
         input_weight_scale=1.0,
@@ -799,7 +783,7 @@ class V1Column(tf.keras.layers.Layer):
         batch_size=1,
         bkg_firing_rate=250,
         pseudo_gauss=False,
-        surrogate_gradient=None,
+        surrogate_gradient="gaussian",
         train_recurrent=True,
         train_recurrent_per_type=True,
         train_input=False,
@@ -868,9 +852,6 @@ class V1Column(tf.keras.layers.Layer):
         )
         # The surrogate gradient is evaluated on the float32 membrane.
         self._bind_constant("_dampening_factor", dampening_factor, tf.float32)
-        self._bind_constant(
-            "_voltage_gradient_dampening", voltage_gradient_dampening, self.compute_dtype
-        )
         self._detach_reset = bool(detach_reset)
         self._detach_asc_reset = bool(detach_asc_reset)
         self._surrogate_gradient = resolve_surrogate_gradient(
@@ -2280,10 +2261,9 @@ def create_model(
     n_output=2,
     dtype=tf.float32,
     input_weight_scale=1.0,
-    gauss_std=0.5,
-    dampening_factor=0.2,
-    recurrent_dampening_factor=0.5,
-    voltage_gradient_dampening=0.5,
+    gauss_std=0.28,
+    dampening_factor=0.05,
+    recurrent_dampening_factor=1.0,
     detach_reset=True,
     detach_asc_reset=False,
     integration_scheme="exact",
@@ -2304,7 +2284,7 @@ def create_model(
     max_delay=0,
     batch_size=None,
     pseudo_gauss=False,
-    surrogate_gradient=None,
+    surrogate_gradient="gaussian",
     hard_reset=False,
     current_input=False,
     use_dummy_state_input=False,
@@ -2352,7 +2332,6 @@ def create_model(
         lr_scale=lr_scale,
         spike_gradient=True,
         recurrent_dampening_factor=recurrent_dampening_factor,
-        voltage_gradient_dampening=voltage_gradient_dampening,
         detach_reset=detach_reset,
         detach_asc_reset=detach_asc_reset,
         integration_scheme=integration_scheme,

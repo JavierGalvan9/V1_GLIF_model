@@ -1389,8 +1389,9 @@ class Callbacks:
 
     def on_epoch_end(self, x, v1_spikes, y, metric_values, bkg_noise=None, verbose=True,
                      x_spont=None, v1_spikes_spont=None, protocol_selectivity=None,
-                     protocol_rates=None):
+                     protocol_rates=None, training_diagnostics=None):
         callback_start = time()
+        training_diagnostics = training_diagnostics or {}
         timings = {}
 
         def mark(name, start):
@@ -1416,16 +1417,25 @@ class Callbacks:
             print_str = '  Validation:\n'
             val_values = metric_values[len(metric_values)//2:]
             print_str += '    ' + compose_str(val_values)
+            if training_diagnostics:
+                print_str += '\n  Gradients:\n    ' + ', '.join(
+                    f'{key} {value:.6g}' for key, value in training_diagnostics.items()
+                )
             print(print_str)
             for gpu_id in range(len(self.strategy.extended.worker_devices)):
                 printgpu(gpu_id=gpu_id)
 
         # val_classification_loss = metric_values[6] - metric_values[8] - metric_values[9]
         # metric_values.append(val_classification_loss)
-        # self.epoch_metric_values = {key: value + [metric_values[i]] for i, (key, value) in enumerate(self.epoch_metric_values.items())}
-        for i, (key, value) in enumerate(self.epoch_metric_values.items()):
-            if key not in ['sync']:
-                self.epoch_metric_values[key] = value + [metric_values[i]]
+        for key, value in zip(self.metrics_keys, metric_values):
+            self.epoch_metric_values[key].append(value)
+        # A training state saved before a diagnostic existed has no history
+        # for it; NaN-pad the earlier epochs so every series stays aligned.
+        n_previous_epochs = len(self.epoch_metric_values[self.metrics_keys[0]]) - 1
+        for key, value in training_diagnostics.items():
+            self.epoch_metric_values.setdefault(
+                key, [float('nan')] * n_previous_epochs
+            ).append(value)
 
         if 'val_loss' in self.metrics_keys:
             val_loss_index = self.metrics_keys.index('val_loss')
@@ -1480,6 +1490,8 @@ class Callbacks:
             start = time()
             with self.summary_writer.as_default():
                 for k, v in zip(self.metrics_keys, metric_values):
+                    tf.summary.scalar(k, v, step=self.epoch)
+                for k, v in training_diagnostics.items():
                     tf.summary.scalar(k, v, step=self.epoch)
             mark("summaries", start)
 
@@ -1580,7 +1592,8 @@ class Callbacks:
         # # reset the gpu memory stat
         # tf.config.experimental.reset_memory_stats('GPU:0')
 
-    def on_step_end(self, train_values, y, verbose=True):
+    def on_step_end(self, train_values, y, verbose=True, gradient_norm=None,
+                    loss_scale=None):
         self.step_running_time.append(time() - self.step_init_time)
         self.step_rate.append(train_values[1])
 
@@ -1593,6 +1606,8 @@ class Callbacks:
         if verbose:
             print_str = f'  Step {self.step:2d}/{self.flags.steps_per_epoch}\n'
             print_str += '    ' + compose_str(train_values)
+            if gradient_norm is not None:
+                print_str += f', GradNorm {gradient_norm:.4g}, LossScale {loss_scale:g}'
             print(print_str)
             tf.print(print_str)
             print(

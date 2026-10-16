@@ -88,6 +88,10 @@ def _cell(
         bkg = external
     column_options = {
         "train_recurrent": False, "train_input": False, "train_noise": False,
+        # The surrogate settings these comparisons were written against,
+        # pinned so that changing the constructor defaults leaves them intact.
+        "surrogate_gradient": "gaussian" if pseudo_gauss else "triangular",
+        "dampening_factor": 0.3, "gauss_std": 0.5, "recurrent_dampening_factor": 0.5,
         **column_options,
     }
     return V1Column(
@@ -99,7 +103,6 @@ def _cell(
         hard_reset=hard_reset,
         pseudo_gauss=pseudo_gauss,
         acceleration=backend,
-        voltage_gradient_dampening=0.5,
         detach_reset=detach_reset,
         detach_asc_reset=detach_asc_reset,
         integration_scheme=integration_scheme,

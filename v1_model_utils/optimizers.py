@@ -4,12 +4,6 @@ from math import pi
 import tensorflow as tf
 
 
-def _uses_keras_3():
-    """Return whether TensorFlow exposes the standalone Keras 3 API."""
-    version = getattr(tf.keras, "version", None)
-    return version is not None and int(version().split(".", 1)[0]) >= 3
-
-
 @tf.function(jit_compile=True)
 def _dense_exponentiated_adam_update(
     weights,
@@ -137,30 +131,83 @@ def build_learning_rate(flags):
     )
 
 
-def create_optimizer(flags, learning_rate, trainable_variables, mixed_precision_module=None):
-    # Keras 3 unscales gradients inside LossScaleOptimizer, so the train step
-    # never sees the gradients the update is built from and clipping belongs on
-    # the optimizer. Keras 3 also gives every optimizer a `scale_loss` method,
-    # so the train step cannot tell a wrapped optimizer from a bare one and has
-    # to hand clipping over for both. The optimizer all-reduces after clipping,
-    # which is where the train step used to clip, so the norm is that of each
-    # replica's local gradient, not of their sum.
-    optimizer_clips = _uses_keras_3() and getattr(flags, "global_clipnorm", 0) > 0
-    optimizer_kwargs = {}
-    if optimizer_clips:
-        optimizer_kwargs["global_clipnorm"] = flags.global_clipnorm
-    if flags.optimizer == "adam":
-        base_optimizer = tf.keras.optimizers.Adam(
-            learning_rate=learning_rate, epsilon=1e-11, **optimizer_kwargs
+class SummedGradientClipping:
+    """Optimizer mixin that measures, and clips, the cross-replica gradient sum.
+
+    Keras' own ``global_clipnorm`` clips in ``apply``, before the TensorFlow
+    backend all-reduces the gradients, so on N replicas it limits each
+    replica's share rather than the update, and a run's clipping depends on its
+    GPU count. Hooking the all-reduce clips the summed gradient instead, the
+    same update on any number of replicas. A loss-scale optimizer unscales
+    before it calls this one, so the norm and the limit are in unscaled units.
+
+    ``summed_gradient_norm`` holds the latest update's norm. Every replica
+    computes the same value from the reduced gradients, so it is kept
+    replica-local, and out of the checkpoint so that checkpoints written before
+    it existed still restore completely.
+    """
+
+    def __init__(self, *args, summed_clipnorm=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.summed_clipnorm = float(summed_clipnorm)
+
+    def build(self, variables):
+        if self.built:
+            return
+        super().build(variables)
+        # object.__setattr__ bypasses the Keras and TensorFlow attribute
+        # tracking that would make the variable a checkpoint dependency.
+        object.__setattr__(self, "summed_gradient_norm", tf.Variable(
+            0.0,
+            trainable=False,
+            name="summed_gradient_norm",
+            synchronization=tf.VariableSynchronization.ON_READ,
+            aggregation=tf.VariableAggregation.ONLY_FIRST_REPLICA,
+        ))
+
+    def _all_reduce_sum_gradients(self, grads_and_vars):
+        grads_and_vars = list(super()._all_reduce_sum_gradients(grads_and_vars))
+        present = [
+            index for index, (gradient, _) in enumerate(grads_and_vars)
+            if gradient is not None
+        ]
+        gradients = [grads_and_vars[index][0] for index in present]
+        norm = tf.cast(tf.linalg.global_norm(gradients), tf.float32)
+        self.summed_gradient_norm.assign(norm)
+        if self.summed_clipnorm <= 0:
+            return grads_and_vars
+        clipped, _ = tf.clip_by_global_norm(
+            gradients, self.summed_clipnorm, use_norm=norm
         )
+        for index, gradient in zip(present, clipped):
+            grads_and_vars[index] = (gradient, grads_and_vars[index][1])
+        return grads_and_vars
+
+    def get_config(self):
+        return {**super().get_config(), "summed_clipnorm": self.summed_clipnorm}
+
+
+# Named after the Keras classes they extend: checkpoints record the optimizer
+# class name, and restoring compares it (see tf_utils.optimizer_identity).
+class Adam(SummedGradientClipping, tf.keras.optimizers.Adam):
+    pass
+
+
+class SGD(SummedGradientClipping, tf.keras.optimizers.SGD):
+    pass
+
+
+def create_optimizer(flags, learning_rate, trainable_variables, mixed_precision_module=None):
+    clipping = {"summed_clipnorm": getattr(flags, "global_clipnorm", 0.0)}
+    if flags.optimizer == "adam":
+        base_optimizer = Adam(learning_rate=learning_rate, epsilon=1e-11, **clipping)
     elif flags.optimizer == "exp_adam":
         base_optimizer = ExponentiatedAdam(
-            learning_rate=learning_rate, epsilon=1e-11, **optimizer_kwargs
+            learning_rate=learning_rate, epsilon=1e-11, **clipping
         )
     elif flags.optimizer == "sgd":
-        base_optimizer = tf.keras.optimizers.SGD(
-            learning_rate=learning_rate, momentum=0.0, nesterov=False,
-            **optimizer_kwargs,
+        base_optimizer = SGD(
+            learning_rate=learning_rate, momentum=0.0, nesterov=False, **clipping
         )
     else:
         print(f"Invalid optimizer: {flags.optimizer}")
@@ -176,38 +223,13 @@ def create_optimizer(flags, learning_rate, trainable_variables, mixed_precision_
     # Both the wrapper and its inner optimizer must have created their state
     # before TensorFlow can match optimizer slots from a checkpoint.
     base_optimizer.build(trainable_variables)
-    base_optimizer.clips_gradients_internally = optimizer_clips
 
     return base_optimizer
 
 
-def optimizer_clips_gradients(optimizer):
-    """Whether the optimizer applies ``--global_clipnorm`` on its own."""
-    return bool(getattr(optimizer, "clips_gradients_internally", False))
-
-
-def optimizer_supports_loss_scaling(optimizer):
-    return hasattr(optimizer, "scale_loss") or (
-        hasattr(optimizer, "get_scaled_loss")
-        and hasattr(optimizer, "get_unscaled_gradients")
-    )
-
-
-def scale_loss_for_optimizer(optimizer, loss):
-    if hasattr(optimizer, "scale_loss"):
-        return optimizer.scale_loss(loss)
-    if hasattr(optimizer, "get_scaled_loss"):
-        return optimizer.get_scaled_loss(loss)
-    return loss
-
-
-def unscale_gradients_for_optimizer(optimizer, gradients):
-    # Keras 3 LossScaleOptimizer performs this step inside apply_gradients.
-    if _uses_keras_3():
-        return gradients
-    if hasattr(optimizer, "get_unscaled_gradients"):
-        return optimizer.get_unscaled_gradients(gradients)
-    return gradients
+def loss_scale(optimizer):
+    """The optimizer's current dynamic loss scale; 1 when it does not scale."""
+    return tf.cast(getattr(optimizer, "dynamic_scale", 1.0), tf.float32)
 
 
 def synchronize_gradient_finiteness(gradients):
@@ -298,30 +320,42 @@ def synchronize_gradient_finiteness(gradients):
     return synchronized
 
 
-def clip_gradients_by_global_norm(gradients, clip_norm, optimizer=None):
-    """Clip present gradients together and return their pre-clip global norm.
+def apply_gradients_and_measure(optimizer, gradients, variables):
+    """Apply one update and return the norm of its summed, unscaled gradient.
 
-    A nonpositive limit disables clipping while retaining norm measurement.
-    Missing gradients keep their positions so variables remain aligned.
+    The norm is NaN when a loss-scale optimizer skipped the update for
+    non-finite gradients: its iterations, those of the inner optimizer, only
+    advance on an applied update, and the stored norm is then stale.
     """
-    present_indices = [index for index, gradient in enumerate(gradients) if gradient is not None]
-    present = [gradients[index] for index in present_indices]
-    global_norm = tf.linalg.global_norm(present)
-    if optimizer is not None and optimizer_clips_gradients(optimizer):
-        # create_optimizer() configured the optimizer to clip after unscaling
-        # and after averaging any accumulated micro-gradients.
-        dynamic_scale = getattr(optimizer, "dynamic_scale", None)
-        if dynamic_scale is not None:
-            global_norm /= tf.cast(dynamic_scale, global_norm.dtype)
-        return gradients, global_norm
-    if clip_norm <= 0:
-        return gradients, global_norm
+    inner = getattr(optimizer, "inner_optimizer", optimizer)
+    iterations = tf.convert_to_tensor(optimizer.iterations)
+    optimizer.apply_gradients(zip(gradients, variables))
+    applied = tf.convert_to_tensor(optimizer.iterations) > iterations
+    return tf.where(
+        applied, tf.convert_to_tensor(inner.summed_gradient_norm), float("nan")
+    )
 
-    clipped_present, _ = tf.clip_by_global_norm(present, clip_norm, use_norm=global_norm)
-    clipped = list(gradients)
-    for index, gradient in zip(present_indices, clipped_present):
-        clipped[index] = gradient
-    return clipped, global_norm
+
+class ReplicaStatistic(tf.keras.metrics.Metric):
+    """A per-replica running scalar laid out like ``Mean``'s accumulators.
+
+    ``total`` holds ``combine(previous, value)`` - by default the latest value -
+    and ``count`` is one once updated, so the replica-summed ``total / count``
+    that a ``Mean`` reader computes is this statistic averaged over replicas.
+    """
+
+    def __init__(self, combine=lambda previous, value: value, name=None):
+        super().__init__(name=name)
+        self._combine = combine
+        self.total = self.add_variable(shape=(), initializer="zeros", name="total")
+        self.count = self.add_variable(shape=(), initializer="zeros", name="count")
+
+    def update_state(self, value):
+        self.total.assign(self._combine(self.total, tf.cast(value, self.dtype)))
+        self.count.assign(1.0)
+
+    def result(self):
+        return tf.math.divide_no_nan(self.total, self.count)
 
 
 @tf.keras.utils.register_keras_serializable(package="V1GLIF")
@@ -394,7 +428,7 @@ class LinearWarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule
         }
 
 
-class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
+class ExponentiatedAdam(SummedGradientClipping, tf.keras.optimizers.Optimizer):
     r"""Adam-like optimizer with *exponentiated* gradient updates.
 
     This rewrites the final update from
@@ -454,11 +488,7 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
             ema_overwrite_frequency=ema_overwrite_frequency,
             **kwargs
         )
-        if _uses_keras_3():
-            super().__init__(learning_rate=learning_rate, **optimizer_kwargs)
-        else:
-            super().__init__(jit_compile=jit_compile, **optimizer_kwargs)
-            self._learning_rate = self._build_learning_rate(learning_rate)
+        super().__init__(learning_rate=learning_rate, **optimizer_kwargs)
         self.beta_1 = beta_1
         self.beta_2 = beta_2
         self.epsilon = epsilon
@@ -473,42 +503,18 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
         - v (second moment)
         - vhat (if amsgrad=True, for the max of second moments).
         """
-        if getattr(self, "built", False) or getattr(self, "_built", False):
+        if self.built:
             return
         super().build(var_list)
         self._momentums = []
         self._velocities = []
         for var in var_list:
-            if _uses_keras_3():
-                self._momentums.append(
-                    self.add_variable_from_reference(var, name="m")
-                )
-                self._velocities.append(
-                    self.add_variable_from_reference(var, name="v")
-                )
-            else:
-                self._momentums.append(
-                    self.add_variable_from_reference(
-                        model_variable=var, variable_name="m"
-                    )
-                )
-                self._velocities.append(
-                    self.add_variable_from_reference(
-                        model_variable=var, variable_name="v"
-                    )
-                )
+            self._momentums.append(self.add_variable_from_reference(var, name="m"))
+            self._velocities.append(self.add_variable_from_reference(var, name="v"))
         if self.amsgrad:
-            self._velocity_hats = []
-            for var in var_list:
-                if _uses_keras_3():
-                    slot = self.add_variable_from_reference(var, name="vhat")
-                else:
-                    slot = self.add_variable_from_reference(
-                        model_variable=var, variable_name="vhat"
-                    )
-                self._velocity_hats.append(slot)
-        if not _uses_keras_3():
-            self._built = True
+            self._velocity_hats = [
+                self.add_variable_from_reference(var, name="vhat") for var in var_list
+            ]
 
     def _coalesce_indexed_slices(self, grad, variable_dtype=None, index_dtype=tf.int32):
         """Coalesce duplicate indices in an IndexedSlices gradient."""
@@ -528,29 +534,6 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
             dense_shape = tf.cast(dense_shape, index_dtype)
 
         return tf.IndexedSlices(coalesced_values, unique_idx, dense_shape)
-
-    def _variable_index(self, variable):
-        """Slot index for `variable`, which may arrive as a raw `tf.Variable`.
-
-        Under `tf.distribute`, Keras 3 hands `update_step` the per-replica
-        `tf.Variable` rather than the Keras `Variable`, so the lookup has to go
-        through the optimizer's own variable keying instead of a name/path map.
-        """
-        if _uses_keras_3():
-            return self._get_variable_index(variable)
-        return self._index_dict[self._var_key(variable)]
-
-    def _assign(self, variable, value):
-        if _uses_keras_3():
-            self.assign(variable, value)
-        else:
-            variable.assign(value)
-
-    def _assign_add(self, variable, value):
-        if _uses_keras_3():
-            self.assign_add(variable, value)
-        else:
-            variable.assign_add(value)
 
     # No `tf.function` here: Keras 3 calls `update_step` with a Keras `Variable`,
     # which is not a traceable type, and the caller is already inside a graph.
@@ -574,7 +557,10 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
         alpha = lr * tf.sqrt(1 - beta_2_power) / (1 - beta_1_power)
 
         # Fetch the slot variables for this parameter
-        variable_index = self._variable_index(variable)
+        # Under `tf.distribute`, Keras 3 hands `update_step` the per-replica
+        # `tf.Variable` rather than the Keras `Variable`, so the lookup goes
+        # through the optimizer's own variable keying.
+        variable_index = self._get_variable_index(variable)
         m = self._momentums[variable_index]
         v = self._velocities[variable_index]
 
@@ -596,18 +582,18 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
                 scatter_indices,
                 gradient.values * (1 - beta_1_t),
             )
-            self._assign(m, beta_1_t * m + m_update)
+            self.assign(m, beta_1_t * m + m_update)
             # 2) Update v (second moment)
             v_update = tf.tensor_scatter_nd_add(
                 tf.zeros_like(v),
                 scatter_indices,
                 tf.square(gradient.values) * (1 - beta_2_t),
             )
-            self._assign(v, beta_2_t * v + v_update)
+            self.assign(v, beta_2_t * v + v_update)
             # 3) AMSGrad if needed
             if self.amsgrad:
                 vhat = self._velocity_hats[variable_index]
-                self._assign(vhat, tf.maximum(vhat, v))
+                self.assign(vhat, tf.maximum(vhat, v))
                 v_used = vhat
             else:
                 v_used = v
@@ -639,7 +625,7 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
             multipliers = tf.tensor_scatter_nd_update(
                 tf.ones_like(variable), scatter_indices, multiplier_slices
             )
-            self._assign(variable, variable * multipliers)
+            self.assign(variable, variable * multipliers)
 
         else:
             if self.jit_compile and not self.amsgrad:
@@ -653,20 +639,20 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
                     beta_2_t,
                     tf.cast(self.epsilon, variable.dtype),
                 )
-                self._assign(m, new_m)
-                self._assign(v, new_v)
-                self._assign(variable, new_weights)
+                self.assign(m, new_m)
+                self.assign(v, new_v)
+                self.assign(variable, new_weights)
                 return
 
             # Dense gradient
             # 1) Update m
-            self._assign_add(m, (gradient - m) * (1 - beta_1_t))
+            self.assign_add(m, (gradient - m) * (1 - beta_1_t))
             # 2) Update v
-            self._assign_add(v, (tf.square(gradient) - v) * (1 - beta_2_t))
+            self.assign_add(v, (tf.square(gradient) - v) * (1 - beta_2_t))
             # 3) AMSGrad
             if self.amsgrad:
                 vhat = self._velocity_hats[variable_index]
-                self._assign(vhat, tf.maximum(vhat, v))
+                self.assign(vhat, tf.maximum(vhat, v))
                 v_used = vhat
             else:
                 v_used = v
@@ -680,7 +666,7 @@ class ExponentiatedAdam(tf.keras.optimizers.Optimizer):
 
             exponent = -alpha * adam_grad * sign_w
             multiplier = tf.exp(exponent)
-            self._assign(variable, variable * multiplier)
+            self.assign(variable, variable * multiplier)
 
     def get_config(self):
         config = super().get_config()

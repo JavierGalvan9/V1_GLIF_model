@@ -50,11 +50,10 @@ parser.add_argument('--annulus_loss_weight', default=0.1, type=float)
 parser.add_argument('--osi_loss_subtraction_ratio', default=0., type=float)
 parser.add_argument('--osi_loss_method', default='crowd_osi', type=str)
 
-parser.add_argument('--dampening_factor', default=0.1, type=float)
-parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
-parser.add_argument('--voltage_gradient_dampening', default=0.5, type=float)
+parser.add_argument('--dampening_factor', default=0.05, type=float)
+parser.add_argument('--recurrent_dampening_factor', default=1.0, type=float)
 parser.add_argument('--input_weight_scale', default=1.0, type=float)
-parser.add_argument('--gauss_std', default=0.3, type=float)
+parser.add_argument('--gauss_std', default=0.28, type=float)
 parser.add_argument('--recurrent_weight_regularization', default=0.0, type=float)
 parser.add_argument('--recurrent_weight_regularizer_type', default="emd", type=str)
 parser.add_argument('--voltage_penalty_mode', default='range', type=str)
@@ -115,7 +114,7 @@ parser.add_argument('--neuron_output', default=False, action='store_true')
 parser.add_argument('--pseudo_gauss', default=False, action='store_true')
 parser.add_argument(
     '--surrogate_gradient',
-    default='triangular',
+    default='gaussian',
     choices=['triangular', 'gaussian', 'slayer'],
 )
 parser.add_argument('--pack_spike_checkpoints', default=False, action='store_true')

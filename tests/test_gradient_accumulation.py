@@ -18,12 +18,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from v1_model_utils import optimizers as optimizer_utils
-from v1_model_utils.optimizers import (
-    GradientAccumulator,
-    clip_gradients_by_global_norm,
-    create_optimizer,
-)
+from v1_model_utils.optimizers import GradientAccumulator, create_optimizer
 
 
 requires_two_gpus = pytest.mark.skipif(
@@ -140,23 +135,6 @@ def test_accumulated_substeps_match_the_single_shot_update(optimizer_name):
     assert int(sequential_optimizer.iterations) == int(combined_optimizer.iterations)
 
 
-def test_the_optimizer_owns_clipping_so_the_train_step_defers():
-    variable = tf.Variable([1.0, 2.0])
-    optimizer = create_optimizer(
-        make_flags(optimizer="sgd", global_clipnorm=1.0), 0.1, [variable]
-    )
-    assert optimizer.global_clipnorm == 1.0
-    assert optimizer_utils.optimizer_clips_gradients(optimizer)
-
-    gradients = [tf.constant([3.0, 4.0])]
-    deferred, raw_norm = clip_gradients_by_global_norm(
-        gradients, 1.0, optimizer=optimizer
-    )
-
-    assert deferred is gradients
-    np.testing.assert_allclose(raw_norm.numpy(), 5.0)
-
-
 def test_clipping_sees_the_summed_gradient_rather_than_a_substep():
     """Substeps that only overshoot together must still be clipped together."""
     variable = tf.Variable([0.0, 0.0])
@@ -185,7 +163,6 @@ def test_clipping_sees_the_summed_gradient_rather_than_a_substep():
 
 
 def test_float32_runs_clip_through_the_optimizer_too():
-    """Keras 3 gives every optimizer ``scale_loss``, so it cannot select one."""
     variable = tf.Variable([0.0, 0.0])
     optimizer = create_optimizer(
         make_flags(optimizer="sgd", global_clipnorm=1.0), 1.0, [variable]

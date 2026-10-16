@@ -215,7 +215,6 @@ def main(_):
         train_recurrent=flags.train_recurrent,
         neuron_output=flags.neuron_output,
         recurrent_dampening_factor=flags.recurrent_dampening_factor,
-        voltage_gradient_dampening=flags.voltage_gradient_dampening,
         batch_size=flags.batch_size,
         pseudo_gauss=flags.pseudo_gauss,
         use_state_input=True,
@@ -537,10 +536,9 @@ if __name__ == "__main__":
     absl.app.flags.DEFINE_float("learning_rate", 0.001, "")
     absl.app.flags.DEFINE_float("rate_cost", 0.0, "")
     absl.app.flags.DEFINE_float("voltage_cost", 0.001, "")
-    absl.app.flags.DEFINE_float("dampening_factor", 0.1, "")
-    absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.5, "")
-    absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")
-    absl.app.flags.DEFINE_float("gauss_std", 0.3, "")
+    absl.app.flags.DEFINE_float("dampening_factor", 0.05, "")
+    absl.app.flags.DEFINE_float("recurrent_dampening_factor", 1.0, "")
+    absl.app.flags.DEFINE_float("gauss_std", 0.28, "")
     absl.app.flags.DEFINE_float("lr_scale", 1.0, "")
     absl.app.flags.DEFINE_float('input_weight_scale', 1.0, "")
     absl.app.flags.DEFINE_float("input_f0", 0.2, "")

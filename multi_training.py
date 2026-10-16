@@ -393,7 +393,6 @@ def main(_):
             input_weight_scale=flags.input_weight_scale,
             dampening_factor=flags.dampening_factor,
             recurrent_dampening_factor=flags.recurrent_dampening_factor,
-            voltage_gradient_dampening=flags.voltage_gradient_dampening,
             detach_reset=flags.detach_reset,
             detach_asc_reset=flags.detach_asc_reset,
             integration_scheme=flags.integration_scheme,
@@ -768,8 +767,37 @@ def main(_):
             val_sync_loss,
         )
 
+        # Gradient diagnostics: the epoch mean and maximum of the pre-clip
+        # global norm over the applied updates, the latest step's norm and the
+        # loss scale after the latest update. The norm is that of the summed,
+        # unscaled gradient, identical on every replica. A skipped update
+        # reports NaN; it is counted separately and left out of the mean and
+        # maximum.
+        gradient_metrics = (
+            tf.keras.metrics.Mean(),
+            optimizer_utils.ReplicaStatistic(tf.maximum),
+            optimizer_utils.ReplicaStatistic(),
+            optimizer_utils.ReplicaStatistic(),
+        )
+        (
+            train_gradient_norm,
+            train_gradient_norm_max,
+            train_last_gradient_norm,
+            train_loss_scale,
+        ) = gradient_metrics
+
+        def update_gradient_metrics(gradient_global_norm):
+            finite = tf.math.is_finite(gradient_global_norm)
+            applied_norm = tf.where(finite, gradient_global_norm, 0.0)
+            train_gradient_norm.update_state(
+                applied_norm, sample_weight=tf.cast(finite, tf.float32)
+            )
+            train_gradient_norm_max.update_state(applied_norm)
+            train_last_gradient_norm.update_state(gradient_global_norm)
+            train_loss_scale.update_state(optimizer_utils.loss_scale(optimizer))
+
         def reset_train_metrics():
-            training_utils.reset_metrics(train_metrics)
+            training_utils.reset_metrics(train_metrics + gradient_metrics)
 
         def reset_validation_metrics():
             training_utils.reset_metrics(validation_metrics)
@@ -817,7 +845,8 @@ def main(_):
 
             return read_metrics
 
-        read_train_metrics = make_running_metric_reader(train_metrics)
+        # One round trip reads the train metrics and the gradient diagnostics.
+        read_train_metrics = make_running_metric_reader(train_metrics + gradient_metrics)
         read_validation_metrics = make_running_metric_reader(validation_metrics)
 
         # Load the spontaneous probabilities once (seq_len, n_input)
@@ -1089,14 +1118,10 @@ def main(_):
                 x, y, x_spontaneous, state_variables, trim=trim
             )
             total_loss = tf.cast(evoked_loss + spont_loss + regularizers_loss, tf.float32)
-            loss_for_grad = optimizer_utils.scale_loss_for_optimizer(optimizer, total_loss)
+            loss_for_grad = optimizer.scale_loss(total_loss)
 
         # Backpropagation of the model (gradients computation and application)
         grad = tape.gradient(loss_for_grad, model.trainable_variables)
-        grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
-        grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
-            grad, flags.global_clipnorm, optimizer=optimizer
-        )
         # Replicas must reach the same finite/non-finite verdict before the
         # loss-scale optimizer branches on it.
         grad = optimizer_utils.synchronize_gradient_finiteness(grad)
@@ -1107,10 +1132,14 @@ def main(_):
         # # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/keras/optimizer_v2/optimizer_v2.py#L741
         # optimizer.apply_gradients(zip(combined_grads, model.trainable_variables))
         if flags.debug_gradients:
-            tf.print("[Combined] pre-clip global norm:", gradient_global_norm)
             grad = _print_and_check_gradients(grad, "[Combined]")
 
-        optimizer.apply_gradients(zip(grad, model.trainable_variables))
+        gradient_global_norm = optimizer_utils.apply_gradients_and_measure(
+            optimizer, grad, model.trainable_variables
+        )
+        if flags.debug_gradients:
+            tf.print("[Combined] summed pre-clip global norm:", gradient_global_norm)
+        update_gradient_metrics(gradient_global_norm)
 
         mean_aux = {
             "rate_loss": (evoked_aux["rate_loss"] + spont_aux["rate_loss"]),
@@ -1163,7 +1192,7 @@ def main(_):
                 _x, y, _state_variables, spontaneous=spontaneous, trim=trim
             )
             _loss = tf.cast(_loss, tf.float32)
-            loss_for_grad = optimizer_utils.scale_loss_for_optimizer(optimizer, _loss)
+            loss_for_grad = optimizer.scale_loss(_loss)
 
         grad = tape.gradient(loss_for_grad, model.trainable_variables)
 
@@ -1172,21 +1201,21 @@ def main(_):
             # gradients - the gradient train_step_combined computes in one
             # backward pass - updates the weights once.
             grad = gradient_accumulator.drain(grad)
-            grad = optimizer_utils.unscale_gradients_for_optimizer(optimizer, grad)
-            grad, gradient_global_norm = optimizer_utils.clip_gradients_by_global_norm(
-                grad, flags.global_clipnorm, optimizer=optimizer
-            )
             # Replicas must reach the same finite/non-finite verdict before the
             # loss-scale optimizer branches on it.
             grad = optimizer_utils.synchronize_gradient_finiteness(grad)
 
             if flags.debug_gradients:
-                tf.print("[Sequential] pre-clip global norm:", gradient_global_norm)
                 grad = _print_and_check_gradients(
                     grad, "[Sequential]", spontaneous=spontaneous
                 )
 
-            optimizer.apply_gradients(zip(grad, model.trainable_variables))
+            gradient_global_norm = optimizer_utils.apply_gradients_and_measure(
+                optimizer, grad, model.trainable_variables
+            )
+            if flags.debug_gradients:
+                tf.print("[Sequential] summed pre-clip global norm:", gradient_global_norm)
+            update_gradient_metrics(gradient_global_norm)
         else:
             gradient_accumulator.accumulate(grad)
 
@@ -1972,9 +2001,14 @@ def main(_):
     next_batch = concurrent.futures.Future()
     next_batch.set_result(next_gratings())
 
+    n_train_metrics = len(train_metrics)
     for epoch in range(n_prev_epochs, n_prev_epochs + flags.n_epochs):
         if not flags.benchmark_output:
             callbacks.on_epoch_start()
+        # The loss-scale optimizer only advances its iterations when it applies
+        # an update, and every step attempts exactly one, so the shortfall
+        # counts the updates skipped for non-finite gradients.
+        epoch_start_iterations = int(optimizer.iterations.numpy())
         # Reset the model state to the gray state
         gray_state = distributed_generate_gray_state()
 
@@ -2097,7 +2131,11 @@ def main(_):
                     print("BENCHMARK_RESULT=" + json.dumps(result, sort_keys=True))
                     return
             else:
-                callbacks.on_step_end(step_values, y, verbose=True)
+                _, _, gradient_norm, loss_scale = step_values[n_train_metrics:]
+                callbacks.on_step_end(
+                    step_values[:n_train_metrics], y, verbose=True,
+                    gradient_norm=gradient_norm, loss_scale=loss_scale,
+                )
             if profiler_finished and flags.profile_stop_after_capture:
                 print("Stopping after captured profiler step (--profile_stop_after_capture).")
                 return
@@ -2124,8 +2162,17 @@ def main(_):
         ) = run_protocol_validation()
         print(f"Validation protocol wall time: {time() - validation_started:.2f}s", flush=True)
 
-        train_values = list(read_train_metrics().numpy())
+        epoch_values = list(read_train_metrics().numpy())
+        train_values = epoch_values[:n_train_metrics]
         metric_values = train_values + val_values
+        grad_norm_mean, grad_norm_max, _, loss_scale = epoch_values[n_train_metrics:]
+        training_diagnostics = {
+            "grad_norm_mean": grad_norm_mean,
+            "grad_norm_max": grad_norm_max,
+            "loss_scale": loss_scale,
+            "skipped_updates": flags.steps_per_epoch
+            - (int(optimizer.iterations.numpy()) - epoch_start_iterations),
+        }
 
         stop = callbacks.on_epoch_end(
             x_val,
@@ -2137,6 +2184,7 @@ def main(_):
             v1_spikes_spont=v1_spikes_spont_val,
             protocol_selectivity=protocol_selectivity,
             protocol_rates=protocol_rates,
+            training_diagnostics=training_diagnostics,
         )
         print(f"Validation and callback wall time: {time() - validation_started:.2f}s", flush=True)
 
@@ -2268,17 +2316,16 @@ if __name__ == '__main__':
         1.0,
         'Weight of the batch_osi_emd imaginary-component penalty; 0 disables it.',
     )
-    absl.app.flags.DEFINE_float('dampening_factor', 0.1, '')
-    absl.app.flags.DEFINE_float("recurrent_dampening_factor", 0.1, "")
+    absl.app.flags.DEFINE_float('dampening_factor', 0.05, '')
+    absl.app.flags.DEFINE_float("recurrent_dampening_factor", 1.0, "")
     absl.app.flags.DEFINE_float(
         "global_clipnorm",
         0.0,
-        "Clip the unscaled global gradient norm of each replica's local "
-        "gradient, before the cross-replica sum (so N GPUs allow up to N times "
-        "this norm); values <= 0 disable clipping.",
+        "Clip the global norm of the summed (all-replica), unscaled gradient; "
+        "values <= 0 disable clipping.",
     )
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
-    absl.app.flags.DEFINE_float('gauss_std', .3, '')
+    absl.app.flags.DEFINE_float('gauss_std', 0.28, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 10., '')
     absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', 'emd',
                                  'Type of recurrent weight regularizer. Options: mean, stiff, kl_lognormal, emd')
@@ -2387,7 +2434,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean("pseudo_gauss", False, "")
     absl.app.flags.DEFINE_enum(
         "surrogate_gradient",
-        "triangular",
+        "gaussian",
         ["triangular", "gaussian", "slayer"],
         "Surrogate derivative used for spike generation.",
     )
@@ -2425,11 +2472,6 @@ if __name__ == '__main__':
         "gradient_checkpoint_chunk_size",
         25,
         "Temporal chunk size for segmented exact-BPTT recomputation.",
-    )
-    absl.app.flags.DEFINE_float(
-        "voltage_gradient_dampening",
-        0.0,
-        "Deprecated compatibility option; the voltage self-loop is not dampened.",
     )
     absl.app.flags.DEFINE_boolean(
         "detach_reset", True, "Detach the spike from the membrane-reset gradient path."

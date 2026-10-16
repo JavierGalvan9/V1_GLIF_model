@@ -103,10 +103,9 @@ parser.add_argument(
 parser.set_defaults(rolling_warmup=True)
 parser.add_argument('--batch_emd_alignment_weight', default=1.0, type=float)
 
-parser.add_argument('--dampening_factor', default=0.1, type=float)
-parser.add_argument('--recurrent_dampening_factor', default=0.1, type=float)
-parser.add_argument('--global_clipnorm', default=0.0, type=float, help='Per-replica gradient norm limit (applied before the cross-replica sum); <= 0 disables.')
-parser.add_argument('--voltage_gradient_dampening', default=0.0, type=float)
+parser.add_argument('--dampening_factor', default=0.05, type=float)
+parser.add_argument('--recurrent_dampening_factor', default=1.0, type=float)
+parser.add_argument('--global_clipnorm', default=0.0, type=float, help='Clip the global norm of the summed (all-replica), unscaled gradient; <= 0 disables.')
 parser.add_argument('--detach_reset', dest='detach_reset', action='store_true')
 parser.add_argument('--nodetach_reset', dest='detach_reset', action='store_false')
 parser.set_defaults(detach_reset=True)
@@ -115,7 +114,7 @@ parser.add_argument('--detach_asc_reset', dest='detach_asc_reset', action='store
 parser.add_argument('--nodetach_asc_reset', dest='detach_asc_reset', action='store_false')
 parser.set_defaults(detach_asc_reset=False)
 parser.add_argument('--input_weight_scale', default=1.0, type=float)
-parser.add_argument('--gauss_std', default=0.3, type=float)
+parser.add_argument('--gauss_std', default=0.28, type=float)
 parser.add_argument('--recurrent_weight_regularization', default=0.0, type=float)
 parser.add_argument('--recurrent_weight_regularizer_type', default="emd", type=str, choices=['mean', 'emd'])
 parser.add_argument('--voltage_penalty_mode', default='range', type=str, choices=['range', 'threshold'])
@@ -185,7 +184,7 @@ parser.add_argument('--neuron_output', default=False, action='store_true')
 parser.add_argument('--pseudo_gauss', default=False, action='store_true')
 parser.add_argument(
     '--surrogate_gradient',
-    default='triangular',
+    default='gaussian',
     choices=['triangular', 'gaussian', 'slayer'],
 )
 parser.add_argument('--current_input', default=False, action='store_true')

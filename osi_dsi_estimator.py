@@ -149,7 +149,6 @@ def main(_):
                 input_weight_scale=flags.input_weight_scale,
                 dampening_factor=flags.dampening_factor,
                 recurrent_dampening_factor=flags.recurrent_dampening_factor,
-                voltage_gradient_dampening=flags.voltage_gradient_dampening,
                 gauss_std=flags.gauss_std,
                 lr_scale=flags.lr_scale,
                 train_input=False,
@@ -529,10 +528,10 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('annulus_loss_weight', 0.1, '')
     absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 1., '')
-    absl.app.flags.DEFINE_float('dampening_factor', .1, '')
-    absl.app.flags.DEFINE_float('recurrent_dampening_factor', .1, '')
+    absl.app.flags.DEFINE_float('dampening_factor', 0.05, '')
+    absl.app.flags.DEFINE_float('recurrent_dampening_factor', 1.0, '')
     absl.app.flags.DEFINE_float('input_weight_scale', 1., '')
-    absl.app.flags.DEFINE_float('gauss_std', .3, '')
+    absl.app.flags.DEFINE_float('gauss_std', 0.28, '')
     absl.app.flags.DEFINE_float('recurrent_weight_regularization', 0., '')
     absl.app.flags.DEFINE_string('recurrent_weight_regularizer_type', "emd", '')
     absl.app.flags.DEFINE_string('voltage_penalty_mode', 'range', '')
@@ -591,7 +590,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('pseudo_gauss', False, '')
     absl.app.flags.DEFINE_enum(
         'surrogate_gradient',
-        'triangular',
+        'gaussian',
         ['triangular', 'gaussian', 'slayer'],
         'Surrogate derivative used for spike generation.',
     )
@@ -628,7 +627,6 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_boolean("track_core_only", False, "Track spikes only from core neurons to reduce memory usage")
     absl.app.flags.DEFINE_boolean("track_voltage", False, "Track and save membrane voltage traces during simulation")
-    absl.app.flags.DEFINE_float("voltage_gradient_dampening", 0.5, "")
 
     absl.app.flags.DEFINE_string("rotation", "ccw", "")
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')

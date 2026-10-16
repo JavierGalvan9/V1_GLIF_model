@@ -166,8 +166,8 @@ uses one process, and `multi_worker` forks one process per GPU with
 `MultiWorkerMirroredStrategy`. Multi-worker measured a few percent faster per
 step but builds the network once per GPU in host memory; its non-chief workers
 write to `Distributed_worker_logs/worker_<n>.log`. See
-`distributed_training_investigation/REPORT.md` for the measurements behind both
-of these.
+[the distributed-training investigation](docs/distributed-training.md) for the
+findings behind these choices.
 
 The CUDA operators are built automatically when the architecture-specific
 cache is missing or stale. Caches for A100 (`sm80`), RTX 3090 (`sm86`), L40S /
