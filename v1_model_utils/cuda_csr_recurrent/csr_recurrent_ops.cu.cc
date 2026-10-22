@@ -931,6 +931,9 @@ Status TiledForwardAvailable(ForwardTileCache* cache, bool* available) {
 #ifndef V1_SWEEP_LGN_EDGES
 #define V1_SWEEP_LGN_EDGES 1
 #endif
+#ifndef V1_SWEEP_BATCHES_PER_WARP
+#define V1_SWEEP_BATCHES_PER_WARP 8
+#endif
 #ifndef V1_SWEEP_REC_EDGES
 #define V1_SWEEP_REC_EDGES 4
 #endif
@@ -975,6 +978,30 @@ __device__ __forceinline__ void SharedAddQuad(::float4* address, const float (&v
 #else
   float* sum = reinterpret_cast<float*>(address);
   for (int index = 0; index < 4; ++index) atomicAdd(sum + index, value[index]);
+#endif
+}
+
+// SharedAddQuad of weighted * basis, each component one fused multiply-add on
+// the shared sum: one rounding per contribution instead of the product's and the
+// sum's.
+__device__ __forceinline__ void SharedFmaQuad(::float4* address, float weighted,
+                                              const ::float4& basis) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  using Word = unsigned __int128;
+  Word* word = reinterpret_cast<Word*>(address);
+  ::float4 old = *address;
+  for (;;) {
+    const ::float4 sum = {fmaf(weighted, basis.x, old.x), fmaf(weighted, basis.y, old.y),
+                          fmaf(weighted, basis.z, old.z), fmaf(weighted, basis.w, old.w)};
+    const Word seen = atomicCAS(word, *reinterpret_cast<const Word*>(&old),
+                                *reinterpret_cast<const Word*>(&sum));
+    if (seen == *reinterpret_cast<const Word*>(&old)) return;
+    old = *reinterpret_cast<const ::float4*>(&seen);
+  }
+#else
+  const float value[4] = {weighted * basis.x, weighted * basis.y, weighted * basis.z,
+                          weighted * basis.w};
+  SharedAddQuad(address, value);
 #endif
 }
 
@@ -1025,11 +1052,13 @@ struct SampleRows {
 
   __device__ __forceinline__ unsigned int count() const { return prefix[kSweepSlots]; }
 
-  // Row `index`'s segment in `tile`, if it has one, and its spike.
+  // Row `index`'s segment in `tile`, if it has one, its spike and (optionally)
+  // the presynaptic row.
   template <typename W>
   __device__ __forceinline__ bool Find(const SweepRows<T>& rows, const SweepCsr<W>& csr,
                                        int64_t sample, unsigned int index, unsigned int tile,
-                                       uint32* start, uint32* stop, float* spike) const {
+                                       uint32* start, uint32* stop, float* spike,
+                                       unsigned int* row_of = nullptr) const {
     const unsigned int* entries = rows.records.record[0];
     const T* values = rows.spikes.slot[0];
     unsigned int slot = 0, at = first[0] + index;
@@ -1049,6 +1078,7 @@ struct SampleRows {
                                        csr.segment_tiles, csr.segment_masks, csr.row_splits,
                                        start, stop);
     if (found) *spike = AsFloat(values[entry]);
+    if (row_of != nullptr) *row_of = row;
     return found;
   }
 };
@@ -1056,8 +1086,9 @@ struct SampleRows {
 // One step group of an edge walk: each lane's kEdges edges (csr, spike, valid)
 // are loaded, weighted and added to the shared tile. With kAggregate a step's
 // run of edges to one target (equal key | post in consecutive lanes) is summed
-// first and its lowest lane adds it.
-template <int kEdges, bool kAggregate, typename W>
+// first and its lowest lane adds it. With kFma (rows that never repeat a
+// target) each edge's weighted basis is fused into the sums (SharedFmaQuad).
+template <int kEdges, bool kAggregate, typename W, bool kFma = false>
 __device__ __forceinline__ void SweepSteps(const bool (&valid)[kEdges],
                                            const uint32 (&csr)[kEdges],
                                            const float (&spike)[kEdges],
@@ -1086,6 +1117,10 @@ __device__ __forceinline__ void SweepSteps(const bool (&valid)[kEdges],
     }
     const float weighted = valid[step] ? spike[step] * weight[step] : 0.0f;
     const ::float4 bv = LoadBasis4(basis, type[step]);
+    if constexpr (kFma && !kAggregate) {
+      SharedFmaQuad(sums + post[step], weighted, bv);
+      continue;
+    }
     float value[4] = {weighted * bv.x, weighted * bv.y, weighted * bv.z, weighted * bv.w};
     bool leader = valid[step];
     if constexpr (kAggregate) {
@@ -1207,8 +1242,8 @@ __device__ __forceinline__ bool SweepBlockRounds(
 // eight batches per warp: the walk of one batch is serial in its warp, so fewer
 // rows per sample need smaller batches to keep every warp busy (32-row batches
 // measured 8 % slower at 0.7 Hz, 4-row ones 23 % slower at 4 Hz). Returns
-// whether this warp added anything.
-template <int kEdges, typename T, typename W>
+// whether this warp added anything. kFma: see SweepSteps.
+template <int kEdges, typename T, typename W, bool kFma = false>
 __device__ __forceinline__ bool SweepWarpBatches(
     const SweepRows<T>& rows, const SweepCsr<W>& graph, int64_t sample, unsigned int tile,
     int first_target, const float* basis, ::float4* sums, SweepItems& items,
@@ -1219,7 +1254,7 @@ __device__ __forceinline__ bool SweepWarpBatches(
   uint32* starts = items.start + warp * 32;
   uint32* offsets = items.offset + warp * 33;
   float* spikes_of = items.spike + warp * 32;
-  const unsigned int share = sample_rows.count() / (kSweepWarps * 8);
+  const unsigned int share = sample_rows.count() / (kSweepWarps * V1_SWEEP_BATCHES_PER_WARP);
   const unsigned int batch_rows = share >= 32 ? 32 : (share >= 16 ? 16 : (share >= 8 ? 8 : 4));
   bool touched = false;
   for (;;) {
@@ -1269,10 +1304,156 @@ __device__ __forceinline__ bool SweepWarpBatches(
         }
         keys[step] = 0;
       }
-      SweepSteps<kEdges, false>(valid, csr, spikes, keys, lane, first_target, graph, basis,
-                                sums);
+      SweepSteps<kEdges, false, W, kFma>(valid, csr, spikes, keys, lane, first_target, graph,
+                                         basis, sums);
     }
     __syncwarp();   // the next batch overwrites this warp's items
+  }
+  return touched;
+}
+
+// ---------------------------------------------------------------------------
+// Scalar external input (the LGN under DIRECT_CSR): every postsynaptic neuron
+// receives the input through ONE synapse type (203,783 posts, 203,783 (post,
+// type) pairs on the 203,816-neuron network), so its four currents are
+// basis[type(post)] * s(post) with the scalar s = sum spike * weight over its
+// incoming edges. The sweep accumulates s in FP32 shared memory (one value per
+// target instead of four) and expands it once per target.
+//
+// A row's edges to one target (on average 1.42, up to 1,260) are consecutive in
+// CSR order. ScalarExternalTable cuts each row into runs of at most kRunEdges
+// edges to one target and stores a run as one word:
+//   bits 0-12  post mod 8192 (a tile is at most 8,192 wide, so the block
+//              recovers the post from its first target),
+//   bits 13-27 offset of the run's first edge within the row (rows <= 2^15),
+//   bits 28-31 edges - 1.
+// A lane takes a run, sums its weights in FP32 registers in edge order and adds
+// spike * sum to the target with one shared atomic. There is no per-edge synapse
+// type, basis product, run detection or 16-byte compare-and-swap; the weights are
+// read at every call, so trained weights need no cache. The tile segments are
+// built over the runs, so a block finds its run range as before.
+// ---------------------------------------------------------------------------
+
+#ifndef V1_SWEEP_RUN_EDGES
+#define V1_SWEEP_RUN_EDGES 4
+#endif
+#ifndef V1_SWEEP_SCALAR_RUNS
+#define V1_SWEEP_SCALAR_RUNS 4
+#endif
+// Pairs per lane per walk step in the coalesced (pair) mode: 8 measured 836 /
+// 338 us against 846 / 338 for 4 at 4/20 and 0.65/5.8 Hz.
+#ifndef V1_SWEEP_PAIR_RUNS
+#define V1_SWEEP_PAIR_RUNS 8
+#endif
+constexpr int kRunEdges = V1_SWEEP_RUN_EDGES;
+constexpr int kRunPostBits = 13;
+constexpr int kRunOffsetBits = 15;
+static_assert(kRunEdges >= 1 && kRunEdges <= (1 << (32 - kRunPostBits - kRunOffsetBits)) &&
+                  kSweepTargets <= (1 << kRunPostBits),
+              "scalar run word layout");
+
+// The scalar external connectivity as the sweep reads it: `runs` is the run CSR
+// (row_splits = run splits, post_ids = run words) with its tile segments.
+template <typename W>
+struct ScalarCsr {
+  SweepCsr<W> runs;
+  const unsigned int* edge_splits;   // the original row splits (edge offsets)
+  const unsigned char* post_types;   // [n_post] the one synapse type per target
+  // Coalesced (pair) mode: one entry per distinct (row, target) pair instead of
+  // per run, its post mod 8192 and its weight sum (V1ExternalPairWeights).
+  const unsigned short* pair_posts;
+  const float* pair_weights;
+};
+
+// Block rounds over the runs of the sample's active rows (as SweepBlockRounds),
+// accumulating the scalars of tile `tile` into `scalars`. Ends with a barrier.
+template <int kRuns, typename T, typename W, typename Scan, bool kPairs = false>
+__device__ __forceinline__ bool SweepScalarRounds(
+    const SweepRows<T>& rows, const ScalarCsr<W>& graph, int64_t sample, unsigned int tile,
+    int first_target, float* scalars, SweepItems& items,
+    typename Scan::TempStorage& scan_storage) {
+  __shared__ unsigned int bases[kSweepThreads];   // each item's first edge
+  const SampleRows<T> sample_rows(rows, sample);
+  const int lane = threadIdx.x & 31;
+  const unsigned int* words = reinterpret_cast<const unsigned int*>(graph.runs.post_ids);
+  const unsigned int low_target = static_cast<unsigned int>(first_target);
+  bool touched = false;
+  for (unsigned int base = 0; base < sample_rows.count(); base += kSweepThreads) {
+    const unsigned int index = base + threadIdx.x;
+    uint32 start = 0, stop = 0;
+    float spike = 0.0f;
+    unsigned int row = 0;
+    const bool found =
+        index < sample_rows.count() &&
+        sample_rows.Find(rows, graph.runs, sample, index, tile, &start, &stop, &spike, &row);
+    unsigned long long packed =
+        found ? (1ull << 32) | static_cast<unsigned long long>(stop - start) : 0ull;
+    unsigned long long round;
+    Scan(scan_storage).ExclusiveSum(packed, packed, round);
+    const int count = static_cast<int>(round >> 32);
+    const unsigned int total = static_cast<unsigned int>(round);
+    if (found) {
+      const int item = static_cast<int>(packed >> 32);
+      items.start[item] = start;
+      items.offset[item] = static_cast<uint32>(packed);
+      items.spike[item] = spike;
+      if constexpr (!kPairs) bases[item] = graph.edge_splits[row];
+    }
+    if (threadIdx.x == 0) items.offset[count] = total;
+    __syncthreads();
+    touched = touched || count > 0;
+    constexpr unsigned int kChunk = 32 * kRuns;
+    for (unsigned int chunk = (threadIdx.x >> 5) * kChunk; chunk < total;
+         chunk += kSweepWarps * kChunk) {
+      int owner = 0;
+      int high = count;
+      while (high - owner > 1) {
+        const int middle = (owner + high) >> 1;
+        if (items.offset[middle] <= chunk) owner = middle; else high = middle;
+      }
+      bool valid[kRuns];
+      unsigned int word[kRuns], first_edge[kRuns];
+      float spikes[kRuns], pair_weight[kRuns];
+#pragma unroll
+      for (int step = 0; step < kRuns; ++step) {
+        const unsigned int run = chunk + step * 32 + lane;
+        valid[step] = run < total;
+        word[step] = 0;
+        if (valid[step]) {
+          while (items.offset[owner + 1] <= run) ++owner;
+          const unsigned int at = items.start[owner] + (run - items.offset[owner]);
+          if constexpr (kPairs) {
+            word[step] = __ldg(&graph.pair_posts[at]);
+            pair_weight[step] = __ldg(&graph.pair_weights[at]);
+          } else {
+            word[step] = __ldg(&words[at]);
+            first_edge[step] = bases[owner];
+          }
+          spikes[step] = items.spike[owner];
+        }
+      }
+#pragma unroll
+      for (int step = 0; step < kRuns; ++step) {
+        if (!valid[step]) continue;
+        if constexpr (kPairs) {
+          const unsigned int target = (word[step] - low_target) & ((1u << kRunPostBits) - 1);
+          atomicAdd(scalars + target, spikes[step] * pair_weight[step]);
+          continue;
+        }
+        const unsigned int target =
+            ((word[step] & ((1u << kRunPostBits) - 1)) - low_target) & ((1u << kRunPostBits) - 1);
+        const W* weight = graph.runs.weights + first_edge[step] +
+                          ((word[step] >> kRunPostBits) & ((1u << kRunOffsetBits) - 1));
+        const unsigned int edges = (word[step] >> (kRunPostBits + kRunOffsetBits)) + 1;
+        float sum = AsFloat(__ldg(weight));
+#pragma unroll
+        for (int edge = 1; edge < kRunEdges; ++edge) {
+          if (edge < edges) sum += AsFloat(__ldg(weight + edge));
+        }
+        atomicAdd(scalars + target, spikes[step] * sum);
+      }
+    }
+    __syncthreads();
   }
   return touched;
 }
@@ -1282,7 +1463,7 @@ __device__ __forceinline__ bool SweepWarpBatches(
 // recurrent history alone keeps TiledForwardKernel: its sweep was 20 % faster
 // at 4 Hz, but its reordered FP32 sums moved the mean errors by ~1e-9 relative
 // outside the baseline's run-to-run envelope.
-enum SweepMode { kSweepExternal, kSweepFused };
+enum SweepMode { kSweepExternal, kSweepFused, kSweepFusedScalar, kSweepFusedPairs };
 
 // One block per (tile of kTargets, sample), numbered tile-major so that the
 // blocks resident at once share a few tiles across samples. (Repeating the
@@ -1290,12 +1471,17 @@ enum SweepMode { kSweepExternal, kSweepFused };
 // block zeroes its FP32 tile, accumulates its rows and writes the tile once,
 // rounded once. kSweepFused adds both sources before that single rounding,
 // where the two-operator chain rounds the recurrent currents to T and the
-// external ones onto them.
+// external ones onto them. kSweepFusedScalar does the same with the scalar
+// external input (ScalarCsr): it first accumulates the external scalars in the
+// front of the tile's shared memory, expands each target's scalar into its four
+// sums (scalar * basis[type]; exactly zero without input), then adds the
+// recurrent history onto them.
 template <typename T, typename W, SweepMode kMode, int kTargets>
 __global__ void __launch_bounds__(kSweepThreads) CsrTileSweepKernel(
     int n_post, int batch, bool accumulate, bool aligned,
     SweepRows<T> recurrent_rows, SweepCsr<W> recurrent_graph, SweepRows<T> external_rows,
-    SweepCsr<W> external_graph, const float* basis, T* currents) {
+    SweepCsr<W> external_graph, const float* basis, T* currents,
+    ScalarCsr<W> scalar_graph) {
   extern __shared__ ::float4 sums[];   // [kTargets]
   __shared__ SweepItems items;
   // Warp scans: their storage is one word per warp, where raking would need
@@ -1307,21 +1493,58 @@ __global__ void __launch_bounds__(kSweepThreads) CsrTileSweepKernel(
   const int64_t sample = blockIdx.x % batch;
   const int first_target = tile * kTargets;
   const int targets = min(kTargets, n_post - first_target);
-  for (int target = threadIdx.x; target < targets; target += kSweepThreads) {
-    sums[target] = ::float4{0, 0, 0, 0};
-  }
-  if (threadIdx.x == 0) next_batch = 0;
-  __syncthreads();
   bool touched = false;
-  if constexpr (kMode == kSweepFused) {
-    touched = SweepWarpBatches<V1_SWEEP_REC_EDGES>(recurrent_rows, recurrent_graph, sample,
-                                                   tile, first_target, basis, sums, items,
-                                                   &next_batch);
-    __syncthreads();   // the walks share `items`
+  if constexpr (kMode == kSweepFusedScalar || kMode == kSweepFusedPairs) {
+    float* scalars = reinterpret_cast<float*>(sums);
+    for (int target = threadIdx.x; target < targets; target += kSweepThreads) {
+      scalars[target] = 0.0f;
+    }
+    if (threadIdx.x == 0) next_batch = 0;
+    __syncthreads();
+    touched = SweepScalarRounds<kMode == kSweepFusedPairs ? V1_SWEEP_PAIR_RUNS
+                                                          : V1_SWEEP_SCALAR_RUNS,
+                                T, W, Scan, kMode == kSweepFusedPairs>(
+        external_rows, scalar_graph, sample, tile, first_target, scalars, items, scan_storage);
+    constexpr int kHeld = (kTargets + kSweepThreads - 1) / kSweepThreads;
+    float held[kHeld];
+#pragma unroll
+    for (int index = 0; index < kHeld; ++index) {
+      const int target = threadIdx.x + index * kSweepThreads;
+      held[index] = target < targets ? scalars[target] : 0.0f;
+    }
+    __syncthreads();   // every scalar is read before the sums overwrite them
+#pragma unroll
+    for (int index = 0; index < kHeld; ++index) {
+      const int target = threadIdx.x + index * kSweepThreads;
+      if (target >= targets) continue;
+      const float scalar = held[index];
+      ::float4 sum = {0, 0, 0, 0};
+      if (scalar != 0.0f) {
+        const ::float4 bv = LoadBasis4(basis, scalar_graph.post_types[first_target + target]);
+        sum = {scalar * bv.x, scalar * bv.y, scalar * bv.z, scalar * bv.w};
+      }
+      sums[target] = sum;
+    }
+    __syncthreads();
+    touched |= SweepWarpBatches<V1_SWEEP_REC_EDGES, T, W, true>(
+        recurrent_rows, recurrent_graph, sample, tile, first_target, basis, sums, items,
+        &next_batch);
+  } else {
+    for (int target = threadIdx.x; target < targets; target += kSweepThreads) {
+      sums[target] = ::float4{0, 0, 0, 0};
+    }
+    if (threadIdx.x == 0) next_batch = 0;
+    __syncthreads();
+    if constexpr (kMode == kSweepFused) {
+      touched = SweepWarpBatches<V1_SWEEP_REC_EDGES>(recurrent_rows, recurrent_graph, sample,
+                                                     tile, first_target, basis, sums, items,
+                                                     &next_batch);
+      __syncthreads();   // the walks share `items`
+    }
+    touched |= SweepBlockRounds<V1_SWEEP_LGN_EDGES, true, T, W, Scan>(
+        external_rows, external_graph, sample, tile, first_target, basis, sums, items,
+        scan_storage);
   }
-  touched |= SweepBlockRounds<V1_SWEEP_LGN_EDGES, true, T, W, Scan>(
-      external_rows, external_graph, sample, tile, first_target, basis, sums, items,
-      scan_storage);
   // Also completes every warp's atomics. With `initial` in place and nothing
   // added, the tile is already right.
   if (!__syncthreads_or(touched) && accumulate) return;
@@ -1421,13 +1644,231 @@ Status PrepareSweepRows(OpKernelContext* context, const SpikeMatrix<const T*>& s
   return BuildMissingRecords<T>(context, spikes, carried, newest, &rows->records, scratch);
 }
 
+// The run table of a scalar external connectivity (see ScalarCsr) for one tile
+// width, built once on the host from the CSR and shared like the tile segments.
+// `usable` is false when the connectivity does not qualify: a target reached
+// through two synapse types, a row longer than 2^15 edges or a post id not
+// ascending within its row. Without DIRECT_CSR the weights would need the
+// edge-id gather, so the table is never built there. A `pairs` table has one
+// entry per distinct (row, target) pair (no edge limit, no row-length limit):
+// `runs` holds each pair's post mod 8192 as uint16 and `pair_edges` its first
+// edge (n_pairs + 1 entries), for V1ExternalPairWeights.
+struct ScalarExternalTable {
+  const DeviceBase* device = nullptr;
+  Tensor post_ids;
+  Tensor row_splits;
+  Tensor synapse_types;
+  int n_post = -1;
+  bool pairs = false;
+  bool usable = false;
+  Tensor pair_edges;
+  Tensor runs;
+  Tensor run_splits;
+  Tensor post_types;
+  Tensor segment_splits;
+  Tensor segment_starts;
+  Tensor segment_tiles;
+  Tensor segment_masks;
+};
+
+template <typename Value>
+Status CopyToHost(const Tensor& tensor, cudaStream_t stream, std::vector<Value>* values) {
+  values->resize(tensor.TotalBytes() / sizeof(Value));
+  if (values->empty()) return OkStatus();
+  cudaMemcpyAsync(values->data(), tensor.tensor_data().data(), tensor.TotalBytes(),
+                  cudaMemcpyDeviceToHost, stream);
+  const cudaError_t status = cudaStreamSynchronize(stream);
+  return status == cudaSuccess ? OkStatus()
+                               : errors::Internal("reading the CSR for the scalar table failed: ",
+                                                  cudaGetErrorString(status));
+}
+
+// A device copy of `values` in a tensor of `dtype` (4-byte words or bytes).
+template <typename Value>
+Status CopyToDevice(OpKernelContext* context, const std::vector<Value>& values, DataType dtype,
+                    Tensor* tensor) {
+  const int64_t bytes = std::max<int64_t>(values.size() * sizeof(Value), 4);
+  const int64_t width = dtype == DT_UINT8 ? 1 : (dtype == DT_UINT16 ? 2 : 4);
+  TF_RETURN_IF_ERROR(context->allocate_temp(dtype, TensorShape({bytes / width}), tensor));
+  if (!values.empty()) {
+    cudaMemcpyAsync(const_cast<char*>(tensor->tensor_data().data()), values.data(),
+                    values.size() * sizeof(Value), cudaMemcpyHostToDevice,
+                    context->eigen_device<GPUDevice>().stream());
+  }
+  return OkStatus();
+}
+
+template <int kTargets>
+Status BuildScalarExternal(OpKernelContext* context, const Tensor& post_ids,
+                           const Tensor& row_splits, const Tensor& synapse_types, int n_post,
+                           bool pairs, ScalarExternalTable* table) {
+  table->device = context->device();
+  table->pairs = pairs;
+  table->post_ids = post_ids;
+  table->row_splits = row_splits;
+  table->synapse_types = synapse_types;
+  table->n_post = n_post;
+  table->usable = false;
+  if (!V1_DIRECT_CSR || n_post <= 0) return OkStatus();
+  auto stream = context->eigen_device<GPUDevice>().stream();
+  std::vector<unsigned int> posts, splits;
+  std::vector<unsigned char> types;
+  TF_RETURN_IF_ERROR(CopyToHost(post_ids, stream, &posts));
+  TF_RETURN_IF_ERROR(CopyToHost(row_splits, stream, &splits));
+  TF_RETURN_IF_ERROR(CopyToHost(synapse_types, stream, &types));
+  const int64_t n_pre = static_cast<int64_t>(splits.size()) - 1;
+  if (n_pre < 0 || types.size() != posts.size() || splits.back() != posts.size()) {
+    return OkStatus();
+  }
+  std::vector<unsigned char> post_types(n_post, 0), seen(n_post, 0);
+  for (size_t edge = 0; edge < posts.size(); ++edge) {
+    const unsigned int post = posts[edge];
+    if (post >= static_cast<unsigned int>(n_post)) return OkStatus();
+    if (seen[post] && post_types[post] != types[edge]) return OkStatus();
+    seen[post] = 1;
+    post_types[post] = types[edge];
+  }
+  const int tiles = (n_post + kTargets - 1) / kTargets;
+  std::vector<unsigned int> runs, run_splits(n_pre + 1), segment_splits(n_pre + 1),
+      segment_starts, segment_tiles, pair_edges;
+  std::vector<unsigned short> pair_posts;
+  const unsigned int run_limit = pairs ? 0xffffffffu : kRunEdges;
+  std::vector<unsigned long long> masks(tiles <= 64 ? n_pre : 0, 0ull);
+  runs.reserve(posts.size());
+  for (int64_t row = 0; row < n_pre; ++row) {
+    const unsigned int begin = splits[row], end = splits[row + 1];
+    if (end < begin || (!pairs && end - begin > (1u << kRunOffsetBits))) return OkStatus();
+    run_splits[row] = static_cast<unsigned int>(pairs ? pair_posts.size() : runs.size());
+    segment_splits[row] = static_cast<unsigned int>(segment_starts.size());
+    unsigned int tile = 0xffffffffu;
+    for (unsigned int edge = begin; edge < end;) {
+      const unsigned int post = posts[edge];
+      if (edge > begin && post < posts[edge - 1]) return OkStatus();
+      unsigned int stop = edge + 1;
+      while (stop < end && posts[stop] == post && stop - edge < run_limit) ++stop;
+      const unsigned int index = static_cast<unsigned int>(pairs ? pair_posts.size() : runs.size());
+      if (post / kTargets != tile) {
+        tile = post / kTargets;
+        segment_starts.push_back(index);
+        segment_tiles.push_back(tile);
+        if (!masks.empty()) masks[row] |= 1ull << tile;
+      }
+      if (pairs) {
+        pair_posts.push_back(static_cast<unsigned short>(post & ((1u << kRunPostBits) - 1)));
+        pair_edges.push_back(edge);
+      } else {
+        runs.push_back((post & ((1u << kRunPostBits) - 1)) | ((edge - begin) << kRunPostBits) |
+                       ((stop - edge - 1) << (kRunPostBits + kRunOffsetBits)));
+      }
+      edge = stop;
+    }
+  }
+  run_splits[n_pre] = static_cast<unsigned int>(pairs ? pair_posts.size() : runs.size());
+  if (pairs) {
+    pair_edges.push_back(static_cast<unsigned int>(posts.size()));
+    TF_RETURN_IF_ERROR(CopyToDevice(context, pair_posts, DT_UINT16, &table->runs));
+    TF_RETURN_IF_ERROR(CopyToDevice(context, pair_edges, DT_INT32, &table->pair_edges));
+  }
+  segment_splits[n_pre] = static_cast<unsigned int>(segment_starts.size());
+  if (!pairs) TF_RETURN_IF_ERROR(CopyToDevice(context, runs, DT_INT32, &table->runs));
+  TF_RETURN_IF_ERROR(CopyToDevice(context, run_splits, DT_INT32, &table->run_splits));
+  TF_RETURN_IF_ERROR(CopyToDevice(context, post_types, DT_UINT8, &table->post_types));
+  TF_RETURN_IF_ERROR(CopyToDevice(context, segment_splits, DT_INT32, &table->segment_splits));
+  TF_RETURN_IF_ERROR(CopyToDevice(context, segment_starts, DT_INT32, &table->segment_starts));
+  TF_RETURN_IF_ERROR(CopyToDevice(context, segment_tiles, DT_INT32, &table->segment_tiles));
+  table->segment_masks = Tensor();
+  if (!masks.empty()) {
+    TF_RETURN_IF_ERROR(CopyToDevice(context, masks, DT_INT32, &table->segment_masks));
+  }
+  const cudaError_t status = cudaStreamSynchronize(stream);
+  if (status != cudaSuccess) {
+    return errors::Internal("uploading the scalar table failed: ", cudaGetErrorString(status));
+  }
+  table->usable = true;
+  return OkStatus();
+}
+
+inline bool MatchesScalarExternal(const ScalarExternalTable& table, OpKernelContext* context,
+                                  const Tensor& post_ids, const Tensor& row_splits,
+                                  const Tensor& synapse_types, int n_post, bool pairs) {
+  const auto same = [](const Tensor& held, const Tensor& given) {
+    return held.tensor_data().data() == given.tensor_data().data() &&
+           held.NumElements() == given.NumElements();
+  };
+  return table.device == context->device() && table.n_post == n_post && table.pairs == pairs &&
+         same(table.post_ids, post_ids) && same(table.row_splits, row_splits) &&
+         same(table.synapse_types, synapse_types);
+}
+
+// As EnsureTileSegments: a weak registry per tile width, a strong reference held
+// by each operator in `held`.
+template <int kTargets>
+Status EnsureScalarExternal(OpKernelContext* context, const Tensor& post_ids,
+                            const Tensor& row_splits, const Tensor& synapse_types, int n_post,
+                            bool pairs, std::shared_ptr<const ScalarExternalTable>* held) {
+  if (*held &&
+      MatchesScalarExternal(**held, context, post_ids, row_splits, synapse_types, n_post,
+                            pairs)) {
+    return OkStatus();
+  }
+  struct Registry {
+    mutex mu;
+    std::vector<std::weak_ptr<const ScalarExternalTable>> tables;
+  };
+  static Registry registry;
+  mutex_lock lock(registry.mu);
+  for (auto it = registry.tables.begin(); it != registry.tables.end();) {
+    auto table = it->lock();
+    if (!table) {
+      it = registry.tables.erase(it);
+    } else {
+      if (MatchesScalarExternal(*table, context, post_ids, row_splits, synapse_types, n_post,
+                                pairs)) {
+        *held = std::move(table);
+        return OkStatus();
+      }
+      ++it;
+    }
+  }
+  auto table = std::make_shared<ScalarExternalTable>();
+  TF_RETURN_IF_ERROR(BuildScalarExternal<kTargets>(context, post_ids, row_splits,
+                                                   synapse_types, n_post, pairs, table.get()));
+  registry.tables.emplace_back(table);
+  *held = std::move(table);
+  return OkStatus();
+}
+
+// The scalar view of a usable table, with the current weights.
+template <typename W>
+ScalarCsr<W> ScalarView(const ScalarExternalTable& table, const Tensor& weights,
+                        const Tensor* pair_weights = nullptr) {
+  const auto words = [](const Tensor& tensor) {
+    return reinterpret_cast<const unsigned int*>(tensor.tensor_data().data());
+  };
+  ScalarCsr<W> view;
+  view.runs = SweepCsr<W>{
+      words(table.segment_splits), words(table.segment_starts), words(table.segment_tiles),
+      table.segment_masks.NumElements() > 0
+          ? reinterpret_cast<const unsigned long long*>(table.segment_masks.tensor_data().data())
+          : nullptr,
+      reinterpret_cast<const uint32*>(words(table.run_splits)), weights.flat<W>().data(),
+      reinterpret_cast<const uint32*>(words(table.runs)), nullptr};
+  view.edge_splits = words(table.row_splits);
+  view.post_types = reinterpret_cast<const unsigned char*>(table.post_types.tensor_data().data());
+  view.pair_posts = table.pairs
+      ? reinterpret_cast<const unsigned short*>(table.runs.tensor_data().data()) : nullptr;
+  view.pair_weights = pair_weights != nullptr ? pair_weights->flat<float>().data() : nullptr;
+  return view;
+}
+
 // Launches CsrTileSweepKernel; *launched is false when the device cannot run
 // it, and the caller falls back.
 template <typename T, typename W, SweepMode kMode, int kTargets>
 Status LaunchSweepKernel(OpKernelContext* context, int64_t batch, int n_post,
                          const Tensor& basis, Tensor* output, bool accumulate,
                          const SweepRows<T>& recurrent_rows, const SweepCsr<W>& recurrent_graph,
-                         const SweepRows<T>& external_rows, const SweepCsr<W>& external_graph) {
+                         const SweepRows<T>& external_rows, const SweepCsr<W>& external_graph,
+                         const ScalarCsr<W>& scalar_graph = ScalarCsr<W>{}) {
   const int tiles = (n_post + kTargets - 1) / kTargets;
   const bool aligned = reinterpret_cast<uintptr_t>(output->flat<T>().data()) % 8 == 0;
   return GpuLaunchKernel(CsrTileSweepKernel<T, W, kMode, kTargets>,
@@ -1436,7 +1877,7 @@ Status LaunchSweepKernel(OpKernelContext* context, int64_t batch, int n_post,
                          context->eigen_device<GPUDevice>().stream(), n_post,
                          static_cast<int>(batch), accumulate, aligned, recurrent_rows,
                          recurrent_graph, external_rows, external_graph,
-                         basis.flat<float>().data(), output->flat<T>().data());
+                         basis.flat<float>().data(), output->flat<T>().data(), scalar_graph);
 }
 
 // Launches CsrTileSweepKernel for the external source alone; *launched is
@@ -1609,18 +2050,29 @@ Status LaunchForward(OpKernelContext* context, const SpikeMatrix<const T*>& spik
 // samples project to zero and are never written back.
 // ---------------------------------------------------------------------------
 
+// A zero spike gradient plus its addend, as the separate add would form it.
+template <typename T>
+__global__ void AddToZeroKernel(int64_t elements, const T* addend, T* output) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    output[index] = FromFloat<T>(__fadd_rn(0.0f, AsFloat(addend[index])));
+  }
+}
+
 // Largest finite |current_grad|, as raw float bits in a uint32. Non-negative
 // floats order identically to their bit patterns, so an integer atomicMax is a
 // float max. Non-finite entries are skipped on purpose: the backward
 // legitimately propagates NaNs from `current_grad`, and letting one NaN poison
 // the scale would turn every spike gradient into a NaN instead of only the
 // affected ones.
+//
+// One warp's share: every lane strides from `first` by `stride`, and the
+// warp's maximum is returned to every lane.
 template <typename T>
-__global__ void AbsMaxFiniteKernel(int64_t elements, const T* values,
-                                   unsigned int* result) {
+__device__ __forceinline__ float WarpAbsMaxFinite(int64_t elements, const T* values,
+                                                  int64_t first, int64_t stride) {
   float local = 0.0f;
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+  for (int64_t index = first; index < elements; index += stride) {
     const float value = fabsf(AsFloat(values[index]));
     if (isfinite(value) && value > local) local = value;
   }
@@ -1628,6 +2080,15 @@ __global__ void AbsMaxFiniteKernel(int64_t elements, const T* values,
   for (int mask = 16; mask > 0; mask >>= 1) {
     local = fmaxf(local, __shfl_xor_sync(0xffffffff, local, mask));
   }
+  return local;
+}
+
+template <typename T>
+__global__ void AbsMaxFiniteKernel(int64_t elements, const T* values,
+                                   unsigned int* result) {
+  const float local = WarpAbsMaxFinite(
+      elements, values, static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x,
+      static_cast<int64_t>(blockDim.x) * gridDim.x);
   if ((threadIdx.x & 31) == 0 && local > 0.0f) {
     atomicMax(result, __float_as_uint(local));
   }
@@ -1647,8 +2108,15 @@ __global__ void AbsMaxFiniteKernel(int64_t elements, const T* values,
 // |projected| <= max|current_grad| * max_type sum_r |basis[type][r]|, so the
 // bound is exact and one pass over `current_grad` suffices -- the projection
 // itself never has to be measured.
+//
+// `max_bits` is a measured bound or a caller's (`abs_max_bound`). A caller's
+// bound may be non-finite: a rescaled bound that overflowed (see
+// V1CsrBackwardPairProjected). The warp then measures `values` itself -- slow,
+// but it only happens when the upstream gradient overflowed.
+template <typename T>
 __global__ void ProjectionScaleKernel(const unsigned int* max_bits, const float* basis,
-                                      int n_types, int n_basis, float* scale_out) {
+                                      int n_types, int n_basis, int64_t elements,
+                                      const T* values, float* scale_out) {
   // One warp: each lane takes every 32nd synapse type, then a max-reduce.
   // Row sums keep their receptor order and max is order-independent, so the
   // scale is bit-identical to a serial loop -- which, as one thread doing 360
@@ -1665,8 +2133,10 @@ __global__ void ProjectionScaleKernel(const unsigned int* max_bits, const float*
   for (int offset = 16; offset > 0; offset >>= 1) {
     basis_l1 = fmaxf(basis_l1, __shfl_xor_sync(0xffffffffu, basis_l1, offset));
   }
+  float max_value = __uint_as_float(*max_bits);
+  if (!isfinite(max_value)) max_value = WarpAbsMaxFinite(elements, values, threadIdx.x, 32);
   if (threadIdx.x != 0) return;
-  const float bound = __uint_as_float(*max_bits) * basis_l1;
+  const float bound = max_value * basis_l1;
   float scale = 1.0f;
   if (isfinite(bound) && bound > 0.0f) {
     scale = exp2f(floorf(log2f(8192.0f / bound)));
@@ -1848,7 +2318,7 @@ __global__ __launch_bounds__(32 * kTileWarps) void BackwardRowTileKernel(
     const P* projected, int64_t runtime_stride, const W* weights, const uint32* pair_ids,
     const uint32* edge_ids, const uint32* row_splits, int64_t n_pre, int64_t batch,
     const T* dampening, SpikeSlots<T*> spike_grad, const float* inverse_scale,
-    uint32 sentinel_pair) {
+    uint32 sentinel_pair, SpikeSlots<const T*> addends) {
   constexpr int kTile = 32;
   constexpr int kLanesPerEdge = kSlice / kPack;
   constexpr int kSlots = 32 / kLanesPerEdge;
@@ -1945,13 +2415,29 @@ __global__ __launch_bounds__(32 * kTileWarps) void BackwardRowTileKernel(
     if (pre >= n_pre) continue;
     T* column = spike_grad.Row(static_cast<unsigned int>(pre));
     const bool oldest = pre >= oldest_first;
+    // The row's addend (see `spike_grad_addends`), if its slot has one.
+    const T* added = nullptr;
+    if (addends.count > 0) {
+      const unsigned int slot =
+          addends.count == 1 ? 0u : spike_grad.by_width.Div(static_cast<unsigned int>(pre));
+#pragma unroll
+      for (int k = 0; k < kMaxSpikeSlots; ++k) {
+        if (k == static_cast<int>(slot) && addends.slot[k] != nullptr) {
+          added = addends.slot[k] + (pre - static_cast<int64_t>(slot) * spike_grad.width);
+        }
+      }
+    }
     for (int sample = threadIdx.x >> 5; sample < kSlice; sample += kTileWarps) {
       const int64_t b = batch_base + sample;
       if (b >= batch) continue;
-      const T value = result[row][sample];
+      T value = result[row][sample];
       // A select rather than an add of +0, which fast math may fold away.
-      column[b * spike_grad.width] =
-          oldest && AsFloat(value) == 0.0f ? FromFloat<T>(0.0f) : value;
+      if (oldest && AsFloat(value) == 0.0f) value = FromFloat<T>(0.0f);
+      // The add a caller would otherwise launch: float sum, rounded once to T.
+      if (added != nullptr) {
+        value = FromFloat<T>(__fadd_rn(AsFloat(value), AsFloat(added[b * spike_grad.width])));
+      }
+      column[b * spike_grad.width] = value;
     }
   }
 }
@@ -1966,7 +2452,9 @@ Status LaunchSlicedPairBackward(
     const Tensor& row_splits, const Tensor& edge_ids,
     const Tensor& nonempty_rows, const Tensor& basis, const Tensor& dampening,
     const Tensor& pair_ids, const Tensor& pair_posts, const Tensor& pair_types,
-    int n_post, const SpikeSlots<T*>& spike_grad, Tensor* weight_grad, bool accumulate) {
+    int n_post, const SpikeSlots<T*>& spike_grad, Tensor* weight_grad, bool accumulate,
+    const ActivityMasks* masks, const unsigned int* abs_max_bits,
+    const SpikeSlots<const T*>& addends) {
   constexpr bool kScaled = std::is_same<T, Eigen::half>::value;
   using P = typename std::conditional<kScaled, __half, float>::type;
   const int64_t n_pairs = pair_posts.NumElements();
@@ -1992,14 +2480,21 @@ Status LaunchSlicedPairBackward(
     // [scale, 1 / scale] in floats, then the abs-max bits.
     TF_RETURN_IF_ERROR(context->allocate_temp(DT_FLOAT, TensorShape({3}), &scale_tensor));
     scale = scale_tensor.flat<float>().data();
-    unsigned int* max_bits = reinterpret_cast<unsigned int*>(scale + 2);
-    cudaMemsetAsync(max_bits, 0, sizeof(unsigned int), device.stream());
+    // A caller-supplied bound (the GLIF backward's fused abs-max of the same
+    // current_grad) replaces the pass over current_grad.
+    const unsigned int* max_bits = abs_max_bits;
+    if (max_bits == nullptr) {
+      unsigned int* measured = reinterpret_cast<unsigned int*>(scale + 2);
+      cudaMemsetAsync(measured, 0, sizeof(unsigned int), device.stream());
+      TF_RETURN_IF_ERROR(GpuLaunchKernel(
+          AbsMaxFiniteKernel<T>, 1024, 256, 0, device.stream(),
+          current_grad.NumElements(), current_grad.flat<T>().data(), measured));
+      max_bits = measured;
+    }
     TF_RETURN_IF_ERROR(GpuLaunchKernel(
-        AbsMaxFiniteKernel<T>, 1024, 256, 0, device.stream(),
-        current_grad.NumElements(), current_grad.flat<T>().data(), max_bits));
-    TF_RETURN_IF_ERROR(GpuLaunchKernel(
-        ProjectionScaleKernel, 1, 32, 0, device.stream(), max_bits,
-        basis.flat<float>().data(), static_cast<int>(basis.dim_size(0)), n_basis, scale));
+        ProjectionScaleKernel<T>, 1, 32, 0, device.stream(), max_bits,
+        basis.flat<float>().data(), static_cast<int>(basis.dim_size(0)), n_basis,
+        current_grad.NumElements(), current_grad.flat<T>().data(), scale));
   }
   constexpr int kGroup = std::min(kSlice, 32 / static_cast<int>(sizeof(P)));
   TF_RETURN_IF_ERROR(GpuLaunchKernel(
@@ -2017,7 +2512,7 @@ Status LaunchSlicedPairBackward(
       weights.flat<W>().data(), pair_ids.flat<uint32>().data(),                     \
       edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(), n_pre,      \
       batch, dampening.flat<T>().data(), spike_grad, scale,                         \
-      static_cast<uint32>(n_pairs)))
+      static_cast<uint32>(n_pairs), addends))
   if (n_slices > 1) {
     LAUNCH_ROWS(true);
   } else {
@@ -2026,7 +2521,7 @@ Status LaunchSlicedPairBackward(
 #undef LAUNCH_ROWS
   return LaunchEventWeightGrad<T, kBasis>(context, spikes, current_grad, basis,
                                           post_ids, synapse_types, row_splits,
-                                          edge_ids, n_post, weight_grad, accumulate);
+                                          edge_ids, n_post, weight_grad, accumulate, masks);
 }
 
 // Any batch size, basis dimension and spike dtype. The slice is the next power
@@ -2044,12 +2539,20 @@ Status LaunchPairProjectedBackward(
     const Tensor& nonempty_rows, const Tensor& basis, const Tensor& dampening,
     const Tensor& pair_ids, const Tensor& pair_posts, const Tensor& pair_types,
     int n_post, const SpikeSlots<T*>& spike_grad, Tensor* weight_grad,
-    bool accumulate = false) {
+    bool accumulate = false, const ActivityMasks* masks = nullptr,
+    const unsigned int* abs_max_bits = nullptr,
+    const SpikeSlots<const T*>& addends = SpikeSlots<const T*>{}) {
   const int64_t batch = spikes.batch;
   if (batch == 0 || nonempty_rows.NumElements() == 0) {
     auto stream = context->eigen_device<GPUDevice>().stream();
     for (int k = 0; k < spike_grad.count; ++k) {
       cudaMemsetAsync(spike_grad.slot[k], 0, batch * spike_grad.width * sizeof(T), stream);
+      const int64_t elements = batch * static_cast<int64_t>(spike_grad.width);
+      if (k < addends.count && addends.slot[k] != nullptr && elements > 0) {
+        TF_RETURN_IF_ERROR(GpuLaunchKernel(
+            AddToZeroKernel<T>, static_cast<int>((elements + 255) / 256), 256, 0, stream,
+            elements, addends.slot[k], spike_grad.slot[k]));
+      }
     }
     if (!accumulate)
       cudaMemsetAsync(weight_grad->flat<float>().data(), 0, weight_grad->TotalBytes(), stream);
@@ -2060,7 +2563,8 @@ Status LaunchPairProjectedBackward(
   return LaunchSlicedPairBackward<T, W, kBasis, SLICE, PACK>(                  \
       context, spikes, current_grad, weights, post_ids, synapse_types,         \
       row_splits, edge_ids, nonempty_rows, basis, dampening, pair_ids,         \
-      pair_posts, pair_types, n_post, spike_grad, weight_grad, accumulate)
+      pair_posts, pair_types, n_post, spike_grad, weight_grad, accumulate, masks,  \
+      abs_max_bits, addends)
   // FP32 keeps 32-sample slices: at four samples per lane a 64-sample slice
   // would leave two edge slots per warp, lengthening each lane's serial sum
   // (measured 1.4x the FP32 spike-gradient error), and FP32 is not the hot path.
@@ -2299,7 +2803,8 @@ class FusedForward {
   // from the carried records at input `queues`) and launches.
   Status Compute(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
                  const ForwardCsr& recurrent, const Tensor& activity,
-                 const ForwardCsr& external, const Tensor& basis, int queues, int n_post) {
+                 const ForwardCsr& external, const Tensor& basis, int queues, int n_post,
+                 const Tensor* pair_weights = nullptr) {
     if (!(activity.dims() == 2 && activity.dim_size(0) == spikes.batch &&
           activity.NumElements() <= kQueueMaxSlots)) {
       return errors::InvalidArgument(
@@ -2315,9 +2820,9 @@ class FusedForward {
         SingleSlot<T>(activity.flat<T>().data(), activity.dim_size(0), activity.dim_size(1));
     return basis.dim_size(1) == 4
                ? Launch<4>(context, spikes, recurrent, external_spikes, external, basis,
-                           n_post, carried, newest, output)
+                           n_post, carried, newest, output, pair_weights)
                : Launch<0>(context, spikes, recurrent, external_spikes, external, basis,
-                           n_post, carried, newest, output);
+                           n_post, carried, newest, output, pair_weights);
   }
 
  private:
@@ -2325,7 +2830,8 @@ class FusedForward {
   Status Launch(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
                 const ForwardCsr& recurrent, const SpikeMatrix<const T*>& activity,
                 const ForwardCsr& external, const Tensor& basis, int n_post,
-                const QueueRecords& carried, unsigned int* newest, Tensor* output) {
+                const QueueRecords& carried, unsigned int* newest, Tensor* output,
+                const Tensor* pair_weights) {
     if constexpr (kBasis == 4 && !V1_FORWARD_FLOAT_ACCUM) {
       // The external input is one slot of the history's batch (validated).
       const int targets =
@@ -2338,17 +2844,53 @@ class FusedForward {
         bool launched = false;
         TF_RETURN_IF_ERROR(WithSweepTargets(targets, [&](auto shape) {
           constexpr int kTargets = decltype(shape)::value;
-          TF_RETURN_IF_ERROR(SweepKernelAvailable<kTargets>(
-              reinterpret_cast<const void*>(CsrTileSweepKernel<T, W, kSweepFused, kTargets>),
-              &fused_, &available));
-          if (!available) return OkStatus();
+          // The scalar external input where the connectivity qualifies, in
+          // FP16 only: in FP32, where no output rounding hides the FP32 sums,
+          // its max_abs came out 59 % above the plain sweep's.
+          // With the caller's per-pair weight sums (V1ExternalPairWeights, one
+          // entry per distinct (row, target) pair), the pair table replaces the
+          // run table: one entry and one weight per pair.
+          const bool pairs = pair_weights != nullptr && pair_weights->NumElements() > 0;
+          std::shared_ptr<const ScalarExternalTable> scalar;
+          if (std::is_same<T, Eigen::half>::value) {
+            mutex_lock lock(fused_scalar_.mu);
+            auto& held = (pairs ? pairs_ : scalar_)[kSweepShape<kTargets>];
+            TF_RETURN_IF_ERROR(EnsureScalarExternal<kTargets>(
+                context, external.post_ids, external.row_splits, external.synapse_types,
+                n_post, pairs, &held));
+            scalar = held;
+          }
+          const bool scalar_mode_wanted = scalar != nullptr && scalar->usable;
+          if (scalar_mode_wanted && pairs &&
+              pair_weights->NumElements() != scalar->pair_edges.NumElements() - 1) {
+            return errors::InvalidArgument("external_pair_weights has ",
+                                           pair_weights->NumElements(), " entries, the CSR ",
+                                           scalar->pair_edges.NumElements() - 1, " pairs");
+          }
+          if (scalar_mode_wanted) {
+            TF_RETURN_IF_ERROR(SweepKernelAvailable<kTargets>(
+                pairs ? reinterpret_cast<const void*>(
+                            CsrTileSweepKernel<T, W, kSweepFusedPairs, kTargets>)
+                      : reinterpret_cast<const void*>(
+                            CsrTileSweepKernel<T, W, kSweepFusedScalar, kTargets>),
+                pairs ? &fused_pairs_ : &fused_scalar_, &available));
+          }
+          const bool scalar_mode = scalar_mode_wanted && available;
+          if (!scalar_mode) {
+            TF_RETURN_IF_ERROR(SweepKernelAvailable<kTargets>(
+                reinterpret_cast<const void*>(CsrTileSweepKernel<T, W, kSweepFused, kTargets>),
+                &fused_, &available));
+            if (!available) return OkStatus();
+          }
           SweepCsr<W> graph, external_graph;
           TF_RETURN_IF_ERROR(PrepareSweepCsr<W, kTargets>(
               context, recurrent.weights, recurrent.post_ids, recurrent.synapse_types,
               recurrent.row_splits, n_post, &recurrent_, &graph));
-          TF_RETURN_IF_ERROR(PrepareSweepCsr<W, kTargets>(
-              context, external.weights, external.post_ids, external.synapse_types,
-              external.row_splits, n_post, &external_, &external_graph));
+          if (!scalar_mode) {
+            TF_RETURN_IF_ERROR(PrepareSweepCsr<W, kTargets>(
+                context, external.weights, external.post_ids, external.synapse_types,
+                external.row_splits, n_post, &external_, &external_graph));
+          }
           SweepRows<T> rows, external_rows;
           Tensor scratch, external_scratch;
           TF_RETURN_IF_ERROR(
@@ -2356,6 +2898,17 @@ class FusedForward {
           TF_RETURN_IF_ERROR(PrepareSweepRows<T>(context, activity, QueueRecords{}, nullptr,
                                                  &external_scratch, &external_rows));
           launched = true;
+          if (scalar_mode && pairs) {
+            return LaunchSweepKernel<T, W, kSweepFusedPairs, kTargets>(
+                context, spikes.batch, n_post, basis, output, false, rows, graph,
+                external_rows, external_graph,
+                ScalarView<W>(*scalar, external.weights, pair_weights));
+          }
+          if (scalar_mode) {
+            return LaunchSweepKernel<T, W, kSweepFusedScalar, kTargets>(
+                context, spikes.batch, n_post, basis, output, false, rows, graph,
+                external_rows, external_graph, ScalarView<W>(*scalar, external.weights));
+          }
           return LaunchSweepKernel<T, W, kSweepFused, kTargets>(
               context, spikes.batch, n_post, basis, output, false, rows, graph,
               external_rows, external_graph);
@@ -2373,10 +2926,15 @@ class FusedForward {
         output, false, &external_);
   }
 
-  // Each connectivity's tables and kernel flags, and the fused kernel's flags.
+  // Each connectivity's tables and kernel flags, and the fused kernels' flags
+  // (fused_scalar_ also guards the scalar tables, one per tile width).
   ForwardTileCache recurrent_;
   ForwardTileCache external_;
   ForwardTileCache fused_;
+  ForwardTileCache fused_scalar_;
+  ForwardTileCache fused_pairs_;
+  std::shared_ptr<const ScalarExternalTable> scalar_[2];
+  std::shared_ptr<const ScalarExternalTable> pairs_[2];
 };
 
 // FusedForward over connectivities passed as tensors.
@@ -2417,8 +2975,9 @@ class V1CsrForwardFusedOp : public OpKernel {
                 errors::InvalidArgument("external_row_splits does not match activity width"));
     OP_REQUIRES_OK(context, ValidateEdgeArrays(external.weights, external.post_ids,
                                                external.synapse_types, external.edge_ids));
+    const Tensor& pair_weights = context->input(first + 13);
     OP_REQUIRES_OK(context, fused_.Compute(context, spikes, recurrent, activity, external,
-                                           basis, first + 13, n_post_));
+                                           basis, first + 14, n_post_, &pair_weights));
   }
 
  private:
@@ -2426,6 +2985,157 @@ class V1CsrForwardFusedOp : public OpKernel {
   bool aggregate_runs_ = false;
   bool external_aggregate_runs_ = true;
   FusedForward<T, W> fused_;
+};
+
+// The backward's optional `activity_masks` input list: empty, or one
+// [width, ceil(batch / 32)] uint32 tensor per spike slot.
+template <typename T>
+Status ReadActivityMasks(OpKernelContext* context, const SpikeMatrix<const T*>& spikes,
+                         ActivityMasks* masks) {
+  OpInputList list;
+  TF_RETURN_IF_ERROR(context->input_list("activity_masks", &list));
+  masks->words = 0;
+  if (list.size() == 0) return OkStatus();
+  const int64_t words = (spikes.batch + 31) / 32;
+  if (list.size() != spikes.slots.count) {
+    return errors::InvalidArgument("activity_masks needs one tensor per spike slot, got ",
+                                   list.size(), " for ", spikes.slots.count);
+  }
+  for (int k = 0; k < list.size(); ++k) {
+    if (list[k].dims() != 2 || list[k].dim_size(0) != spikes.slots.width ||
+        list[k].dim_size(1) != words) {
+      return errors::InvalidArgument("activity_masks[", k, "] must be [", spikes.slots.width,
+                                     ", ", words, "]");
+    }
+    masks->slot[k] = reinterpret_cast<const unsigned int*>(list[k].tensor_data().data());
+  }
+  masks->words = words > 0 ? static_cast<int>(words) : 0;
+  return OkStatus();
+}
+
+// The backward's optional `spike_grad_addends` list: empty, or one tensor per
+// spike slot, each that slot's shape or empty (no addend).
+template <typename T>
+Status ReadSpikeGradAddends(OpKernelContext* context, const OpInputList& spikes,
+                            SpikeSlots<const T*>* addends) {
+  OpInputList list;
+  TF_RETURN_IF_ERROR(context->input_list("spike_grad_addends", &list));
+  addends->count = 0;
+  if (list.size() == 0) return OkStatus();
+  if (list.size() != spikes.size()) {
+    return errors::InvalidArgument("spike_grad_addends needs one tensor per spike slot, got ",
+                                   list.size(), " for ", spikes.size());
+  }
+  for (int k = 0; k < list.size(); ++k) {
+    if (list[k].NumElements() == 0) {
+      addends->slot[k] = nullptr;
+    } else if (list[k].shape() == spikes[k].shape()) {
+      addends->slot[k] = list[k].flat<T>().data();
+    } else {
+      return errors::InvalidArgument("spike_grad_addends[", k, "] must be empty or ",
+                                     spikes[k].shape().DebugString());
+    }
+  }
+  addends->count = list.size();
+  return OkStatus();
+}
+
+// The recurrent backward's optional inputs (see V1CsrBackwardPairProjected),
+// read alike by the tensor and the resource ops.
+template <typename T>
+struct BackwardOptions {
+  ActivityMasks masks{};
+  const unsigned int* abs_max_bits = nullptr;
+  SpikeSlots<const T*> addends{};
+
+  const ActivityMasks* carried_masks() const { return masks.words > 0 ? &masks : nullptr; }
+};
+
+template <typename T>
+Status ReadBackwardOptions(OpKernelContext* context, const OpInputList& spike_slots,
+                           const SpikeMatrix<const T*>& spikes, BackwardOptions<T>* options) {
+  TF_RETURN_IF_ERROR(ReadActivityMasks(context, spikes, &options->masks));
+  OpInputList bound;
+  TF_RETURN_IF_ERROR(context->input_list("abs_max_bound", &bound));
+  if (bound.size() > 1 || (bound.size() == 1 && bound[0].NumElements() != 1)) {
+    return errors::InvalidArgument("abs_max_bound must be empty or one uint32");
+  }
+  options->abs_max_bits =
+      bound.size() == 0 ? nullptr
+                        : reinterpret_cast<const unsigned int*>(bound[0].tensor_data().data());
+  return ReadSpikeGradAddends<T>(context, spike_slots, &options->addends);
+}
+
+template <typename T>
+__global__ void OverwriteEntriesKernel(int64_t count, int64_t size,
+                                       const int64_t* __restrict__ indices,
+                                       const T* __restrict__ values, T* __restrict__ output) {
+  const int64_t k = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (k >= count) return;
+  const int64_t index = indices[k];
+  if (index >= 0 && index < size) output[index] = values[k];
+}
+
+// See V1OverwriteEntries.
+template <typename T>
+class V1OverwriteEntriesOp : public OpKernel {
+ public:
+  explicit V1OverwriteEntriesOp(OpKernelConstruction* context) : OpKernel(context) {}
+
+  void Compute(OpKernelContext* context) override {
+    const Tensor& base = context->input(0);
+    const Tensor& indices = context->input(1);
+    const Tensor& values = context->input(2);
+    OP_REQUIRES(context, indices.dims() == 1 && values.shape() == indices.shape(),
+                errors::InvalidArgument("indices and values must be equal-length vectors"));
+    Tensor* output;
+    OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(
+                                {0}, 0, base.shape(), &output));
+    const cudaStream_t stream = context->eigen_device<GPUDevice>().stream();
+    if (output->flat<T>().data() != base.flat<T>().data() && base.NumElements() > 0) {
+      OP_REQUIRES(context,
+                  cudaMemcpyAsync(output->flat<T>().data(), base.flat<T>().data(),
+                                  base.TotalBytes(), cudaMemcpyDeviceToDevice,
+                                  stream) == cudaSuccess,
+                  errors::Internal("V1OverwriteEntries: copying base failed"));
+    }
+    const int64_t count = indices.NumElements();
+    if (count == 0) return;
+    OP_REQUIRES_OK(context,
+                   GpuLaunchKernel(OverwriteEntriesKernel<T>,
+                                   static_cast<int>((count + kEventThreads - 1) / kEventThreads),
+                                   kEventThreads, 0, stream, count, base.NumElements(),
+                                   indices.flat<int64_t>().data(), values.flat<T>().data(),
+                                   output->flat<T>().data()));
+  }
+};
+
+// One spike slot's activity masks (see ActivityMasks).
+template <typename T>
+class V1SpikeActivityMasksOp : public OpKernel {
+ public:
+  explicit V1SpikeActivityMasksOp(OpKernelConstruction* context) : OpKernel(context) {}
+
+  void Compute(OpKernelContext* context) override {
+    const Tensor& spikes = context->input(0);
+    OP_REQUIRES(context, spikes.dims() == 2,
+                errors::InvalidArgument("spikes must be a rank-two slot"));
+    const int64_t batch = spikes.dim_size(0), width = spikes.dim_size(1);
+    const int64_t words = (batch + 31) / 32;
+    Tensor* masks;
+    OP_REQUIRES_OK(context, context->allocate_output(0, TensorShape({width, words}), &masks));
+    if (masks->NumElements() == 0) return;
+    // Two columns per thread when the width allows the vector load.
+    const bool paired = width % 2 == 0;
+    const int64_t threads = paired ? width / 2 : width;
+    OP_REQUIRES_OK(context,
+                   GpuLaunchKernel(paired ? SpikeActivityMasksKernel<T, 2>
+                                          : SpikeActivityMasksKernel<T, 1>,
+                                   static_cast<int>((threads + kEventThreads - 1) / kEventThreads),
+                                   kEventThreads, 0, context->eigen_device<GPUDevice>().stream(),
+                                   batch, width, static_cast<int>(words), spikes.flat<T>().data(),
+                                   reinterpret_cast<unsigned int*>(masks->flat<uint32>().data())));
+  }
 };
 
 template <typename T, typename W, bool kAccumulate = false>
@@ -2474,13 +3184,16 @@ class V1CsrBackwardPairProjectedOp : public OpKernel {
                 errors::InvalidArgument("pair_ids must align with CSR edges"));
     OP_REQUIRES(context, pair_posts.NumElements() == pair_types.NumElements(),
                 errors::InvalidArgument("pair metadata lengths differ"));
+    BackwardOptions<T> options;
+    OP_REQUIRES_OK(context, ReadBackwardOptions<T>(context, spike_slots, spikes, &options));
     SpikeSlots<T*> spike_grad;
     OP_REQUIRES_OK(context, AllocateSpikeGradients<T>(context, spike_slots, spikes, &spike_grad));
 #define LAUNCH_BACKWARD(BASIS)                                                     \
   LaunchPairProjectedBackward<T, W, BASIS>(                                        \
       context, spikes, current_grad, weights, post_ids, synapse_types,            \
       row_splits, edge_ids, nonempty_rows, basis, dampening, pair_ids,            \
-      pair_posts, pair_types, n_post_, spike_grad, weight_grad, kAccumulate)
+      pair_posts, pair_types, n_post_, spike_grad, weight_grad, kAccumulate,      \
+      options.carried_masks(), options.abs_max_bits, options.addends)
     OP_REQUIRES_OK(context, WithWeightGradBuffer<kAccumulate>(
                                 context, first + 13, n_edges_, [&](Tensor* weight_grad) {
                                   return basis.dim_size(1) == 4 ? LAUNCH_BACKWARD(4)
@@ -2492,6 +3205,81 @@ class V1CsrBackwardPairProjectedOp : public OpKernel {
  private:
   int n_post_;
   int n_edges_;
+};
+
+// sums[p] = the sum of the weights of pair p's edges [pair_edges[p],
+// pair_edges[p + 1]) (CSR order: DIRECT_CSR weights), accumulated in FP64 and
+// rounded once to FP32 (once per rollout, so the FP64 adds cost nothing): an
+// FP32 accumulation over the heaviest pairs (up to 1,260 edges) left the
+// currents slightly farther from fp64 than the per-run sweep.
+__global__ void PairWeightSumsKernel(int64_t pairs, const unsigned int* pair_edges,
+                                     const float* weights, float* sums) {
+  for (int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; pair < pairs;
+       pair += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const unsigned int begin = pair_edges[pair], end = pair_edges[pair + 1];
+    // One or two edges (94 % of the pairs): the FP32 sum is already the
+    // correctly rounded one; FP64 is slow on this card.
+    if (end - begin <= 2) {
+      sums[pair] = end - begin == 1 ? weights[begin] : weights[begin] + weights[begin + 1];
+      continue;
+    }
+    double sum = 0.0;
+    for (unsigned int edge = begin; edge < end; ++edge) sum += weights[edge];
+    sums[pair] = static_cast<float>(sum);
+  }
+}
+
+// An external connectivity's per-pair weight sums for the coalesced sweep of
+// V1CsrForwardFused (V1ExternalPairWeights) and V1CsrForwardFusedResource
+// (V1ExternalPairWeightsResource): one FP32 sum per distinct (row, target)
+// pair, in the order of the pair table, or an empty vector (output 0) where
+// that sweep does not apply (no DIRECT_CSR, or a target reached through two
+// synapse types). Weights stay constant over a rollout, so a caller computes
+// these once per rollout. Each op owns one: the table lives here, never in a
+// static (both libraries compile this source).
+class PairWeightSums {
+ public:
+  Status Compute(OpKernelContext* context, const Tensor& weights, const Tensor& post_ids,
+                 const Tensor& synapse_types, const Tensor& row_splits, int n_post) {
+    if (weights.NumElements() != post_ids.NumElements()) {
+      return errors::InvalidArgument("weights and post_ids must have one entry per edge");
+    }
+    std::shared_ptr<const ScalarExternalTable> table;
+    {
+      mutex_lock lock(mu_);
+      TF_RETURN_IF_ERROR(EnsureScalarExternal<kSweepTargets>(
+          context, post_ids, row_splits, synapse_types, n_post, true, &table_));
+      table = table_;
+    }
+    const int64_t pairs = table->usable ? table->pair_edges.NumElements() - 1 : 0;
+    Tensor* output;
+    TF_RETURN_IF_ERROR(context->allocate_output(0, TensorShape({pairs}), &output));
+    if (pairs == 0) return OkStatus();
+    return GpuLaunchKernel(
+        PairWeightSumsKernel, 1024, 256, 0, context->eigen_device<GPUDevice>().stream(), pairs,
+        reinterpret_cast<const unsigned int*>(table->pair_edges.tensor_data().data()),
+        weights.flat<float>().data(), output->flat<float>().data());
+  }
+
+ private:
+  mutex mu_;
+  std::shared_ptr<const ScalarExternalTable> table_;
+};
+
+class V1ExternalPairWeightsOp : public OpKernel {
+ public:
+  explicit V1ExternalPairWeightsOp(OpKernelConstruction* context) : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    OP_REQUIRES_OK(context, sums_.Compute(context, context->input(0), context->input(1),
+                                          context->input(2), context->input(3), n_post_));
+  }
+
+ private:
+  int n_post_;
+  PairWeightSums sums_;
 };
 
 // One slot's queue record (see QueueRecordWords), for the first step of a
@@ -2531,6 +3319,12 @@ class V1SpikeQueueOp : public OpKernel {
       Name("V1SpikeQueue").Device(DEVICE_GPU).TypeConstraint<T>("T"),       \
       V1SpikeQueueOp<T>);                                                  \
   REGISTER_KERNEL_BUILDER(                                                 \
+      Name("V1SpikeActivityMasks").Device(DEVICE_GPU).TypeConstraint<T>("T"), \
+      V1SpikeActivityMasksOp<T>);                                          \
+  REGISTER_KERNEL_BUILDER(                                                 \
+      Name("V1OverwriteEntries").Device(DEVICE_GPU).TypeConstraint<T>("T"), \
+      V1OverwriteEntriesOp<T>);                                            \
+  REGISTER_KERNEL_BUILDER(                                                 \
       Name("V1CsrBackwardPairProjected")                                    \
           .Device(DEVICE_GPU).TypeConstraint<T>("T"),                      \
       V1CsrBackwardPairProjectedOp<T, float>);                              \
@@ -2543,6 +3337,8 @@ class V1SpikeQueueOp : public OpKernel {
 TF_CALL_half(REGISTER_TYPE);
 TF_CALL_float(REGISTER_TYPE);
 #undef REGISTER_TYPE
+REGISTER_KERNEL_BUILDER(Name("V1ExternalPairWeights").Device(DEVICE_GPU),
+                        V1ExternalPairWeightsOp);
 #endif
 
 #endif

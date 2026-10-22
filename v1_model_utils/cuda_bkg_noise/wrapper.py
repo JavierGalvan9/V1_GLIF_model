@@ -42,13 +42,16 @@ def available():
     return True
 
 
-def bkg_poisson_counts(noise_seed, replica_id, step, shape, cdf, dtype):
+def bkg_poisson_counts(noise_seed, replica_id, step, shape, cdf, dtype, num_steps=0):
     """Counts [batch, n_bkg] in `dtype`, equal to sample_poisson_counts with the
     seed [int32(noise_seed) + replica_id * 1000003, int32(step[0])].
+
+    With num_steps > 0, counts [num_steps, batch, n_bkg] whose slice t is the
+    call at step step[0] + t (wrapping int32), in one launch.
 
     noise_seed is the int64 variable (or tensor) on the GPU; replica_id, step
     and shape are int32, which TensorFlow keeps in host memory.
     """
     return _load_ops().bkg_poisson_counts(
         noise_seed, tf.cast(replica_id, tf.int32), tf.cast(step, tf.int32),
-        tf.cast(shape, tf.int32), tf.cast(cdf, tf.float64), T=dtype)
+        tf.cast(shape, tf.int32), tf.cast(cdf, tf.float64), T=dtype, num_steps=num_steps)

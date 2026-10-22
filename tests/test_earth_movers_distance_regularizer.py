@@ -4,7 +4,7 @@ from unittest import mock
 import numpy as np
 import tensorflow as tf
 
-from v1_model_utils.loss_functions import EarthMoversDistanceRegularizer
+from v1_model_utils.loss_functions import EarthMoversDistanceRegularizer, _grouped_emd
 
 
 def _network(initial_weights):
@@ -49,6 +49,34 @@ def _legacy_tf_emd(current, initial, groups, strength):
             tf.reduce_mean(tf.abs(tf.sort(current_group) - initial_group))
         )
     return tf.cast(strength, tf.float32) * tf.reduce_mean(tf.stack(losses))
+
+
+def _per_group_emd(values, group_order, sorted_initial_values, group_slices, n_groups):
+    """The regularizer before its sorts were batched: one top_k, gather,
+    subtraction, mean and sensitivity per group (bitwise reference)."""
+    group_index = tf.cast(tf.reshape(group_order, [-1, 1]), tf.int32)
+
+    @tf.custom_gradient
+    def emd(x):
+        grouped_x = tf.reshape(tf.gather(x, group_index), [-1])
+        group_losses, positions, sensitivities = [], [], []
+        for start, end in group_slices:
+            x_i = grouped_x[start:end]
+            order = tf.math.top_k(-x_i, end - start).indices
+            deviation = tf.gather(x_i, order) - sorted_initial_values[start:end]
+            group_losses.append(tf.reduce_mean(tf.abs(deviation)))
+            positions.append(tf.cast(order, tf.int64) + start)
+            sensitivities.append(tf.sign(deviation) / float((end - start) * n_groups))
+        reg_loss = tf.reduce_mean(tf.stack(group_losses))
+        targets = tf.gather(group_index, tf.concat(positions, axis=0))
+        derivative = tf.concat(sensitivities, axis=0)
+
+        def grad(upstream):
+            return tf.scatter_nd(targets, derivative * upstream, tf.shape(x, out_type=tf.int32))
+
+        return reg_loss, grad
+
+    return emd(values)
 
 
 class EarthMoversDistanceRegularizerTests(unittest.TestCase):
@@ -177,6 +205,48 @@ class EarthMoversDistanceRegularizerTests(unittest.TestCase):
                 gradient[mask].sum(), legacy_gradient[mask].sum(),
                 rtol=2e-6, atol=1e-8,
             )
+
+    def test_batched_sorts_are_bitwise_the_per_group_sorts(self):
+        """Batched group sorts give the per-group implementation's loss and
+        gradient bit for bit: groups of 1 to 300,000 entries (single-tile and
+        multi-pass sorts, block and device reductions), heavy ties, signed
+        zeros, unaligned group starts and an edge order unrelated to groups."""
+        if not tf.config.list_physical_devices("GPU"):
+            self.skipTest("CUDA GPU required")
+        rng = np.random.default_rng(3)
+        sizes = [1, 2, 3, 7, 100, 999, 4097, 5000, 70001, 300000]
+        n, n_groups = sum(sizes), len(sizes)
+        bounds = np.concatenate([[0], np.cumsum(sizes)])
+        slices = tuple((int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:]))
+        order = rng.permutation(n).astype(np.uint32)
+        values = (np.round(rng.normal(size=n) * 64) / 64).astype(np.float32)
+        values[rng.random(n) < 0.05] = 0.0
+        values[rng.random(n) < 0.05] = -0.0
+        initial = np.concatenate(
+            [np.sort(rng.normal(size=size)) for size in sizes]
+        ).astype(np.float32)
+        initial[rng.random(n) < 0.02] = 0.0
+        initial = np.concatenate([np.sort(initial[a:b]) for a, b in slices]).astype(np.float32)
+        x = tf.constant(values)
+        upstream = tf.constant(1.75, tf.float32)
+
+        def run(implementation):
+            @tf.function
+            def loss_and_gradient():
+                with tf.GradientTape() as tape:
+                    tape.watch(x)
+                    loss = implementation(
+                        x, tf.constant(order), tf.constant(initial), slices, n_groups
+                    )
+                return loss, tape.gradient(loss, x, output_gradients=upstream)
+
+            return [tensor.numpy() for tensor in loss_and_gradient()]
+
+        (loss, gradient), (expected_loss, expected_gradient) = run(_grouped_emd), run(_per_group_emd)
+        np.testing.assert_array_equal(loss.view(np.uint32), expected_loss.view(np.uint32))
+        np.testing.assert_array_equal(
+            gradient.view(np.uint32), expected_gradient.view(np.uint32)
+        )
 
     def test_empty_connectivity_returns_zero_with_empty_dense_gradient(self):
         current = tf.Variable([], dtype=tf.float32)

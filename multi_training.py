@@ -274,7 +274,7 @@ def main(_):
     import stim_dataset
     from v1_model_utils.callbacks import Callbacks
     import v1_model_utils.loss_functions as losses
-    from v1_model_utils import load_sparse, models, other_v1_utils
+    from v1_model_utils import load_sparse, models, other_v1_utils, recorded_adjoint
     from v1_model_utils import optimizers as optimizer_utils
 
     # Configure seed for reproducibility
@@ -684,9 +684,12 @@ def main(_):
             model, rsnn_layer, name="training_sequence_and_state_extractor"
         )
         segmented_extractor = None
+        # Whether training rollouts record minimal forward histories and
+        # differentiate them with the recorded adjoint, returning spike
+        # summaries instead of the spike sequence (RecordedAdjointRunner).
+        recorded_rollouts = False
         if flags.gradient_checkpointing:
-            segmented_extractor = models.SegmentedRecomputeRunner(
-                sequence_and_state_model,
+            runner_options = dict(
                 sequence_length=flags.seq_len,
                 chunk_size=flags.gradient_checkpoint_chunk_size,
                 differentiate_inputs=False,
@@ -695,9 +698,22 @@ def main(_):
                     rsnn_layer.cell.accumulated_weight_gradient_variable
                 ),
             )
+            if flags.minimal_record_backward:
+                segmented_extractor = recorded_adjoint.RecordedAdjointRunner(
+                    sequence_and_state_model, rsnn_layer.cell, **runner_options
+                )
+                recorded_rollouts = (
+                    segmented_extractor.records and flags.use_online_voltage_loss
+                )
+            else:
+                segmented_extractor = models.SegmentedRecomputeRunner(
+                    sequence_and_state_model, **runner_options
+                )
             print(
-                "Gradient checkpointing: segmented exact BPTT "
-                f"({segmented_extractor.n_chunks} chunks, "
+                "Gradient checkpointing: "
+                + ("recorded exact adjoint, no replay"
+                   if recorded_rollouts else "segmented exact BPTT")
+                + f" ({segmented_extractor.n_chunks} chunks, "
                 f"chunk_size={segmented_extractor.chunk_size})."
             )
         else:
@@ -890,6 +906,56 @@ def main(_):
         )
         return extractor_forward(_x, _state_variables)
 
+    def run_extractor_summaries(_x, _state_variables, groups, trim):
+        """run_extractor through the recorded adjoint.
+
+        ``groups`` are consecutive ``(batch rows, synchronization loss)`` pairs.
+        Returns one losses.SpikeSummary per group in place of its spike
+        sequence, and the voltage-penalty accumulator.
+        """
+        _x = int32_safe_cast(_x, dtype)
+        seed_helper.advance_noise_seed()
+        _state_variables = models.reset_voltage_penalty_state(
+            rsnn_layer.cell, _state_variables
+        )
+        spike_dtype = rsnn_layer.cell._output_spike_dtype
+        count_window = losses.spike_trimming_window(
+            flags.seq_len, delays[0], delays[1], trim
+        )
+        traces, sampled, start = [], [], 0
+        for rows, sync_loss in groups:
+            sampled.append(
+                isinstance(sync_loss, losses.SynchronizationLoss) and sync_loss._sync_cost > 0
+            )
+            if sampled[-1]:
+                # The plan the loss would draw for the spike sequence.
+                sample_ids, neuron_mask, _, _ = sync_loss.prepare_sampled_trace_plan(
+                    rows, spike_dtype
+                )
+                traces.append(recorded_adjoint.SampledTraces(
+                    (start, start + rows), sync_loss.trace_window(flags.seq_len, trim),
+                    sample_ids, neuron_mask,
+                ))
+            start += rows
+        outputs = segmented_extractor(
+            _x, _state_variables,
+            recorded_adjoint.SpikeStatistics(count_window, tuple(traces)),
+        )
+        counts = (
+            split_combined_outputs(outputs[0], groups[0][0])
+            if len(groups) == 2 else (outputs[0],)
+        )
+        trace_values = iter(outputs[1:1 + len(traces)])
+        summaries = tuple(
+            losses.SpikeSummary(
+                group_counts,
+                count_window[1] - count_window[0],
+                next(trace_values) if group_sampled else None,
+            )
+            for group_counts, group_sampled in zip(counts, sampled)
+        )
+        return summaries, outputs[-1]
+
     def voltage_loss_from_source(voltage_source):
         if flags.use_online_voltage_loss:
             return (
@@ -1052,11 +1118,19 @@ def main(_):
 
         return _loss, _aux
 
-    def roll_out(x, y, initial_state, spontaneous=False, trim=True, update_loss_state=True):
+    def roll_out(x, y, initial_state, spontaneous=False, trim=True, update_loss_state=True,
+                 summarize=False):
 
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), initial_state)
-        _out = run_extractor(x, initial_state)
-        _z, voltage_source = _out
+        if summarize:
+            sync_loss = spont_sync_loss if spontaneous else evoked_sync_loss
+            (_z,), voltage_source = run_extractor_summaries(
+                x, initial_state, ((x.shape[0], sync_loss),), trim
+            )
+            _out = None
+        else:
+            _out = run_extractor(x, initial_state)
+            _z, voltage_source = _out
 
         # # update state_variables with the new model state
         # new_state = tuple(_out[1:])
@@ -1080,16 +1154,24 @@ def main(_):
 
         return _out, _loss, _aux
 
-    def roll_out_combined(x, y, x_spontaneous, initial_state, trim=True, update_loss_state=True):
+    def roll_out_combined(x, y, x_spontaneous, initial_state, trim=True, update_loss_state=True,
+                          summarize=False):
 
         x_concat = concatenate_stimulus_batches(x, x_spontaneous, dtype)
 
-        _out = run_extractor(x_concat, initial_state)
-        _z_full, voltage_source_full = _out
-
-        _z_evoked, _z_spont = split_combined_outputs(
-            _z_full, grating_batch_size
-        )
+        if summarize:
+            (_z_evoked, _z_spont), voltage_source_full = run_extractor_summaries(
+                x_concat, initial_state,
+                ((grating_batch_size, evoked_sync_loss), (gray_batch_size, spont_sync_loss)),
+                trim,
+            )
+            _out = None
+        else:
+            _out = run_extractor(x_concat, initial_state)
+            _z_full, voltage_source_full = _out
+            _z_evoked, _z_spont = split_combined_outputs(
+                _z_full, grating_batch_size
+            )
         voltage_source_evoked, voltage_source_spont = split_combined_outputs(
             voltage_source_full, grating_batch_size
         )
@@ -1115,7 +1197,8 @@ def main(_):
         # Forward propagation of the model (single call for evoked + spontaneous)
         with tf.GradientTape() as tape:
             _out, evoked_loss, spont_loss, regularizers_loss, evoked_aux, spont_aux = roll_out_combined(
-                x, y, x_spontaneous, state_variables, trim=trim
+                x, y, x_spontaneous, state_variables, trim=trim,
+                summarize=recorded_rollouts and not return_sequences,
             )
             total_loss = tf.cast(evoked_loss + spont_loss + regularizers_loss, tf.float32)
             loss_for_grad = optimizer.scale_loss(total_loss)
@@ -1189,7 +1272,8 @@ def main(_):
 
         with tf.GradientTape() as tape:
             _out, _loss, _aux = roll_out(
-                _x, y, _state_variables, spontaneous=spontaneous, trim=trim
+                _x, y, _state_variables, spontaneous=spontaneous, trim=trim,
+                summarize=recorded_rollouts and not return_sequences,
             )
             _loss = tf.cast(_loss, tf.float32)
             loss_for_grad = optimizer.scale_loss(_loss)
@@ -2449,6 +2533,13 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
     absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
+    absl.app.flags.DEFINE_boolean(
+        "minimal_record_backward",
+        True,
+        "With gradient checkpointing and the online voltage loss, differentiate "
+        "training rollouts from minimal forward records (exact, no forward replay) "
+        "when the cell supports it; otherwise replay checkpointed chunks.",
+    )
     absl.app.flags.DEFINE_boolean(
         "pack_spike_checkpoints",
         True,

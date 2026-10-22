@@ -155,19 +155,86 @@ inline Status AllocateQueueWords(OpKernelContext* context, int64_t words, Tensor
   return OkStatus();
 }
 
+// Per-slot activity bit masks (V1SpikeActivityMasks): word w of column c of
+// slot k is slot[k][c * words + w], bit j standing for sample 32 w + j being
+// non-zero. `words == 0` means none: the queue kernel reads the spikes.
+struct ActivityMasks {
+  const unsigned int* slot[kMaxSpikeSlots];
+  int words;
+};
+
+// One thread per kColumns adjacent columns: their mask words, from `batch`
+// independent vector loads coalesced across the warp (kColumns = 2 needs an
+// even width).
+template <typename T, int kColumns>
+__global__ __launch_bounds__(kEventThreads) void SpikeActivityMasksKernel(
+    int64_t batch, int64_t width, int words, const T* spikes, unsigned int* masks) {
+  const int64_t first = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * kColumns;
+  if (first >= width) return;
+  for (int word = 0; word < words; ++word) {
+    unsigned int bits[kColumns] = {};
+#pragma unroll
+    for (int bit = 0; bit < 32; ++bit) {
+      const int64_t sample = word * 32 + bit;
+      if (sample < batch) {
+        const T* values = spikes + sample * width + first;
+        if constexpr (kColumns == 2) {
+          using Pair = typename std::conditional<sizeof(T) == 2, ::ushort2, ::uint2>::type;
+          const Pair raw = *reinterpret_cast<const Pair*>(values);
+          T pair[2];
+          memcpy(pair, &raw, sizeof(raw));
+          bits[0] |= static_cast<unsigned int>(static_cast<float>(pair[0]) != 0.0f) << bit;
+          bits[1] |= static_cast<unsigned int>(static_cast<float>(pair[1]) != 0.0f) << bit;
+        } else {
+          bits[0] |= static_cast<unsigned int>(static_cast<float>(values[0]) != 0.0f) << bit;
+        }
+      }
+    }
+#pragma unroll
+    for (int column = 0; column < kColumns; ++column) masks[(first + column) * words + word] = bits[column];
+  }
+}
+
 // `row_masks` is null when the batch fits the item mask; otherwise word w of
 // row `pre`'s mask, samples 32w to 32w + 31, is row_masks[pre * mask_words + w],
 // so pass 2 reads a row's mask (up to 256 samples) from one 32-byte sector.
 template <typename T>
 __global__ __launch_bounds__(kEventThreads) void EventRowQueueKernel(
     int64_t n_pre, int64_t batch, SpikeSlots<const T*> slots, const uint32* row_splits,
-    unsigned int* row_masks, int mask_words, unsigned int* queue, unsigned int* queue_count) {
+    unsigned int* row_masks, int mask_words, unsigned int* queue, unsigned int* queue_count,
+    ActivityMasks masks) {
   const int lane = threadIdx.x & 31;
   const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   unsigned int chunks = 0;
   unsigned int mask = 0;
   unsigned int mask_high = 0;
-  if (row < n_pre) {
+  if (row < n_pre && masks.words > 0) {
+    // The same bits, read from the slot's carried masks.
+    const unsigned int index = slots.count == 1 ? 0 : slots.by_width.Div(row);
+    const unsigned int* base = masks.slot[0];
+#pragma unroll
+    for (int k = 1; k < kMaxSpikeSlots; ++k) {
+      if (k == static_cast<int>(index)) base = masks.slot[k];
+    }
+    const unsigned int* words =
+        base + static_cast<int64_t>(row - index * slots.width) * masks.words;
+    bool active = false;
+    if (batch <= kEventMaskSamples) {
+      mask = words[0];
+      mask_high = masks.words > 1 ? words[1] : 0u;
+      active = (mask | mask_high) != 0;
+    } else {
+      for (int word = 0; word < mask_words; ++word) {
+        row_masks[row * mask_words + word] = words[word];
+        active |= words[word] != 0;
+      }
+    }
+    if (active) {
+      const unsigned int edges =
+          static_cast<unsigned int>(row_splits[row + 1] - row_splits[row]);
+      chunks = (edges + kEventChunk - 1) / kEventChunk;
+    }
+  } else if (row < n_pre) {
     // activity[sample * stride] is (sample, row).
     const T* activity = slots.Row(static_cast<unsigned int>(row));
     const int64_t stride = slots.width;
@@ -371,7 +438,8 @@ Status LaunchEventWeightGrad(OpKernelContext* context, const SpikeMatrix<const T
                              const Tensor& current_grad, const Tensor& basis,
                              const Tensor& post_ids, const Tensor& synapse_types,
                              const Tensor& row_splits, const Tensor& edge_ids,
-                             int n_post, Tensor* weight_grad, bool accumulate = false) {
+                             int n_post, Tensor* weight_grad, bool accumulate = false,
+                             const ActivityMasks* masks = nullptr) {
   auto device = context->eigen_device<GPUDevice>();
   if (!accumulate)
     cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
@@ -396,7 +464,8 @@ Status LaunchEventWeightGrad(OpKernelContext* context, const SpikeMatrix<const T
   TF_RETURN_IF_ERROR(GpuLaunchKernel(
       EventRowQueueKernel<T>, static_cast<int>((n_pre + kEventThreads - 1) / kEventThreads),
       kEventThreads, 0, device.stream(), n_pre, batch, activity.slots,
-      row_splits.flat<uint32>().data(), row_masks, mask_words, queue, queue_count));
+      row_splits.flat<uint32>().data(), row_masks, mask_words, queue, queue_count,
+      masks != nullptr ? *masks : ActivityMasks{}));
   const auto pass2 = item_masks ? EventWeightGradWarpKernel<T, kBasis, false>
                                 : EventWeightGradWarpKernel<T, kBasis, true>;
   return GpuLaunchKernel(

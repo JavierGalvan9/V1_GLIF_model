@@ -10,6 +10,8 @@ from v1_model_utils.cuda_csr_recurrent import (
     accumulate_recurrent_weight_gradient,
     build_csr_connectivity,
     calculate_recurrent_csr_currents,
+    recurrent_backward,
+    spike_activity_masks,
     spike_queue,
 )
 
@@ -737,6 +739,141 @@ def test_spike_slots_match_the_concatenated_history(n_slots, batch, dtype):
     assert no_weight_grad is None
     assert _relative_error(tf.concat(accumulated_grads, axis=1), spike_grad.numpy()) < tolerance
     assert _relative_error(accumulator.numpy() - offset, weight_grad.numpy()) < 1e-6
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("batch", [1, 33, 64, 65, 130])
+@pytest.mark.parametrize("n_slots", [1, 3])
+def test_activity_masks_give_bitwise_the_swept_backward(n_slots, batch, dtype):
+    """Carried activity masks replace the weight gradient's sweep over the slots.
+
+    The masks hold bit j of word w of column c set exactly when sample 32 w + j
+    of that column is non-zero, and both backward ops return bitwise the same
+    gradients with them as without.
+    """
+    (indices, synapse_types, spikes, weights, basis, upstream,
+     n_pre, n_post) = _dense_fixture(batch, 4, 13 * batch + n_slots, n_pre=48 * n_slots)
+    spikes[:, ::7] = -0.0  # signed zeros are inactive too
+    c = _connectivity(indices, synapse_types, n_pre, n_post)
+    slots = tuple(tf.split(tf.constant(spikes, dtype), n_slots, axis=1))
+    masks = [spike_activity_masks(slot) for slot in slots]
+    words = (batch + 31) // 32
+    for slot, mask in zip(slots, masks):
+        assert mask.dtype == tf.uint32 and mask.shape == (slot.shape[1], words)
+        bits = (mask.numpy()[:, :, None] >> np.arange(32, dtype=np.uint32)) & 1
+        active = np.zeros((slot.shape[1], 32 * words), bool)
+        active[:, :batch] = slot.numpy().T != 0
+        np.testing.assert_array_equal(bits.reshape(slot.shape[1], -1).astype(bool), active)
+
+    def backward(activity_masks):
+        return recurrent_backward(
+            c, slots, tf.constant(upstream, dtype), tf.constant(weights), tf.constant(basis),
+            0.5, c.post_ids, c.synapse_types, c.row_splits, c.edge_ids, c.nonempty_rows,
+            c.pair_ids, c.pair_posts, c.pair_types, activity_masks=activity_masks,
+        )
+
+    swept_grads, swept_weight_grad = backward(())
+    masked_grads, masked_weight_grad = backward(masks)
+    for swept, masked in zip(swept_grads, masked_grads):
+        np.testing.assert_array_equal(masked.numpy().view(np.uint8), swept.numpy().view(np.uint8))
+    np.testing.assert_array_equal(masked_weight_grad.numpy().view(np.uint8),
+                                  swept_weight_grad.numpy().view(np.uint8))
+    offset = np.random.default_rng(batch).normal(size=weights.shape).astype(np.float32)
+    accumulator = tf.Variable(offset)
+    with accumulate_recurrent_weight_gradient(accumulator.handle):
+        accumulated_grads, no_weight_grad = backward(masks)
+    assert no_weight_grad is None
+    for swept, accumulated in zip(swept_grads, accumulated_grads):
+        np.testing.assert_array_equal(accumulated.numpy().view(np.uint8),
+                                      swept.numpy().view(np.uint8))
+    np.testing.assert_array_equal(accumulator.numpy(), offset + swept_weight_grad.numpy())
+    with pytest.raises(tf.errors.InvalidArgumentError, match="activity_masks"):
+        backward(masks[:-1] + [masks[-1][:-1]])
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("batch", [1, 64, 65])
+def test_abs_max_bound_gives_bitwise_the_measured_backward(batch, dtype):
+    """A precomputed bound (float bits of the largest finite |current_grad|, as
+    the GLIF backward's emit_abs_max returns it) replaces the operator's own
+    pass and leaves both backward ops' outputs bitwise unchanged."""
+    (indices, synapse_types, spikes, weights, basis, upstream,
+     n_pre, n_post) = _dense_fixture(batch, 4, 29 * batch + 3, n_pre=96)
+    upstream[0, 0] = np.inf  # non-finite entries are left out of the bound
+    c = _connectivity(indices, synapse_types, n_pre, n_post)
+    slots = tuple(tf.split(tf.constant(spikes, dtype), 3, axis=1))
+    current_grad = tf.constant(upstream, dtype)
+    magnitudes = np.abs(current_grad.numpy().astype(np.float32))
+    bound = tf.constant(
+        [magnitudes[np.isfinite(magnitudes)].max().view(np.uint32)], tf.uint32
+    )
+
+    def backward(abs_max_bound):
+        return recurrent_backward(
+            c, slots, current_grad, tf.constant(weights), tf.constant(basis),
+            0.5, c.post_ids, c.synapse_types, c.row_splits, c.edge_ids, c.nonempty_rows,
+            c.pair_ids, c.pair_posts, c.pair_types, abs_max_bound=abs_max_bound,
+        )
+
+    measured_grads, measured_weight_grad = backward(None)
+    bounded_grads, bounded_weight_grad = backward(bound)
+    for measured, bounded in zip(measured_grads, bounded_grads):
+        np.testing.assert_array_equal(bounded.numpy().view(np.uint8),
+                                      measured.numpy().view(np.uint8))
+    np.testing.assert_array_equal(bounded_weight_grad.numpy().view(np.uint8),
+                                  measured_weight_grad.numpy().view(np.uint8))
+    accumulator = tf.Variable(tf.zeros_like(measured_weight_grad))
+    with accumulate_recurrent_weight_gradient(accumulator.handle):
+        accumulated_grads, _ = backward(bound)
+    for measured, accumulated in zip(measured_grads, accumulated_grads):
+        np.testing.assert_array_equal(accumulated.numpy().view(np.uint8),
+                                      measured.numpy().view(np.uint8))
+    np.testing.assert_array_equal(accumulator.numpy(), measured_weight_grad.numpy())
+    with pytest.raises(tf.errors.InvalidArgumentError, match="abs_max_bound"):
+        backward(tf.concat([bound, bound], 0))
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("batch", [1, 64, 65])
+def test_spike_grad_addends_equal_a_following_add(batch, dtype):
+    """Per-slot addends (none for the oldest slot) give bitwise what adding them
+    to the returned gradients gives, in both backward ops, signed zeros included."""
+    (indices, synapse_types, spikes, weights, basis, upstream,
+     n_pre, n_post) = _dense_fixture(batch, 4, 31 * batch + 5, n_pre=96)
+    c = _connectivity(indices, synapse_types, n_pre, n_post)
+    slots = tuple(tf.split(tf.constant(spikes, dtype), 3, axis=1))
+    rng = np.random.default_rng(batch)
+    addends = []
+    for slot in slots[:2]:
+        values = rng.normal(size=slot.shape).astype(np.float32)
+        values[rng.random(slot.shape) < 0.2] = -0.0
+        addends.append(tf.constant(values, dtype))
+    addends.append(tf.zeros([0], dtype))
+
+    def backward(spike_grad_addends):
+        return recurrent_backward(
+            c, slots, tf.constant(upstream, dtype), tf.constant(weights), tf.constant(basis),
+            0.5, c.post_ids, c.synapse_types, c.row_splits, c.edge_ids, c.nonempty_rows,
+            c.pair_ids, c.pair_posts, c.pair_types, spike_grad_addends=spike_grad_addends,
+        )
+
+    plain_grads, plain_weight_grad = backward(())
+    expected = [plain + addend for plain, addend in zip(plain_grads[:2], addends[:2])]
+    expected.append(plain_grads[2])
+    added_grads, added_weight_grad = backward(addends)
+    for want, got in zip(expected, added_grads):
+        np.testing.assert_array_equal(got.numpy().view(np.uint8), want.numpy().view(np.uint8))
+    np.testing.assert_array_equal(added_weight_grad.numpy(), plain_weight_grad.numpy())
+    accumulator = tf.Variable(tf.zeros_like(plain_weight_grad))
+    with accumulate_recurrent_weight_gradient(accumulator.handle):
+        accumulated_grads, _ = backward(addends)
+    for want, got in zip(expected, accumulated_grads):
+        np.testing.assert_array_equal(got.numpy().view(np.uint8), want.numpy().view(np.uint8))
+    with pytest.raises(tf.errors.InvalidArgumentError, match="spike_grad_addends"):
+        backward(addends[:2] + [addends[0][:, :-1]])
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")

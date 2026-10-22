@@ -26,10 +26,15 @@ The library provides recurrent forward/backward (including the in-place
 accumulating backward, see `cuda_csr_recurrent/README.md`), the model's fused
 recurrent + LGN forward (`V1CsrForwardFusedResource`, which takes both resource
 names and runs the same `FusedForward` and tile sweep as the tensor
-`V1CsrForwardFused`, so replicated runs keep the single-rounding step), the background
+`V1CsrForwardFused`, so replicated runs keep the single-rounding step, with the
+LGN's per-pair weight sums from `V1ExternalPairWeightsResource`), the background
 input's fixed-four forward gather (`BkgCsrForwardResource`, reading the
-incoming CSR stored in the resource), and the external weight-only and
-activity backward operations. Two contracts are shared with the tensor
+incoming CSR stored in the resource) and its weight gradient
+(`BkgCsrWeightBackwardResource`, the tensor `BkgCsrWeightBackward` kernel on the
+same incoming CSR), and the external weight-only and activity backward
+operations. The recurrent backward takes the tensor
+backward's optional `activity_masks`, `abs_max_bound` and `spike_grad_addends`
+inputs, so the recorded adjoint passes them on either backend. Two contracts are shared with the tensor
 backend and must not drift:
 
 - **Compile flags.** `csr_resource_ops.cu.cc` `#include`s the recurrent and

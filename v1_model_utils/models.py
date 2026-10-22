@@ -56,8 +56,11 @@ def sample_poisson_counts(cdf_levels, shape, seed, dtype):
     return tf.cast(tf.reshape(counts, shape), dtype)
 
 
-def sample_bkg_activity(cell, batch_size, noise_step):
+def sample_bkg_activity(cell, batch_size, noise_step, num_steps=0):
     """This step's [batch, n_bkg] Poisson counts of a V1Column's background sources.
+
+    With ``num_steps > 0``, the [num_steps, batch, n_bkg] counts of steps
+    noise_step + 0 .. num_steps - 1, each bitwise this function's at that step.
 
     The seed is [int32(cell.noise_seed) + replica_id * 1000003, int32(noise_step[0])].
     With the CUDA current backend the counts come from the cuda_bkg_noise op,
@@ -87,14 +90,19 @@ def sample_bkg_activity(cell, batch_size, noise_step):
 
         if cuda_bkg_noise.available():
             return cuda_bkg_noise.bkg_poisson_counts(
-                cell.noise_seed, replica_id, noise_step, poisson_shape, cell.bkg_count_cdf, dtype
+                cell.noise_seed, replica_id, noise_step, poisson_shape, cell.bkg_count_cdf, dtype,
+                num_steps=num_steps,
             )
     step_seed = tf.cast(tf.reshape(noise_step, (-1,))[0], tf.int32)
-    base_seed = tf.cast(cell.noise_seed, tf.int32)
-    noise_seed = tf.stack(
-        [base_seed + replica_id * tf.constant(1000003, dtype=tf.int32), step_seed], axis=0
-    )
-    return sample_poisson_counts(cell.bkg_count_cdf, poisson_shape, noise_seed, dtype)
+    base_seed = tf.cast(cell.noise_seed, tf.int32) + replica_id * tf.constant(1000003, dtype=tf.int32)
+
+    def counts(step):
+        noise_seed = tf.stack([base_seed, step], axis=0)
+        return sample_poisson_counts(cell.bkg_count_cdf, poisson_shape, noise_seed, dtype)
+
+    if num_steps:
+        return tf.map_fn(counts, step_seed + tf.range(num_steps), fn_output_signature=dtype)
+    return counts(step_seed)
 
 
 def _keras_op(name, tensorflow_op):
@@ -1492,6 +1500,9 @@ class V1Column(tf.keras.layers.Layer):
             self.input_csr,
             compute_activity_gradient=compute_activity_gradient,
             compute_weight_gradient=self.input_weight_values.trainable,
+            # Set by a runner for the duration of one rollout (see
+            # RecordedAdjointRunner._forward_records); None otherwise.
+            external_pair_weights=getattr(self, "_lgn_pair_weights", None),
         )
 
     def calculate_input_current_from_spikes(self, x_t, initial=None):
@@ -2687,6 +2698,27 @@ class SegmentedRecomputeRunner:
             return self._unpack_spikes(value, width, like.dtype)
         return tf.cast(value, like.dtype) if value.dtype != like.dtype else value
 
+    def _accumulation(self, accumulates):
+        """Zero the accumulator and route the recurrent weight gradients the
+        reverse pass builds inside the returned context into it."""
+        if not accumulates:
+            return contextlib.nullcontext()
+        accumulator = self._weight_gradient_accumulator
+        # Every accumulating kernel consumes the handle, so publishing it
+        # after the zeroing orders the whole reverse pass behind it.
+        with tf.control_dependencies([
+            accumulator.assign(
+                tf.zeros(accumulator.shape, accumulator.dtype), read_value=False
+            )
+        ]):
+            return accumulate_recurrent_weight_gradient(tf.identity(accumulator.handle))
+
+    def _accumulated_gradient(self, reverse_outputs, dtype):
+        """Read the accumulator once the reverse loop producing ``reverse_outputs``
+        has finished, so the read sees every timestep's contribution."""
+        with tf.control_dependencies(tf.nest.flatten(reverse_outputs)):
+            return tf.cast(self._weight_gradient_accumulator.read_value(), dtype)
+
     def _run_chunk(self, inputs, *state):
         outputs = self.core_model([inputs, *state])
         return tuple(tf.nest.flatten(outputs))
@@ -2902,20 +2934,7 @@ class SegmentedRecomputeRunner:
                 )
             return input_history, tuple(next_state_cotangents), next_variable_gradients
 
-        if accumulated_index is None:
-            accumulation = contextlib.nullcontext()
-        else:
-            accumulator = self._weight_gradient_accumulator
-            # Every accumulating kernel consumes the handle, so publishing it
-            # after the zeroing orders the whole reverse pass behind it.
-            with tf.control_dependencies([
-                accumulator.assign(
-                    tf.zeros(accumulator.shape, accumulator.dtype), read_value=False
-                )
-            ]):
-                accumulation = accumulate_recurrent_weight_gradient(
-                    tf.identity(accumulator.handle)
-                )
+        accumulation = self._accumulation(accumulated_index is not None)
 
         def run_reverse_full_chunk(
             chunk_index, input_history, output_state_cotangents,
@@ -2951,12 +2970,9 @@ class SegmentedRecomputeRunner:
                 parallel_iterations=1,
             )
         if accumulated_index is not None:
-            # The reverse loop's outputs exist only once it has finished, so
-            # the read sees every chunk's contribution.
-            with tf.control_dependencies(tf.nest.flatten(state_cotangents)):
-                accumulated_gradient = tf.cast(
-                    accumulator.read_value(), variables[accumulated_index].dtype
-                )
+            accumulated_gradient = self._accumulated_gradient(
+                state_cotangents, variables[accumulated_index].dtype
+            )
             variable_gradients = (
                 variable_gradients[:accumulated_index]
                 + (accumulated_gradient,)

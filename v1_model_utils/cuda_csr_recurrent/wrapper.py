@@ -297,13 +297,44 @@ def spike_queue(slot):
     return _load_ops().v1_spike_queue(slot)
 
 
+def spike_activity_masks(slot):
+    """One [batch, width] spike slot's activity masks (uint32 [width, ceil(batch / 32)]).
+
+    A backward that walks the spike history in reverse can carry them: at the
+    step whose slots are (z[t-1], z[t-2], z[t-3]), the first two are the
+    previous (later) step's slots 1 and 2, so only z[t-3] needs new masks. Pass
+    the step's masks, in slot order, as ``activity_masks`` of
+    :func:`recurrent_backward`; the gradients are bitwise the same, and the
+    weight gradient then reads the masks instead of sweeping every slot.
+    """
+    return _load_ops().v1_spike_activity_masks(slot)
+
+
+def overwrite_entries(base, indices, values):
+    """``base`` with its flat entries ``indices`` (int64) replaced by ``values``
+    (equal values for repeated indices), like ``tf.tensor_scatter_nd_update``
+    (which has no float16 GPU kernel). The op writes into ``base``'s buffer when
+    it holds the only reference, so a loop that rewrites a few entries of its
+    previous result every step copies nothing else."""
+    return _load_ops().v1_overwrite_entries(base, indices, values)
+
+
 def recurrent_backward(
     connectivity, spike_values, current_grad, weight_values, basis_values, dampening_value,
     post_ids, synapse_types, row_splits, edge_ids, nonempty_rows, pair_ids, pair_posts,
-    pair_types,
+    pair_types, activity_masks=(), abs_max_bound=None, spike_grad_addends=(),
 ):
     """The recurrent spike gradients (one per slot) and weight gradient (None
-    when an accumulator takes it, see accumulate_recurrent_weight_gradient)."""
+    when an accumulator takes it, see accumulate_recurrent_weight_gradient).
+    ``activity_masks`` is empty or one :func:`spike_activity_masks` per slot.
+    ``abs_max_bound`` is None or the [1] uint32 float bits of the largest finite
+    ``|current_grad|`` (the GLIF backward's ``emit_abs_max`` output for the
+    same tensor), which saves the operator that pass; the results are the same.
+    Non-finite bits make the operator measure the bound after all (a rescaled
+    bound that overflowed).
+    ``spike_grad_addends`` is empty or one tensor per slot, of the slot's shape
+    or empty: each slot's gradient is returned plus its addend, as a following
+    add of the two would give it, without that add's pass."""
     ops = _load_ops()
     inputs = (
         spike_values,
@@ -321,12 +352,16 @@ def recurrent_backward(
         pair_types,
     )
     sizes = {"n_post": connectivity.n_post, "n_edges": connectivity.n_edges}
+    bound = [] if abs_max_bound is None else [abs_max_bound]
     accumulator = _weight_gradient_accumulator()
     if accumulator is None:
-        spike_grads, weight_grad = ops.v1_csr_backward_pair_projected(*inputs, **sizes)
+        spike_grads, weight_grad = ops.v1_csr_backward_pair_projected(
+            *inputs, list(activity_masks), bound, list(spike_grad_addends), **sizes
+        )
         return spike_grads, tf.cast(weight_grad, weight_values.dtype)
     spike_grads = ops.v1_csr_backward_pair_projected_accumulate(
-        *inputs, accumulator, **sizes
+        *inputs, accumulator, list(activity_masks), bound, list(spike_grad_addends),
+        **sizes
     )
     return spike_grads, None
 
@@ -448,9 +483,11 @@ def calculate_recurrent_csr_currents(
 
 
 def resource_recurrent_backward(
-    connectivity, spike_values, current_grad, weight_values, basis_values, dampening_value
+    connectivity, spike_values, current_grad, weight_values, basis_values, dampening_value,
+    activity_masks=(), abs_max_bound=None, spike_grad_addends=(),
 ):
-    """recurrent_backward with the connectivity read from its GPU-local resource."""
+    """recurrent_backward with the connectivity read from its GPU-local resource
+    (same optional inputs, same results)."""
     ops = load_resource_ops()
     inputs = (
         spike_values,
@@ -459,6 +496,11 @@ def resource_recurrent_backward(
         basis_values,
         tf.cast(dampening_value, spike_values[0].dtype),
     )
+    options = (
+        list(activity_masks),
+        [] if abs_max_bound is None else [abs_max_bound],
+        list(spike_grad_addends),
+    )
     attributes = {
         "n_post": connectivity.n_post,
         "n_edges": connectivity.n_edges,
@@ -466,10 +508,12 @@ def resource_recurrent_backward(
     }
     accumulator = _weight_gradient_accumulator()
     if accumulator is None:
-        spike_grads, weight_grad = ops.v1_csr_backward_resource(*inputs, **attributes)
+        spike_grads, weight_grad = ops.v1_csr_backward_resource(
+            *inputs, *options, **attributes
+        )
         return spike_grads, tf.cast(weight_grad, weight_values.dtype)
     spike_grads = ops.v1_csr_backward_accumulate_resource(
-        *inputs, accumulator, **attributes
+        *inputs, accumulator, *options, **attributes
     )
     return spike_grads, None
 

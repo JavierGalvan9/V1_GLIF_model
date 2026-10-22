@@ -26,6 +26,31 @@ REGISTER_OP("BkgCsrForward")
       return OkStatus();
     });
 
+// The dense BKG weight gradient from BkgCsrForward's fixed-four incoming CSR:
+// bitwise ExternalCsrWeightBackward's (dense, basis 4, FP16) at every batch the
+// latter sums in a fixed order; below 32, at batches that are not powers of two,
+// where it adds 4-sample tiles with atomics, this adds them in launch order (the
+// latter's usual result). One pass over `current_grad` instead of writing and
+// re-reading its [pairs, batch] projection. Edges are written at
+// `incoming_edge_ids`.
+REGISTER_OP("BkgCsrWeightBackward")
+    .Attr("T: {half}")
+    .Attr("n_post: int >= 1")
+    .Attr("n_edges: int >= 0")
+    .Input("activity: T")
+    .Input("current_grad: T")
+    .Input("incoming_pre_ids: uint32")
+    .Input("incoming_edge_ids: uint32")
+    .Input("incoming_types: uint8")
+    .Input("basis: float")
+    .Output("weight_grad: float")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      int n_edges;
+      TF_RETURN_IF_ERROR(c->GetAttr("n_edges", &n_edges));
+      c->set_output(0, c->Vector(n_edges));
+      return OkStatus();
+    });
+
 // `sparse_activity` selects the event-driven weight gradient (sparse inputs such
 // as LGN; the pair inputs may then be empty) or the dense compact
 // pair-projected one (dense inputs such as the Poisson BKG).

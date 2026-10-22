@@ -182,6 +182,21 @@ slice. The backward is split into two halves:
   weight gradient of silent rows. Mixed-precision loss scaling still sees it
   through the spike gradient and the firing rows. The external operator uses the
   same kernels for the LGN weight gradient.
+- **Carried activity masks.** `EventRowQueueKernel` finds the active rows by
+  reading every spike slot (78 MB at batch 64 with three slots). A backward that
+  walks the spike history in reverse can instead pass `activity_masks`, one
+  `spike_activity_masks(slot)` per slot (`uint32 [width, ceil(batch / 32)]`,
+  bit j of word w set when sample 32 w + j is non-zero). At the step whose slots
+  are `(z[t-1], z[t-2], z[t-3])`, the first two are the later step's slots 1 and
+  2, so only `z[t-3]` needs new masks (19 us). The queue kernel then reads the
+  masks (15 us instead of 68). The gradients are bitwise the same with or
+  without masks. The tape-based model path passes none.
+- **Optional inputs on both backends.** `activity_masks`, `abs_max_bound` (the
+  GLIF backward's fused abs-max, rescaled by `lr_scale` when that applies; a
+  non-finite bound makes the op measure) and `spike_grad_addends` are read by
+  one helper (`ReadBackwardOptions`) for the tensor ops and the resource ops
+  (`V1CsrBackwardResource`, `V1CsrBackwardAccumulateResource`), which then run
+  the same launcher.
 
 ## In-place weight-gradient accumulation
 

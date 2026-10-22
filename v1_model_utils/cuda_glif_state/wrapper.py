@@ -1,6 +1,9 @@
 """Deep adapter for the differentiable GLIF state and spike transition."""
 
+import contextlib
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import tensorflow as tf
 
@@ -10,6 +13,29 @@ from v1_model_utils.cuda_operator_cache import ensure_artifact
 HERE = Path(__file__).resolve().parent
 BUILD_FLAGS = ("--expt-relaxed-constexpr",)
 _GLIF_OPS = None
+# Per thread, because MirroredStrategy traces every replica in its own thread:
+# a replica's GLIF step must only ever fill its own record.
+_MASK_RECORD = threading.local()
+
+
+@contextlib.contextmanager
+def record_packed_masks(word_bits):
+    """Within the block, each GLIF step also has the op write its spikes and
+    refractory mask (new_r > 0) bit-packed ``word_bits`` per int32 word
+    ([batch, ceil(neurons / word_bits)], ``models._pack_spike_words``' layout
+    and values) into the yielded record's ``spike_words`` and
+    ``blocked_words``. The op then skips the dense mask the step's gradient
+    reads; a gradient taken through such a step (a recorded rollout normally
+    differentiates its records instead) unpacks it from ``blocked_words``,
+    which is exact. Both stay None if no step ran.
+    """
+    record = SimpleNamespace(word_bits=word_bits, spike_words=None, blocked_words=None)
+    previous = getattr(_MASK_RECORD, "record", None)
+    _MASK_RECORD.record = record
+    try:
+        yield record
+    finally:
+        _MASK_RECORD.record = previous
 
 
 def _gradient_like(gradient, output):
@@ -41,6 +67,55 @@ def _load_ops():
         )
         _GLIF_OPS = tf.load_op_library(str(glif))
     return _GLIF_OPS
+
+
+def glif_constants(cell):
+    """The derived float32 constants, in the order both GLIF ops take them."""
+    return (
+        cell.syn_coeffs, cell.asc_decay, cell.asc_amps, cell.decay,
+        cell.asc_factor, cell.reset_coeff, cell.asc_spike_factor,
+    )
+
+
+def glif_step_backward(cell, prev_z, new_v, blocked, constants, dt, v_th, sigma,
+                       amplitude, inverse, *upstream, penalty, emit_abs_max=False,
+                       word_bits=None):
+    """FusedGlifStepBackward with the cell's flags: the ``(prev_z, v, asc, rise,
+    psc, inputs)`` gradients from the step's saved ``prev_z``, ``new_v`` and
+    ``blocked``, then the inputs gradient's largest finite magnitude as uint32
+    float bits ([1] with ``emit_abs_max``, else empty).
+
+    ``upstream`` holds the gradients of ``(spikes, new_z, prev_z passthrough, v,
+    asc, rise, psc, exposed voltage, penalty accumulator)``, each in the dtype
+    and shape of the forward output it belongs to. With ``word_bits``,
+    ``prev_z`` and ``blocked`` are bit-packed words (``models._pack_spike_words``
+    layout) read by FusedGlifStepBackwardPacked, bitwise the same.
+    """
+    ops = _load_ops()
+    flags = dict(
+        surrogate=cell._surrogate_gradient,
+        hard_reset=cell._hard_reset,
+        detach_reset=cell._detach_reset,
+        detach_asc_reset=cell._detach_asc_reset,
+        emit_voltage=cell._return_voltage_sequences, penalty=penalty,
+        emit_abs_max=emit_abs_max,
+    )
+    if word_bits is not None:
+        return ops.fused_glif_step_backward_packed(
+            prev_z, new_v, blocked, *constants, dt, v_th, sigma, amplitude,
+            *upstream, inverse, word_bits=word_bits, **flags,
+        )
+    return ops.fused_glif_step_backward(
+        prev_z, new_v, blocked, *constants, dt, v_th, sigma, amplitude,
+        *upstream, inverse, **flags,
+    )
+
+
+def _unpack_words(words, width, word_bits):
+    """The [batch, width] booleans of ``models._pack_spike_words`` words."""
+    shifts = tf.range(word_bits, dtype=words.dtype)
+    bits = tf.bitwise.bitwise_and(tf.bitwise.right_shift(words[..., None], shifts), 1)
+    return tf.reshape(bits, [tf.shape(words)[0], -1])[:, :width] > 0
 
 
 def update_glif_state(
@@ -108,10 +183,8 @@ def update_glif_state(
     # no gradient, but they are passed through the custom gradient rather than
     # closed over: a tensor it captures is rejected when the step is retraced
     # inside the segmented-recompute backward pass.
-    constants = (
-        cell.syn_coeffs, cell.asc_decay, cell.asc_amps, cell.decay,
-        cell.asc_factor, cell.reset_coeff, cell.asc_spike_factor,
-    )
+    constants = glif_constants(cell)
+    record = getattr(_MASK_RECORD, "record", None)
 
     # The outputs end with the next history: the spikes again (a separate
     # output, so the gradient of the exposed spike sequence and that of the
@@ -131,12 +204,19 @@ def update_glif_state(
             *constants, t_ref_steps, dt, v_reset, v_th, accumulator, inverse,
             bkg_activity, bkg_weights, *gather, bkg_basis,
             hard_reset=cell._hard_reset, emit_voltage=emit_voltage,
-            penalty=penalty,
+            penalty=penalty, emit_refractory=record is None,
+            pack_masks=record is not None,
+            mask_word_bits=31 if record is None else record.word_bits,
         )
+        outputs, words = tuple(outputs[:9]), outputs[9:]
         (spikes, new_v, _, new_asc, new_rise, new_psc, blocked,
          exposed, new_accumulator) = outputs
+        if record is not None:
+            record.spike_words, record.blocked_words = words
 
         def grad(gs, gv, _gr, ga, grise, gpsc, _gb, gvoltage, gacc, gz, *gpass):
+            mask = (blocked if record is None
+                    else _unpack_words(words[1], prev_z.shape[1], record.word_bits))
             # The accumulator adds this step's penalty to the running sum, so its
             # gradient passes through unchanged and also drives the membrane.
             gacc = (_gradient_like(gacc, new_accumulator) if penalty != "none"
@@ -151,17 +231,12 @@ def update_glif_state(
             # next history, gets none.
             prev_grad = (_gradient_like(gpass[0], prev_z) if gpass
                          else tf.zeros([0], prev_z.dtype))
-            zg, vg, ag, rg, pg, ig = glif_ops.fused_glif_step_backward(
-                prev_z, new_v, blocked, *constants, dt, v_th, sigma, amplitude,
-                _gradient_like(gs, spikes), _gradient_like(gz, spikes), prev_grad,
-                _gradient_like(gv, new_v), _gradient_like(ga, new_asc),
+            zg, vg, ag, rg, pg, ig, _ = glif_step_backward(
+                cell, prev_z, new_v, mask, constants, dt, v_th, sigma, amplitude,
+                inverse, _gradient_like(gs, spikes), _gradient_like(gz, spikes),
+                prev_grad, _gradient_like(gv, new_v), _gradient_like(ga, new_asc),
                 _gradient_like(grise, new_rise), _gradient_like(gpsc, new_psc),
-                _gradient_like(gvoltage, exposed), gacc, inverse,
-                surrogate=cell._surrogate_gradient,
-                hard_reset=cell._hard_reset,
-                detach_reset=cell._detach_reset,
-                detach_asc_reset=cell._detach_asc_reset,
-                emit_voltage=emit_voltage, penalty=penalty,
+                _gradient_like(gvoltage, exposed), gacc, penalty=penalty,
             )
             accumulator_grad = gacc if penalty != "none" else None
             bkg_weight_grad = None

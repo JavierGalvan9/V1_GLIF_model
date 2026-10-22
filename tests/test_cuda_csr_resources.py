@@ -225,6 +225,41 @@ def test_resource_bkg_forward_takes_the_gather_like_the_tensor_backend(
     len(tf.config.list_physical_devices("GPU")) != 1,
     reason="resource workers require exactly one visible CUDA GPU",
 )
+@pytest.mark.parametrize("batch_size", [5, 48, 64])
+def test_resource_bkg_weight_backward_is_bitwise_the_tensor_backend(
+    monkeypatch, batch_size
+):
+    """Replicated training must get the one-GPU BKG weight gradient: the
+    resource operator runs the tensor kernel on the incoming CSR it stores."""
+    from v1_model_utils.cuda_csr_external.wrapper import incoming_weight_backward
+
+    rng = np.random.default_rng(batch_size)
+    n_pre, n_post = 100, 2000
+    posts = np.repeat(np.arange(n_post), 4)
+    pres = rng.integers(0, n_pre, posts.size)
+    order = np.lexsort((np.arange(posts.size), posts, pres))
+    indices = np.stack([posts, pres], axis=1)[order].astype(np.int64)
+    types = rng.integers(0, 7, size=len(indices)).astype(np.int64)
+    activity = tf.constant(rng.poisson(1.5, (batch_size, n_pre)), tf.float16)
+    upstream = tf.constant(rng.normal(size=(batch_size * n_post, 4)), tf.float16)
+    basis = tf.constant(rng.normal(size=(7, 4)), tf.float32)
+
+    def evaluate(mode):
+        monkeypatch.setenv("V1_CSR_RESOURCE_MODE", mode)
+        connectivity = build_external_csr(
+            indices, types, n_pre, n_post, sparse_activity=False
+        )
+        assert (connectivity.resource_name is not None) == (mode == "1")
+        return incoming_weight_backward(connectivity, activity, upstream, basis).numpy()
+
+    expected = evaluate("0")
+    np.testing.assert_array_equal(evaluate("1").view(np.uint32), expected.view(np.uint32))
+
+
+@pytest.mark.skipif(
+    len(tf.config.list_physical_devices("GPU")) != 1,
+    reason="resource workers require exactly one visible CUDA GPU",
+)
 def test_multiple_resources_are_isolated(monkeypatch):
     monkeypatch.setenv("V1_CSR_RESOURCE_MODE", "1")
     first = build_csr_connectivity(
@@ -341,6 +376,9 @@ def test_recurrent_backward_is_refused_without_the_projection(monkeypatch):
             tf.zeros((4,)),
             tf.zeros((1, 4)),
             tf.constant(0.3),
+            [],
+            [],
+            [],
             n_post=2,
             n_edges=4,
             resource_name=connectivity.resource_name,
@@ -421,4 +459,176 @@ def test_resource_initial_receives_the_upstream_gradient(monkeypatch):
         loss = tf.reduce_sum(currents * upstream)
     np.testing.assert_allclose(
         tape.gradient(loss, seed).numpy(), upstream.numpy(), rtol=1e-6, atol=1e-6
+    )
+
+
+def _backward_fixture(batch, dtype, seed):
+    """A 3-slot history and every optional backward input, on both backends."""
+    from v1_model_utils.cuda_csr_recurrent import spike_activity_masks
+
+    rng = np.random.default_rng(seed)
+    n_pre, n_post, n_types, n_edges = 96, 96, 7, 6000
+    indices = np.stack(
+        (rng.integers(0, n_post, n_edges), rng.integers(0, n_pre, n_edges)), axis=1
+    ).astype(np.int64)
+    synapse_types = rng.integers(0, n_types, n_edges).astype(np.int64)
+    order = np.lexsort((np.arange(n_edges), synapse_types, indices[:, 0], indices[:, 1]))
+    indices, synapse_types = indices[order], synapse_types[order]
+    spikes = rng.uniform(0.1, 1.0, (batch, n_pre)).astype(np.float32)
+    spikes[rng.random(spikes.shape) < 0.4] = 0.0
+    spikes[:, ::7] = -0.0
+    upstream = rng.normal(size=(batch * n_post, 4)).astype(np.float32)
+    upstream[0, 0] = np.inf  # left out of the bound
+    slots = tuple(tf.split(tf.constant(spikes, dtype), 3, axis=1))
+    current_grad = tf.constant(upstream, dtype)
+    magnitudes = np.abs(current_grad.numpy().astype(np.float32))
+    addends = []
+    for slot in slots[:2]:
+        values = rng.normal(size=slot.shape).astype(np.float32)
+        values[rng.random(slot.shape) < 0.2] = -0.0
+        addends.append(tf.constant(values, dtype))
+    options = {
+        "activity_masks": [spike_activity_masks(slot) for slot in slots],
+        "abs_max_bound": tf.constant(
+            [magnitudes[np.isfinite(magnitudes)].max().view(np.uint32)], tf.uint32
+        ),
+        "spike_grad_addends": addends + [tf.zeros([0], dtype)],
+    }
+    arrays = (
+        slots, current_grad, tf.constant(rng.normal(size=n_edges).astype(np.float32)),
+        tf.constant(rng.normal(size=(n_types, 4)).astype(np.float32)), 0.5,
+    )
+    return indices, synapse_types, n_pre, n_post, arrays, options
+
+
+def _run_backward(connectivity, arrays, accumulate=False, **options):
+    """Spike and weight gradients of the backend `connectivity` was built for."""
+    from v1_model_utils.cuda_csr_recurrent.wrapper import (
+        accumulate_recurrent_weight_gradient,
+        recurrent_backward,
+        resource_recurrent_backward,
+    )
+
+    c = connectivity
+    if c.resource_name is not None:
+        def backward():
+            return resource_recurrent_backward(c, *arrays, **options)
+    else:
+        def backward():
+            return recurrent_backward(
+                c, *arrays, c.post_ids, c.synapse_types, c.row_splits, c.edge_ids,
+                c.nonempty_rows, c.pair_ids, c.pair_posts, c.pair_types, **options,
+            )
+    if not accumulate:
+        spike_grads, weight_grad = backward()
+        return [grad.numpy() for grad in spike_grads], weight_grad.numpy()
+    accumulator = tf.Variable(tf.zeros([c.n_edges], tf.float32))
+    with accumulate_recurrent_weight_gradient(accumulator.handle):
+        spike_grads, _ = backward()
+    return [grad.numpy() for grad in spike_grads], accumulator.numpy()
+
+
+def _assert_bitwise(got, want):
+    got_spikes, got_weights = got
+    want_spikes, want_weights = want
+    for got_slot, want_slot in zip(got_spikes, want_spikes, strict=True):
+        np.testing.assert_array_equal(got_slot.view(np.uint8), want_slot.view(np.uint8))
+    np.testing.assert_array_equal(got_weights.view(np.uint8), want_weights.view(np.uint8))
+
+
+@pytest.mark.skipif(
+    not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required"
+)
+@pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("batch", [1, 8, 64, 65, 130])
+@pytest.mark.parametrize(
+    "names",
+    [(), ("activity_masks",), ("abs_max_bound",), ("spike_grad_addends",),
+     ("activity_masks", "abs_max_bound", "spike_grad_addends")],
+)
+def test_resource_backward_options_match_the_tensor_backward(
+    monkeypatch, names, batch, dtype, accumulate
+):
+    """The resource backward ops take the tensor ops' optional inputs (carried
+    activity masks, the GLIF backward's abs-max bound, per-slot spike-gradient
+    addends) and return bitwise what the tensor ops return with them, plain and
+    accumulating; malformed inputs are refused, so the inputs are read."""
+    indices, synapse_types, n_pre, n_post, arrays, options = _backward_fixture(
+        batch, dtype, 17 * batch + len(names)
+    )
+    options = {name: options[name] for name in names}
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", "0")
+    tensor = build_csr_connectivity(indices, synapse_types, n_pre, n_post)
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", "1")
+    resource = build_csr_connectivity(indices, synapse_types, n_pre, n_post)
+    assert tensor.resource_name is None and resource.resource_name is not None
+    _assert_bitwise(
+        _run_backward(resource, arrays, accumulate, **options),
+        _run_backward(tensor, arrays, accumulate, **options),
+    )
+    malformed = {
+        "activity_masks": lambda masks: masks[:-1] + [masks[-1][:-1]],
+        "abs_max_bound": lambda bound: tf.concat([bound, bound], 0),
+        "spike_grad_addends": lambda addends: addends[:2] + [addends[0][:, :-1]],
+    }
+    for name in names:
+        with pytest.raises(tf.errors.InvalidArgumentError, match=name):
+            _run_backward(resource, arrays, accumulate, **{
+                **options, name: malformed[name](options[name])
+            })
+
+
+@pytest.mark.skipif(
+    not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required"
+)
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("scale", [0.3, 3.0, 1000.0, -2.0])
+def test_scaled_abs_max_bound_gives_bitwise_the_measured_backward(
+    monkeypatch, scale, dtype, resource_mode
+):
+    """lr_scale rescales the upstream after the GLIF backward emitted its bound.
+
+    The recorded adjoint rescales that bound by the same compute-dtype multiply.
+    Rounding is monotone and symmetric, so the rescaled bound is exactly the
+    largest finite magnitude of the rescaled upstream unless it overflows; an
+    overflowed (non-finite) bound makes the operator measure. Either way the
+    backward is bitwise the one that measures the rescaled upstream itself.
+    """
+    from v1_model_utils.recorded_adjoint import _scaled_abs_max
+
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    indices, synapse_types, n_pre, n_post, arrays, options = _backward_fixture(
+        64, dtype, 101
+    )
+    connectivity = build_csr_connectivity(indices, synapse_types, n_pre, n_post)
+    slots, current_grad, *rest = arrays
+    if scale == 1000.0:
+        # 70 * 1000 overflows FP16 (the bound would be inf), 30 * 1000 does not.
+        values = current_grad.numpy()
+        values[1, 1], values[2, 2] = 70.0, -30.0
+        current_grad = tf.constant(values)
+        magnitudes = np.abs(values.astype(np.float32))
+        options["abs_max_bound"] = tf.constant(
+            [magnitudes[np.isfinite(magnitudes)].max().view(np.uint32)], tf.uint32
+        )
+    lr_scale = tf.constant(scale, dtype)
+    scaled = current_grad * lr_scale
+    bound = _scaled_abs_max(options["abs_max_bound"], lr_scale)
+    magnitudes = np.abs(scaled.numpy().astype(np.float32))
+    measured = magnitudes[np.isfinite(magnitudes)].max()
+    rescaled = bound.numpy().view(np.float32)[0]
+    overflows = dtype == tf.float16 and scale == 1000.0
+    assert np.isinf(rescaled) if overflows else rescaled == measured
+    arrays = (slots, scaled, *rest)
+    _assert_bitwise(
+        _run_backward(connectivity, arrays, abs_max_bound=bound),
+        _run_backward(connectivity, arrays),
+    )
+    # Any non-finite bound is measured, NaN bits included.
+    nan_bits = tf.constant([np.float32(np.nan).view(np.uint32)], tf.uint32)
+    _assert_bitwise(
+        _run_backward(connectivity, arrays, abs_max_bound=nan_bits),
+        _run_backward(connectivity, arrays),
     )

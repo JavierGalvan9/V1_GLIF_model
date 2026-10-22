@@ -307,6 +307,7 @@ class V1CsrForwardFusedResourceOp : public OpKernel {
     const Tensor& basis = context->input(first + 2);
     const Tensor& activity = context->input(first + 3);
     const Tensor& external_weights = context->input(first + 4);
+    const Tensor& pair_weights = context->input(first + 5);
     OP_REQUIRES_OK(context, ValidateRuntimeInputs(
                                 *resource, TensorShape({spikes.batch, spikes.n_pre()}),
                                 weights, basis, n_post_, resource->post_ids.NumElements()));
@@ -326,7 +327,8 @@ class V1CsrForwardFusedResourceOp : public OpKernel {
                                   external->edge_ids,
                                   external_aggregate_runs_};
     OP_REQUIRES_OK(context, fused_.Compute(context, spikes, recurrent_csr, activity,
-                                           external_csr, basis, first + 5, n_post_));
+                                           external_csr, basis, first + 6, n_post_,
+                                           &pair_weights));
   }
 
  private:
@@ -336,6 +338,33 @@ class V1CsrForwardFusedResourceOp : public OpKernel {
   bool aggregate_runs_ = false;
   bool external_aggregate_runs_ = true;
   FusedForward<T, W> fused_;
+};
+
+// V1ExternalPairWeights with the connectivity read from its resource: the same
+// pair table (built from the resource's CSR, shared with the fused resource
+// op's sweep) and the same FP64-accumulated sums.
+class V1ExternalPairWeightsResourceOp : public OpKernel {
+ public:
+  explicit V1ExternalPairWeightsResourceOp(OpKernelConstruction* context) : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("resource_name", &resource_name_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    V1CsrResource* resource = nullptr;
+    OP_REQUIRES_OK(context, context->resource_manager()->Lookup(
+                                "distributed_connectivity",
+                                DeviceResourceName(context, resource_name_), &resource));
+    core::ScopedUnref resource_unref(resource);
+    OP_REQUIRES_OK(context, sums_.Compute(context, context->input(0), resource->post_ids,
+                                          resource->synapse_types, resource->row_splits,
+                                          n_post_));
+  }
+
+ private:
+  int n_post_;
+  string resource_name_;
+  PairWeightSums sums_;
 };
 
 template <typename T>
@@ -442,6 +471,8 @@ class V1CsrBackwardResourceOp : public OpKernel {
                 errors::InvalidArgument("current_grad has an incompatible shape"));
     OP_REQUIRES(context, TensorShapeUtils::IsScalar(dampening.shape()),
                 errors::InvalidArgument("dampening must be scalar"));
+    BackwardOptions<T> options;
+    OP_REQUIRES_OK(context, ReadBackwardOptions<T>(context, spike_slots, spikes, &options));
     SpikeSlots<T*> spike_grad;
     OP_REQUIRES_OK(context, AllocateSpikeGradients<T>(context, spike_slots, spikes, &spike_grad));
     // The same launcher as the tensor backend: unless it accumulates, it clears
@@ -457,7 +488,8 @@ class V1CsrBackwardResourceOp : public OpKernel {
   LaunchPairProjectedBackward<T, W, BASIS>(                                      \
       context, spikes, current_grad, weights, posts, types, rows, edges,        \
       nonempty, basis, dampening, resource->pair_ids, resource->pair_posts,     \
-      resource->pair_types, n_post_, spike_grad, weight_grad, kAccumulate)
+      resource->pair_types, n_post_, spike_grad, weight_grad, kAccumulate,      \
+      options.carried_masks(), options.abs_max_bits, options.addends)
     OP_REQUIRES_OK(context, WithWeightGradBuffer<kAccumulate>(
                                 context, first + 5, n_edges_, [&](Tensor* weight_grad) {
                                   return basis.dim_size(1) == 4 ? LAUNCH_BACKWARD(4)
@@ -563,6 +595,50 @@ class ExternalCsrWeightBackwardResourceOp : public OpKernel {
   int n_edges_;
   string resource_name_;
   bool sparse_activity_ = true;
+};
+
+template <typename T>
+class BkgCsrWeightBackwardResourceOp : public OpKernel {
+ public:
+  explicit BkgCsrWeightBackwardResourceOp(OpKernelConstruction* context)
+      : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("n_edges", &n_edges_));
+    OP_REQUIRES_OK(context, context->GetAttr("resource_name", &resource_name_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    V1CsrResource* resource = nullptr;
+    OP_REQUIRES_OK(context, context->resource_manager()->Lookup(
+                                "distributed_connectivity",
+                                DeviceResourceName(context, resource_name_),
+                                &resource));
+    core::ScopedUnref resource_unref(resource);
+    const Tensor& activity = context->input(0);
+    OP_REQUIRES(context,
+                TensorShapeUtils::IsMatrix(activity.shape()) &&
+                    activity.dim_size(1) + 1 == resource->row_splits.NumElements(),
+                errors::InvalidArgument(
+                    "activity width does not match resource row_splits"));
+    OP_REQUIRES(context,
+                resource->incoming_row_splits.NumElements() == n_post_ + 1,
+                errors::InvalidArgument(
+                    "resource carries no fixed-four incoming CSR for n_post"));
+    Tensor* weight_grad;
+    OP_REQUIRES_OK(context, context->allocate_output(
+                                0, TensorShape({n_edges_}), &weight_grad));
+    OP_REQUIRES_OK(
+        context,
+        external_resource_kernel::LaunchBkgIncomingWeightBackward<T>(
+            context, activity, context->input(1), resource->incoming_pre_ids,
+            resource->incoming_edge_ids, resource->incoming_types,
+            context->input(2), n_post_, n_edges_, weight_grad));
+  }
+
+ private:
+  int n_post_;
+  int n_edges_;
+  string resource_name_;
 };
 
 template <typename T>
@@ -688,5 +764,10 @@ REGISTER_KERNEL_BUILDER(Name("InitializeV1CsrResource")
                             .Device(DEVICE_GPU)
                             .HostMemory("initialized"),
                         InitializeV1CsrResourceOp);
+REGISTER_KERNEL_BUILDER(Name("V1ExternalPairWeightsResource").Device(DEVICE_GPU),
+                        V1ExternalPairWeightsResourceOp);
+REGISTER_KERNEL_BUILDER(
+    Name("BkgCsrWeightBackwardResource").Device(DEVICE_GPU).TypeConstraint<Eigen::half>("T"),
+    BkgCsrWeightBackwardResourceOp<Eigen::half>);
 
 #endif

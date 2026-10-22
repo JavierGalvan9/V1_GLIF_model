@@ -36,9 +36,19 @@ using namespace tensorflow;
 //
 // `refractory` (new_r > 0) exists for the backward pass: it masks the
 // surrogate, and the hard reset's voltage gradient, without the refractory
-// counter, whose dtype has no GPU TensorList kernel. With emit_voltage the op
+// counter, whose dtype has no GPU TensorList kernel. A caller that never takes
+// the gradient (a rollout outside any tape, or one that records the mask
+// itself) can set emit_refractory = false: `refractory` is then empty and the
+// op writes one byte less per (sample, neuron). With emit_voltage the op
 // also writes new_v in T, the exposed voltage sequence; otherwise `voltage` is
 // empty.
+//
+// With pack_masks, spike_words and blocked_words ([batch, ceil(neurons /
+// mask_word_bits)] int32) hold the spikes and the refractory mask (new_r > 0)
+// bit-packed mask_word_bits (31 or 32) per word, value n in bit n %
+// mask_word_bits of word n / mask_word_bits: the words models._pack_spike_words
+// builds from `spikes` and `new_r > 0`, bit for bit, and those
+// FusedGlifStepBackwardPacked reads. Without it both are empty.
 //
 // With `penalty` other than 'none' the op also advances the online voltage
 // penalty: new_penalty_acc[b] = penalty_acc[b] + inverse_neurons *
@@ -59,6 +69,8 @@ using namespace tensorflow;
 REGISTER_OP("FusedGlifStep")
     .Attr("T: {half, float}").Attr("R: {int8, int16}")
     .Attr("hard_reset: bool = false").Attr("emit_voltage: bool = false")
+    .Attr("emit_refractory: bool = true")
+    .Attr("pack_masks: bool = false").Attr("mask_word_bits: int = 31")
     .Attr("penalty: {'none', 'range', 'threshold'} = 'none'")
     .Input("prev_z: T").Input("v: float").Input("r: R").Input("asc: float")
     .Input("psc_rise: T").Input("psc: T").Input("rec_inputs: T")
@@ -76,15 +88,31 @@ REGISTER_OP("FusedGlifStep")
     .Output("new_psc_rise: T").Output("new_psc: T")
     .Output("refractory: bool").Output("voltage: T")
     .Output("new_penalty_acc: float")
+    .Output("spike_words: int32").Output("blocked_words: int32")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       bool emit_voltage;
       TF_RETURN_IF_ERROR(c->GetAttr("emit_voltage", &emit_voltage));
       c->set_output(0, c->input(1)); c->set_output(1, c->input(1));
       c->set_output(2, c->input(2)); c->set_output(3, c->input(3));
       c->set_output(4, c->input(4)); c->set_output(5, c->input(5));
-      c->set_output(6, c->input(1));
+      bool emit_refractory;
+      TF_RETURN_IF_ERROR(c->GetAttr("emit_refractory", &emit_refractory));
+      c->set_output(6, emit_refractory ? c->input(1) : c->Vector(0));
       c->set_output(7, emit_voltage ? c->input(1) : c->Vector(0));
       c->set_output(8, c->input(18));
+      bool pack_masks;
+      int word_bits;
+      TF_RETURN_IF_ERROR(c->GetAttr("pack_masks", &pack_masks));
+      TF_RETURN_IF_ERROR(c->GetAttr("mask_word_bits", &word_bits));
+      shape_inference::ShapeHandle words = c->Vector(0);
+      if (pack_masks) {
+        const auto neurons = c->Dim(c->input(1), 1);
+        words = c->Matrix(c->Dim(c->input(1), 0),
+                          c->ValueKnown(neurons)
+                              ? c->MakeDim((c->Value(neurons) + word_bits - 1) / word_bits)
+                              : c->UnknownDim());
+      }
+      c->set_output(9, words); c->set_output(10, words);
       return absl::OkStatus();
     });
 
@@ -101,6 +129,10 @@ REGISTER_OP("FusedGlifStep")
 // unchanged as the next step's second slot, so its gradient there
 // (grad_prev_z, empty with a single delay slot) joins prev_z_grad here, in the
 // order the former shifted history added it.
+//
+// With emit_abs_max, rec_inputs_grad_abs_max ([1] uint32) holds the float bits
+// of the largest finite |rec_inputs_grad| (0 if none), exactly the bound the
+// recurrent backward's AbsMaxFiniteKernel measures; otherwise it is empty.
 REGISTER_OP("FusedGlifStepBackward")
     .Attr("T: {half, float}")
     .Attr("surrogate: {'triangular', 'gaussian', 'slayer'} = 'triangular'")
@@ -109,6 +141,7 @@ REGISTER_OP("FusedGlifStepBackward")
     .Attr("detach_asc_reset: bool = false")
     .Attr("emit_voltage: bool = false")
     .Attr("penalty: {'none', 'range', 'threshold'} = 'none'")
+    .Attr("emit_abs_max: bool = false")
     .Input("prev_z: T").Input("new_v: float").Input("refractory: bool")
     .Input("syn_coeffs: float").Input("asc_decay: float")
     .Input("asc_amps: float").Input("decay: float").Input("asc_factor: float")
@@ -121,9 +154,55 @@ REGISTER_OP("FusedGlifStepBackward")
     .Input("grad_penalty_acc: float").Input("inverse_neurons: float")
     .Output("prev_z_grad: T").Output("v_grad: float").Output("asc_grad: float")
     .Output("psc_rise_grad: T").Output("psc_grad: T").Output("rec_inputs_grad: T")
+    .Output("rec_inputs_grad_abs_max: uint32")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0)); c->set_output(1, c->input(1));
       c->set_output(2, c->input(18)); c->set_output(3, c->input(19));
       c->set_output(4, c->input(19)); c->set_output(5, c->input(19));
+      bool emit_abs_max;
+      TF_RETURN_IF_ERROR(c->GetAttr("emit_abs_max", &emit_abs_max));
+      c->set_output(6, c->Vector(emit_abs_max ? 1 : 0));
+      return absl::OkStatus();
+    });
+
+// FusedGlifStepBackward with the previous spikes and the refractory mask read
+// as binary values packed `word_bits` (31 or 32) to a 32-bit word (int32 or
+// uint32 W; prefer uint32, which TensorFlow never places in host memory) instead of
+// the dense prev_z (T) and refractory (bool) tensors: [batch, words] each, with
+// words = ceil(neurons / word_bits) and value n in bit n % word_bits of word
+// n / word_bits (models._pack_spike_words). The results are those of
+// FusedGlifStepBackward on the unpacked tensors, bit for bit. Four synaptic
+// bases only; every other input and output is as in FusedGlifStepBackward,
+// and prev_z_grad takes new_v's shape.
+REGISTER_OP("FusedGlifStepBackwardPacked")
+    .Attr("T: {half, float}")
+    .Attr("surrogate: {'triangular', 'gaussian', 'slayer'} = 'triangular'")
+    .Attr("hard_reset: bool = false")
+    .Attr("detach_reset: bool = true")
+    .Attr("detach_asc_reset: bool = false")
+    .Attr("emit_voltage: bool = false")
+    .Attr("penalty: {'none', 'range', 'threshold'} = 'none'")
+    .Attr("emit_abs_max: bool = false")
+    .Attr("word_bits: int = 31").Attr("W: {int32, uint32} = DT_INT32")
+    .Input("prev_z_bits: W").Input("new_v: float").Input("refractory_bits: W")
+    .Input("syn_coeffs: float").Input("asc_decay: float")
+    .Input("asc_amps: float").Input("decay: float").Input("asc_factor: float")
+    .Input("reset_coeff: float").Input("asc_spike_factor: float")
+    .Input("dt: float").Input("v_th: float")
+    .Input("sigma: float").Input("amplitude: float")
+    .Input("grad_spikes: T").Input("grad_new_z: T").Input("grad_prev_z: T")
+    .Input("grad_v: float").Input("grad_asc: float")
+    .Input("grad_psc_rise: T").Input("grad_psc: T").Input("grad_voltage: T")
+    .Input("grad_penalty_acc: float").Input("inverse_neurons: float")
+    .Output("prev_z_grad: T").Output("v_grad: float").Output("asc_grad: float")
+    .Output("psc_rise_grad: T").Output("psc_grad: T").Output("rec_inputs_grad: T")
+    .Output("rec_inputs_grad_abs_max: uint32")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(1)); c->set_output(1, c->input(1));
+      c->set_output(2, c->input(18)); c->set_output(3, c->input(19));
+      c->set_output(4, c->input(19)); c->set_output(5, c->input(19));
+      bool emit_abs_max;
+      TF_RETURN_IF_ERROR(c->GetAttr("emit_abs_max", &emit_abs_max));
+      c->set_output(6, c->Vector(emit_abs_max ? 1 : 0));
       return absl::OkStatus();
     });

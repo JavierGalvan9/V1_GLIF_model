@@ -505,9 +505,12 @@ def test_bkg_counts_are_poisson_and_fixed_by_the_seed(device):
     assert stats.chisquare(observed, expected).pvalue > 1e-4
 
 
-def _history_and_lgn(batch, dtype, n_post=6000, width=2000, n_slots=3, n_lgn=300, n_basis=4):
+def _history_and_lgn(batch, dtype, n_post=6000, width=2000, n_slots=3, n_lgn=300, n_basis=4,
+                     scalar_lgn=False):
     """An `n_slots` recurrent history and an LGN-like input (rows repeating
-    targets) onto the same neurons, in their operators' CSR orders."""
+    targets) onto the same neurons, in their operators' CSR orders. With
+    `scalar_lgn` every neuron receives the LGN through one synapse type, as in
+    the production network, and some rows repeat a target up to 20 times."""
     from v1_model_utils.cuda_csr_recurrent import build_csr_connectivity as build_recurrent
 
     rng = np.random.default_rng(batch + n_post)
@@ -522,10 +525,15 @@ def _history_and_lgn(batch, dtype, n_post=6000, width=2000, n_slots=3, n_lgn=300
     edges = []
     for pre in range(n_lgn):
         targets = np.unique(rng.integers(0, n_post, 800))
-        posts = np.repeat(targets, rng.integers(1, 4, targets.size))
+        repeats = rng.integers(1, 4, targets.size)
+        if scalar_lgn:
+            repeats[rng.random(targets.size) < 0.02] = 20
+        posts = np.repeat(targets, repeats)
         edges.append(np.stack((posts, np.full_like(posts, pre)), axis=1))
     lgn_indices = np.concatenate(edges).astype(np.int64)
     lgn_types = rng.integers(0, 5, len(lgn_indices))
+    if scalar_lgn:
+        lgn_types = rng.integers(0, 5, n_post)[lgn_indices[:, 0]]
     lgn_weights = rng.normal(size=len(lgn_indices)).astype(np.float32)
     lgn_indices, lgn_types, lgn_weights = _csr_sorted(lgn_indices, lgn_types, lgn_weights)
     lgn = _connectivity(lgn_indices, lgn_types, n_lgn, n_post)
@@ -543,10 +551,14 @@ def _history_and_lgn(batch, dtype, n_post=6000, width=2000, n_slots=3, n_lgn=300
     )
 
 
-def _two_sources(case, fused):
+def _two_sources(case, fused, coalesced=False):
     """Currents, record and every gradient of the recurrent + LGN step, through
-    the fused wrapper or through the two operators chained as the model did."""
-    from v1_model_utils.cuda_csr_external import calculate_recurrent_and_external_currents
+    the fused wrapper (with the LGN's per-pair weight sums if `coalesced`) or
+    through the two operators chained as the model did."""
+    from v1_model_utils.cuda_csr_external import (
+        calculate_recurrent_and_external_currents,
+        external_pair_weights,
+    )
     from v1_model_utils.cuda_csr_recurrent import (
         calculate_recurrent_csr_currents,
         spike_queue,
@@ -558,9 +570,10 @@ def _two_sources(case, fused):
     with tf.GradientTape() as tape:
         tape.watch((case.slots, case.activity))
         if fused:
+            pairs = external_pair_weights(lgn_weights, case.lgn) if coalesced else None
             currents, record = calculate_recurrent_and_external_currents(
                 case.slots, rec_weights, basis, 0.37, case.recurrent, queues,
-                case.activity, lgn_weights, case.lgn,
+                case.activity, lgn_weights, case.lgn, external_pair_weights=pairs,
             )
         else:
             currents, record = calculate_recurrent_csr_currents(
@@ -630,6 +643,40 @@ def test_fused_recurrent_and_lgn_match_the_two_operators(monkeypatch, resource_m
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize("resource_mode", ["0", "1"])
+@pytest.mark.parametrize("batch", [1, 8, 64])
+@pytest.mark.parametrize("coalesced", [False, True])
+def test_fused_scalar_lgn_matches_float64(monkeypatch, resource_mode, batch, coalesced):
+    """One LGN synapse type per neuron (the production LGN) takes the scalar
+    sweep, whose runs of repeated targets (here up to 20 edges) are split into
+    words of a few edges: within half an FP16 ulp of fp64 plus FP32 slack, at
+    least as accurate as the chained operators, and every gradient and the queue
+    record equal theirs. `coalesced` passes the per-pair weight sums, which
+    both fused operators sweep instead of the runs."""
+    monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
+    case = _history_and_lgn(batch, tf.float16, scalar_lgn=True)
+    fused, fused_record, fused_grads = _two_sources(case, fused=True, coalesced=coalesced)
+    chained, chained_record, chained_grads = _two_sources(case, fused=False)
+    reference = _two_source_reference(case)
+    fused_error = np.abs(fused.astype(np.float64) - reference)
+    chained_error = np.abs(chained.astype(np.float64) - reference)
+    bound = np.spacing(np.abs(reference).astype(np.float16)).astype(np.float64) / 2
+    assert np.all(fused_error <= bound + 1e-4)
+    assert fused_error.mean() <= chained_error.mean()
+    capacity = batch * case.width
+    count = int(chained_record[capacity])
+    np.testing.assert_array_equal(fused_record[:count], chained_record[:count])
+    np.testing.assert_array_equal(fused_record[capacity:], chained_record[capacity:])
+    (fused_slots, fused_rec, fused_activity, fused_lgn) = fused_grads
+    (chained_slots, chained_rec, chained_activity, chained_lgn) = chained_grads
+    for got, want in zip((*fused_slots, fused_rec, fused_lgn),
+                         (*chained_slots, chained_rec, chained_lgn)):
+        np.testing.assert_array_equal(got.numpy(), want.numpy())
+    np.testing.assert_allclose(fused_activity.numpy().astype(np.float32),
+                               chained_activity.numpy().astype(np.float32), rtol=2e-3, atol=0.1)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("resource_mode", ["0", "1"])
 @pytest.mark.parametrize("batch, dtype, n_slots, n_basis", [
     (5, tf.float16, 3, 4), (64, tf.float32, 3, 4), (130, tf.float32, 3, 4),
     (130, tf.float16, 3, 4), (64, tf.float16, 2, 4), (64, tf.float16, 3, 3),
@@ -658,7 +705,8 @@ def test_fused_operator_matches_float64_on_every_path(
         case.recurrent.synapse_types, case.recurrent.row_splits, case.recurrent.edge_ids,
         tf.constant(case.basis), case.activity, tf.constant(case.lgn_weights),
         case.lgn.post_ids, case.lgn.synapse_types, case.lgn.row_splits, case.lgn.edge_ids,
-        tuple(spike_queue(slot) for slot in case.slots[1:]), n_post=case.n_post,
+        tf.zeros([0], tf.float32), tuple(spike_queue(slot) for slot in case.slots[1:]),
+        n_post=case.n_post,
         aggregate_runs=case.recurrent.repeats_targets,
         external_aggregate_runs=case.lgn.repeats_targets,
     )
@@ -702,6 +750,52 @@ def test_fused_resource_operator_matches_the_tensor_operator(monkeypatch, batch,
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("batch", [1, 64])
+def test_coalesced_resource_sweep_matches_the_tensor_sweep(monkeypatch, batch):
+    """Replicated runs get the coalesced LGN sweep too: V1ExternalPairWeightsResource
+    returns the tensor operator's per-pair sums bitwise, V1CsrForwardFusedResource
+    reads them (a vector of the wrong length is refused), and the currents,
+    record and gradients match the tensor sweep's as in the plain fused case."""
+    from v1_model_utils.cuda_csr_external import (
+        calculate_recurrent_and_external_currents,
+        external_pair_weights,
+    )
+    from v1_model_utils.cuda_csr_recurrent import spike_queue
+
+    outputs, sums = {}, {}
+    for mode in ("0", "1"):
+        monkeypatch.setenv("V1_CSR_RESOURCE_MODE", mode)
+        case = _history_and_lgn(batch, tf.float16, scalar_lgn=True)
+        assert (case.lgn.resource_name is not None) == (mode == "1")
+        sums[mode] = external_pair_weights(tf.constant(case.lgn_weights), case.lgn).numpy()
+        outputs[mode] = _two_sources(case, fused=True, coalesced=True)
+    assert sums["0"].size > 0 and sums["0"].size < case.lgn_weights.size
+    np.testing.assert_array_equal(sums["1"], sums["0"])
+    with pytest.raises(tf.errors.InvalidArgumentError, match="external_pair_weights"):
+        calculate_recurrent_and_external_currents(
+            case.slots, tf.constant(case.rec_weights), tf.constant(case.basis), 0.37,
+            case.recurrent, tuple(spike_queue(slot) for slot in case.slots[1:]),
+            case.activity, tf.constant(case.lgn_weights), case.lgn,
+            external_pair_weights=tf.constant(sums["1"][:-1]),
+        )
+    (tensor, tensor_record, tensor_grads), (resource, resource_record, resource_grads) = (
+        outputs["0"], outputs["1"])
+    capacity = batch * case.width
+    count = int(tensor_record[capacity])
+    np.testing.assert_array_equal(resource_record[:count], tensor_record[:count])
+    np.testing.assert_array_equal(resource_record[capacity:], tensor_record[capacity:])
+    (tensor_slots, tensor_rec, tensor_activity, tensor_lgn) = tensor_grads
+    (resource_slots, resource_rec, resource_activity, resource_lgn) = resource_grads
+    for got, want in zip((*resource_slots, resource_rec, resource_lgn),
+                         (*tensor_slots, tensor_rec, tensor_lgn)):
+        np.testing.assert_array_equal(got.numpy(), want.numpy())
+    np.testing.assert_allclose(resource_activity.numpy().astype(np.float32),
+                               tensor_activity.numpy().astype(np.float32), rtol=2e-3, atol=0.1)
+    ulp = np.spacing(np.abs(tensor).astype(np.float16)).astype(np.float64)
+    assert np.all(np.abs(resource.astype(np.float64) - tensor) <= ulp + 1e-4)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 def test_fused_step_with_a_dynamic_batch():
     """A graph traced with an unknown batch takes the fused operator, which picks
     its path from the run-time batch: the currents equal the eager ones."""
@@ -727,3 +821,86 @@ def test_fused_step_with_a_dynamic_batch():
         # Rounded once from FP32 sums: within half an FP16 ulp, plus FP32 slack.
         bound = np.spacing(np.abs(reference).astype(np.float16)).astype(np.float64) / 2
         assert np.all(error <= bound + 1e-4)
+
+
+def _bkg_weight_case(batch):
+    """A fixed-four BKG connectivity, Poisson activity and an FP16 upstream."""
+    rng = np.random.default_rng(batch)
+    n_pre, n_post, n_types = 100, 3001, 15
+    posts = np.repeat(np.arange(n_post), 4)
+    pres = rng.integers(0, n_pre, posts.size)
+    indices = np.stack([posts, pres], axis=1).astype(np.int64)
+    types = rng.integers(0, n_types, posts.size).astype(np.int64)
+    weights = rng.normal(size=posts.size).astype(np.float32)
+    indices, types, weights = _csr_sorted(indices, types, weights)
+    c = _connectivity(indices, types, n_pre, n_post, sparse_activity=False)
+    assert c.incoming_row_splits is not None
+    activity = rng.poisson(1.5, (batch, n_pre)).astype(np.float16)
+    upstream = rng.normal(size=(batch * n_post, 4)).astype(np.float16)
+    upstream[rng.random(upstream.shape) < 0.1] = -0.0
+    basis = rng.normal(size=(n_types, 4)).astype(np.float32)
+    return c, indices, types, weights, activity, upstream, basis
+
+
+def _compact_weight_gradient(c, weights, activity, upstream, basis):
+    from v1_model_utils.cuda_csr_external.wrapper import external_backward
+
+    return external_backward(
+        c, activity, upstream, tf.constant(weights), basis, c.post_ids, c.synapse_types,
+        c.row_splits, c.edge_ids, c.nonempty_rows, c.pair_ids, c.pair_posts, c.pair_types,
+        compute_activity_gradient=False, compute_weight_gradient=True,
+    )[1]
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 48, 63, 64, 65, 100, 128])
+def test_incoming_bkg_weight_backward_is_bitwise_the_compact_path(batch):
+    """BkgCsrWeightBackward reproduces the dense weight gradient bit for bit
+    (FP16, four bases, fixed four incoming edges per post) at every batch whose
+    dense path sums in a fixed order: the compact kernels (powers of two) and
+    the generic direct kernel (other batches above 32)."""
+    from v1_model_utils.cuda_csr_external.wrapper import incoming_weight_backward
+
+    c, _, _, weights, activity, upstream, basis = _bkg_weight_case(batch)
+    activity, upstream, basis = map(tf.constant, (activity, upstream, basis))
+    expected = _compact_weight_gradient(c, weights, activity, upstream, basis)
+    actual = incoming_weight_backward(c, activity, upstream, basis)
+    assert actual is not None
+    # The populated lanes meet in the same tree; empty lanes add exact zeros,
+    # which can only turn a -0 into +0.
+    np.testing.assert_array_equal(
+        (actual.numpy() + 0.0).view(np.uint32), (expected.numpy() + 0.0).view(np.uint32)
+    )
+    assert incoming_weight_backward(
+        c, tf.cast(activity, tf.float32), tf.cast(upstream, tf.float32), basis
+    ) is None
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("batch", [3, 12, 24, 31])
+def test_incoming_bkg_weight_backward_adds_atomic_batches_in_launch_order(batch):
+    """Below 32, at batches that are not powers of two, the dense path adds its
+    4-sample tiles with atomics; the incoming op adds them in launch order:
+    deterministic, and as close to the FP64 gradient as the dense path."""
+    from v1_model_utils.cuda_csr_external.wrapper import incoming_weight_backward
+
+    c, indices, types, weights, activity, upstream, basis = _bkg_weight_case(batch)
+    n_post = c.n_post
+    projected = np.einsum(
+        "bpr,pr->bp",
+        upstream.astype(np.float64).reshape(batch, n_post, 4)[:, indices[:, 0]],
+        basis.astype(np.float64)[types],
+    )
+    reference = np.sum(projected * activity.astype(np.float64)[:, indices[:, 1]], axis=0)
+    activity, upstream, basis = map(tf.constant, (activity, upstream, basis))
+    actual = incoming_weight_backward(c, activity, upstream, basis).numpy()
+    np.testing.assert_array_equal(
+        actual, incoming_weight_backward(c, activity, upstream, basis).numpy()
+    )
+    old = _compact_weight_gradient(c, weights, activity, upstream, basis).numpy()
+    new_error = np.abs(actual - reference)
+    old_error = np.abs(old - reference)
+    # Same terms, different association: equal accuracy up to one FP32 rounding.
+    slack = np.spacing(np.abs(reference).astype(np.float32)).astype(np.float64)
+    assert new_error.max() <= old_error.max() + slack.max()
+    assert new_error.mean() <= old_error.mean() + slack.mean()

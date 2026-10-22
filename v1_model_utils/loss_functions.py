@@ -10,6 +10,7 @@ except Exception:
     HAS_NUMBA = False
 
 import functools
+from typing import NamedTuple
 import os
 import sys
 sys.path.append(os.path.join(os.getcwd(), "v1_model_utils"))
@@ -564,6 +565,25 @@ class L2Regularizer(tf.keras.regularizers.Regularizer):
     #     return reg_loss * self._strength
 
 
+@tf.function(jit_compile=True)
+def _group_major_keys(by_value, group_starts, n_groups):
+    """Sort keys that put the value-sorted positions ``by_value`` group by group
+    (top_k is descending: group g gets key n_groups - 1 - g). Integer work
+    stays in XLA: TensorFlow would run these int32 ops on the host."""
+    starts = group_starts[1:, None]
+    group = tf.cumsum(tf.scatter_nd(starts, tf.ones_like(starts[:, 0]), by_value.shape))
+    return (n_groups - 1) - tf.gather(group, by_value)
+
+
+@tf.function(jit_compile=True)
+def _group_major_positions(by_value, by_group, group_starts, denominators):
+    """The grouped positions in group-major, value-sorted order (int64) and
+    each sorted entry's sensitivity denominator, its group's."""
+    starts = group_starts[1:, None]
+    group = tf.cumsum(tf.scatter_nd(starts, tf.ones_like(starts[:, 0]), by_value.shape))
+    return tf.cast(tf.gather(by_value, by_group), tf.int64), tf.gather(denominators, group)
+
+
 def _grouped_emd(values, group_order, sorted_initial_values, group_slices, n_groups):
     """Mean per-group Wasserstein-1 distance with an analytic gradient.
 
@@ -573,11 +593,19 @@ def _grouped_emd(values, group_order, sorted_initial_values, group_slices, n_gro
     whole backward into one gather and one scatter, instead of differentiating
     through ``n_groups`` sorts and the group gather.
 
+    All groups are sorted at once by two stable sorts: of every value (top_k of
+    -x: ties in position order, as each group's own top_k of -x orders them),
+    then by group. Each group thus keeps the order its own sort gives, and
+    every element-wise result is bitwise that of per-group sorts. Only the
+    group means stay per group, each a reduce_mean of its own slice, so the
+    loss sums in the same order too: ~2 small ops per group instead of ~12,
+    whose host-bound launches left the GPU idle ahead of the forward loop.
+
     TensorFlow runs int32 element-wise ops, concats, slices and reshapes on the
     host, so every index tensor here is either int64 or produced by a GPU-only
-    op (cast, gather, top_k): ``group_order`` arrives as uint32 (or int64 when
-    the count exceeds the int32 range) and is cast once to a column of gather
-    indices on the device.
+    op (cast, gather, top_k, XLA): ``group_order`` arrives as uint32 (or int64
+    when the count exceeds the int32 range) and is cast once to a column of
+    gather indices on the device.
     """
 
     index_dtype = tf.int64 if group_order.dtype == tf.int64 or (
@@ -585,27 +613,32 @@ def _grouped_emd(values, group_order, sorted_initial_values, group_slices, n_gro
     # A [n, 1] column serves both the flat gather and scatter_nd, whose indices
     # need a trailing axis that an int32 reshape would build on the host.
     group_index = tf.cast(tf.reshape(group_order, [-1, 1]), index_dtype)
+    size = int(group_order.shape[0])
+    group_starts = tf.constant([start for start, _ in group_slices], tf.int32)
+    # What each group's sensitivity sign(...) / float(n_g * n_groups) divides by.
+    denominators = tf.constant(
+        [float((end - start) * n_groups) for start, end in group_slices], tf.float32
+    )
 
     @tf.custom_gradient
     def emd(x):
         grouped_x = tf.reshape(tf.gather(x, group_index), [-1])
-        group_losses, positions, sensitivities = [], [], []
-        for start, end in group_slices:
-            x_i = grouped_x[start:end]
-            # tf.argsort(x_i), spelled out: TopKV2 has no int64 GPU kernel, so
-            # widen its int32 indices with a device cast before the offset.
-            order = tf.math.top_k(-x_i, end - start).indices
-            deviation = tf.gather(x_i, order) - sorted_initial_values[start:end]
-            group_losses.append(tf.reduce_mean(tf.abs(deviation)))
-            positions.append(tf.cast(order, tf.int64) + start)
-            sensitivities.append(
-                tf.sign(deviation) / float((end - start) * n_groups)
-            )
-        reg_loss = tf.reduce_mean(tf.stack(group_losses))
+        by_value = tf.math.top_k(-grouped_x, size).indices
+        by_group = tf.math.top_k(
+            _group_major_keys(by_value, group_starts, n_groups), size
+        ).indices
+        positions, denominator = _group_major_positions(
+            by_value, by_group, group_starts, denominators
+        )
+        deviation = tf.gather(grouped_x, positions) - sorted_initial_values
+        distance = tf.abs(deviation)
+        reg_loss = tf.reduce_mean(tf.stack(
+            [tf.reduce_mean(distance[start:end]) for start, end in group_slices]
+        ))
         # Compose the two permutations once so the backward is a single scatter
         # straight into the caller's edge order.
-        targets = tf.gather(group_index, tf.concat(positions, axis=0))
-        derivative = tf.concat(sensitivities, axis=0)
+        targets = tf.gather(group_index, positions)
+        derivative = tf.sign(deviation) / denominator
 
         def grad(upstream):
             return tf.scatter_nd(
@@ -710,6 +743,28 @@ def spike_trimming(spikes, pre_delay=50, post_delay=50, trim=True):
     else:
         spikes = spikes[:, pre:, :]
     return spikes
+
+
+def spike_trimming_window(sequence_length, pre_delay=50, post_delay=50, trim=True):
+    """The ``[start, stop)`` timesteps that ``spike_trimming`` keeps."""
+    stop = sequence_length - post_delay if trim and post_delay else sequence_length
+    return (pre_delay or 0, stop)
+
+
+class SpikeSummary(NamedTuple):
+    """Stands in for a ``[batch, time, neurons]`` spike sequence that a
+    recorded rollout (recorded_adjoint.RecordedAdjointRunner) never builds.
+
+    ``counts`` are the spike counts of every (sample, neuron) over the
+    ``duration`` timesteps the rate losses trim the sequence to, in the spike
+    dtype; ``traces`` are the synchronization loss's sampled population traces
+    of its window, in the spike dtype, or None without that loss. The rate and
+    synchronization losses accept a summary wherever they accept the spikes.
+    """
+
+    counts: tf.Tensor
+    duration: int
+    traces: tf.Tensor | None = None
 
 
 _INT32_MAX = 2**31 - 1
@@ -1151,6 +1206,10 @@ class SpikeRateDistributionTarget:
     @tf.function # jit compile is not used here because it converts the spikes to float32 before summing, which can cause memory issues for large spike tensors.
     def rates_per_sample_from_spikes(self, spikes, trim=True):
         """Return full-population rates with shape ``[batch, neurons]``."""
+        if isinstance(spikes, SpikeSummary):
+            # temporal_sum's counts: the spike-dtype sum, cast once.
+            counts = tf.cast(spikes.counts, self._dtype)
+            return counts / tf.cast(spikes.duration, self._dtype)
         spikes = spike_trimming(
             spikes,
             pre_delay=self._pre_delay,
@@ -1489,6 +1548,9 @@ class SynchronizationLoss(Layer):
     def __call__(self, spikes, trim=True):
         if self._sync_cost <= 0:
             return tf.constant(0.0, dtype=self._dtype)
+        if isinstance(spikes, SpikeSummary):
+            # The traces gather_sampled_traces returns, cast as it casts them.
+            return self.loss_from_sampled_traces(tf.cast(spikes.traces, self._dtype))
 
         if trim:
             spikes = spikes[:, self._t_start_seconds:self._t_end_seconds, :]
@@ -1503,6 +1565,13 @@ class SynchronizationLoss(Layer):
             spikes, plan, tf.range(n_trials, dtype=tf.int32)
         )
         return self.loss_from_sampled_traces(selected_spikes_sample)
+
+    def trace_window(self, sequence_length, trim=True):
+        """The ``[start, stop)`` timesteps ``__call__`` reads the traces from."""
+        if not trim:
+            return (0, sequence_length)
+        return (min(self._t_start_seconds, sequence_length),
+                min(self._t_end_seconds, sequence_length))
 
     def prepare_sampled_trace_plan(self, n_trials, spike_dtype):
         """Draw one global trial plan before a chunked validation rollout.
@@ -2500,6 +2569,10 @@ class OrientationSelectivityLoss:
     @tf.function # jit compile is not used here because it converts the spikes to float32 before summing, which can cause memory issues for large spike tensors.
     def rates_per_sample_from_spikes(self, spikes, trim=True):
         """Return full-population rates with shape ``[batch, neurons]``."""
+        if isinstance(spikes, SpikeSummary):
+            # temporal_sum's counts: the spike-dtype sum, cast once.
+            counts = tf.cast(spikes.counts, self._dtype)
+            return counts / tf.cast(spikes.duration, self._dtype)
         spikes = spike_trimming(
             spikes,
             pre_delay=self._pre_delay,

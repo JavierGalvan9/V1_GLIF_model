@@ -322,6 +322,36 @@ def external_backward(
     return activity_grad, weight_grad
 
 
+def incoming_weight_backward(connectivity, values, upstream, basis_values):
+    """The dense BKG weight gradient from the fixed-four incoming CSR in one pass
+    over ``upstream``; None where it does not apply (then call external_backward
+    or resource_external_backward).
+
+    Bitwise what those return at every batch they sum in a fixed order; at the
+    batches below 32 that are not powers of two they add 4-sample tiles with
+    atomics, and this adds the same tiles in launch order, their usual result.
+    """
+    if (
+        connectivity.sparse_activity
+        or not uses_bkg_gather(connectivity, basis_values)
+        or values.dtype != tf.float16
+        or upstream.dtype != tf.float16
+    ):
+        return None
+    if connectivity.resource_name is not None:
+        return load_resource_ops().bkg_csr_weight_backward_resource(
+            values, upstream, basis_values,
+            n_post=connectivity.n_post, n_edges=connectivity.n_edges,
+            resource_name=connectivity.resource_name,
+        )
+    _, external_ops = _load_ops()
+    return external_ops.bkg_csr_weight_backward(
+        values, upstream, connectivity.incoming_pre_ids, connectivity.incoming_edge_ids,
+        connectivity.incoming_types, basis_values,
+        n_post=connectivity.n_post, n_edges=connectivity.n_edges,
+    )
+
+
 def calculate_external_csr_currents(
     activity,
     weights,
@@ -544,6 +574,27 @@ def fusable(spikes, basis, connectivity, queues, activity, external_connectivity
     )
 
 
+def external_pair_weights(weights, connectivity):
+    """Per-pair FP32 weight sums of an external connectivity for
+    calculate_recurrent_and_external_currents: one per distinct (row, target)
+    pair, summed in edge order; None without DIRECT_CSR. The operator returns an
+    empty vector where the connectivity does not qualify, which the sweep treats
+    as absent."""
+    if not DIRECT_CSR:
+        return None
+    require_csr_ordered_weights(connectivity, "external connectivity")
+    weights = tf.stop_gradient(tf.convert_to_tensor(weights, tf.float32))
+    if connectivity.resource_name is not None:
+        return load_resource_ops().v1_external_pair_weights_resource(
+            weights, n_post=connectivity.n_post, resource_name=connectivity.resource_name,
+        )
+    recurrent_ops, _ = _load_ops()
+    return recurrent_ops.v1_external_pair_weights(
+        weights, connectivity.post_ids, connectivity.synapse_types, connectivity.row_splits,
+        n_post=connectivity.n_post,
+    )
+
+
 def calculate_recurrent_and_external_currents(
     spikes,
     weights,
@@ -557,6 +608,7 @@ def calculate_recurrent_and_external_currents(
     *,
     compute_activity_gradient=True,
     compute_weight_gradient=True,
+    external_pair_weights=None,
 ):
     """``(currents, record)``: the recurrent currents of a spike history plus an
     external input's (``record`` is None without ``queues``), as
@@ -569,7 +621,13 @@ def calculate_recurrent_and_external_currents(
     the configurations its tile sweep serves it accumulates them in FP32 and
     rounds once, skipping the external pass's read and rewrite of the currents.
     The gradients come from the same backward operators. Otherwise this makes
-    exactly those two calls."""
+    exactly those two calls.
+
+    ``external_pair_weights`` (from `external_pair_weights`, computed from the
+    same ``external_weights``) lets the fused operator's sweep read one weight
+    sum per distinct (row, target) pair instead of every edge's weight. It is a
+    forward-only input: the external weight gradient stays per edge. Ignored
+    where the two forwards run separately."""
     if not fusable(spikes, basis, connectivity, queues, activity, external_connectivity):
         currents = calculate_recurrent_csr_currents(
             spikes, weights, basis, dampening, connectivity, queues=queues
@@ -590,12 +648,15 @@ def calculate_recurrent_and_external_currents(
             f"{connectivity.n_synapse_types} synapse types"
         )
     slots = spike_slots(spikes)
+    pair_weight_sums = (tf.zeros([0], tf.float32) if external_pair_weights is None
+                        else tf.stop_gradient(external_pair_weights))
     if connectivity.resource_name is not None:
         return _calculate_resource_recurrent_and_external_currents(
             slots, weights, basis, dampening, connectivity, queues, activity,
             external_weights, external_connectivity,
             compute_activity_gradient=compute_activity_gradient,
             compute_weight_gradient=compute_weight_gradient,
+            external_pair_weights=pair_weight_sums,
         )
     recurrent_ops, _ = _load_ops()
 
@@ -605,14 +666,15 @@ def calculate_recurrent_and_external_currents(
         nonempty_rows, dampening_value, pair_ids, pair_posts, pair_types,
         values, master_weights, external_post_ids, external_synapse_types,
         external_row_splits, external_edge_ids, external_nonempty_rows,
-        external_pair_ids, external_pair_posts, external_pair_types,
+        external_pair_ids, external_pair_posts, external_pair_types, pair_weight_sums,
         *rest,
     ):
         spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
         currents, record = recurrent_ops.v1_csr_forward_fused(
             spike_values, weight_values, post_ids, synapse_types, row_splits, edge_ids,
             basis_values, values, master_weights, external_post_ids,
-            external_synapse_types, external_row_splits, external_edge_ids, queue_values,
+            external_synapse_types, external_row_splits, external_edge_ids, pair_weight_sums,
+            queue_values,
             n_post=connectivity.n_post,
             aggregate_runs=connectivity.repeats_targets,
             external_aggregate_runs=external_connectivity.repeats_targets,
@@ -636,7 +698,7 @@ def calculate_recurrent_and_external_currents(
                 compute_weight_gradient=compute_weight_gradient,
             )
             return ((weight_grad,) + (None,) * 10 + (activity_grad, external_weight_grad)
-                    + (None,) * 8 + tuple(spike_grads) + (None,) * len(queue_values))
+                    + (None,) * 9 + tuple(spike_grads) + (None,) * len(queue_values))
 
         return (currents, record), grad
 
@@ -662,6 +724,7 @@ def calculate_recurrent_and_external_currents(
         external_connectivity.pair_ids,
         external_connectivity.pair_posts,
         external_connectivity.pair_types,
+        pair_weight_sums,
         *slots,
         *queues,
     )
@@ -670,6 +733,7 @@ def calculate_recurrent_and_external_currents(
 def _calculate_resource_recurrent_and_external_currents(
     slots, weights, basis, dampening, connectivity, queues, activity, external_weights,
     external_connectivity, *, compute_activity_gradient, compute_weight_gradient,
+    external_pair_weights,
 ):
     """calculate_recurrent_and_external_currents with both connectivities in
     GPU-local resources (V1CsrForwardFusedResource)."""
@@ -677,11 +741,13 @@ def _calculate_resource_recurrent_and_external_currents(
 
     @tf.custom_gradient
     def fused(
-        weight_values, basis_values, dampening_value, values, master_weights, *rest
+        weight_values, basis_values, dampening_value, values, master_weights,
+        pair_weight_sums, *rest
     ):
         spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
         currents, record = ops.v1_csr_forward_fused_resource(
-            spike_values, weight_values, basis_values, values, master_weights, queue_values,
+            spike_values, weight_values, basis_values, values, master_weights,
+            pair_weight_sums, queue_values,
             n_post=connectivity.n_post,
             resource_name=connectivity.resource_name,
             external_resource_name=external_connectivity.resource_name,
@@ -701,7 +767,7 @@ def _calculate_resource_recurrent_and_external_currents(
                 compute_activity_gradient=compute_activity_gradient,
                 compute_weight_gradient=compute_weight_gradient,
             )
-            return ((weight_grad, None, None, activity_grad, external_weight_grad)
+            return ((weight_grad, None, None, activity_grad, external_weight_grad, None)
                     + tuple(spike_grads) + (None,) * len(queue_values))
 
         return (currents, record), grad
@@ -712,6 +778,7 @@ def _calculate_resource_recurrent_and_external_currents(
         tf.cast(dampening, slots[0].dtype),
         tf.convert_to_tensor(activity),
         tf.convert_to_tensor(external_weights, tf.float32),
+        external_pair_weights,
         *slots,
         *queues,
     )

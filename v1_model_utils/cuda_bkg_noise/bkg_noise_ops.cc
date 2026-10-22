@@ -14,8 +14,12 @@ using namespace tensorflow;
 // noise_seed stays in device memory and is read by the kernel; replica_id, step
 // (the int32 noise_step loop state; element 0 is used) and shape are host
 // memory, so nothing crosses PCIe per call.
+// With num_steps > 0 the op returns [num_steps, batch, n_bkg]: slice t holds
+// the counts of step int32(step[0] + t) (wrapping), bitwise those of separate
+// calls, in one launch.
 REGISTER_OP("BkgPoissonCounts")
     .Attr("T: {half, float, int32}")
+    .Attr("num_steps: int >= 0 = 0")
     .Input("noise_seed: int64").Input("replica_id: int32").Input("step: int32")
     .Input("shape: int32").Input("cdf: double")
     .Output("counts: T")
@@ -23,6 +27,11 @@ REGISTER_OP("BkgPoissonCounts")
       shape_inference::ShapeHandle shape;
       TF_RETURN_IF_ERROR(c->MakeShapeFromShapeTensor(3, &shape));
       TF_RETURN_IF_ERROR(c->WithRank(shape, 2, &shape));
+      int64_t num_steps;
+      TF_RETURN_IF_ERROR(c->GetAttr("num_steps", &num_steps));
+      if (num_steps > 0) {
+        TF_RETURN_IF_ERROR(c->Concatenate(c->Vector(num_steps), shape, &shape));
+      }
       c->set_output(0, shape);
       return absl::OkStatus();
     });

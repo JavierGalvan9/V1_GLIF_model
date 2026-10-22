@@ -79,6 +79,9 @@ REGISTER_OP("V1CsrForwardFusedResource")
     .Input("basis: float")
     .Input("activity: T")
     .Input("external_weights: float")
+    // V1ExternalPairWeightsResource of external_weights, or empty: see
+    // V1CsrForwardFused.
+    .Input("external_pair_weights: float")
     .Input("queues: carried * uint32")
     .Output("currents: T")
     .Output("queue: uint32")
@@ -96,6 +99,18 @@ REGISTER_OP("V1CsrForwardFusedResource")
       TF_RETURN_IF_ERROR(
           context->Multiply(context->Dim(spikes, 0), n_post, &rows));
       context->set_output(0, context->Matrix(rows, context->Dim(basis, 1)));
+      return OkStatus();
+    });
+
+// V1ExternalPairWeights (cuda_csr_recurrent) with the connectivity read from
+// its resource.
+REGISTER_OP("V1ExternalPairWeightsResource")
+    .Attr("n_post: int >= 1")
+    .Attr("resource_name: string")
+    .Input("weights: float")
+    .Output("pair_weights: float")
+    .SetShapeFn([](shape_inference::InferenceContext* context) {
+      context->set_output(0, context->Vector(context->UnknownDim()));
       return OkStatus();
     });
 
@@ -122,17 +137,26 @@ REGISTER_OP("BkgCsrForwardResource")
       return OkStatus();
     });
 
+// V1CsrBackwardPairProjected (cuda_csr_recurrent) with the connectivity read
+// from its resource, including the optional `activity_masks`, `abs_max_bound`
+// and `spike_grad_addends` inputs (same contracts, same kernels).
 REGISTER_OP("V1CsrBackwardResource")
     .Attr("T: {half, float}")
     .Attr("N: int >= 1")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")
+    .Attr("carried: int >= 0 = 0")
+    .Attr("bounded: int >= 0 = 0")
+    .Attr("added: int >= 0 = 0")
     .Input("spikes: N * T")
     .Input("current_grad: T")
     .Input("weights: float")
     .Input("basis: float")
     .Input("dampening: T")
+    .Input("activity_masks: carried * uint32")
+    .Input("abs_max_bound: bounded * uint32")
+    .Input("spike_grad_addends: added * T")
     .Output("spike_grad: N * T")
     .Output("weight_grad: float")
     .SetShapeFn([](shape_inference::InferenceContext* context) {
@@ -158,12 +182,18 @@ REGISTER_OP("V1CsrBackwardAccumulateResource")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")
+    .Attr("carried: int >= 0 = 0")
+    .Attr("bounded: int >= 0 = 0")
+    .Attr("added: int >= 0 = 0")
     .Input("spikes: N * T")
     .Input("current_grad: T")
     .Input("weights: float")
     .Input("basis: float")
     .Input("dampening: T")
     .Input("accumulator: resource")
+    .Input("activity_masks: carried * uint32")
+    .Input("abs_max_bound: bounded * uint32")
+    .Input("spike_grad_addends: added * T")
     .Output("spike_grad: N * T")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* context) {
@@ -193,6 +223,24 @@ REGISTER_OP("ExternalCsrWeightBackwardResource")
       shape_inference::ShapeHandle basis;
       TF_RETURN_IF_ERROR(context->WithRank(context->input(0), 2, &activity));
       TF_RETURN_IF_ERROR(context->WithRank(context->input(2), 2, &basis));
+      int n_edges;
+      TF_RETURN_IF_ERROR(context->GetAttr("n_edges", &n_edges));
+      context->set_output(0, context->Vector(n_edges));
+      return OkStatus();
+    });
+
+// BkgCsrWeightBackward (cuda_csr_external) reading its incoming CSR from the
+// resource: same kernel, same bits.
+REGISTER_OP("BkgCsrWeightBackwardResource")
+    .Attr("T: {half}")
+    .Attr("n_post: int >= 1")
+    .Attr("n_edges: int >= 0")
+    .Attr("resource_name: string")
+    .Input("activity: T")
+    .Input("current_grad: T")
+    .Input("basis: float")
+    .Output("weight_grad: float")
+    .SetShapeFn([](shape_inference::InferenceContext* context) {
       int n_edges;
       TF_RETURN_IF_ERROR(context->GetAttr("n_edges", &n_edges));
       context->set_output(0, context->Vector(n_edges));

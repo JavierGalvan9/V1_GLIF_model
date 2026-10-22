@@ -1118,6 +1118,170 @@ class ExternalCsrWeightBackwardOp : public OpKernel {
   bool sparse_activity_ = true;
 };
 
+// The BKG weight gradient from the fixed-four incoming CSR (BkgCsrForward's
+// metadata), bit for bit what ExternalCsrWeightBackward's compact large-batch
+// path (ProjectCompactBatchTilesKernel + WeightBackwardPackedLargeKernel)
+// returns, without the [pairs, batch] FP32 projection it writes and reads back.
+// That path gives edge e
+//   sum over lanes s = 0..7 of p_s,  p_s = sum over tiles t, then i = 0..3 of
+//   P(b) * a(b) (b = 32 t + 4 s + i, one FMA each, from 0),
+// with P(b) the BasisProjection of the upstream row (b, post) onto the edge's
+// type, reduced over the lanes by a butterfly whose tree is
+// ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)) up to the order of each
+// two-term sum. One thread here owns a post: it reads each of its upstream
+// rows once (consecutive threads, consecutive posts: coalesced) and keeps the
+// four edges' lane partials in registers, adding each p_s's terms in the same
+// order.
+// `kBatch == 0` takes any batch at run time with the same map, skipping the
+// samples past the batch. That is also the order of the old operator's other
+// deterministic dense paths: GenericWeightDirectKernel (batch > 32 outside
+// 64/128/256/512) has these lanes and this tree, and WeightBackwardPackedKernel
+// (batch 1, 2, 4, ..., 32) sums its populated lanes with the same tree, the
+// empty lanes here adding exact zeros. At the other batches below 32 the old
+// operator adds its 4-sample tiles (here: the lanes) with atomics into a
+// cleared output, in launch order unless blocks retire out of order; these
+// batches add the lanes in that order, so the result is the old one's usual
+// (measured: most frequent) value, now deterministic.
+template <typename T, int kBatch, bool kStaged>
+__global__ __launch_bounds__(128) void BkgWeightBackwardIncomingKernel(
+    int64_t batch_size, int64_t n_post, int64_t n_pre, const T* activity,
+    const T* current_grad, const uint32* incoming_pre_ids,
+    const uint32* incoming_edge_ids, const uint8* incoming_types,
+    const float* basis, float* weight_grad) {
+  constexpr int kEdges = 4, kLanes = 8, kPack = 4;
+  const int64_t batch = kBatch > 0 ? kBatch : batch_size;
+  const bool lane_order = kBatch == 0 && batch < 32 && (batch & (batch - 1)) != 0;
+  // The [batch, n_pre] activity (12.8 KB at batch 64) is gathered four times
+  // per sample and post: read it from shared memory when it fits.
+  extern __shared__ unsigned char staged_bytes[];
+  if constexpr (kStaged) {
+    T* staged = reinterpret_cast<T*>(staged_bytes);
+    for (int64_t i = threadIdx.x; i < batch * n_pre; i += blockDim.x) staged[i] = activity[i];
+    __syncthreads();
+    activity = staged;
+  }
+  for (int64_t post = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       post < n_post; post += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    uint32 pre[kEdges];
+    float row[kEdges][4];  // basis[type], in registers for the 64 samples
+#pragma unroll
+    for (int k = 0; k < kEdges; ++k) {
+      pre[k] = incoming_pre_ids[kEdges * post + k];
+      const int type = incoming_types[kEdges * post + k];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) row[k][r] = basis[type * 4 + r];
+    }
+    float partial[kEdges][kLanes] = {};
+    // An int tile counter, as the fixed-batch kernels had before the runtime
+    // batch: an int64 one costs them ~4 % (extra 64-bit index arithmetic).
+    const int tiles = kBatch > 0 ? kBatch / 32 : static_cast<int>((batch + 31) / 32);
+#pragma unroll 1
+    for (int tile = 0; tile < tiles; ++tile) {
+#pragma unroll
+      for (int lane = 0; lane < kLanes; ++lane) {
+#pragma unroll
+        for (int i = 0; i < kPack; ++i) {
+          const int64_t b = tile * 32 + lane * kPack + i;
+          if (kBatch == 0 && b >= batch) continue;
+          const T* upstream = current_grad + (b * n_post + post) * 4;
+          float up[4];
+#pragma unroll
+          for (int r = 0; r < 4; ++r) up[r] = AsFloat(upstream[r]);
+#pragma unroll
+          for (int k = 0; k < kEdges; ++k) {
+            // BasisProjection<T, 4>::Apply's sum, term by term.
+            float value = 0.0f;
+#pragma unroll
+            for (int r = 0; r < 4; ++r) value += up[r] * row[k][r];
+            const float sample = AsFloat(activity[b * n_pre + pre[k]]);
+            partial[k][lane] += value * sample;
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < kEdges; ++k) {
+      const float* p = partial[k];
+      float sum = ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
+      if (lane_order) {
+        sum = p[0];
+#pragma unroll
+        for (int lane = 1; lane < kLanes; ++lane) sum += p[lane];
+      }
+      // A plain store: the scattered 4-byte writes then merge in L2 instead of
+      // each streaming a partial sector to DRAM.
+      weight_grad[incoming_edge_ids[kEdges * post + k]] = sum;
+    }
+  }
+}
+
+// Validates and launches BkgWeightBackwardIncomingKernel for the tensor and the
+// resource operator, which differ only in where the incoming CSR lives.
+template <typename T>
+Status LaunchBkgIncomingWeightBackward(
+    OpKernelContext* context, const Tensor& activity, const Tensor& current_grad,
+    const Tensor& incoming_pre_ids, const Tensor& incoming_edge_ids,
+    const Tensor& incoming_types, const Tensor& basis, int n_post, int n_edges,
+    Tensor* weight_grad) {
+  if (activity.dims() != 2 || basis.dims() != 2 || basis.dim_size(1) != 4) {
+    return errors::InvalidArgument("activity must be rank two and basis [types, 4]");
+  }
+  const int64_t batch = activity.dim_size(0);
+  if (current_grad.dims() != 2 || current_grad.dim_size(0) != batch * n_post ||
+      current_grad.dim_size(1) != 4) {
+    return errors::InvalidArgument("current_grad has an incompatible shape");
+  }
+  if (n_edges != 4 * static_cast<int64_t>(n_post) ||
+      incoming_pre_ids.NumElements() != n_edges ||
+      incoming_edge_ids.NumElements() != n_edges ||
+      incoming_types.NumElements() != n_edges) {
+    return errors::InvalidArgument("the incoming CSR must hold four edges per post");
+  }
+  auto device = context->eigen_device<GPUDevice>();
+  const int blocks = static_cast<int>(std::min<int64_t>((n_post + 127) / 128, 65535));
+  const int64_t staged_bytes = activity.NumElements() * static_cast<int64_t>(sizeof(T));
+  const bool staged = staged_bytes <= 32 * 1024;
+#define LAUNCH_INCOMING(BATCH)                                                       \
+  return GpuLaunchKernel(                                                            \
+      staged ? BkgWeightBackwardIncomingKernel<T, BATCH, true>                       \
+             : BkgWeightBackwardIncomingKernel<T, BATCH, false>,                     \
+      blocks, 128, staged ? staged_bytes : 0, device.stream(), batch,                \
+      static_cast<int64_t>(n_post), activity.dim_size(1), activity.flat<T>().data(), \
+      current_grad.flat<T>().data(), incoming_pre_ids.flat<uint32>().data(),         \
+      incoming_edge_ids.flat<uint32>().data(), incoming_types.flat<uint8>().data(),  \
+      basis.flat<float>().data(), weight_grad->flat<float>().data())
+  switch (batch) {
+    case 64: LAUNCH_INCOMING(64);
+    case 128: LAUNCH_INCOMING(128);
+    case 256: LAUNCH_INCOMING(256);
+    case 512: LAUNCH_INCOMING(512);
+    default: LAUNCH_INCOMING(0);
+  }
+#undef LAUNCH_INCOMING
+}
+
+template <typename T>
+class BkgCsrWeightBackwardOp : public OpKernel {
+ public:
+  explicit BkgCsrWeightBackwardOp(OpKernelConstruction* context) : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("n_post", &n_post_));
+    OP_REQUIRES_OK(context, context->GetAttr("n_edges", &n_edges_));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    Tensor* weight_grad;
+    OP_REQUIRES_OK(context, context->allocate_output(0, TensorShape({n_edges_}), &weight_grad));
+    OP_REQUIRES_OK(context, LaunchBkgIncomingWeightBackward<T>(
+                                context, context->input(0), context->input(1),
+                                context->input(2), context->input(3), context->input(4),
+                                context->input(5), n_post_, n_edges_, weight_grad));
+  }
+
+ private:
+  int n_post_;
+  int n_edges_;
+};
+
 template <typename T>
 class ExternalCsrActivityBackwardOp : public OpKernel {
  public:
@@ -1189,6 +1353,10 @@ class ExternalCsrActivityBackwardOp : public OpKernel {
 TF_CALL_half(REGISTER_BKG_TYPE);
 TF_CALL_float(REGISTER_BKG_TYPE);
 #undef REGISTER_BKG_TYPE
+
+REGISTER_KERNEL_BUILDER(
+    Name("BkgCsrWeightBackward").Device(DEVICE_GPU).TypeConstraint<Eigen::half>("T"),
+    BkgCsrWeightBackwardOp<Eigen::half>);
 
 #define REGISTER_TYPE(T)                                                \
   REGISTER_KERNEL_BUILDER(                                             \

@@ -63,6 +63,20 @@ REGISTER_OP("V1CsrForward")
 // rounds once, at every batch; otherwise it runs the two forwards in sequence.
 // V1CsrForwardFusedResource (cuda_csr_resources) is the same op reading both
 // connectivities from GPU-local resources.
+// Per-pair FP32 weight sums of an external connectivity (one per distinct (row,
+// target) pair), empty where V1CsrForwardFused's coalesced sweep does not apply.
+REGISTER_OP("V1ExternalPairWeights")
+    .Attr("n_post: int >= 1")
+    .Input("weights: float")
+    .Input("post_ids: uint32")
+    .Input("synapse_types: uint8")
+    .Input("row_splits: uint32")
+    .Output("pair_weights: float")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->Vector(c->UnknownDim()));
+      return OkStatus();
+    });
+
 REGISTER_OP("V1CsrForwardFused")
     .Attr("T: {half, float}")
     .Attr("N: int >= 1")
@@ -83,6 +97,7 @@ REGISTER_OP("V1CsrForwardFused")
     .Input("external_synapse_types: uint8")
     .Input("external_row_splits: uint32")
     .Input("external_edge_ids: uint32")
+    .Input("external_pair_weights: float")
     .Input("queues: carried * uint32")
     .Output("currents: T")
     .Output("queue: uint32")
@@ -113,6 +128,40 @@ REGISTER_OP("V1SpikeQueue")
       return OkStatus();
     });
 
+// One [batch, width] spike slot's activity masks for the backward's weight
+// gradient: [width, ceil(batch / 32)], bit j of word w of column c set when
+// sample 32 w + j of that column is non-zero. A slot's masks depend only on the
+// slot, so a backward that walks the spike history in reverse carries them
+// across steps like the forward carries queue records (see `activity_masks`).
+REGISTER_OP("V1SpikeActivityMasks")
+    .Attr("T: {half, float}")
+    .Input("spikes: T")
+    .Output("masks: uint32")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle spikes;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 2, &spikes));
+      c->set_output(0, c->Matrix(c->Dim(spikes, 1), c->UnknownDim()));
+      return OkStatus();
+    });
+
+// `base` with the entries at the flat `indices` replaced by `values` (entries
+// sharing an index must carry equal values). The op reuses `base`'s buffer when
+// it holds the only reference, so a loop that rewrites a few entries of its
+// previous result every step moves no other memory; else it copies `base` first.
+REGISTER_OP("V1OverwriteEntries")
+    .Attr("T: {half, float}")
+    .Input("base: T")
+    .Input("indices: int64")
+    .Input("values: T")
+    .Output("output: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle unused;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 1, &unused));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 1, &unused));
+      c->set_output(0, c->input(0));
+      return OkStatus();
+    });
+
 // Spike and weight gradients for any batch size and basis dimension. Each
 // distinct (postsynaptic neuron, synapse type) pair is projected onto the basis
 // once instead of once per edge, and the weight gradient is computed only for
@@ -124,11 +173,30 @@ REGISTER_OP("V1SpikeQueue")
 // history was one tensor shifted by the GLIF op: the shift gave its oldest slot
 // a zero gradient, which TensorFlow added to this one. The result is therefore
 // bitwise that of the shifted history, sign of zero included.
+//
+// `activity_masks` is empty, or holds every spike slot's V1SpikeActivityMasks
+// (one per slot, in slot order): the weight gradient then finds its active rows
+// from those masks instead of sweeping the slots. Outputs are bitwise the same.
+//
+// `abs_max_bound` is empty, or one uint32: the float bits of the largest finite
+// |current_grad| (as FusedGlifStepBackward's `rec_inputs_grad_abs_max` returns
+// it for the same tensor). The FP16 projection scale is then derived from it
+// instead of a pass over `current_grad`. Outputs are bitwise the same. A
+// non-finite bound (a caller's rescaled bound that overflowed) makes the op
+// measure `current_grad` after all.
+//
+// `spike_grad_addends` is empty, or one tensor per spike slot, each of that
+// slot's shape or empty: slot k's spike gradient is then returned plus its
+// addend (summed in float and rounded once to T, as a separate add of the two
+// T tensors would), which saves that add's pass.
 REGISTER_OP("V1CsrBackwardPairProjected")
     .Attr("T: {half, float}")
     .Attr("N: int >= 1")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
+    .Attr("carried: int >= 0 = 0")
+    .Attr("bounded: int >= 0 = 0")
+    .Attr("added: int >= 0 = 0")
     .Input("spikes: N * T")
     .Input("current_grad: T")
     .Input("weights: float")
@@ -142,6 +210,9 @@ REGISTER_OP("V1CsrBackwardPairProjected")
     .Input("pair_ids: uint32")
     .Input("pair_posts: uint32")
     .Input("pair_types: uint8")
+    .Input("activity_masks: carried * uint32")
+    .Input("abs_max_bound: bounded * uint32")
+    .Input("spike_grad_addends: added * T")
     .Output("spike_grad: N * T")
     .Output("weight_grad: float")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -168,6 +239,9 @@ REGISTER_OP("V1CsrBackwardPairProjectedAccumulate")
     .Attr("N: int >= 1")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
+    .Attr("carried: int >= 0 = 0")
+    .Attr("bounded: int >= 0 = 0")
+    .Attr("added: int >= 0 = 0")
     .Input("spikes: N * T")
     .Input("current_grad: T")
     .Input("weights: float")
@@ -182,6 +256,9 @@ REGISTER_OP("V1CsrBackwardPairProjectedAccumulate")
     .Input("pair_posts: uint32")
     .Input("pair_types: uint8")
     .Input("accumulator: resource")
+    .Input("activity_masks: carried * uint32")
+    .Input("abs_max_bound: bounded * uint32")
+    .Input("spike_grad_addends: added * T")
     .Output("spike_grad: N * T")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
