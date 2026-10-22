@@ -1,7 +1,8 @@
 """Process orchestration for one-process-per-GPU V1 training.
 
 This module deliberately has no TensorFlow imports: ``multi_training.py`` calls
-it before importing TensorFlow so every worker can expose exactly one GPU.
+it before importing TensorFlow so every worker can expose exactly one GPU, and
+so the PCIe-balanced GPU auto-selection runs before CUDA initializes.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import time
 
+from v1_model_utils import gpu_selection
 
 _WORKER_FLAG = "distributed_worker_index"
 _MODE_FLAG = "distributed_mode"
@@ -371,10 +373,23 @@ def launch_worker_processes(plan, *, enabled=False, log_directory=None):
             handle.close()
 
 
+def _auto_select_gpus_enabled(argv):
+    """Read absl's ``--[no]auto_select_gpus`` boolean before absl parses it."""
+    enabled = True
+    for value in argv[1:]:
+        if value in ("--auto_select_gpus", "--noauto_select_gpus"):
+            enabled = value == "--auto_select_gpus"
+        elif value.startswith("--auto_select_gpus="):
+            enabled = value.split("=", 1)[1].lower() in ("true", "t", "1")
+    return enabled
+
+
 def maybe_launch_training_workers(argv=None, environ=None):
     """Launch distributed workers from the parent, returning its exit code."""
     argv = tuple(sys.argv if argv is None else argv)
     target_environ = os.environ if environ is None else environ
+    if _auto_select_gpus_enabled(argv) and _option(argv, _WORKER_FLAG) is None:
+        gpu_selection.auto_select_gpus(int(_option(argv, "n_gpus", 1)), target_environ)
     plan = plan_training_launch(argv, environ=target_environ)
     if not plan.launch_workers:
         if plan.worker_index is None and plan.visible_devices:

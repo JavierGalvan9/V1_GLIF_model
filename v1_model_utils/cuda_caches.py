@@ -36,25 +36,26 @@ def _visible_gpu_key():
     Autotuning results are only valid for the GPU they were measured on, so the
     cache file is keyed by device. Requires `CUDA_DEVICE_ORDER=PCI_BUS_ID` to
     already be set, which makes `CUDA_VISIBLE_DEVICES` indices line up with the
-    ones `nvidia-smi` reports.
+    ones `nvidia-smi` reports; UUID entries (as the GPU auto-selection writes)
+    are matched directly.
     """
     try:
         listing = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=name,uuid", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=10, check=True,
         ).stdout.split("\n")
     except (OSError, subprocess.SubprocessError):
         return "unknown-gpu"
 
-    names = [line.strip() for line in listing if line.strip()]
+    rows = [[field.strip() for field in line.rsplit(",", 1)]
+            for line in listing if line.strip()]
+    names = [row[0] for row in rows]
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
-        selected = []
-        for index in visible.split(","):
-            index = index.strip()
-            if index.isdigit() and int(index) < len(names):
-                selected.append(names[int(index)])
-        names = selected
+        by_device = {str(index): name for index, name in enumerate(names)}
+        by_device.update((row[-1], row[0]) for row in rows)
+        names = [by_device[device] for device in map(str.strip, visible.split(","))
+                 if device in by_device]
     if not names:
         return "unknown-gpu"
     unique = sorted(set(names))

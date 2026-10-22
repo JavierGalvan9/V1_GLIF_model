@@ -123,9 +123,14 @@ parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')
 parser.add_argument('--random_weights', default=False, action='store_true')
 parser.add_argument('--uniform_weights', default=False, action='store_true')
-parser.add_argument('--gradient_checkpointing', dest='gradient_checkpointing', action='store_true')
-parser.add_argument('--nogradient_checkpointing', dest='gradient_checkpointing', action='store_false')
-parser.set_defaults(gradient_checkpointing=True)
+parser.add_argument('--backward_mode', default='recorded', choices=['recorded', 'checkpointing', 'autodiff'],
+                    help='Training backward mode (see multi_training.py)')
+parser.add_argument('--voltage_offload', default='none', choices=['none', 'raw', 'compressed'],
+                    help='Training membrane-record offload with --backward_mode recorded (see multi_training.py)')
+parser.add_argument('--segmented_rollout', dest='segmented_rollout', action='store_true',
+                    help='Evaluation rollout in int32-safe chunks (see osi_dsi_estimator.py)')
+parser.add_argument('--nosegmented_rollout', dest='segmented_rollout', action='store_false')
+parser.set_defaults(segmented_rollout=True)
 parser.add_argument('--rotation', default='ccw', type=str)
 parser.add_argument('--print_only', default=False, action='store_true', help='Only print the commands without submitting them')
 parser.add_argument('--neuropixels_df', default='Neuropixels_data/v1_OSI_DSI_DF.csv', type=str, help='File name of the Neuropixels DataFrame for OSI/DSI analysis')
@@ -220,9 +225,13 @@ def main():
                 argument = f"--{name} " if value else f"--no{name} "
             else:
                 argument = f"--{name} {shlex.quote(str(value))} "
-            training_script += argument
-            # osi_dsi_estimator.py does not define the training batch splits.
-            if name not in ('grating_batch_size', 'gray_batch_size'):
+            # multi_training.py does not define the evaluation rollout flag.
+            if name != 'segmented_rollout':
+                training_script += argument
+            # osi_dsi_estimator.py does not define the training batch splits or
+            # the backward options.
+            if name not in ('grating_batch_size', 'gray_batch_size', 'backward_mode',
+                            'voltage_offload'):
                 evaluation_script += argument
 
     job_ids = []

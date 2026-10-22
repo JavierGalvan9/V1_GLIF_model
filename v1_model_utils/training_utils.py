@@ -64,9 +64,10 @@ def infer_effective_sequence_length(flags):
 
 def require_int32_safe_rnn_output(batch_size, seq_len, n_neurons,
                                   full_tensor_element_limit=None):
-    """Refuse an un-checkpointed run whose RNN output exceeds the int32 limit.
+    """Refuse a stock-Keras-RNN rollout whose output exceeds the int32 limit.
 
-    Without gradient checkpointing, Keras assembles the RNN output with
+    Without the segmented runner (--backward_mode autodiff in training,
+    --nosegmented_rollout in evaluation), Keras assembles the RNN output with
     ``TensorArray.stack()`` -- an axis-0 concat of ``seq_len`` slices. With 16
     or more inputs TensorFlow's concat switches to a pointer-array GPU kernel
     whose offsets are int32, so above 2**31 elements it returns the wrong
@@ -86,12 +87,13 @@ def require_int32_safe_rnn_output(batch_size, seq_len, n_neurons,
     elements = int(batch_size) * int(seq_len) * int(n_neurons)
     if elements > full_tensor_element_limit:
         raise ValueError(
-            "Gradient checkpointing is disabled, but the RNN output "
+            "The rollout runs through the stock Keras RNN, but its output "
             f"[{batch_size}, {seq_len}, {n_neurons}] is {elements:,} elements, "
             f"past the {full_tensor_element_limit:,} TensorFlow's stock GPU "
             "kernels index correctly. Keras assembles that output with "
             "TensorArray.stack(), which is silently wrong above the limit. "
-            "Pass --gradient_checkpointing, or lower the per-replica batch "
+            "Pass --backward_mode recorded|checkpointing (training) or "
+            "--segmented_rollout (evaluation), or lower the per-replica batch "
             "size / --seq_len so the product stays under it."
         )
     return elements

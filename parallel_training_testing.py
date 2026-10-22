@@ -194,9 +194,14 @@ parser.add_argument('--reset_every_step', default=False, action='store_true')
 parser.add_argument('--spontaneous_training', default=False, action='store_true')
 parser.add_argument('--random_weights', default=False, action='store_true')
 parser.add_argument('--uniform_weights', default=False, action='store_true')
-parser.add_argument('--gradient_checkpointing', dest='gradient_checkpointing', action='store_true')
-parser.add_argument('--nogradient_checkpointing', dest='gradient_checkpointing', action='store_false')
-parser.set_defaults(gradient_checkpointing=True)
+parser.add_argument('--backward_mode', default='recorded', choices=['recorded', 'checkpointing', 'autodiff'],
+                    help='Training backward mode (see multi_training.py)')
+parser.add_argument('--voltage_offload', default='none', choices=['none', 'raw', 'compressed'],
+                    help='Training membrane-record offload with --backward_mode recorded (see multi_training.py)')
+parser.add_argument('--segmented_rollout', dest='segmented_rollout', action='store_true',
+                    help='Evaluation rollout in int32-safe chunks (see osi_dsi_estimator.py)')
+parser.add_argument('--nosegmented_rollout', dest='segmented_rollout', action='store_false')
+parser.set_defaults(segmented_rollout=True)
 parser.add_argument('--pack_spike_checkpoints', dest='pack_spike_checkpoints', action='store_true')
 parser.add_argument('--nopack_spike_checkpoints', dest='pack_spike_checkpoints', action='store_false')
 parser.set_defaults(pack_spike_checkpoints=True)
@@ -283,7 +288,10 @@ def main():
     # Append each flag to the string
     for name, value in vars(flags).items():
         if name not in ['seed', 'low_memory_gpu', 'print_only', 'gpu_type', 'walltime']:
-            if isinstance(value, bool) and not value:
+            # multi_training.py does not define the evaluation rollout flag.
+            if name == 'segmented_rollout':
+                pass
+            elif isinstance(value, bool) and not value:
                 training_script += f"--no{name} "
             elif isinstance(value, bool) and value:
                 training_script += f"--{name} "
@@ -291,12 +299,12 @@ def main():
                 training_script += f"--{name} {shlex.quote(str(value))} "
 
             # osi_dsi_estimator.py does not define training-only batch splits,
-            # rolling-loss flags, or training debug flags.
+            # rolling-loss flags, training debug flags, or the backward options.
             if name in {
                 'n_gpus', 'grating_batch_size', 'gray_batch_size',
                 'debug_gradients', 'global_clipnorm',
                 'detach_reset', 'detach_asc_reset',
-                'pack_spike_checkpoints',
+                'pack_spike_checkpoints', 'backward_mode', 'voltage_offload',
             } or name.startswith(('rolling_', 'batch_emd_')):
                 continue
 

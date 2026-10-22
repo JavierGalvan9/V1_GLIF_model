@@ -48,14 +48,16 @@ def test_first_run_only_dumps_then_later_runs_also_load(tmp_path):
 
 
 def test_cache_file_is_keyed_by_visible_gpu(tmp_path):
-    listing = "NVIDIA L40S\nNVIDIA RTX PRO 6000\nNVIDIA L40S\n"
+    listing = ("NVIDIA L40S, GPU-a\nNVIDIA RTX PRO 6000, GPU-b\n"
+               "NVIDIA L40S, GPU-c\n")
     completed = mock.Mock(stdout=listing)
-    env = _clean_env(tmp_path, CUDA_VISIBLE_DEVICES="1")
-    with mock.patch.dict(os.environ, env, clear=True), \
-            mock.patch.object(cuda_caches.subprocess, "run", return_value=completed):
-        cuda_caches.configure_cuda_caches()
-        assert "NVIDIA-RTX-PRO-6000.txtpb" in os.environ["XLA_FLAGS"]
-        assert "L40S" not in os.environ["XLA_FLAGS"]
+    for mask in ("1", "GPU-b"):  # physical index or UUID (GPU auto-selection)
+        env = _clean_env(tmp_path, CUDA_VISIBLE_DEVICES=mask)
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(cuda_caches.subprocess, "run", return_value=completed):
+            cuda_caches.configure_cuda_caches()
+            assert "NVIDIA-RTX-PRO-6000.txtpb" in os.environ["XLA_FLAGS"]
+            assert "L40S" not in os.environ["XLA_FLAGS"]
 
 
 def test_missing_nvidia_smi_falls_back(tmp_path):

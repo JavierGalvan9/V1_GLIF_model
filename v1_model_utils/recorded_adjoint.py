@@ -34,6 +34,7 @@ from .cuda_csr_recurrent.wrapper import (
     spike_activity_masks,
     spike_slots,
 )
+from .cuda_frame_store import wrapper as frame_store
 from .cuda_glif_state.wrapper import glif_constants, glif_step_backward, record_packed_masks
 
 
@@ -214,10 +215,28 @@ def _pop(handle, like):
     )
 
 
+# How the runner keeps its float32 membrane record (see the runner).
+VOLTAGE_OFFLOAD_MODES = ("none", "raw", "compressed")
+
+
 class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     """A SegmentedRecomputeRunner whose rollouts, given SpikeStatistics, return
     those statistics instead of the spike sequence and differentiate from
     minimal forward records instead of replaying chunks.
+
+    With ``voltage_offload`` "raw" or "compressed" (graph mode, CUDA frame
+    store available) the float32 membrane record, its earliest frames first,
+    goes to pinned host memory as the forward runs and comes back ahead of the
+    reverse loop (cuda_frame_store). The latest ``_PREFETCH`` frames, which the
+    reverse loop needs first, stay on the GPU, and so do the frames the copy
+    engine could not take before the forward ended (the store admits copies as
+    earlier ones finish), so the offloaded share adapts to the PCIe bandwidth.
+    "raw" copies are exact, so the gradients are those of the GPU-resident
+    record. "compressed" encodes offloaded frames with TQ-pack (lossy, on the
+    grid 2**-16: absolute error <= 2**-17 ~= 7.6e-6 per stored value; the live
+    forward voltage stays exact) only as far as the link could not otherwise
+    take them before the forward ends; the others go out exact, and the
+    frames the copy engine cannot take stay on the GPU encoded.
 
     ``__call__(inputs, initial_state, statistics)`` returns the counts (in the
     spike dtype, like the dense sequence they sum), one [rows * per_trial,
@@ -228,39 +247,56 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     for the same forward trajectory.
     """
 
-    def __init__(self, core_model, cell, sequence_length, chunk_size, **kwargs):
+    # Membrane frames the reverse loop fetches ahead of the one it takes (the
+    # latest of them are never offloaded), and frames per copy group: one
+    # compute-stream event per group each way.
+    _PREFETCH = 8
+    _COPY_GROUP = 4
+
+    def __init__(self, core_model, cell, sequence_length, chunk_size,
+                 voltage_offload="none", **kwargs):
         super().__init__(core_model, sequence_length, chunk_size, **kwargs)
+        if voltage_offload not in VOLTAGE_OFFLOAD_MODES:
+            raise ValueError(f"voltage_offload must be one of {VOLTAGE_OFFLOAD_MODES}.")
         self.cell = cell
+        self.voltage_offload = voltage_offload
         self._weight_roles = {
             "recurrent": cell.recurrent_weight_values.value,
             "bkg": cell.bkg_input_weights.value,
             "lgn": cell.input_weight_values.value,
         }
-        self.records = self._supports(cell)
+        self.unsupported = self._unsupported(cell)
+        self.records = not self.unsupported
 
-    def _supports(self, cell):
-        """Whether every derivative the cell's rollout has is one this adjoint takes."""
+    def _unsupported(self, cell):
+        """The conditions of this adjoint the cell's rollout fails (empty when
+        every derivative it has is one this adjoint takes)."""
         trainable = {id(variable.value) for variable in cell.trainable_variables}
-        return (
-            cell._state_backend == "cuda"
-            and cell._chain_current_sources
-            and 1 < cell.max_delay <= MAX_SPIKE_SLOTS
-            and not cell._return_voltage_sequences
-            and cell._output_neuron_ids is None
-            and cell._output_spike_dtype == cell.compute_dtype
-            and not cell._compute_lgn_activity_gradient
-            and not cell._compute_bkg_activity_gradient
-            and not self.differentiate_inputs
-            and trainable <= {id(value) for value in self._weight_roles.values()}
-            and (self._accumulated_variable is not None
-                 or not cell.recurrent_weight_values.trainable)
-        )
+        conditions = {
+            "cuda state backend": cell._state_backend == "cuda",
+            "chained current sources": cell._chain_current_sources,
+            f"1 < max_delay <= {MAX_SPIKE_SLOTS}": 1 < cell.max_delay <= MAX_SPIKE_SLOTS,
+            "no voltage sequences": not cell._return_voltage_sequences,
+            "no output_neuron_ids": cell._output_neuron_ids is None,
+            "spike dtype = compute dtype": cell._output_spike_dtype == cell.compute_dtype,
+            "no LGN/BKG activity gradients": not (cell._compute_lgn_activity_gradient
+                                                  or cell._compute_bkg_activity_gradient),
+            "differentiate_inputs off": not self.differentiate_inputs,
+            "only rec/BKG/LGN trainable":
+                trainable <= {id(value) for value in self._weight_roles.values()},
+            "accumulator present": (self._accumulated_variable is not None
+                                    or not cell.recurrent_weight_values.trainable),
+        }
+        return tuple(name for name, met in conditions.items() if not met)
 
     def __call__(self, inputs, initial_state, statistics=None):
         if statistics is None:
             return super().__call__(inputs, initial_state)
         if not self.records:
-            raise ValueError("This cell's rollout has derivatives the recorded adjoint lacks.")
+            raise ValueError(
+                "This cell's rollout has derivatives the recorded adjoint lacks: "
+                + ", ".join(self.unsupported)
+            )
         time_check = tf.debugging.assert_equal(
             tf.shape(inputs)[1],
             self.sequence_length,
@@ -304,7 +340,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         frames = _empty_list(tf.int32, [batch, words])
         for slot in reversed(history):
             frames = _push(frames, models._pack_spike_words(slot, _WORD_BITS))
-        voltages = _empty_list(tf.float32, [batch, width])
+        store = self._voltage_store(batch, width)
+        voltages = tf.zeros([0]) if store else _empty_list(tf.float32, [batch, width])
+        # Frames from resident_from on stay on the GPU.
+        resident_from = length - self._PREFETCH
         blocked = _empty_list(tf.int32, [batch, words])
         sampling = _Sampling.of(statistics, width) if statistics.traces else None
         traces = (tf.TensorArray(spike_dtype, size=length),) if sampling else ()
@@ -349,8 +388,15 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             )
             counts, *values = _record_step(spikes, counts, counted[time], sampling)
             traces = tuple(array.write(time, value) for array, value in zip(traces, values))
+            voltages = (
+                frame_store.offload_frame(
+                    voltage, time, store, length, resident_from, self._COPY_GROUP,
+                    codec="tq" if self.voltage_offload == "compressed" else "raw",
+                ) if store
+                else _push(voltages, voltage)
+            )
             return (time + 1, new_states, counts, _push(frames, packed_spikes),
-                    _push(voltages, voltage), _push(blocked, packed_blocked), traces)
+                    voltages, _push(blocked, packed_blocked), traces)
 
         object.__setattr__(cell, "_lgn_pair_weights", pair_weights)
         try:
@@ -380,7 +426,22 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             bkg_activity = tf.stop_gradient(models.sample_bkg_activity(
                 cell, batch, initial_state[6], num_steps=length
             ))
-        return outputs, final_state, (frames, voltages, blocked, bkg_activity)
+        return outputs, final_state, (frames, voltages, blocked, bkg_activity, store)
+
+    def _voltage_store(self, batch, width):
+        """The host store key of this rollout's membrane record, or None to
+        keep the record on the GPU. Keys count the rollouts of the outermost
+        graph being traced (so retraces reuse their stores) and name the
+        frame shape; the op keeps one store per key and GPU."""
+        if (self.voltage_offload == "none" or self._PREFETCH >= self.sequence_length
+                or tf.executing_eagerly() or not frame_store.available()):
+            return None
+        graph = tf.compat.v1.get_default_graph()
+        while getattr(graph, "outer_graph", None) is not None:
+            graph = graph.outer_graph
+        count = getattr(graph, "_v1_voltage_stores", 0)
+        graph._v1_voltage_stores = count + 1
+        return f"voltages_{count}_{batch}x{width}"
 
     # Backward ------------------------------------------------------------
 
@@ -449,7 +510,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     def _adjoint(self, inputs, initial_state, final_state, records, statistics,
                  statistic_gradients, state_gradients, variables):
         cell, length, delay = self.cell, self.sequence_length, self.cell.max_delay
-        frames, voltages, blocked, bkg_activity = records
+        frames, voltages, blocked, bkg_activity, store = records
         final_slots = tf.split(final_state[0], delay, axis=1)
         spike_dtype = final_slots[0].dtype
         width = final_slots[0].shape[1]
@@ -574,7 +635,17 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             when carried their activity masks, and the spike cotangent's carry."""
             slots, masks, spike_carry = window
             history, voltage_g, asc_g, rise_g, psc_g = cotangents
-            voltages, voltage = _pop(voltages, final_state[1])
+            if store:
+                # After the previous step's GLIF backward (and, at the first
+                # step, every offload), so the frame's wait sits right before
+                # its consumer on the compute stream.
+                with tf.control_dependencies([voltage_g, voltages]):
+                    voltage = frame_store.take_frame(
+                        time, store, final_state[1],
+                        prefetch=self._PREFETCH, group=self._COPY_GROUP,
+                    )
+            else:
+                voltages, voltage = _pop(voltages, final_state[1])
             blocked, packed_blocked = _pop(blocked, frames_like)
             # z[time - 1 - delay], the next step's oldest slot, is frame
             # time - 1; at time 0 the read is unused.

@@ -142,7 +142,7 @@ class UnchunkedRnnOutputGuardTest(unittest.TestCase):
         )
 
     def test_rejects_the_active_203k_batch_64_shape(self):
-        with self.assertRaisesRegex(ValueError, "gradient_checkpointing"):
+        with self.assertRaisesRegex(ValueError, "--backward_mode recorded.checkpointing"):
             multi_training.require_int32_safe_rnn_output(64, 500, 203816)
 
     def test_boundary_is_the_int32_element_limit_exactly(self):

@@ -134,7 +134,7 @@ python multi_training.py --data_dir GLIF_network \
     --neurons 0 --seq_len 500 --n_epochs 75 --steps_per_epoch 25 \
     --batch_size 5 --optimizer exp_adam --learning_rate 0.005 \
     --rate_cost 10000 --voltage_cost 1 --sync_cost 1.5 --osi_cost 20 \
-    --train_recurrent --gradient_checkpointing
+    --train_recurrent
 ```
 
 `multi_training.py` is also the production multi-GPU entry point. It runs one
@@ -145,7 +145,7 @@ NCCL. Batch flags remain per-replica for backward compatibility:
 CUDA_VISIBLE_DEVICES=0,1 python multi_training.py --n_gpus 2 \
     --batch_size 32 --grating_batch_size 16 --gray_batch_size 16 \
     --data_dir GLIF_network --neurons 0 --seq_len 500 \
-    --train_recurrent --train_noise --gradient_checkpointing
+    --train_recurrent --train_noise
 ```
 
 This example has global batch 64. The equivalent convenience form is
@@ -184,23 +184,39 @@ Parameters:
 - `--train_recurrent`: Enable training of recurrent connections
 - `--optimizer`: Optimizer used for the paper-aligned runs (`exp_adam`)
 - `--learning_rate`: Learning rate used in the reported configuration (`0.005`)
-- `--gradient_checkpointing`: Enable exact-BPTT activation recomputation. The
-  default `segmented` implementation stores recurrent state only at temporal
-  chunk boundaries and recomputes the chunks in reverse during backpropagation.
-- `--gradient_checkpoint_chunk_size`: Number of timesteps per recomputed chunk
-  (default: `25`). Smaller chunks reduce peak VRAM at the cost of additional
-  loop overhead.
+- `--backward_mode`: How training differentiates its rollouts (all exact):
+  - `recorded` (default): the recorded adjoint stores the membrane voltages,
+    packed spikes and refractory masks during the forward and never replays
+    it. It needs the online voltage loss and a cell whose derivatives it
+    covers; otherwise training falls back to `checkpointing` with a warning
+    naming the failed conditions.
+  - `checkpointing`: segmented exact BPTT stores the recurrent state only at
+    temporal chunk boundaries and recomputes the chunks in reverse.
+  - `autodiff`: plain TensorFlow backprop (refused when the spike sequence
+    passes 2**31 elements).
+- `--voltage_offload`: With `--backward_mode recorded`, where its float32
+  membrane record lives: `none` (default, GPU memory), `raw` (pinned host
+  memory, exact) or `compressed` (as `raw`, with the frames the PCIe link
+  cannot take encoded on the 2^-16 grid: lossy, |error| <= 7.6e-6 on the
+  stored voltages only). Ignored with a warning in the other modes. See
+  [the frame store README](v1_model_utils/cuda_frame_store/README.md).
+- `--gradient_checkpoint_chunk_size`: Timesteps per chunk (default: `25`): the
+  replay chunk of `checkpointing` (smaller chunks reduce peak VRAM at the cost
+  of additional loop overhead) and the gradient-summation chunk of `recorded`.
 - `--pack_spike_checkpoints`: Store the binary recurrent spike-delay state at
   temporal checkpoint boundaries in a bit-packed `int32` representation. This
   is opt-in while its end-to-end memory and runtime trade-off is evaluated.
-- `--n_gpus`: Number of already-visible GPUs to use (default: `1`).
+- `--n_gpus`: Number of GPUs to use (default: `1`).
+- `--auto_select_gpus`: Expose `--n_gpus` idle GPUs spread across PCIe root
+  ports (default: on). It never acts inside a Slurm job or when
+  `CUDA_VISIBLE_DEVICES` is already set.
 - `--global_batch_size`: Optional global batch divided evenly across replicas;
   when zero, the existing per-replica batch flags are used.
 - `--distributed_mode`: `mirrored` (default, one process) or `multi_worker`
   (one process per GPU) when `--n_gpus > 1`.
 
-For the 203,816-neuron model at sequence length 500 and batch size 1, chunk
-sizes 25, 50, and 100 measured approximately 17.9, 26.2, and 43.6 GiB of peak
+For the 203,816-neuron model at sequence length 500 and batch size 1, the
+`checkpointing` chunk sizes 25, 50, and 100 measured approximately 17.9, 26.2, and 43.6 GiB of peak
 TensorFlow allocation, respectively, with similar steady-state step times.
 Whole-sequence recomputation and chunk size 250 exceeded 96 GiB. These figures
 depend on the connectivity, losses, TensorFlow build, and GPU architecture.
@@ -214,6 +230,11 @@ python osi_dsi_estimator.py --data_dir GLIF_network \
     --neurons 0 --n_trials_per_angle 10 --restore_from "/path/to/model/checkpoint" \
     --track_core_only
 ```
+
+`--segmented_rollout` (default: on) runs the evaluation rollout in
+`--gradient_checkpoint_chunk_size` chunks, which stays correct past 2**31
+spike-sequence elements; `--nosegmented_rollout` runs the stock Keras RNN and
+refuses such sizes.
 
 `output_spike_dtype` controls only the spike sequence exposed by the recurrent
 layer. The OSI/DSI core-neuron path uses `tf.float32` inside the GPU RNN and

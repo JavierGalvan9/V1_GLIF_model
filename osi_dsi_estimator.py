@@ -231,7 +231,7 @@ def main(_):
         # spikes with no error at all, so route it through the segmented runner --
         # which rejoins along axis 1 and is int32-safe -- or refuse outright.
         segmented_extractor = None
-        if flags.gradient_checkpointing:
+        if flags.segmented_rollout:
             segmented_extractor = models.SegmentedRecomputeRunner(
                 sequence_and_state_model,
                 sequence_length=flags.seq_len,
@@ -614,7 +614,13 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean('restore_runtime_dtype_cast', True, 'Enable in-memory checkpoint dtype conversion when checkpoint and requested model dtype differ.')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
-    absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
+    absl.app.flags.DEFINE_boolean(
+        "segmented_rollout",
+        True,
+        "Run the rollout in --gradient_checkpoint_chunk_size chunks (the int32-safe "
+        "SegmentedRecomputeRunner forward); off runs the stock Keras RNN, refused when "
+        "its output passes 2**31 elements.",
+    )
     absl.app.flags.DEFINE_integer(
         "gradient_checkpoint_chunk_size",
         25,

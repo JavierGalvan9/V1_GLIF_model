@@ -11,11 +11,12 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 # os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-from v1_model_utils.cuda_caches import configure_cuda_caches
-configure_cuda_caches()  # before CUDA and XLA initialize
-
+# The launch plan picks the visible GPUs first, so the cache key names them.
 from v1_model_utils import training_orchestration
 from v1_model_utils.training_bootstrap import TRAINING_LAUNCH_PLAN
+
+from v1_model_utils.cuda_caches import configure_cuda_caches
+configure_cuda_caches()  # before CUDA and XLA initialize
 
 import absl
 import socket
@@ -684,11 +685,8 @@ def main(_):
             model, rsnn_layer, name="training_sequence_and_state_extractor"
         )
         segmented_extractor = None
-        # Whether training rollouts record minimal forward histories and
-        # differentiate them with the recorded adjoint, returning spike
-        # summaries instead of the spike sequence (RecordedAdjointRunner).
-        recorded_rollouts = False
-        if flags.gradient_checkpointing:
+        backward_mode = flags.backward_mode
+        if backward_mode != "autodiff":
             runner_options = dict(
                 sequence_length=flags.seq_len,
                 chunk_size=flags.gradient_checkpoint_chunk_size,
@@ -698,29 +696,49 @@ def main(_):
                     rsnn_layer.cell.accumulated_weight_gradient_variable
                 ),
             )
-            if flags.minimal_record_backward:
-                segmented_extractor = recorded_adjoint.RecordedAdjointRunner(
-                    sequence_and_state_model, rsnn_layer.cell, **runner_options
-                )
-                recorded_rollouts = (
-                    segmented_extractor.records and flags.use_online_voltage_loss
-                )
-            else:
-                segmented_extractor = models.SegmentedRecomputeRunner(
-                    sequence_and_state_model, **runner_options
-                )
-            print(
-                "Gradient checkpointing: "
-                + ("recorded exact adjoint, no replay"
-                   if recorded_rollouts else "segmented exact BPTT")
-                + f" ({segmented_extractor.n_chunks} chunks, "
-                f"chunk_size={segmented_extractor.chunk_size})."
+        voltage_offload = flags.voltage_offload
+        if backward_mode == "recorded":
+            # Training rollouts record minimal forward histories and differentiate
+            # them with the recorded adjoint, returning spike summaries instead of
+            # the spike sequence. Called without statistics, the runner replays
+            # its checkpointed chunks, which is also the fallback.
+            segmented_extractor = recorded_adjoint.RecordedAdjointRunner(
+                sequence_and_state_model, rsnn_layer.cell,
+                voltage_offload=voltage_offload, **runner_options,
             )
-        else:
+            unsupported = segmented_extractor.unsupported + (
+                () if flags.use_online_voltage_loss else ("online voltage loss",)
+            )
+            if unsupported:
+                print(
+                    f"WARNING: --backward_mode recorded unavailable ({', '.join(unsupported)}); "
+                    "falling back to checkpointing."
+                )
+                backward_mode = "checkpointing"
+        if backward_mode != "recorded" and voltage_offload != "none":
+            print(
+                f"WARNING: --voltage_offload {voltage_offload} needs --backward_mode recorded; "
+                "ignored."
+            )
+            voltage_offload = "none"
+        if segmented_extractor is None and backward_mode == "checkpointing":
+            segmented_extractor = models.SegmentedRecomputeRunner(
+                sequence_and_state_model, **runner_options
+            )
+        if backward_mode == "autodiff":
             require_int32_safe_rnn_output(
                 real_batch_size, flags.seq_len, network["n_nodes"]
             )
-            print("Gradient checkpointing disabled.")
+            print("Backward mode: autodiff (plain TensorFlow backprop).")
+        else:
+            print(
+                f"Backward mode: {backward_mode}"
+                + (f", voltage offload {voltage_offload}" if backward_mode == "recorded" else "")
+                + f" ({segmented_extractor.n_chunks} chunks, "
+                f"chunk_size={segmented_extractor.chunk_size})."
+            )
+        # Whether training rollouts return spike summaries (RecordedAdjointRunner).
+        recorded_rollouts = backward_mode == "recorded"
         # State-only model to avoid storing full sequences when only the final state is needed.
         try:
             state_model = models.build_state_only_model(model, rsnn_layer)
@@ -2445,6 +2463,11 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer(
         'n_gpus', 1, 'Number of visible GPUs to use.'
     )
+    absl.app.flags.DEFINE_boolean(
+        'auto_select_gpus', True,
+        'Expose n_gpus idle GPUs spread across PCIe root ports (read before '
+        'TensorFlow starts). Skipped when a device mask or scheduler job is set.',
+    )
     absl.app.flags.DEFINE_integer(
         'global_batch_size', 0,
         'Optional global batch split evenly across n_gpus; 0 keeps per-replica flags.',
@@ -2532,13 +2555,31 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('random_weights', False, '')
     absl.app.flags.DEFINE_boolean('uniform_weights', False, '')
     absl.app.flags.DEFINE_boolean("current_input", False, "")
-    absl.app.flags.DEFINE_boolean("gradient_checkpointing", True, "")
-    absl.app.flags.DEFINE_boolean(
-        "minimal_record_backward",
-        True,
-        "With gradient checkpointing and the online voltage loss, differentiate "
-        "training rollouts from minimal forward records (exact, no forward replay) "
-        "when the cell supports it; otherwise replay checkpointed chunks.",
+    absl.app.flags.DEFINE_enum(
+        "backward_mode",
+        "recorded",
+        ["recorded", "checkpointing", "autodiff"],
+        "How training differentiates its rollouts: recorded (the exact recorded adjoint: "
+        "stores the membrane voltages, spikes and refractory masks in the forward and "
+        "never replays it; needs the online voltage loss and a supported cell, otherwise "
+        "falls back to checkpointing with a warning naming the failed conditions), "
+        "checkpointing (segmented exact BPTT: stores chunk-boundary states and replays "
+        "each chunk in the backward) or autodiff (plain TensorFlow backprop; limited to "
+        "int32-indexable spike sequences).",
+    )
+    absl.app.flags.DEFINE_enum(
+        "voltage_offload",
+        "none",
+        ["none", "raw", "compressed"],
+        "With --backward_mode recorded, where its float32 membrane record lives: none "
+        "(GPU memory), raw (copied to pinned host memory during the forward, exact, and "
+        "prefetched back in the backward; the frames the copy engine cannot take stay on "
+        "the GPU) or compressed (as raw, but frames the PCIe link could not otherwise take "
+        "are TQ-pack encoded: LOSSY on the grid 2^-16, |error| <= 7.6e-6 on the stored "
+        "voltages only, so gradients are no longer bitwise). Needs the CUDA frame store "
+        "op and pinned host RAM per GPU for the whole record (52 MB per step at batch 64 "
+        "and 203,816 neurons: ~26 GB at seq_len 500); ignored with a warning in the "
+        "other backward modes.",
     )
     absl.app.flags.DEFINE_boolean(
         "pack_spike_checkpoints",
@@ -2562,7 +2603,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_integer(
         "gradient_checkpoint_chunk_size",
         25,
-        "Temporal chunk size for segmented exact-BPTT recomputation.",
+        "Temporal chunk size: the replay chunk of --backward_mode checkpointing, and the "
+        "gradient-summation chunk of --backward_mode recorded (which sums its weight "
+        "gradients per chunk as checkpointing does, so both give the same bits).",
     )
     absl.app.flags.DEFINE_boolean(
         "detach_reset", True, "Detach the spike from the membrane-reset gradient path."
