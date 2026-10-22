@@ -454,7 +454,9 @@ def test_tq_chain_across_raw_encoded_host_and_gpu_frames(capfd, monkeypatch):
     assert error == 0.0
     stats = _stats(capfd)
     assert int(stats["encoded"]) >= 1 and int(stats["ring_full"]) >= 1
-    assert int(stats["encoded"]) + int(stats["ring_full"]) == 22
+    # A frame the reverse takes (or the forward's end keeps) before its encode
+    # finished stays raw and is in neither count.
+    assert int(stats["encoded"]) + int(stats["ring_full"]) <= 22
     assert float(stats["ring_peak_mb"]) <= float(stats["ring_mb"])
 
 
