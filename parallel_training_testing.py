@@ -9,6 +9,18 @@ from v1_model_utils import spatial_layout
 from v1_model_utils import training_utils
 # # script_path = "bash d
 
+# GPU classes each cluster's scheduler accepts; the first one is the default.
+CLUSTER_GPU_TYPES = {
+    'nuredduna': ('rtxpro6000', 'rtx3090', 'L40S'),
+    'talaia': ('b200', 'h200', 'l40s'),
+}
+# TalaIA node sizes cap the GPUs one training job can request.
+TALAIA_GPUS_PER_NODE = {'b200': 8, 'h200': 2, 'l40s': 8}
+THREAD_VARIABLES = (
+    'OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+    'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS',
+)
+
 # Create argument parser
 parser = argparse.ArgumentParser()
 
@@ -127,11 +139,15 @@ parser.add_argument('--plot_core_radius', default=400.0, type=float)
 
 parser.add_argument('--n_gpus', default=1, type=int)
 parser.add_argument(
-    '--gpu_type', default='rtxpro6000',
-    choices=['rtx3090', 'L40S', 'rtxpro6000'],
-    help='Scheduler GPU class for training jobs.',
+    '--cluster', default='nuredduna', choices=list(CLUSTER_GPU_TYPES),
+    help='Cluster whose scheduler receives the jobs.',
 )
-parser.add_argument('--walltime', default='48:00', help='Scheduler wall time.')
+parser.add_argument(
+    '--gpu_type', default=None,
+    help='Scheduler GPU class for training jobs (default: the first one listed for --cluster).',
+)
+parser.add_argument('--qos', default='normal', help='Slurm QoS for TalaIA jobs.')
+parser.add_argument('--walltime', default='48:00', help='Scheduler wall time as hours:minutes.')
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=75, type=int)
 parser.add_argument('--batch_size', default=2, type=int)
@@ -216,6 +232,34 @@ def format_command(command):
     return shlex.join([str(part) for part in command])
 
 
+def scheduler_command(flags, script, job_name, log_name, gpus, cpus, memory_gb, walltime,
+                      gpu_type=None, dependency=None):
+    """
+    Build the submission command of one job for the scheduler of flags.cluster.
+    Nuredduna jobs go through its `run` helper; TalaIA jobs call sbatch directly
+    with the same resources, inheriting the submitting shell's environment.
+    """
+    logs = [f"Out/{log_name}.out", f"Error/{log_name}.err"]
+    if flags.cluster == 'nuredduna':
+        command = ["run", "-g", str(gpus)] + (["-G", gpu_type] if gpu_type else [])
+        command += ["-c", str(cpus), "-m", str(memory_gb), "-t", walltime]
+        if dependency:
+            command += ["-d", dependency]
+        return command + ["-o", logs[0], "-e", logs[1], "-j", job_name, script]
+
+    gres = f"gpu:{gpu_type}:{gpus}" if gpu_type else f"gpu:{gpus}"
+    threads = ",".join(f"{name}={cpus}" for name in THREAD_VARIABLES)
+    command = [
+        "sbatch", "-A", "uib_focosineu_acc", "-p", "acc", "--qos", flags.qos,
+        f"--gres={gres}", "-c", str(cpus), f"--mem={memory_gb}G",
+        # Like `run`, the wall time is given as hours:minutes.
+        "-t", f"{walltime}:00", f"--export=ALL,{threads}",
+    ]
+    if dependency:
+        command.append(f"--dependency=afterok:{dependency}")
+    return command + ["-o", logs[0], "-e", logs[1], "-J", job_name, "--wrap", script]
+
+
 def submit_job(command, print_only=False):
     """
     Submit a job to the cluster using the command provided.
@@ -240,6 +284,15 @@ def submit_job(command, print_only=False):
 def main():
     # Initialize the flags and customize the simulation main characteristics
     flags = parser.parse_args()
+    gpu_types = CLUSTER_GPU_TYPES[flags.cluster]
+    flags.gpu_type = flags.gpu_type or gpu_types[0]
+    if flags.gpu_type not in gpu_types:
+        parser.error(f"--gpu_type {flags.gpu_type} is not available on {flags.cluster}: {gpu_types}")
+    if flags.cluster == 'talaia' and flags.n_gpus > TALAIA_GPUS_PER_NODE[flags.gpu_type]:
+        parser.error(
+            f"--n_gpus {flags.n_gpus} exceeds the {TALAIA_GPUS_PER_NODE[flags.gpu_type]} "
+            f"{flags.gpu_type} GPUs of one TalaIA node"
+        )
 
     # Get the neurons of each column of the network
     v1_neurons = flags.neurons
@@ -272,15 +325,11 @@ def main():
     # sim_name = 'b_xwue'
     print(f'> Results for {flags.task_name} will be stored in:\n {logdir} \n')
 
-    # Define the job submission commands for the training and evaluation scripts
+    # Define the job resources for the training and evaluation scripts
     cpu_count = 4 if flags.low_memory_gpu else 8 * flags.n_gpus # even when using just 2 cpus the performance with respect to 8 degrades in 2-3% speed
-    training_commands = [
-        "run", "-g", str(flags.n_gpus), "-G", flags.gpu_type,
-        "-c", str(cpu_count), "-m", "80", "-t", flags.walltime,
-    ]
-
-    # evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
-    evaluation_commands = ["run", "-g", "1", "-m", "200", "-c", "8", "-t", "3:00"]
+    training_resources = dict(gpus=flags.n_gpus, gpu_type=flags.gpu_type, cpus=cpu_count, memory_gb=80, walltime=flags.walltime)
+    # Evaluation jobs take any available GPU class
+    evaluation_resources = dict(gpus=1, cpus=8, memory_gb=200, walltime="3:00")
 
     # Define the training and evaluation script calls
     # training_script = "python multi_training.py "
@@ -289,7 +338,7 @@ def main():
 
     # Append each flag to the string
     for name, value in vars(flags).items():
-        if name not in ['seed', 'low_memory_gpu', 'print_only', 'gpu_type', 'walltime']:
+        if name not in ['seed', 'low_memory_gpu', 'print_only', 'cluster', 'gpu_type', 'qos', 'walltime']:
             # multi_training.py does not define the evaluation rollout flag.
             if name == 'segmented_rollout':
                 pass
@@ -331,21 +380,21 @@ def main():
     for i in range(flags.n_runs):
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...
         if i == 0:
-            new_training_command = training_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-j", f"{sim_name}_train_{i}"]
+            dependency = None
             if initial_benchmark_model:
                 new_training_script = training_script + f"--seed {flags.seed} --ckpt_dir {logdir} --run_session {i} --restore_from {initial_benchmark_model} "
             else:
                 new_training_script = training_script + f"--seed {flags.seed} --ckpt_dir {logdir} --run_session {i}"
-            new_training_command = new_training_command + [new_training_script]
-            job_id = submit_job(new_training_command, print_only=flags.print_only)
         else:
             dependency = job_ids[i-1]
             if flags.print_only:
                 dependency = f"<{sim_name}_train_{i-1}_JOBID>"
-            new_training_command = training_commands + ['-d', dependency, "-o", f"Out/{sim_name}_{v1_neurons}_train_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_train_{i}.err", "-j", f"{sim_name}_train_{i}"]
             new_training_script = training_script + f"--seed {flags.seed} --ckpt_dir {logdir} --run_session {i}"
-            new_training_command = new_training_command + [new_training_script]
-            job_id = submit_job(new_training_command, print_only=flags.print_only)
+        new_training_command = scheduler_command(
+            flags, new_training_script, f"{sim_name}_train_{i}", f"{sim_name}_{v1_neurons}_train_{i}",
+            dependency=dependency, **training_resources,
+        )
+        job_id = submit_job(new_training_command, print_only=flags.print_only)
         job_ids.append(job_id)
 
         if flags.n_runs == 1: # the run is a single run, no need to submit evaluation jobs. osi_dsi will be evaluated at the end of training run
@@ -354,9 +403,11 @@ def main():
             dependency = job_id
             if flags.print_only:
                 dependency = f"<{sim_name}_train_{i}_JOBID>"
-            new_evaluation_command = evaluation_commands + ['-d', dependency, "-o", f"Out/{sim_name}_{v1_neurons}_test_{i}.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_{i}.err", "-j", f"{sim_name}_test_{i}"]
             new_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir} --restore_from 'Intermediate_checkpoints' --run_session {i}"
-            new_evaluation_command = new_evaluation_command + [new_evaluation_script]
+            new_evaluation_command = scheduler_command(
+                flags, new_evaluation_script, f"{sim_name}_test_{i}", f"{sim_name}_{v1_neurons}_test_{i}",
+                dependency=dependency, **evaluation_resources,
+            )
             eval_job_id = submit_job(new_evaluation_command, print_only=flags.print_only)
             eval_job_ids.append(eval_job_id)
 

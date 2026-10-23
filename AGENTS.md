@@ -123,7 +123,7 @@ python -c "import tensorflow as tf, ctypes.util; print('CUDA', tf.sysconfig.get_
 
 ## Running Heavy Training/Testing Jobs
 - Always confirm with the user before launching any long-running or resource-intensive jobs.
-- Important: `parallel_training_testing.py` is a Nuredduna cluster submission wrappers. They call the external `run` command and expect scheduler JOB IDs.
+- Important: `parallel_training_testing.py` is a cluster submission wrapper. With the default `--cluster nuredduna` it calls the external `run` command; with `--cluster talaia` it calls `sbatch` directly (see the TalaIA section). Both expect scheduler JOB IDs.
 - Never run other scripts than the wrappers directly on the Nuredduna cluster. The wrappers handle environment setup, logging, and resource management for cluster runs.
 - For local testing or quick checks, submit a job with the `run` command as detailed below.
 - If `run` is unavailable, do not execute wrapper training runs locally. Use direct scripts (`multi_training.py`, `osi_dsi_estimator.py`) for local checks.
@@ -166,6 +166,20 @@ conda activate neuro_tf221
 - Run the desired training/testing script.
 - If the scheduler prints a node name and requires a second hop, follow that host dynamically (do not assume `gpu01`).
 - Never run other scripts than the wrappers on the Nuredduna cluster.
+
+## TalaIA Cluster (BSAI)
+- SSH: `ssh talaia` (`bsai010059@ssh.talaia.uib.cat`, key login only). The login node `login01` has no GPU.
+- Project: `/projects/focosineu/jgalvan/repos/V1_GLIF_model`; Miniforge in `/projects/focosineu/jgalvan/miniforge3`, envs in `/projects/focosineu/jgalvan/envs`. `/scratch` is wiped every 30 days: caches only.
+- Slurm: account `uib_focosineu_acc`, partition `acc` (3-day limit), QoS `normal|test|interactive|scavenger`. GPUs `b200` (8/node), `h200` (2/node), `l40s` (8/node), requested as `--gres=gpu:<type>:N`.
+- Submit from an activated `neuro_tf221` shell in the project path (jobs inherit it), after `mkdir -p Out Error`:
+```bash
+python parallel_training_testing.py --cluster talaia [--gpu_type b200] [--qos normal] ...
+```
+- Interactive GPU session:
+```bash
+srun -A uib_focosineu_acc -p acc --qos interactive --gres=gpu:b200:1 -c 8 --mem=80G -t 1:00:00 --pty bash
+```
+- The B200 (sm_100) GPU class has no Nuredduna counterpart; validate CUDA ops and numerics on it before trusting results.
 
 
 # Paper Writing AI Instructions
