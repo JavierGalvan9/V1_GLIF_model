@@ -67,6 +67,7 @@ def test_talaia_jobs_are_sbatch_commands_with_dependencies(tmp_path, monkeypatch
         assert command[-2] == "--wrap"
         assert command[command.index("-A") + 1] == "uib_focosineu_acc"
         assert command[command.index("--qos") + 1] == "normal"
+        assert "-p" not in command and not any(arg.startswith("--partition") for arg in command)
         assert "OMP_NUM_THREADS=" in next(arg for arg in command if arg.startswith("--export=ALL,"))
         assert "--cluster" not in command[-1]
     assert "--gres=gpu:b200:2" in training[0]

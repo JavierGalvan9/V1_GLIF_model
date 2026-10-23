@@ -170,16 +170,29 @@ conda activate neuro_tf221
 ## TalaIA Cluster (BSAI)
 - SSH: `ssh talaia` (`bsai010059@ssh.talaia.uib.cat`, key login only). The login node `login01` has no GPU.
 - Project: `/projects/focosineu/jgalvan/repos/V1_GLIF_model`; Miniforge in `/projects/focosineu/jgalvan/miniforge3`, envs in `/projects/focosineu/jgalvan/envs`. `/scratch` is wiped every 30 days: caches only.
-- Slurm: account `uib_focosineu_acc`, partition `acc` (3-day limit), QoS `normal|test|interactive|scavenger`. GPUs `b200` (8/node), `h200` (2/node), `l40s` (8/node), requested as `--gres=gpu:<type>:N`.
+- Slurm: account `uib_focosineu_acc`, QoS `normal|test|interactive|scavenger`. GPUs `b200` (8/node), `h200` (2/node), `l40s` (8/node), requested as `--gres=gpu:<type>:N`. Never pass `-p/--partition`: sbatch rejects it and routes GPU jobs to `acc` (3-day limit) itself.
 - Submit from an activated `neuro_tf221` shell in the project path (jobs inherit it), after `mkdir -p Out Error`:
 ```bash
 python parallel_training_testing.py --cluster talaia [--gpu_type b200] [--qos normal] ...
 ```
 - Interactive GPU session:
 ```bash
-srun -A uib_focosineu_acc -p acc --qos interactive --gres=gpu:b200:1 -c 8 --mem=80G -t 1:00:00 --pty bash
+srun -A uib_focosineu_acc --qos interactive --gres=gpu:b200:1 -c 8 --mem=80G -t 1:00:00 --pty bash
 ```
 - The B200 (sm_100) GPU class has no Nuredduna counterpart; validate CUDA ops and numerics on it before trusting results.
+- TalaIA GPU nodes have no system CUDA toolkit, and the TF 2.21 wheel's RUNPATH omits `nvidia/cusolver/lib`: without help TF fails to dlopen `libcusolver.so.11` and lists no GPUs. The env carries an activation hook that prepends that directory to `LD_LIBRARY_PATH` (jobs inherit it). Recreate it after rebuilding the env:
+```bash
+mkdir -p $CONDA_PREFIX/etc/conda/{activate.d,deactivate.d}
+cat > $CONDA_PREFIX/etc/conda/activate.d/nvidia_cusolver.sh <<'H'
+export _V1_CUSOLVER_OLD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH-}"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cusolver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+H
+cat > $CONDA_PREFIX/etc/conda/deactivate.d/nvidia_cusolver.sh <<'H'
+export LD_LIBRARY_PATH="${_V1_CUSOLVER_OLD_LD_LIBRARY_PATH-}"
+[ -n "$LD_LIBRARY_PATH" ] || unset LD_LIBRARY_PATH
+unset _V1_CUSOLVER_OLD_LD_LIBRARY_PATH
+H
+```
 
 
 # Paper Writing AI Instructions

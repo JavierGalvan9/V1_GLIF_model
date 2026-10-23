@@ -250,7 +250,8 @@ def scheduler_command(flags, script, job_name, log_name, gpus, cpus, memory_gb, 
     gres = f"gpu:{gpu_type}:{gpus}" if gpu_type else f"gpu:{gpus}"
     threads = ",".join(f"{name}={cpus}" for name in THREAD_VARIABLES)
     command = [
-        "sbatch", "-A", "uib_focosineu_acc", "-p", "acc", "--qos", flags.qos,
+        # TalaIA rejects --partition: it routes jobs by their GPU request.
+        "sbatch", "-A", "uib_focosineu_acc", "--qos", flags.qos,
         f"--gres={gres}", "-c", str(cpus), f"--mem={memory_gb}G",
         # Like `run`, the wall time is given as hours:minutes.
         "-t", f"{walltime}:00", f"--export=ALL,{threads}",

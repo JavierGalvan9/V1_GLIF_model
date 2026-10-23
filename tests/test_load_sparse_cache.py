@@ -1,4 +1,5 @@
 import os
+import shutil
 from types import SimpleNamespace
 
 import h5py
@@ -188,6 +189,28 @@ def test_matching_legacy_cache_is_renamed_instead_of_rebuilt(tmp_path, monkeypat
 
     result = load_sparse.cached_load_v1(flags, 2, flag_str="shared")
 
-    assert result[0] == {"legacy": True}
+    assert result[0]["legacy"] is True
     assert not legacy.exists()
     assert os.path.exists(load_sparse.v1_cache_path(flags, 2, "shared"))
+
+
+def test_cache_restored_from_a_moved_data_dir_points_at_the_new_location(tmp_path, monkeypatch):
+    original = tmp_path / "original"
+    (original / "tf_data").mkdir(parents=True)
+    (original / "network").mkdir()
+    (original / "network" / "v1_nodes.h5").write_bytes(b"source")
+    monkeypatch.setattr(
+        load_sparse, "load_v1",
+        lambda flags, n_neurons: ({"data_dir": flags.data_dir}, {}, {}),
+    )
+    load_sparse.cached_load_v1(_flags(original, 1), 2, flag_str="shared")
+
+    # Copying with metadata (as rsync -a does) keeps the provenance valid.
+    moved = tmp_path / "moved"
+    shutil.copytree(original, moved)
+    shutil.rmtree(original)
+    monkeypatch.setattr(load_sparse, "load_v1", lambda *args, **kwargs: pytest.fail("rebuilt"))
+
+    result = load_sparse.cached_load_v1(_flags(moved, 1), 2, flag_str="shared")
+
+    assert result[0]["data_dir"] == str(moved)

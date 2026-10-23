@@ -873,6 +873,10 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
                 and cached.get("provenance") == provenance
             ):
                 network, lgn_input, bkg_input = cached["payload"]
+                # The provenance is location-independent, so a data directory
+                # copied to another host or path keeps its caches valid; the
+                # stored data_dir must then follow the current location.
+                network["data_dir"] = flags.data_dir
                 if read_path != cache_path:
                     os.replace(read_path, cache_path)
                 print(f"> Sucessfully restored V1 model from {read_path}")

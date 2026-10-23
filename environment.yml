@@ -13,6 +13,10 @@ dependencies:
   # those operators compatible with the Ubuntu 22.04 host ABI.
   - gxx_linux-64=11.4.0
   - pip:
+      # The TensorFlow 2.21 wheel RUNPATH omits nvidia/cusolver/lib. Hosts
+      # without a system CUDA 12 toolkit (TalaIA) then fail to load
+      # libcusolver.so.11 and TensorFlow disables every GPU. After creating the
+      # env, add the activation hook described in AGENTS.md (TalaIA section).
       - tensorflow[and-cuda]==2.21.0
       - keras==3.15.1
       - tensorboard==2.21.0
