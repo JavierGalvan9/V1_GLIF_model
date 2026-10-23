@@ -4,7 +4,8 @@
 #   bash multi_training_talaia.sh
 # parallel_training_testing.py --cluster talaia submits sbatch jobs that inherit
 # this shell's environment, so the conda env is activated here.
-set -euo pipefail
+# No `set -u`: conda's compiler activation scripts read unset variables.
+set -eo pipefail
 
 cd "$(dirname "$0")"
 source "$(conda info --base)/etc/profile.d/conda.sh"
