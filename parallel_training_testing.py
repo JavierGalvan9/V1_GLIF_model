@@ -148,6 +148,7 @@ parser.add_argument(
 )
 parser.add_argument('--qos', default='normal', help='Slurm QoS for TalaIA jobs.')
 parser.add_argument('--walltime', default='48:00', help='Scheduler wall time as hours:minutes.')
+parser.add_argument('--memory_gb', default=80, type=int, help='Host memory (GB) requested for training jobs.')
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=75, type=int)
 parser.add_argument('--batch_size', default=2, type=int)
@@ -328,7 +329,7 @@ def main():
 
     # Define the job resources for the training and evaluation scripts
     cpu_count = 4 if flags.low_memory_gpu else 8 * flags.n_gpus # even when using just 2 cpus the performance with respect to 8 degrades in 2-3% speed
-    training_resources = dict(gpus=flags.n_gpus, gpu_type=flags.gpu_type, cpus=cpu_count, memory_gb=80, walltime=flags.walltime)
+    training_resources = dict(gpus=flags.n_gpus, gpu_type=flags.gpu_type, cpus=cpu_count, memory_gb=flags.memory_gb, walltime=flags.walltime)
     # Evaluation jobs take any available GPU class
     evaluation_resources = dict(gpus=1, cpus=8, memory_gb=200, walltime="3:00")
 
@@ -339,7 +340,7 @@ def main():
 
     # Append each flag to the string
     for name, value in vars(flags).items():
-        if name not in ['seed', 'low_memory_gpu', 'print_only', 'cluster', 'gpu_type', 'qos', 'walltime']:
+        if name not in ['seed', 'low_memory_gpu', 'print_only', 'cluster', 'gpu_type', 'qos', 'walltime', 'memory_gb']:
             # multi_training.py does not define the evaluation rollout flag.
             if name == 'segmented_rollout':
                 pass

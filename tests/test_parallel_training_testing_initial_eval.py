@@ -54,7 +54,7 @@ def test_history_offload_defaults_to_none():
 def test_talaia_jobs_are_sbatch_commands_with_dependencies(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", [
         "parallel_training_testing.py", "--neurons", "66652", "--n_runs", "2", "--cluster", "talaia",
-        "--n_gpus", "2", "--results_dir", str(tmp_path), "--print_only",
+        "--n_gpus", "2", "--memory_gb", "256", "--results_dir", str(tmp_path), "--print_only",
     ])
     wrapper.main()
     commands = [
@@ -71,6 +71,8 @@ def test_talaia_jobs_are_sbatch_commands_with_dependencies(tmp_path, monkeypatch
         assert "OMP_NUM_THREADS=" in next(arg for arg in command if arg.startswith("--export=ALL,"))
         assert "--cluster" not in command[-1]
     assert "--gres=gpu:b200:2" in training[0]
+    assert "--mem=256G" in training[0] and "--mem=200G" in evaluation[0]
+    assert "--memory_gb" not in training[0][-1]
     assert training[0][training[0].index("-t") + 1] == "48:00:00"
     assert not any(arg.startswith("--dependency") for arg in training[0])
     assert any(arg.startswith("--dependency=afterok:<") for arg in training[1])
