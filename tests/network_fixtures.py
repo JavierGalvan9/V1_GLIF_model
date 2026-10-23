@@ -49,7 +49,11 @@ def load_network(n_neurons):
         )
     with open(path, "rb") as handle:
         cached = pickle.load(handle)
-    return cached["payload"] if isinstance(cached, dict) else cached
+    network, lgn_input, bkg_input = cached["payload"] if isinstance(cached, dict) else cached
+    # Like load_sparse.cached_load_v1: a cache built under another path or host
+    # must read its companion files from this checkout's data directory.
+    network["data_dir"] = DATA_DIR
+    return network, lgn_input, bkg_input
 
 
 def build_network(n_neurons):
