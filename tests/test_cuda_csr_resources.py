@@ -167,8 +167,9 @@ def test_resource_external_backward_modes_match_tensor_backend(
 )
 @pytest.mark.parametrize("batch_size", [2, 32])
 @pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
+@pytest.mark.parametrize("edges_per_post", [4, 3, 8])
 def test_resource_bkg_forward_takes_the_gather_like_the_tensor_backend(
-    monkeypatch, batch_size, dtype
+    monkeypatch, batch_size, dtype, edges_per_post
 ):
     """Replicated training must run the same BKG forward as one GPU.
 
@@ -180,9 +181,9 @@ def test_resource_bkg_forward_takes_the_gather_like_the_tensor_backend(
     """
     rng = np.random.default_rng(2026)
     n_pre, n_post = 100, 64
-    posts = np.repeat(np.arange(n_post), 4)
+    posts = np.repeat(np.arange(n_post), edges_per_post)
     pres = np.concatenate(
-        [rng.choice(n_pre, size=4, replace=False) for _ in range(n_post)]
+        [rng.choice(n_pre, size=edges_per_post, replace=False) for _ in range(n_post)]
     )
     order = np.lexsort((posts, pres))
     indices = np.stack([posts, pres], axis=1)[order].astype(np.int64)
@@ -225,9 +226,10 @@ def test_resource_bkg_forward_takes_the_gather_like_the_tensor_backend(
     len(tf.config.list_physical_devices("GPU")) != 1,
     reason="resource workers require exactly one visible CUDA GPU",
 )
+@pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
 @pytest.mark.parametrize("batch_size", [5, 48, 64])
 def test_resource_bkg_weight_backward_is_bitwise_the_tensor_backend(
-    monkeypatch, batch_size
+    monkeypatch, batch_size, dtype
 ):
     """Replicated training must get the one-GPU BKG weight gradient: the
     resource operator runs the tensor kernel on the incoming CSR it stores."""
@@ -240,8 +242,8 @@ def test_resource_bkg_weight_backward_is_bitwise_the_tensor_backend(
     order = np.lexsort((np.arange(posts.size), posts, pres))
     indices = np.stack([posts, pres], axis=1)[order].astype(np.int64)
     types = rng.integers(0, 7, size=len(indices)).astype(np.int64)
-    activity = tf.constant(rng.poisson(1.5, (batch_size, n_pre)), tf.float16)
-    upstream = tf.constant(rng.normal(size=(batch_size * n_post, 4)), tf.float16)
+    activity = tf.constant(rng.poisson(1.5, (batch_size, n_pre)), dtype)
+    upstream = tf.constant(rng.normal(size=(batch_size * n_post, 4)), dtype)
     basis = tf.constant(rng.normal(size=(7, 4)), tf.float32)
 
     def evaluate(mode):
@@ -596,7 +598,7 @@ def test_scaled_abs_max_bound_gives_bitwise_the_measured_backward(
     overflowed (non-finite) bound makes the operator measure. Either way the
     backward is bitwise the one that measures the rescaled upstream itself.
     """
-    from v1_model_utils.recorded_adjoint import _scaled_abs_max
+    from v1_model_utils.cuda_csr_recurrent.wrapper import scaled_abs_max_bound
 
     monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
     indices, synapse_types, n_pre, n_post, arrays, options = _backward_fixture(
@@ -615,7 +617,7 @@ def test_scaled_abs_max_bound_gives_bitwise_the_measured_backward(
         )
     lr_scale = tf.constant(scale, dtype)
     scaled = current_grad * lr_scale
-    bound = _scaled_abs_max(options["abs_max_bound"], lr_scale)
+    bound = scaled_abs_max_bound(options["abs_max_bound"], lr_scale)
     magnitudes = np.abs(scaled.numpy().astype(np.float32))
     measured = magnitudes[np.isfinite(magnitudes)].max()
     rescaled = bound.numpy().view(np.float32)[0]

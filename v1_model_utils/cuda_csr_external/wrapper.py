@@ -108,22 +108,27 @@ def _compact_pairs(post_ids, synapse_types, needed=True):
     }
 
 
+# The edge counts per post the BKG gather kernel is instantiated for
+# (kMaxBkgEdges in csr_external_grad_ops.cu.cc).
+MAX_BKG_EDGES = 8
+
+
 def _bkg_incoming_metadata(
     post_ids, synapse_types, row_splits, n_pre, n_post, weights_csr_ordered
 ):
-    """Build the fixed-four incoming CSR used by the BKG forward fast path.
+    """Build the uniform incoming CSR (the same 1 to MAX_BKG_EDGES edges per post)
+    used by the BKG forward fast path.
 
     Both backends use it: the tensor operators read it from these tensors, and
     resource mode stores it in each GPU's resource.
     """
-    if (
-        not weights_csr_ordered
-        or n_pre != 100
-        or len(post_ids) != 4 * n_post
-    ):
+    if not weights_csr_ordered or n_pre != 100 or n_post == 0:
+        return {}
+    edges_per_post, remainder = divmod(len(post_ids), n_post)
+    if remainder or not 1 <= edges_per_post <= MAX_BKG_EDGES:
         return {}
     post_counts = np.bincount(post_ids, minlength=n_post)
-    if post_counts.size != n_post or not np.all(post_counts == 4):
+    if post_counts.size != n_post or not np.all(post_counts == edges_per_post):
         return {}
     incoming_order = np.argsort(post_ids, kind="stable").astype(np.uint32)
     pre_ids = np.repeat(
@@ -131,7 +136,7 @@ def _bkg_incoming_metadata(
     )
     return {
         "incoming_row_splits": tf.constant(
-            np.arange(0, 4 * n_post + 1, 4, dtype=np.uint32)
+            np.arange(0, len(post_ids) + 1, edges_per_post, dtype=np.uint32)
         ),
         "incoming_pre_ids": tf.constant(pre_ids[incoming_order], tf.uint32),
         "incoming_edge_ids": tf.constant(incoming_order, tf.uint32),
@@ -140,7 +145,8 @@ def _bkg_incoming_metadata(
 
 
 def uses_bkg_gather(connectivity, basis):
-    """Whether the forward takes the fixed-four incoming gather.
+    """Whether the forward takes the uniform incoming gather (any 1 to
+    MAX_BKG_EDGES edges per post).
 
     The one gate for both backends, so the tensor and resource paths cannot
     select different kernels for the same connectivity.
@@ -322,20 +328,24 @@ def external_backward(
     return activity_grad, weight_grad
 
 
-def incoming_weight_backward(connectivity, values, upstream, basis_values):
-    """The dense BKG weight gradient from the fixed-four incoming CSR in one pass
+def incoming_weight_backward(connectivity, values, upstream, basis_values, incoming=None):
+    """The dense BKG weight gradient from a four-edge incoming CSR in one pass
     over ``upstream``; None where it does not apply (then call external_backward
     or resource_external_backward).
 
-    Bitwise what those return at every batch they sum in a fixed order; at the
-    batches below 32 that are not powers of two they add 4-sample tiles with
-    atomics, and this adds the same tiles in launch order, their usual result.
+    Bitwise what those return, FP16 or FP32: both add the same terms in the
+    same fixed order.
+
+    ``incoming`` stands for the connectivity's ``(incoming_pre_ids,
+    incoming_edge_ids, incoming_types)``: the same tensors as a custom
+    gradient's arguments, which it must not capture.
     """
     if (
         connectivity.sparse_activity
         or not uses_bkg_gather(connectivity, basis_values)
-        or values.dtype != tf.float16
-        or upstream.dtype != tf.float16
+        or connectivity.n_edges != 4 * connectivity.n_post
+        or values.dtype not in (tf.float16, tf.float32)
+        or upstream.dtype != values.dtype
     ):
         return None
     if connectivity.resource_name is not None:
@@ -345,9 +355,11 @@ def incoming_weight_backward(connectivity, values, upstream, basis_values):
             resource_name=connectivity.resource_name,
         )
     _, external_ops = _load_ops()
+    if incoming is None:
+        incoming = (connectivity.incoming_pre_ids, connectivity.incoming_edge_ids,
+                    connectivity.incoming_types)
     return external_ops.bkg_csr_weight_backward(
-        values, upstream, connectivity.incoming_pre_ids, connectivity.incoming_edge_ids,
-        connectivity.incoming_types, basis_values,
+        values, upstream, *incoming, basis_values,
         n_post=connectivity.n_post, n_edges=connectivity.n_edges,
     )
 
@@ -609,6 +621,7 @@ def calculate_recurrent_and_external_currents(
     compute_activity_gradient=True,
     compute_weight_gradient=True,
     external_pair_weights=None,
+    link=None,
 ):
     """``(currents, record)``: the recurrent currents of a spike history plus an
     external input's (``record`` is None without ``queues``), as
@@ -627,10 +640,13 @@ def calculate_recurrent_and_external_currents(
     same ``external_weights``) lets the fused operator's sweep read one weight
     sum per distinct (row, target) pair instead of every edge's weight. It is a
     forward-only input: the external weight gradient stays per edge. Ignored
-    where the two forwards run separately."""
+    where the two forwards run separately.
+
+    ``link`` is the timestep's StepGradientLink (V1Column.call), taken up by the
+    recurrent backward when the spike slots are its own."""
     if not fusable(spikes, basis, connectivity, queues, activity, external_connectivity):
         currents = calculate_recurrent_csr_currents(
-            spikes, weights, basis, dampening, connectivity, queues=queues
+            spikes, weights, basis, dampening, connectivity, queues=queues, link=link
         )
         currents, record = currents if queues is not None else (currents, None)
         currents = calculate_external_csr_currents(
@@ -656,7 +672,7 @@ def calculate_recurrent_and_external_currents(
             external_weights, external_connectivity,
             compute_activity_gradient=compute_activity_gradient,
             compute_weight_gradient=compute_weight_gradient,
-            external_pair_weights=pair_weight_sums,
+            external_pair_weights=pair_weight_sums, link=link,
         )
     recurrent_ops, _ = _load_ops()
 
@@ -670,6 +686,7 @@ def calculate_recurrent_and_external_currents(
         *rest,
     ):
         spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        linked = link is not None and link.accept(spike_values)
         currents, record = recurrent_ops.v1_csr_forward_fused(
             spike_values, weight_values, post_ids, synapse_types, row_splits, edge_ids,
             basis_values, values, master_weights, external_post_ids,
@@ -688,6 +705,7 @@ def calculate_recurrent_and_external_currents(
                 connectivity, spike_values, upstream, weight_values, basis_values,
                 dampening_value, post_ids, synapse_types, row_splits, edge_ids,
                 nonempty_rows, pair_ids, pair_posts, pair_types,
+                **(link.take() if linked else {}),
             )
             activity_grad, external_weight_grad = external_backward(
                 external_connectivity, values, upstream, master_weights, basis_values,
@@ -733,7 +751,7 @@ def calculate_recurrent_and_external_currents(
 def _calculate_resource_recurrent_and_external_currents(
     slots, weights, basis, dampening, connectivity, queues, activity, external_weights,
     external_connectivity, *, compute_activity_gradient, compute_weight_gradient,
-    external_pair_weights,
+    external_pair_weights, link=None,
 ):
     """calculate_recurrent_and_external_currents with both connectivities in
     GPU-local resources (V1CsrForwardFusedResource)."""
@@ -745,6 +763,7 @@ def _calculate_resource_recurrent_and_external_currents(
         pair_weight_sums, *rest
     ):
         spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        linked = link is not None and link.accept(spike_values)
         currents, record = ops.v1_csr_forward_fused_resource(
             spike_values, weight_values, basis_values, values, master_weights,
             pair_weight_sums, queue_values,
@@ -760,7 +779,7 @@ def _calculate_resource_recurrent_and_external_currents(
             # gradient of the two-operator chain.
             spike_grads, weight_grad = resource_recurrent_backward(
                 connectivity, spike_values, upstream, weight_values, basis_values,
-                dampening_value,
+                dampening_value, **(link.take() if linked else {}),
             )
             activity_grad, external_weight_grad = resource_external_backward(
                 external_connectivity, values, upstream, master_weights, basis_values,

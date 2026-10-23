@@ -58,7 +58,7 @@ class V1CsrResource : public ResourceBase {
   Tensor pair_ids;
   Tensor pair_posts;
   Tensor pair_types;
-  // Fixed-four incoming CSR of the BKG forward gather; empty when absent.
+  // Uniform-K incoming CSR of the BKG forward gather; empty when absent.
   Tensor incoming_row_splits;
   Tensor incoming_pre_ids;
   Tensor incoming_edge_ids;
@@ -103,7 +103,7 @@ Status ValidateMetadata(const V1CsrResource& resource) {
         "pair_posts and pair_types must have equal lengths");
   }
   // The incoming CSR is all or nothing, and when present lists every edge
-  // once, four per post.
+  // once, the same 1 to 8 (kMaxBkgEdges) per post.
   const int64_t incoming_rows = resource.incoming_row_splits.NumElements();
   const bool has_incoming = incoming_rows != 0;
   for (const Tensor* tensor :
@@ -114,9 +114,11 @@ Status ValidateMetadata(const V1CsrResource& resource) {
           "incoming CSR metadata must be empty or list every edge once");
     }
   }
-  if (has_incoming && n_edges != 4 * (incoming_rows - 1)) {
+  if (has_incoming && (incoming_rows < 2 || n_edges % (incoming_rows - 1) != 0 ||
+                       n_edges / (incoming_rows - 1) < 1 ||
+                       n_edges / (incoming_rows - 1) > 8)) {
     return errors::InvalidArgument(
-        "incoming CSR metadata requires exactly four edges per post");
+        "incoming CSR metadata requires the same 1 to 8 edges per post");
   }
   return OkStatus();
 }
@@ -395,7 +397,7 @@ class BkgCsrForwardResourceOp : public OpKernel {
     OP_REQUIRES(context,
                 resource->incoming_row_splits.NumElements() == n_post_ + 1,
                 errors::InvalidArgument(
-                    "resource carries no fixed-four incoming CSR for n_post"));
+                    "resource carries no uniform incoming CSR for n_post"));
     const int64_t count = activity.dim_size(0) * n_post_;
     const TensorShape shape({count, 4});
     OP_REQUIRES(context,
@@ -407,19 +409,16 @@ class BkgCsrForwardResourceOp : public OpKernel {
     OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(
                                 {3}, 0, shape, &output));
     if (count == 0) return;
-    auto device = context->eigen_device<GPUDevice>();
     OP_REQUIRES_OK(
         context,
-        GpuLaunchKernel(
-            external_resource_kernel::BkgGatherKernel<T>,
-            dim3((n_post_ + 127) / 128, activity.dim_size(0)), 128, 0,
-            device.stream(), static_cast<int>(activity.dim_size(1)), n_post_,
-            activity.flat<T>().data(), weights.flat<float>().data(),
+        external_resource_kernel::LaunchBkgGather<T>(
+            context, activity.dim_size(0), static_cast<int>(activity.dim_size(1)), n_post_,
+            resource->incoming_edge_ids.NumElements(), activity.flat<T>().data(),
+            weights.flat<float>().data(),
             resource->incoming_row_splits.flat<uint32>().data(),
             resource->incoming_pre_ids.flat<uint32>().data(),
             resource->incoming_edge_ids.flat<uint32>().data(),
-            resource->incoming_types.flat<uint8>().data(),
-            basis.flat<float>().data(),
+            resource->incoming_types.flat<uint8>().data(), basis.flat<float>().data(),
             initial.NumElements() ? initial.flat<T>().data() : nullptr,
             output->flat<T>().data()));
   }
@@ -568,13 +567,6 @@ class ExternalCsrWeightBackwardResourceOp : public OpKernel {
                 errors::InvalidArgument(
                     "the dense weight backward needs the per-edge pair projection, "
                     "but this resource holds none"));
-    if (!external_resource_kernel::UsesCompactWeightPath<T>(
-            activity.dim_size(0), basis.dim_size(1),
-            resource->pair_posts.NumElements())) {
-      cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
-                      weight_grad->NumElements() * sizeof(float),
-                      context->eigen_device<GPUDevice>().stream());
-    }
 #define LAUNCH_DENSE(BASIS)                                                      \
   OP_REQUIRES_OK(context, external_resource_kernel::LaunchWeightBackward<T, BASIS>( \
                               context, activity, current_grad, resource->post_ids, \
@@ -623,7 +615,7 @@ class BkgCsrWeightBackwardResourceOp : public OpKernel {
     OP_REQUIRES(context,
                 resource->incoming_row_splits.NumElements() == n_post_ + 1,
                 errors::InvalidArgument(
-                    "resource carries no fixed-four incoming CSR for n_post"));
+                    "resource carries no uniform incoming CSR for n_post"));
     Tensor* weight_grad;
     OP_REQUIRES_OK(context, context->allocate_output(
                                 0, TensorShape({n_edges_}), &weight_grad));
@@ -766,8 +758,12 @@ REGISTER_KERNEL_BUILDER(Name("InitializeV1CsrResource")
                         InitializeV1CsrResourceOp);
 REGISTER_KERNEL_BUILDER(Name("V1ExternalPairWeightsResource").Device(DEVICE_GPU),
                         V1ExternalPairWeightsResourceOp);
-REGISTER_KERNEL_BUILDER(
-    Name("BkgCsrWeightBackwardResource").Device(DEVICE_GPU).TypeConstraint<Eigen::half>("T"),
-    BkgCsrWeightBackwardResourceOp<Eigen::half>);
+#define REGISTER_BKG_WEIGHT_BACKWARD_RESOURCE_TYPE(T)                                \
+  REGISTER_KERNEL_BUILDER(                                                           \
+      Name("BkgCsrWeightBackwardResource").Device(DEVICE_GPU).TypeConstraint<T>("T"), \
+      BkgCsrWeightBackwardResourceOp<T>);
+TF_CALL_half(REGISTER_BKG_WEIGHT_BACKWARD_RESOURCE_TYPE);
+TF_CALL_float(REGISTER_BKG_WEIGHT_BACKWARD_RESOURCE_TYPE);
+#undef REGISTER_BKG_WEIGHT_BACKWARD_RESOURCE_TYPE
 
 #endif

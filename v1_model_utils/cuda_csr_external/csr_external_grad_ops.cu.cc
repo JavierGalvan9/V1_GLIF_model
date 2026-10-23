@@ -73,7 +73,11 @@ __device__ __forceinline__ void StoreBkgFour(T* values, float4 result) {
   }
 }
 
-template <typename T>
+// The incoming gather of a uniform kEdges-per-post CSR (the production BKG has
+// four; kMaxBkgEdges bounds the instantiated counts).
+constexpr int kMaxBkgEdges = 8;
+
+template <typename T, int kEdges = 4>
 __global__ void BkgGatherKernel(
     int n_pre, int n_post, const T* activity, const float* weights,
     const uint32* rows, const uint32* pre_ids, const uint32* edge_ids,
@@ -85,7 +89,7 @@ __global__ void BkgGatherKernel(
   float4 sums = initial ? LoadBkgFour(initial + index * 4)
                         : make_float4(0, 0, 0, 0);
 #pragma unroll
-  for (uint32 incoming = rows[post]; incoming < rows[post] + 4; ++incoming) {
+  for (uint32 incoming = rows[post]; incoming < rows[post] + kEdges; ++incoming) {
     const float spike =
         static_cast<float>(activity[batch * n_pre + pre_ids[incoming]]);
     if (spike == 0.0f) continue;
@@ -97,6 +101,38 @@ __global__ void BkgGatherKernel(
     sums.w += weighted * projection.w;
   }
   StoreBkgFour(output + index * 4, sums);
+}
+
+// Launches BkgGatherKernel for `n_edges / n_post` edges per post (1..kMaxBkgEdges);
+// shared by the tensor and the resource operator.
+template <typename T>
+Status LaunchBkgGather(OpKernelContext* context, int64_t batch, int n_pre, int n_post,
+                       int64_t n_edges, const T* activity, const float* weights,
+                       const uint32* rows, const uint32* pre_ids, const uint32* edge_ids,
+                       const uint8* types, const float* basis, const T* initial, T* output) {
+  if (n_post <= 0 || n_edges % n_post != 0 || n_edges / n_post < 1 ||
+      n_edges / n_post > kMaxBkgEdges) {
+    return errors::InvalidArgument(
+        "BKG fast path requires the same 1 to ", kMaxBkgEdges, " edges per post");
+  }
+  const dim3 blocks((n_post + 127) / 128, batch);
+  const auto stream = context->eigen_device<GPUDevice>().stream();
+#define LAUNCH_GATHER(EDGES)                                                         \
+  case EDGES:                                                                        \
+    return GpuLaunchKernel(BkgGatherKernel<T, EDGES>, blocks, 128, 0, stream, n_pre, \
+                           n_post, activity, weights, rows, pre_ids, edge_ids,       \
+                           types, basis, initial, output)
+  switch (n_edges / n_post) {
+    LAUNCH_GATHER(1);
+    LAUNCH_GATHER(2);
+    LAUNCH_GATHER(3);
+    LAUNCH_GATHER(5);
+    LAUNCH_GATHER(6);
+    LAUNCH_GATHER(7);
+    LAUNCH_GATHER(8);
+    default: LAUNCH_GATHER(4);
+  }
+#undef LAUNCH_GATHER
 }
 
 template <typename T>
@@ -124,10 +160,8 @@ class BkgCsrForwardOp : public OpKernel {
                     "incoming_row_splits must have n_post + 1 entries"));
     OP_REQUIRES(context,
                 pre_ids.NumElements() == edge_ids.NumElements() &&
-                    types.NumElements() == edge_ids.NumElements() &&
-                    edge_ids.NumElements() == 4 * n_post_,
-                errors::InvalidArgument(
-                    "BKG fast path requires exactly four edges per post"));
+                    types.NumElements() == edge_ids.NumElements(),
+                errors::InvalidArgument("incoming CSR arrays must have equal lengths"));
     const int64_t count = activity.dim_size(0) * n_post_;
     const TensorShape shape({count, 4});
     OP_REQUIRES(context,
@@ -137,14 +171,10 @@ class BkgCsrForwardOp : public OpKernel {
     OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(
                                 {7}, 0, shape, &output));
     if (count == 0) return;
-    auto device = context->eigen_device<GPUDevice>();
-    OP_REQUIRES_OK(context, GpuLaunchKernel(
-                                BkgGatherKernel<T>,
-                                dim3((n_post_ + 127) / 128,
-                                     activity.dim_size(0)),
-                                128, 0, device.stream(),
+    OP_REQUIRES_OK(context, LaunchBkgGather<T>(
+                                context, activity.dim_size(0),
                                 static_cast<int>(activity.dim_size(1)), n_post_,
-                                activity.flat<T>().data(),
+                                edge_ids.NumElements(), activity.flat<T>().data(),
                                 weights.flat<float>().data(),
                                 rows.flat<uint32>().data(),
                                 pre_ids.flat<uint32>().data(),
@@ -196,78 +226,86 @@ struct BasisProjection<T, 0> {
   }
 };
 
-template <typename T, int kBasis, int kBatch, int kTile>
-__global__ void WeightBackwardStaticBatchKernel(
-    int64_t n_pre, int n_post, int n_basis, const T* activity,
-    const T* current_grad, const uint32* post_ids,
-    const uint8* synapse_types, const uint32* row_splits,
-    const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const float* basis, float* weight_grad) {
-  static_assert(kBatch % kTile == 0, "batch tiles must divide the batch");
-  const int64_t tile_id = blockIdx.x / n_rows;
-  const int64_t row_id = blockIdx.x - tile_id * n_rows;
-  if (row_id >= n_rows) return;
-  const int first_batch = static_cast<int>(tile_id) * kTile;
-  const uint32 pre = nonempty_rows[row_id];
-  for (uint32 csr = row_splits[pre] + threadIdx.x;
-       csr < row_splits[pre + 1]; csr += blockDim.x) {
-    const uint32 edge = V1_EDGE_INDEX(csr);
-    const uint32 post = post_ids[csr];
-    const uint32 type = synapse_types[csr];
-    float tile_weight_grad = 0.0f;
-#pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      const int batch = first_batch + offset;
-      const T* upstream =
-          current_grad +
-          (batch * static_cast<int64_t>(n_post) + post) * n_basis;
-      tile_weight_grad +=
-          BasisProjection<T, kBasis>::Apply(upstream, basis, type, n_basis) *
-          AsFloat(activity[batch * n_pre + pre]);
-    }
-    if (kBatch == kTile) {
-      weight_grad[edge] = tile_weight_grad;
-    } else if (tile_weight_grad != 0.0f) {
-      atomicAdd(weight_grad + edge, tile_weight_grad);
-    }
+// The batch tile of the weight gradient's direct path: the whole batch at 1,
+// 2, 4, 8 and 16, V1_EXTERNAL_BATCH32_TILE at 32, 32 at 64, 128, 256 (and 512
+// with at least 1,024 non-empty rows), four otherwise. These are the tiles of
+// the atomic kernels this path replaced, so it adds the same tile sums.
+__host__ __forceinline__ int DirectWeightTile(int64_t batch, int64_t n_rows) {
+  switch (batch) {
+    case 1: case 2: case 4: case 8: case 16: return static_cast<int>(batch);
+    case 32: return V1_EXTERNAL_BATCH32_TILE;
+    case 64: case 128: case 256: return 32;
+    case 512: return n_rows >= 1024 ? 32 : 4;
+    default: return 4;
   }
 }
 
-template <typename T, int kBasis, int kTile>
-__global__ void WeightBackwardRuntimeBatchKernel(
-    int64_t batch_size, int64_t n_pre, int n_post, int n_basis,
+// Direct weight gradient (every dtype and basis width; the FP32 dense path):
+// per edge, each tile of kTile consecutive samples is summed in sample order,
+// then the tiles in tile order onto zero, skipping zero tiles (one tile: stored
+// as is). That is the order in which the atomic kernels it replaced usually
+// landed their tile sums (launch order, tile-major) and the only order where
+// they were deterministic, so it reproduces them bit for bit there, now
+// deterministically everywhere. One launch covers the kDirectSpan samples from
+// `first` (whole tiles; `kGuard` only for the last, partial span) and adds
+// onto what the previous launch stored, so each launch reads only a slice of
+// `current_grad` (L2-resident at production sizes) the way the tile blocks of
+// the atomic kernels did. `blockIdx.y` splits a row into contiguous chunks so
+// that BKG's 100 rows fill the GPU.
+constexpr int kDirectSpan = 32;
+
+template <typename T, int kBasis, int kTile, bool kGuard>
+__global__ void WeightBackwardDirectKernel(
+    int64_t batch_size, int first, int64_t n_pre, int n_post, int n_basis,
     const T* activity, const T* current_grad, const uint32* post_ids,
-    const uint8* synapse_types, const uint32* row_splits,
-    const uint32* edge_ids, const uint32* nonempty_rows, int64_t n_rows,
-    const float* basis, float* weight_grad) {
-  const int64_t tile_id = blockIdx.x / n_rows;
-  const int64_t row_id = blockIdx.x - tile_id * n_rows;
+    const uint8* synapse_types, const uint32* row_splits, const uint32* edge_ids,
+    const uint32* nonempty_rows, int64_t n_rows, uint32 splits, const float* basis,
+    float* weight_grad) {
+  static_assert(kDirectSpan % kTile == 0, "a span holds whole tiles");
+  const int64_t row_id = blockIdx.x;
   if (row_id >= n_rows) return;
-  const int64_t first_batch = tile_id * kTile;
   const uint32 pre = nonempty_rows[row_id];
-  for (uint32 csr = row_splits[pre] + threadIdx.x;
-       csr < row_splits[pre + 1]; csr += blockDim.x) {
+  const uint32 row_start = row_splits[pre];
+  const uint32 row_end = row_splits[pre + 1];
+  const uint32 chunk = (row_end - row_start + splits - 1) / splits;
+  const uint32 start = row_start + blockIdx.y * chunk;
+  const uint32 end = min(row_end, start + chunk);
+  for (uint32 csr = start + threadIdx.x; csr < end; csr += blockDim.x) {
     const uint32 edge = V1_EDGE_INDEX(csr);
     const uint32 post = post_ids[csr];
     const uint32 type = synapse_types[csr];
-    float tile_weight_grad = 0.0f;
+    // One tile's sum, guarded only for a partial tile: unguarded, all of its
+    // loads can be issued ahead of the sum.
+    const auto tile_sum = [&](int tile_first, auto guard) {
+      float tile_weight_grad = 0.0f;
 #pragma unroll
-    for (int offset = 0; offset < kTile; ++offset) {
-      const int64_t batch = first_batch + offset;
-      if (batch < batch_size) {
-        const T* upstream =
-            current_grad +
-            (batch * static_cast<int64_t>(n_post) + post) * n_basis;
-        tile_weight_grad +=
-            BasisProjection<T, kBasis>::Apply(upstream, basis, type, n_basis) *
-            AsFloat(activity[batch * n_pre + pre]);
+      for (int offset = 0; offset < kTile; ++offset) {
+        const int batch = tile_first + offset;
+        if (!decltype(guard)::value || batch < batch_size) {
+          const T* upstream =
+              current_grad + (batch * static_cast<int64_t>(n_post) + post) * n_basis;
+          tile_weight_grad +=
+              BasisProjection<T, kBasis>::Apply(upstream, basis, type, n_basis) *
+              AsFloat(activity[batch * n_pre + pre]);
+        }
+      }
+      return tile_weight_grad;
+    };
+    float total = first == 0 ? 0.0f : weight_grad[edge];
+#pragma unroll
+    for (int tile = 0; tile < kDirectSpan; tile += kTile) {
+      if (kGuard && first + tile >= batch_size) break;
+      const float tile_weight_grad =
+          !kGuard || first + tile + kTile <= batch_size
+              ? tile_sum(first + tile, std::false_type())
+              : tile_sum(first + tile, std::true_type());
+      if (batch_size <= kTile) {
+        total = tile_weight_grad;
+      } else if (tile_weight_grad != 0.0f) {
+        total += tile_weight_grad;
       }
     }
-    if (batch_size <= kTile) {
-      weight_grad[edge] = tile_weight_grad;
-    } else if (tile_weight_grad != 0.0f) {
-      atomicAdd(weight_grad + edge, tile_weight_grad);
-    }
+    weight_grad[edge] = total;
   }
 }
 
@@ -356,20 +394,6 @@ struct ExtPackedProjection<4> {
 // presynaptic sources: BKG has 100 rows against a 4,512-block resident
 // capacity. Splitting each row across `blockIdx.y` restores it. LGN's 17,400
 // rows already exceed the capacity, so it gets one split and is unaffected.
-// The compact pair-projected path writes every CSR position exactly once, so
-// it needs no cleared output. Every other weight-gradient path splits the batch
-// across tiles and accumulates with `atomicAdd`, which does. `LaunchWeightBackward`
-// selects on exactly this predicate, so the two must agree.
-template <typename T>
-__host__ __forceinline__ bool UsesCompactWeightPath(int64_t batch, int n_basis,
-                                                    int64_t n_pairs) {
-  return std::is_same<T, Eigen::half>::value && n_pairs > 0 &&
-         ((n_basis == 4 &&
-           (batch == 1 || batch == 2 || batch == 4 || batch == 8 ||
-            batch == 16 || batch >= 32)) ||
-          (n_basis != 4 && batch >= 3));
-}
-
 __host__ __forceinline__ uint32 RowSplitCount(int64_t n_rows) {
   constexpr int64_t kTargetBlocks = 4512;
   if (n_rows <= 0) return 1;
@@ -812,11 +836,6 @@ __global__ __launch_bounds__(32 * kWarps) void ActivityBackwardPackedLargeKernel
 
 #include "generic_backward_kernels.cuh"
 
-#define EXTERNAL_BATCH_CASE(BATCH, TILE, LAUNCH) \
-  case BATCH:                                    \
-    LAUNCH(BATCH, TILE);                         \
-    break
-
 template <typename T, int kBasis>
 Status LaunchWeightBackward(
     OpKernelContext* context, const Tensor& activity,
@@ -827,11 +846,20 @@ Status LaunchWeightBackward(
     int n_post, Tensor* weight_grad) {
   const int64_t n_rows = nonempty_rows.NumElements();
   const int64_t batch = activity.dim_size(0);
-  if (batch == 0 || n_rows == 0) return OkStatus();
-  const int n_basis = basis.dim_size(1);
   auto device = context->eigen_device<GPUDevice>();
-  if (std::is_same<T, Eigen::half>::value && kBasis == 4 &&
-      pair_posts.NumElements() > 0 && batch <= 32 && (batch & (batch - 1)) == 0) {
+  // Every path below writes each CSR position exactly once (row splits
+  // partition every non-empty row, and every edge is in one), so only an empty
+  // problem needs the output cleared.
+  if (batch == 0 || n_rows == 0) {
+    cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
+                    weight_grad->NumElements() * sizeof(float), device.stream());
+    return OkStatus();
+  }
+  const int n_basis = basis.dim_size(1);
+  // The compact paths serve FP16; FP32 keeps the direct kernel's order.
+  constexpr bool kCompact = std::is_same<T, Eigen::half>::value;
+  if (kCompact && kBasis == 4 && pair_posts.NumElements() > 0 && batch <= 32 &&
+      (batch & (batch - 1)) == 0) {
 #define LAUNCH_COMPACT_WEIGHT(BATCH, PACK) do {                                Tensor projected_tensor;                                                   const int64_t projected_elements = pair_posts.NumElements() * BATCH;       TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({projected_elements}), &projected_tensor));       constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactTiledKernel<T, kBasis, BATCH, kPairsPerTile>,                 static_cast<int>((pair_posts.NumElements() + kPairsPerTile - 1) /                            kPairsPerTile),                                            256, 0, device.stream(), n_post, n_basis, pair_posts.NumElements(),         pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<float>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             WeightBackwardPackedKernel<T, BATCH, PACK, kWarps, kTile>,                  dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                 device.stream(), activity.dim_size(1), activity.flat<T>().data(),           projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),         edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),           nonempty_rows.flat<uint32>().data(), n_rows, splits,                        weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
     switch (batch) {
       case 1: LAUNCH_COMPACT_WEIGHT(1, 1);
@@ -844,8 +872,7 @@ Status LaunchWeightBackward(
 #undef LAUNCH_COMPACT_WEIGHT
   }
 #define LAUNCH_COMPACT_WEIGHT_LARGE(BATCH) do {                                Tensor projected_tensor;                                                   const int64_t n_pairs = pair_posts.NumElements();                          TF_RETURN_IF_ERROR(context->allocate_temp(                                      DT_FLOAT, TensorShape({n_pairs * BATCH}), &projected_tensor));          constexpr int kPairsPerTile = 32;                                          TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             ProjectCompactBatchTilesKernel<T, kBasis, BATCH, kPairsPerTile>,            dim3(static_cast<unsigned>((n_pairs + kPairsPerTile - 1) /                                             kPairsPerTile), BATCH / 32),                     256, 0, device.stream(), n_post, n_basis, n_pairs,                          pair_posts.flat<uint32>().data(), pair_types.flat<uint8>().data(),          current_grad.flat<T>().data(), basis.flat<float>().data(),                      projected_tensor.flat<float>().data()));                                constexpr int kWarps = 2;                                                  constexpr int kTile = 32;                                                  const uint32 splits = RowSplitCount(n_rows);                                TF_RETURN_IF_ERROR(GpuLaunchKernel(                                             WeightBackwardPackedLargeKernel<T, BATCH, kWarps, kTile>,                  dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,                device.stream(), activity.dim_size(1), activity.flat<T>().data(),           projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),         edge_ids.flat<uint32>().data(), row_splits.flat<uint32>().data(),           nonempty_rows.flat<uint32>().data(), n_rows, splits,                        weight_grad->flat<float>().data()));                                    return OkStatus();                                                        } while (false)
-  if (std::is_same<T, Eigen::half>::value && kBasis == 4 &&
-      pair_posts.NumElements() > 0) {
+  if (kCompact && kBasis == 4 && pair_posts.NumElements() > 0) {
     switch (batch) {
       case 64: LAUNCH_COMPACT_WEIGHT_LARGE(64);
       case 128: LAUNCH_COMPACT_WEIGHT_LARGE(128);
@@ -854,8 +881,12 @@ Status LaunchWeightBackward(
     }
   }
 #undef LAUNCH_COMPACT_WEIGHT_LARGE
-  if (std::is_same<T, Eigen::half>::value && pair_posts.NumElements() > 0 &&
-      ((kBasis == 0 && batch >= 3) || (kBasis == 4 && batch >= 32))) {
+  // Every other batch with four bases. Below 32 (not a power of two) the lanes
+  // are added in order instead of by the butterfly: that is the order in which
+  // the atomic 4-sample tiles this replaces usually land (see
+  // BkgWeightBackwardIncomingKernel), now fixed.
+  if (kCompact && pair_posts.NumElements() > 0 &&
+      ((kBasis == 0 && batch >= 3) || kBasis == 4)) {
     Tensor projected_tensor;
     const int64_t n_pairs = pair_posts.NumElements();
     TF_RETURN_IF_ERROR(context->allocate_temp(
@@ -874,7 +905,8 @@ Status LaunchWeightBackward(
     constexpr int kTile = 32;
     const uint32 splits = RowSplitCount(n_rows);
     TF_RETURN_IF_ERROR(GpuLaunchKernel(
-        GenericWeightDirectKernel<T, kWarps, kTile>,
+        kBasis == 4 && batch < 32 ? GenericWeightDirectKernel<T, kWarps, kTile, true>
+                                  : GenericWeightDirectKernel<T, kWarps, kTile, false>,
         dim3(static_cast<unsigned>(n_rows), splits), 32 * kWarps, 0,
         device.stream(), batch, activity.dim_size(1), activity.flat<T>().data(),
         projected_tensor.flat<float>().data(), pair_ids.flat<uint32>().data(),
@@ -883,48 +915,39 @@ Status LaunchWeightBackward(
         weight_grad->flat<float>().data()));
     return OkStatus();
   }
-#define LAUNCH_STATIC(BATCH, TILE)                                        \
-  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                    \
-      WeightBackwardStaticBatchKernel<T, kBasis, BATCH, TILE>,           \
-      static_cast<int>(n_rows * (BATCH / TILE)), LaunchThreads<T>(), 0, \
-      device.stream(), activity.dim_size(1), n_post, n_basis,            \
-      activity.flat<T>().data(), current_grad.flat<T>().data(),          \
-      post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(), \
-      row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(),  \
-      nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<float>().data(), \
-      weight_grad->flat<float>().data()))
-  switch (batch) {
-    EXTERNAL_BATCH_CASE(1, 1, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(2, 2, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(4, 4, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(8, 8, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(16, 16, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(32, V1_EXTERNAL_BATCH32_TILE, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(64, 32, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(128, 32, LAUNCH_STATIC);
-    EXTERNAL_BATCH_CASE(256, 32, LAUNCH_STATIC);
-    case 512:
-      if (n_rows >= 1024) {
-        LAUNCH_STATIC(512, 32);
-        break;
-      }
-      [[fallthrough]];
-    default: {
-      constexpr int kRuntimeTile = 4;
-      const int64_t tiles = (batch + kRuntimeTile - 1) / kRuntimeTile;
-      TF_RETURN_IF_ERROR(GpuLaunchKernel(
-          WeightBackwardRuntimeBatchKernel<T, kBasis, kRuntimeTile>,
-          static_cast<int>(tiles * n_rows), kThreads, 0, device.stream(),
-          batch, activity.dim_size(1), n_post, n_basis,
-          activity.flat<T>().data(), current_grad.flat<T>().data(),
-          post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(),
-          row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(),
-          nonempty_rows.flat<uint32>().data(), n_rows, basis.flat<float>().data(),
-          weight_grad->flat<float>().data()));
-    }
+  const uint32 splits = RowSplitCount(n_rows);
+  // kDirectSpan samples per launch; see WeightBackwardDirectKernel.
+#define LAUNCH_DIRECT_SPAN(TILE, GUARD)                                              \
+  TF_RETURN_IF_ERROR(GpuLaunchKernel(                                                \
+      WeightBackwardDirectKernel<T, kBasis, TILE, GUARD>,                            \
+      dim3(static_cast<unsigned>(n_rows), splits), LaunchThreads<T>(), 0,            \
+      device.stream(), batch, static_cast<int>(first), activity.dim_size(1), n_post, \
+      n_basis, activity.flat<T>().data(), current_grad.flat<T>().data(),             \
+      post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(),            \
+      row_splits.flat<uint32>().data(), edge_ids.flat<uint32>().data(),              \
+      nonempty_rows.flat<uint32>().data(), n_rows, splits,                           \
+      basis.flat<float>().data(), weight_grad->flat<float>().data()))
+#define LAUNCH_DIRECT(TILE)                                                          \
+  case TILE:                                                                         \
+    for (int64_t first = 0; first < batch; first += kDirectSpan) {                   \
+      if (first + kDirectSpan <= batch) {                                            \
+        LAUNCH_DIRECT_SPAN(TILE, false);                                             \
+      } else {                                                                       \
+        LAUNCH_DIRECT_SPAN(TILE, true);                                              \
+      }                                                                              \
+    }                                                                                \
+    return OkStatus()
+  switch (DirectWeightTile(batch, n_rows)) {
+    LAUNCH_DIRECT(1);
+    LAUNCH_DIRECT(2);
+    LAUNCH_DIRECT(4);
+    LAUNCH_DIRECT(8);
+    LAUNCH_DIRECT(16);
+    LAUNCH_DIRECT(32);
   }
-#undef LAUNCH_STATIC
-  return OkStatus();
+#undef LAUNCH_DIRECT
+#undef LAUNCH_DIRECT_SPAN
+  return errors::Internal("unsupported direct weight-gradient tile");
 }
 
 template <typename T, int kBasis>
@@ -1029,8 +1052,6 @@ Status LaunchActivityBackward(
       activity_grad->flat<T>().data());
 }
 
-#undef EXTERNAL_BATCH_CASE
-
 // The weight gradient has two implementations, and the connectivity picks one:
 // - event driven (event_weight_grad.cuh) for sparse activity such as LGN, where
 //   only rows with an active sample are visited;
@@ -1094,15 +1115,6 @@ class ExternalCsrWeightBackwardOp : public OpKernel {
 #undef LAUNCH_EVENT
       return;
     }
-    // Skipping this clear is only safe on the compact path: its packed
-    // kernel's row splits partition every row, so each CSR position is written
-    // exactly once.
-    if (!UsesCompactWeightPath<T>(activity.dim_size(0), basis.dim_size(1),
-                                  pair_posts.NumElements())) {
-      cudaMemsetAsync(weight_grad->flat<float>().data(), 0,
-                      weight_grad->NumElements() * sizeof(float),
-                      context->eigen_device<GPUDevice>().stream());
-    }
 #define LAUNCH_DENSE(BASIS)                                                          OP_REQUIRES_OK(context, LaunchWeightBackward<T, BASIS>(                                                       context, activity, current_grad, post_ids,                                       synapse_types, row_splits, edge_ids, nonempty_rows,                               basis, pair_ids, pair_posts, pair_types, n_post_,                                weight_grad))
     if (basis.dim_size(1) == 4) {
       LAUNCH_DENSE(4);
@@ -1133,15 +1145,13 @@ class ExternalCsrWeightBackwardOp : public OpKernel {
 // four edges' lane partials in registers, adding each p_s's terms in the same
 // order.
 // `kBatch == 0` takes any batch at run time with the same map, skipping the
-// samples past the batch. That is also the order of the old operator's other
-// deterministic dense paths: GenericWeightDirectKernel (batch > 32 outside
-// 64/128/256/512) has these lanes and this tree, and WeightBackwardPackedKernel
-// (batch 1, 2, 4, ..., 32) sums its populated lanes with the same tree, the
-// empty lanes here adding exact zeros. At the other batches below 32 the old
-// operator adds its 4-sample tiles (here: the lanes) with atomics into a
-// cleared output, in launch order unless blocks retire out of order; these
-// batches add the lanes in that order, so the result is the old one's usual
-// (measured: most frequent) value, now deterministic.
+// samples past the batch. That is also the order of the dense operator's other
+// paths: GenericWeightDirectKernel (batch > 32 outside 64/128/256/512) has
+// these lanes and this tree, and WeightBackwardPackedKernel (batch 1, 2, 4,
+// ..., 32) sums its populated lanes with the same tree, the empty lanes here
+// adding exact zeros. At the other batches below 32 both add the lanes in lane
+// order: the order in which the 4-sample tiles of the atomic kernels they
+// replaced usually landed (measured: most frequent), now deterministic.
 template <typename T, int kBatch, bool kStaged>
 __global__ __launch_bounds__(128) void BkgWeightBackwardIncomingKernel(
     int64_t batch_size, int64_t n_post, int64_t n_pre, const T* activity,
@@ -1215,6 +1225,76 @@ __global__ __launch_bounds__(128) void BkgWeightBackwardIncomingKernel(
   }
 }
 
+// The FP32 form: ExternalCsrWeightBackward's FP32 (direct) order instead of
+// the lanes, i.e. WeightBackwardDirectKernel's sums with its tile kTile, so
+// the two agree bit for bit. One thread per post, as above.
+template <typename T, int kTile, bool kStaged>
+__global__ __launch_bounds__(128) void BkgWeightBackwardIncomingTiledKernel(
+    int64_t batch_size, int64_t n_post, int64_t n_pre, const T* activity,
+    const T* current_grad, const uint32* incoming_pre_ids,
+    const uint32* incoming_edge_ids, const uint8* incoming_types,
+    const float* basis, float* weight_grad) {
+  constexpr int kEdges = 4;
+  extern __shared__ unsigned char staged_bytes[];
+  if constexpr (kStaged) {
+    T* staged = reinterpret_cast<T*>(staged_bytes);
+    for (int64_t i = threadIdx.x; i < batch_size * n_pre; i += blockDim.x) {
+      staged[i] = activity[i];
+    }
+    __syncthreads();
+    activity = staged;
+  }
+  for (int64_t post = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       post < n_post; post += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    uint32 pre[kEdges];
+    float row[kEdges][4];
+#pragma unroll
+    for (int k = 0; k < kEdges; ++k) {
+      pre[k] = incoming_pre_ids[kEdges * post + k];
+      const int type = incoming_types[kEdges * post + k];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) row[k][r] = basis[type * 4 + r];
+    }
+    float total[kEdges] = {};
+    // As in WeightBackwardDirectKernel: only the last, partial tile is guarded.
+    const auto add_tile = [&](int first, auto guard) {
+      float tile[kEdges] = {};
+#pragma unroll
+      for (int offset = 0; offset < kTile; ++offset) {
+        const int b = first + offset;
+        if (decltype(guard)::value && b >= batch_size) continue;
+        const T* upstream = current_grad + (b * n_post + post) * 4;
+        float up[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) up[r] = AsFloat(upstream[r]);
+#pragma unroll
+        for (int k = 0; k < kEdges; ++k) {
+          // BasisProjection<T, 4>::Apply's sum, term by term.
+          float value = 0.0f;
+#pragma unroll
+          for (int r = 0; r < 4; ++r) value += up[r] * row[k][r];
+          tile[k] += value * AsFloat(activity[b * n_pre + pre[k]]);
+        }
+      }
+#pragma unroll
+      for (int k = 0; k < kEdges; ++k) {
+        if (batch_size <= kTile) {
+          total[k] = tile[k];
+        } else if (tile[k] != 0.0f) {
+          total[k] += tile[k];
+        }
+      }
+    };
+    const int full = static_cast<int>(batch_size / kTile * kTile);
+    for (int first = 0; first < full; first += kTile) add_tile(first, std::false_type());
+    if (full < batch_size) add_tile(full, std::true_type());
+#pragma unroll
+    for (int k = 0; k < kEdges; ++k) {
+      weight_grad[incoming_edge_ids[kEdges * post + k]] = total[k];
+    }
+  }
+}
+
 // Validates and launches BkgWeightBackwardIncomingKernel for the tensor and the
 // resource operator, which differ only in where the incoming CSR lives.
 template <typename T>
@@ -1250,13 +1330,39 @@ Status LaunchBkgIncomingWeightBackward(
       current_grad.flat<T>().data(), incoming_pre_ids.flat<uint32>().data(),         \
       incoming_edge_ids.flat<uint32>().data(), incoming_types.flat<uint8>().data(),  \
       basis.flat<float>().data(), weight_grad->flat<float>().data())
-  switch (batch) {
-    case 64: LAUNCH_INCOMING(64);
-    case 128: LAUNCH_INCOMING(128);
-    case 256: LAUNCH_INCOMING(256);
-    case 512: LAUNCH_INCOMING(512);
-    default: LAUNCH_INCOMING(0);
+#define LAUNCH_INCOMING_TILED(TILE)                                                  \
+  case TILE:                                                                         \
+    return GpuLaunchKernel(                                                          \
+        staged ? BkgWeightBackwardIncomingTiledKernel<T, TILE, true>                 \
+               : BkgWeightBackwardIncomingTiledKernel<T, TILE, false>,               \
+        blocks, 128, staged ? staged_bytes : 0, device.stream(), batch,              \
+        static_cast<int64_t>(n_post), activity.dim_size(1), activity.flat<T>().data(), \
+        current_grad.flat<T>().data(), incoming_pre_ids.flat<uint32>().data(),       \
+        incoming_edge_ids.flat<uint32>().data(), incoming_types.flat<uint8>().data(), \
+        basis.flat<float>().data(), weight_grad->flat<float>().data())
+  if constexpr (!std::is_same<T, Eigen::half>::value) {
+    // The dense operator's FP32 tile. Its row count is that of the non-empty
+    // pre-CSR rows, at most n_pre; it only matters at batch 512 from 1,024
+    // rows on, which a fixed-four BKG (n_pre == 100) never reaches.
+    switch (DirectWeightTile(batch, activity.dim_size(1))) {
+      LAUNCH_INCOMING_TILED(1);
+      LAUNCH_INCOMING_TILED(2);
+      LAUNCH_INCOMING_TILED(4);
+      LAUNCH_INCOMING_TILED(8);
+      LAUNCH_INCOMING_TILED(16);
+      LAUNCH_INCOMING_TILED(32);
+    }
+    return errors::Internal("unsupported direct weight-gradient tile");
+  } else {
+    switch (batch) {
+      case 64: LAUNCH_INCOMING(64);
+      case 128: LAUNCH_INCOMING(128);
+      case 256: LAUNCH_INCOMING(256);
+      case 512: LAUNCH_INCOMING(512);
+      default: LAUNCH_INCOMING(0);
+    }
   }
+#undef LAUNCH_INCOMING_TILED
 #undef LAUNCH_INCOMING
 }
 
@@ -1354,9 +1460,13 @@ TF_CALL_half(REGISTER_BKG_TYPE);
 TF_CALL_float(REGISTER_BKG_TYPE);
 #undef REGISTER_BKG_TYPE
 
-REGISTER_KERNEL_BUILDER(
-    Name("BkgCsrWeightBackward").Device(DEVICE_GPU).TypeConstraint<Eigen::half>("T"),
-    BkgCsrWeightBackwardOp<Eigen::half>);
+#define REGISTER_BKG_WEIGHT_BACKWARD_TYPE(T)                                  \
+  REGISTER_KERNEL_BUILDER(                                                    \
+      Name("BkgCsrWeightBackward").Device(DEVICE_GPU).TypeConstraint<T>("T"), \
+      BkgCsrWeightBackwardOp<T>);
+TF_CALL_half(REGISTER_BKG_WEIGHT_BACKWARD_TYPE);
+TF_CALL_float(REGISTER_BKG_WEIGHT_BACKWARD_TYPE);
+#undef REGISTER_BKG_WEIGHT_BACKWARD_TYPE
 
 #define REGISTER_TYPE(T)                                                \
   REGISTER_KERNEL_BUILDER(                                             \

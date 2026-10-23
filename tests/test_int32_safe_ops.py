@@ -16,6 +16,8 @@ import unittest
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.core.protobuf import config_pb2, meta_graph_pb2
+from tensorflow.python.grappler import tf_optimizer
 
 import multi_training
 from v1_model_utils import loss_functions
@@ -78,6 +80,129 @@ class Int32SafeCastTest(unittest.TestCase):
         self.assertEqual(out.shape, (5, 6, 3))
         self.assertEqual(out.dtype, tf.float16)
         self.assertEqual(float(tf.reduce_sum(tf.cast(out, tf.float32))), 2 * 6 * 3)
+
+    def test_fused_inputs_preserve_mixed_boolean_and_floating_values(self):
+        grating = tf.constant([[[True, False, True]]])
+        spontaneous = tf.constant([[[0.25, -1.5, 2.0]], [[0.0, 0.5, 1.0]]])
+        for dtype in (tf.float16, tf.float32):
+            with self.subTest(dtype=dtype):
+                expected = tf.concat(
+                    [tf.cast(grating, dtype), tf.cast(spontaneous, dtype)], axis=0
+                )
+                actual = multi_training.concatenate_stimulus_batches(
+                    grating, spontaneous, dtype
+                )
+                np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+
+    def test_fused_inputs_preserve_floating_input_gradients(self):
+        grating = tf.Variable([[[0.25, 0.5]]], dtype=tf.float32)
+        spontaneous = tf.Variable([[[1.0, 1.5]], [[2.0, 2.5]]], dtype=tf.float32)
+        weights = tf.constant([[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]]], tf.float16)
+        with tf.GradientTape() as tape:
+            joined = multi_training.concatenate_stimulus_batches(
+                grating, spontaneous, tf.float16
+            )
+            loss = tf.reduce_sum(joined * weights)
+        gradients = tape.gradient(loss, (grating, spontaneous))
+        for actual, expected in zip(gradients, (weights[:1], weights[1:])):
+            np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+
+
+class BooleanBernoulliBatchTest(unittest.TestCase):
+    """Large spontaneous batches keep compact spikes and safe GPU kernels."""
+
+    def test_chunked_samples_match_full_float32_sampling(self):
+        probability = tf.reshape(tf.linspace(0.0, 1.0, 16), (4, 4))
+        seed = (17, 29)
+        expected = multi_training.sample_stateless_bernoulli_batch(
+            probability, 19, seed
+        )
+        for chunk_size in (1, 3, 64):
+            with self.subTest(chunk_size=chunk_size):
+                actual = multi_training.sample_stateless_bernoulli_batch(
+                    probability, 19, seed,
+                    batch_chunk_size=chunk_size, full_tensor_element_limit=32,
+                )
+                self.assertEqual(actual.dtype, tf.bool)
+                np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+
+    def test_production_shapes_above_int32_limit_without_allocating(self):
+        for batch_size, chunk_size in ((128, 64), (256, 64), (1024, 64), (1024, 1024)):
+            with self.subTest(batch_size=batch_size, chunk_size=chunk_size):
+                def sample(probability):
+                    return multi_training.sample_stateless_bernoulli_batch(
+                        probability, batch_size, (17, 29), batch_chunk_size=chunk_size
+                    )
+
+                graph = tf.function(sample, autograph=False).get_concrete_function(
+                    tf.TensorSpec((500, 17400), tf.float32)
+                )
+                self.assertEqual(graph.output_dtypes, tf.bool)
+                self.assertEqual(graph.output_shapes, (batch_size, 500, 17400))
+                for op in graph.graph.get_operations():
+                    if op.type in ("StatelessRandomUniformV2", "Less", "Cast"):
+                        self.assertLessEqual(op.outputs[0].shape.num_elements(), INT32_MAX)
+                    elif op.type == "ConcatV2":
+                        self.assertLessEqual(op.get_attr("N"), 8)
+
+    def test_large_boolean_samples_reach_model_through_mandatory_xla(self):
+        def model_inputs(probability, grating):
+            spontaneous = multi_training.sample_stateless_bernoulli_batch(
+                probability, 256, (17, 29)
+            )
+            return multi_training.concatenate_stimulus_batches(
+                grating, spontaneous, tf.float16
+            )
+
+        graph = tf.function(model_inputs, autograph=False).get_concrete_function(
+            tf.TensorSpec((500, 17400), tf.float32),
+            tf.TensorSpec((256, 500, 17400), tf.bool),
+        )
+        self.assertEqual(graph.output_shapes, (512, 500, 17400))
+        self.assertEqual(graph.output_dtypes, tf.float16)
+        compiled_calls = []
+        for op in graph.graph.get_operations():
+            if op.type == "Cast":
+                self.assertLessEqual(op.outputs[0].shape.num_elements(), INT32_MAX)
+            elif op.type == "PartitionedCall":
+                compiled_calls.append(op)
+        self.assertEqual(len(compiled_calls), 1)
+        call = compiled_calls[0]
+        self.assertGreater(call.inputs[0].shape.num_elements(), INT32_MAX)
+        self.assertGreater(call.inputs[1].shape.num_elements(), INT32_MAX)
+        functions = {
+            function.signature.name: function
+            for function in graph.graph.as_graph_def().library.function
+        }
+        fused = functions[call.get_attr("f").name]
+        self.assertTrue(fused.attr["_XlaMustCompile"].b)
+        operations = [node.op for node in fused.node_def]
+        self.assertEqual(operations.count("Cast"), 2)
+        self.assertEqual(operations.count("ConcatV2"), 1)
+        self.assertNotIn("StridedSlice", operations)
+
+    def test_optimizer_preserves_safe_concat_fan_in(self):
+        def sample(probability):
+            return multi_training.sample_stateless_bernoulli_batch(
+                probability, 1024, (17, 29)
+            )
+
+        graph = tf.function(sample, autograph=False).get_concrete_function(
+            tf.TensorSpec((500, 17400), tf.float32)
+        )
+        meta = meta_graph_pb2.MetaGraphDef()
+        meta.graph_def.CopyFrom(graph.graph.as_graph_def())
+        meta.collection_def["train_op"].node_list.value.append(graph.outputs[0].name)
+        config = config_pb2.ConfigProto(device_count={"GPU": 0})
+        config.graph_options.rewrite_options.min_graph_nodes = 0
+        optimized = tf_optimizer.OptimizeGraph(config, meta)
+        nodes = list(optimized.node)
+        for function in optimized.library.function:
+            nodes.extend(function.node_def)
+        concats = [node for node in nodes if node.op == "ConcatV2"]
+        self.assertTrue(concats)
+        for node in concats:
+            self.assertLessEqual(node.attr["N"].i, 8)
 
 
 class VoltageCoreSelectionTest(unittest.TestCase):

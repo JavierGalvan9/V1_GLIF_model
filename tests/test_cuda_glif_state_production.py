@@ -118,6 +118,79 @@ def test_production_width_op_matches_tensorflow(dtype, basis, penalty):
                                  atol=tolerance, rtol=tolerance)
 
 
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+def test_transposed_tile_grid_matches_tensorflow(dtype):
+    """From ~260k neurons the four-basis kernels launch their grid transposed
+    once there are four or more sample blocks (its per-neuron constants then
+    no longer stay in L2): same outputs, gradients and penalty reduction."""
+    cell = _op_cell(300_001, 4, dtype, "range")
+    state = _op_state(cell, batch=8)
+    expected = _op_outputs_and_gradients(_reference_step, cell, state)
+    actual = _op_outputs_and_gradients(update_glif_state, cell, state)
+    tolerance = 1e-2 if dtype == tf.float16 else 1e-5
+    for want, got in zip(sum(expected, []), sum(actual, [])):
+        if want is None or got is None:
+            assert want is got
+            continue
+        tf.debugging.assert_near(tf.cast(got, tf.float32), tf.cast(want, tf.float32),
+                                 atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("basis", [1, 2, 3, 4, 6, 8, 9])
+def test_packed_masks_and_abs_max_match_the_dense_op_at_every_basis(dtype, basis):
+    """The tiled kernels (1 to 8 bases) and the runtime-basis ones (9): the
+    forward's packed spike and blocked words are models._pack_spike_words of
+    its dense outputs, and the packed-mask backward (31- and 32-bit words, hard
+    reset so prev_z is read) with the fused abs-max bound returns the dense
+    backward's gradients bitwise and the largest finite |inputs gradient|."""
+    from v1_model_utils.cuda_glif_state.wrapper import (
+        _load_ops,
+        glif_constants,
+        glif_step_backward,
+    )
+
+    ops = _load_ops()
+    cell = SimpleNamespace(**{**vars(_op_cell(10007, basis, dtype)), "_hard_reset": True,
+                              "_return_voltage_sequences": False})
+    slots, v, r, asc, rise, psc, inputs, acc = _op_state(cell, batch=3)
+    constants = glif_constants(cell)
+    inverse = tf.constant(1.0 / cell._n_neurons)
+    no_bkg = (tf.zeros([0, 0], dtype), tf.zeros([0]), tf.zeros([0], tf.uint32),
+              tf.zeros([0], tf.uint32), tf.zeros([0], tf.uint8), tf.zeros([0, 4]))
+
+    def forward(**flags):
+        return ops.fused_glif_step(
+            slots[0], v, r, asc, rise, psc, inputs, *constants, cell.t_ref_steps, cell._dt,
+            cell.v_reset, cell.v_th, acc, inverse, *no_bkg, hard_reset=True,
+            emit_voltage=False, penalty="range", **flags)
+
+    dense = forward()
+    rng = np.random.default_rng(4)
+    upstream = [tf.constant(rng.normal(size=x.shape), x.dtype)
+                for x in (dense[0], dense[0], slots[1], dense[1], dense[3], dense[4], dense[5])]
+    upstream += [tf.zeros([0], dtype), tf.constant(rng.normal(size=(3, 1)), tf.float32)]
+
+    def backward(prev_z, blocked, word_bits=None):
+        return glif_step_backward(
+            cell, prev_z, dense[1], blocked, constants, cell._dt, cell.v_th, cell._gauss_std,
+            cell._dampening_factor, inverse, *upstream, penalty="range", emit_abs_max=True,
+            word_bits=word_bits)
+
+    expected = backward(slots[0], dense[6])
+    gradient = np.abs(expected[5].numpy().astype(np.float32))
+    assert expected[6].numpy().view(np.float32)[0] == gradient[np.isfinite(gradient)].max()
+    for word_bits in (31, 32):
+        packed = forward(pack_masks=True, mask_word_bits=word_bits, emit_refractory=False)
+        spike_words, blocked_words = packed[9:]
+        np.testing.assert_array_equal(spike_words, models._pack_spike_words(dense[0], word_bits))
+        np.testing.assert_array_equal(blocked_words,
+                                      models._pack_spike_words(dense[2] > 0, word_bits))
+        actual = backward(models._pack_spike_words(slots[0], word_bits), blocked_words, word_bits)
+        for got, want in zip(actual, expected):
+            np.testing.assert_array_equal(got.numpy().view(np.uint8), want.numpy().view(np.uint8))
+
+
 def _bkg_inputs(cell, batch, n_bkg=100, seed=2):
     """A fused-BKG argument with four incoming edges per neuron."""
     rng = np.random.default_rng(seed)

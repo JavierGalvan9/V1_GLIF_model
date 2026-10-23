@@ -5,6 +5,7 @@
 #include "tensorflow/core/util/gpu_kernel_helper.h"
 #include <type_traits>
 #include <algorithm>
+#include <atomic>
 #include <limits>
 
 using namespace tensorflow;
@@ -12,7 +13,10 @@ using GPUDevice = Eigen::GpuDevice;
 template <typename T> __device__ float F(T x) { return static_cast<float>(x); }
 template <typename T> __device__ T V(float x) { return static_cast<T>(x); }
 
+// The fused BKG gather's basis count; the tiled kernels are instantiated for
+// 1 to kMaxTiledBasis bases (wider rows take the runtime-basis kernels).
 constexpr int kBasis = 4;
+constexpr int kMaxTiledBasis = 8;
 // Samples per forward thread (sharing the neuron constants in registers).
 constexpr int kTileBatch = 2;
 constexpr int kTileThreads = 512;
@@ -101,9 +105,56 @@ __device__ __forceinline__ void AddBkg(const Bkg& bkg, const BkgEdges& edges, in
 // Sums each sample's per-thread penalty over the block and writes one
 // partial per (sample, block); FinalizePenaltyKernel adds the partials in a
 // fixed order, so the reduction is deterministic. Needs blockDim.x % 32 == 0.
+// The tiled kernels' (neuron block, sample block) coordinates. A transposed
+// launch puts the sample blocks on x, so that the blocks of one neuron range
+// for every sample block are dispatched together and share that range's
+// constants in L2 instead of each streaming the whole table: that matters once
+// the per-neuron constants no longer fit in L2 (the 936k-neuron network).
+// Every element is computed exactly as before; only the dispatch order moves.
+struct TileCoords {
+  int neuron_block, neuron_blocks, sample_block, sample_blocks;
+};
+
+// Whether to transpose: once a pass of one sample block over every neuron
+// (its constants plus that block's state, about kPassBytesPerNeuron) no longer
+// fits in half the L2, and there are enough sample blocks to share it.
+// Measured (tracks/batch/NOTES.md, RTX PRO 6000, 128 MiB L2): slower by 3-5 %
+// at 66k x 256 and 203k x 64 (L2-resident), faster from 300k x 16 on (936k x 8:
+// forward -36 %, backward -45 %).
+constexpr int64_t kPassBytesPerNeuron = 256;
+constexpr int64_t kMinTransposedSampleBlocks = 4;
+
+inline bool TransposedTileGrid(int64_t neurons, int64_t sample_blocks) {
+  if (sample_blocks < kMinTransposedSampleBlocks) return false;
+  // The threshold neurons * kPassBytesPerNeuron > L2 / 2, per device, queried
+  // once (0 when the query fails: never transpose).
+  constexpr int kDevices = 64;
+  static std::atomic<int64_t> threshold[kDevices] = {};
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= kDevices) return false;
+  int64_t limit = threshold[device].load(std::memory_order_relaxed);
+  if (limit == 0) {
+    int l2_bytes = 0;
+    limit = cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, device) == cudaSuccess
+                ? static_cast<int64_t>(l2_bytes) / 2 / kPassBytesPerNeuron + 1
+                : std::numeric_limits<int64_t>::max();
+    threshold[device].store(limit, std::memory_order_relaxed);
+  }
+  return neurons >= limit;
+}
+
+__device__ __forceinline__ TileCoords TileGrid(bool transposed) {
+  if (transposed) {
+    return {static_cast<int>(blockIdx.y), static_cast<int>(gridDim.y),
+            static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x)};
+  }
+  return {static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x),
+          static_cast<int>(blockIdx.y), static_cast<int>(gridDim.y)};
+}
+
 template <int Tile>
 __device__ void StoreBlockPenalty(const float (&local)[Tile], float* partials,
-                                  int64_t first_sample, int64_t batch) {
+                                  int64_t first_sample, int64_t batch, TileCoords grid) {
   __shared__ float warp_sums[kTileThreads / 32][Tile];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 #pragma unroll
@@ -118,7 +169,7 @@ __device__ void StoreBlockPenalty(const float (&local)[Tile], float* partials,
   if (threadIdx.x < Tile && first_sample + threadIdx.x < batch) {
     float total = 0.f;
     for (int w = 0; w < static_cast<int>(blockDim.x / 32); ++w) total += warp_sums[w][threadIdx.x];
-    partials[(first_sample + threadIdx.x) * gridDim.x + blockIdx.x] = total;
+    partials[(first_sample + threadIdx.x) * grid.neuron_blocks + grid.neuron_block] = total;
   }
 }
 
@@ -198,23 +249,62 @@ __global__ void ForwardKernel(int64_t count, int neurons, int n_basis,
   }
 }
 
-template <typename T, int Basis>
+// max(largest, |value|) over finite values only: the recurrent backward
+// skips non-finite gradients when it bounds them (csr_recurrent_ops.cu.cc).
+__device__ __forceinline__ float LargerFinite(float largest, float value) {
+  value = fabsf(value);
+  return isfinite(value) && value > largest ? value : largest;
+}
+
+// Warp max, then one integer atomicMax per warp: non-negative floats order
+// like their bit patterns. Every lane of the warp must call it.
+__device__ __forceinline__ void StoreAbsMax(float largest, unsigned int* result) {
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    largest = fmaxf(largest, __shfl_xor_sync(0xffffffffu, largest, mask));
+  if ((threadIdx.x & 31) == 0 && largest > 0.0f) atomicMax(result, __float_as_uint(largest));
+}
+
+// Where the backward reads the previous spikes and the refractory mask. Dense
+// (WordBits = 0): the forward's [batch, neurons] T spikes and bool mask.
+// Packed: WordBits (31 or 32) binary values per 32-bit word, rows of `words`
+// words per sample, value n in bit n % WordBits of word n / WordBits (the
+// layout of models._pack_spike_words). Spikes are binary, so the unpacked
+// value is exactly F(prev_z).
+template <typename T, int WordBits> struct SpikeMasks {
+  const void* prev_z; const void* refractory; int words;
+  __device__ __forceinline__ bool Bit(const void* bits, int64_t sample, int neuron) const {
+    const int word = __ldg(static_cast<const int*>(bits) + sample * words + neuron / WordBits);
+    return (word >> (neuron % WordBits)) & 1;
+  }
+  __device__ __forceinline__ bool Blocked(int64_t i, int64_t sample, int neuron) const {
+    if constexpr (WordBits == 0) return static_cast<const bool*>(refractory)[i];
+    else return Bit(refractory, sample, neuron);
+  }
+  __device__ __forceinline__ float PrevZ(int64_t i, int64_t sample, int neuron) const {
+    if constexpr (WordBits == 0) return F(static_cast<const T*>(prev_z)[i]);
+    else return Bit(prev_z, sample, neuron) ? 1.0f : 0.0f;
+  }
+};
+
+template <typename T, int Basis, int WordBits>
 __global__ void BackwardKernel(int64_t count, int neurons, int n_basis,
-    const T* prev_z, const float* new_v, const bool* refractory, Constants k,
+    SpikeMasks<T, WordBits> masks, const float* new_v, Constants k,
     const float* dt, const float* v_th, const float* sigma,
     const float* amplitude, int surrogate, const T* gspikes, const T* gnew_z,
     const T* gprev_z, const float* gv, const float* ga, const T* grise, const T* gpsc,
     const T* gvoltage, bool hard_reset, bool detach_reset,
     bool detach_asc_reset, bool emit_voltage, T* prev_z_grad, float* v_grad,
     float* asc_grad, T* rise_grad, T* psc_grad, T* input_grad, int penalty,
-    const float* grad_penalty, const float* inverse_neurons) {
+    const float* grad_penalty, const float* inverse_neurons, unsigned int* abs_max) {
   const float step = *dt; const float threshold = *v_th;
   const float scale = *sigma; const float gain = *amplitude;
   const int width = Basis == 0 ? n_basis : Basis;
+  float largest = 0.0f;
   GPU_1D_KERNEL_LOOP(i, count) {
     const int64_t sample = i / neurons;
     const int neuron = i - sample * neurons;
-    const bool blocked = refractory[i];
+    const bool blocked = masks.Blocked(i, sample, neuron);
     // The surrogate of the threshold. Both consumers of a spike read it in T,
     // so the upstream gradient is summed in T before it meets the float32
     // surrogate of the float32 membrane.
@@ -250,7 +340,7 @@ __global__ void BackwardKernel(int64_t count, int neurons, int n_basis,
     prev_z_grad[i] = gprev_z ? V<T>(F(gprev_z[i]) + F(z_grad)) : z_grad;
     // The hard reset replaces the pre-spike membrane, so it carries no gradient.
     v_grad[i] = active_gv*k.decay[neuron]*
-        (hard_reset ? 1.0f - F(prev_z[i]) : 1.0f);
+        (hard_reset ? 1.0f - masks.PrevZ(i, sample, neuron) : 1.0f);
     asc_grad[2*i] = active_gv*k.asc_factor[2*neuron] +
                     ga[2*i]*k.asc_decay[2*neuron];
     asc_grad[2*i+1] = active_gv*k.asc_factor[2*neuron+1] +
@@ -263,22 +353,41 @@ __global__ void BackwardKernel(int64_t count, int neurons, int n_basis,
       rise_grad[j] = V<T>(F(grise[j])*c.x + F(gpsc[j])*step*c.x +
                           active_gv*c.w);
       psc_grad[j] = V<T>(F(gpsc[j])*c.x + active_gv*c.z);
-      input_grad[j] = V<T>(F(grise[j])*c.y);
+      const T to_input = V<T>(F(grise[j])*c.y);
+      input_grad[j] = to_input;
+      if (abs_max) largest = LargerFinite(largest, F(to_input));
     }
   }
+  if (abs_max) StoreAbsMax(largest, abs_max);
 }
 
-// A row of N adjacent values moved as one aligned access (N * sizeof(T) bytes:
-// 8 for four fp16 bases, 16 for four fp32 ones). Only the memory movement is
-// vectorized; every value is widened and rounded exactly as a scalar access.
+// A row of N adjacent values moved in aligned accesses of RowChunk values
+// each: the largest power-of-two count dividing N within 16 bytes (one 8-byte
+// access for four fp16 bases, one 16-byte access for four fp32 ones, two
+// 16-byte accesses for eight fp32 ones; scalar for odd N). Only the memory
+// movement is vectorized; every value is widened and rounded exactly as a
+// scalar access.
 template <typename T, int N> struct alignas(sizeof(T) * N) Pack { T v[N]; };
+
+template <typename T, int N> constexpr int RowChunk() {
+  int chunk = 1;
+  while (N % (2 * chunk) == 0 && 2 * chunk * sizeof(T) <= 16) chunk *= 2;
+  return chunk;
+}
 
 template <typename T, int N, bool Vec>
 __device__ __forceinline__ void LoadRow(const T* __restrict__ p, float (&out)[N]) {
   if constexpr (Vec) {
-    const Pack<T, N> row = *reinterpret_cast<const Pack<T, N>*>(p);
+    constexpr int C = RowChunk<T, N>();
+    // Stepping a pointer: indexing the chunks made nvcc turn the four-basis
+    // loads into read-only (LDG.CONSTANT) ones, which measured slower.
+    const Pack<T, C>* rows = reinterpret_cast<const Pack<T, C>*>(p);
 #pragma unroll
-    for (int b = 0; b < N; ++b) out[b] = F(row.v[b]);
+    for (int part = 0; part < N / C; ++part, ++rows) {
+      const Pack<T, C> row = *rows;
+#pragma unroll
+      for (int b = 0; b < C; ++b) out[part * C + b] = F(row.v[b]);
+    }
   } else {
 #pragma unroll
     for (int b = 0; b < N; ++b) out[b] = F(p[b]);
@@ -288,10 +397,15 @@ __device__ __forceinline__ void LoadRow(const T* __restrict__ p, float (&out)[N]
 template <typename T, int N, bool Vec>
 __device__ __forceinline__ void StoreRow(T* __restrict__ p, const float (&in)[N]) {
   if constexpr (Vec) {
-    Pack<T, N> row;
+    constexpr int C = RowChunk<T, N>();
+    Pack<T, C>* rows = reinterpret_cast<Pack<T, C>*>(p);
 #pragma unroll
-    for (int b = 0; b < N; ++b) row.v[b] = V<T>(in[b]);
-    *reinterpret_cast<Pack<T, N>*>(p) = row;
+    for (int part = 0; part < N / C; ++part, ++rows) {
+      Pack<T, C> row;
+#pragma unroll
+      for (int b = 0; b < C; ++b) row.v[b] = V<T>(in[part * C + b]);
+      *rows = row;
+    }
   } else {
 #pragma unroll
     for (int b = 0; b < N; ++b) p[b] = V<T>(in[b]);
@@ -299,16 +413,31 @@ __device__ __forceinline__ void StoreRow(T* __restrict__ p, const float (&in)[N]
 }
 
 // Whether every pointer allows the row accesses of LoadRow/StoreRow: the
-// synaptic rows of `basis` T values and the two-value float32 ASC rows.
-template <typename T>
-static bool RowsAligned(int64_t basis, std::initializer_list<const void*> state,
+// synaptic rows of Basis T values and the two-value float32 ASC rows.
+template <typename T, int Basis>
+static bool RowsAligned(std::initializer_list<const void*> state,
                         std::initializer_list<const void*> asc) {
-  if (basis != kBasis) return false;
   for (const void* p : state)
-    if (reinterpret_cast<uintptr_t>(p) % (sizeof(T) * kBasis)) return false;
+    if (reinterpret_cast<uintptr_t>(p) % (sizeof(T) * RowChunk<T, Basis>())) return false;
   for (const void* p : asc)
     if (reinterpret_cast<uintptr_t>(p) % (2 * sizeof(float))) return false;
   return true;
+}
+
+// launch(std::integral_constant<int, basis>{}) for a tiled basis count, else
+// launch(std::integral_constant<int, 0>{}) (the runtime-basis kernels).
+template <typename Launch, int... B>
+static absl::Status DispatchBasis(int64_t basis, const Launch& launch,
+                                  std::integer_sequence<int, B...>) {
+  absl::Status status;
+  const bool tiled =
+      ((basis == B + 1 && (status = launch(std::integral_constant<int, B + 1>{}), true)) || ...);
+  return tiled ? status : launch(std::integral_constant<int, 0>{});
+}
+
+template <typename Launch>
+static absl::Status DispatchBasis(int64_t basis, const Launch& launch) {
+  return DispatchBasis(basis, launch, std::make_integer_sequence<int, kMaxTiledBasis>{});
 }
 
 // The per-neuron float32 constants the tiled backward loads once per
@@ -394,11 +523,11 @@ __global__ void PackMasksKernel(int64_t rows, int neurons, const T* spikes, cons
   }
 }
 
-// For four bases, the kTileBatch samples of a thread reuse the neuron's
-// synaptic coefficients and BKG edges, held in registers. The generic kernel
-// below handles every other positive basis width. Vec moves the synaptic and
-// ASC rows as single aligned accesses (four bases only); a null
-// refractory_out skips that output; Pack also writes the packed masks.
+// For 1 to kMaxTiledBasis bases, the kTileBatch samples of a thread reuse the
+// neuron's synaptic coefficients (and, for four bases, BKG edges), held in
+// registers. The generic kernel above handles wider rows. Vec moves the
+// synaptic and ASC rows in aligned accesses (LoadRow); a null refractory_out
+// skips that output; Pack also writes the packed masks.
 // Launched with kTileThreads threads; the bound keeps the register allocation
 // (with the fused penalty and BKG gather) within one 512-thread block per SM.
 template <typename T, typename R, int Basis, bool Vec, bool Pack>
@@ -410,17 +539,18 @@ __global__ __launch_bounds__(kTileThreads, 1) void ForwardKernelTiled(int64_t co
     bool emit_voltage, T* spikes, float* new_v, R* new_r,
     float* new_asc, T* new_rise, T* new_psc,
     bool* refractory_out, T* voltage_out, int penalty,
-    float* penalty_partials, Bkg bkg, PackedMasks pack) {
+    float* penalty_partials, Bkg bkg, PackedMasks pack, bool transposed) {
   const float step = *dt; const float rest = *v_reset;
   const float threshold = *v_th;
   const int64_t batch = count / neurons;
-  const int64_t tile_first = static_cast<int64_t>(blockIdx.y) * kTileBatch;
+  const TileCoords grid = TileGrid(transposed);
+  const int64_t tile_first = static_cast<int64_t>(grid.sample_block) * kTileBatch;
   float penalty_sum[kTileBatch] = {};
   // With Pack every thread runs every block iteration (each warp ballots its
   // masks); those past the last neuron only join the ballot.
-  for (int start = blockIdx.x * blockDim.x;
+  for (int start = grid.neuron_block * blockDim.x;
        Pack ? start < neurons : start + static_cast<int>(threadIdx.x) < neurons;
-       start += blockDim.x * gridDim.x) {
+       start += blockDim.x * grid.neuron_blocks) {
     const int neuron = start + threadIdx.x;
     const bool valid = !Pack || neuron < neurons;
     float4 syn[Basis];
@@ -498,50 +628,14 @@ __global__ __launch_bounds__(kTileThreads, 1) void ForwardKernelTiled(int64_t co
                      blocked_bit);
     }
   }
-  if (penalty) StoreBlockPenalty<kTileBatch>(penalty_sum, penalty_partials, tile_first, batch);
+  if (penalty) StoreBlockPenalty<kTileBatch>(penalty_sum, penalty_partials, tile_first, batch, grid);
 }
-
-// max(largest, |value|) over finite values only: the recurrent backward
-// skips non-finite gradients when it bounds them (csr_recurrent_ops.cu.cc).
-__device__ __forceinline__ float LargerFinite(float largest, float value) {
-  value = fabsf(value);
-  return isfinite(value) && value > largest ? value : largest;
-}
-
-// Warp max, then one integer atomicMax per warp: non-negative floats order
-// like their bit patterns. Every lane of the warp must call it.
-__device__ __forceinline__ void StoreAbsMax(float largest, unsigned int* result) {
-#pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1)
-    largest = fmaxf(largest, __shfl_xor_sync(0xffffffffu, largest, mask));
-  if ((threadIdx.x & 31) == 0 && largest > 0.0f) atomicMax(result, __float_as_uint(largest));
-}
-
-// Where the backward reads the previous spikes and the refractory mask. Dense
-// (WordBits = 0): the forward's [batch, neurons] T spikes and bool mask.
-// Packed: WordBits (31 or 32) binary values per 32-bit word, rows of `words`
-// words per sample, value n in bit n % WordBits of word n / WordBits (the
-// layout of models._pack_spike_words). Spikes are binary, so the unpacked
-// value is exactly F(prev_z).
-template <typename T, int WordBits> struct SpikeMasks {
-  const void* prev_z; const void* refractory; int words;
-  __device__ __forceinline__ bool Bit(const void* bits, int64_t sample, int neuron) const {
-    const int word = __ldg(static_cast<const int*>(bits) + sample * words + neuron / WordBits);
-    return (word >> (neuron % WordBits)) & 1;
-  }
-  __device__ __forceinline__ bool Blocked(int64_t i, int64_t sample, int neuron) const {
-    if constexpr (WordBits == 0) return static_cast<const bool*>(refractory)[i];
-    else return Bit(refractory, sample, neuron);
-  }
-  __device__ __forceinline__ float PrevZ(int64_t i, int64_t sample, int neuron) const {
-    if constexpr (WordBits == 0) return F(static_cast<const T*>(prev_z)[i]);
-    else return Bit(prev_z, sample, neuron) ? 1.0f : 0.0f;
-  }
-};
 
 // One sample per blockIdx.y (grid-strided beyond 65535 samples): unlike the
 // forward, the backward measured faster without sharing the neuron constants
-// across samples.
+// across samples. Launched with kTileThreads threads (at most 94 registers
+// up to kMaxTiledBasis bases on sm_120; a launch bound would change the
+// four-basis register allocation).
 template <typename T, int Basis, bool Vec, int WordBits>
 __global__ void BackwardKernelTiled(int64_t count, int neurons, int n_basis,
     SpikeMasks<T, WordBits> masks, const float* __restrict__ new_v, Constants k,
@@ -553,14 +647,16 @@ __global__ void BackwardKernelTiled(int64_t count, int neurons, int n_basis,
     bool detach_asc_reset, bool emit_voltage, T* __restrict__ prev_z_grad,
     float* __restrict__ v_grad, float* __restrict__ asc_grad, T* __restrict__ rise_grad,
     T* __restrict__ psc_grad, T* __restrict__ input_grad, int penalty,
-    const float* grad_penalty, const float* inverse_neurons, unsigned int* abs_max) {
+    const float* grad_penalty, const float* inverse_neurons, unsigned int* abs_max,
+    bool transposed) {
   const float step = *dt; const float threshold = *v_th;
   const float scale = *sigma; const float gain = *amplitude;
   const int64_t batch = count / neurons;
+  const TileCoords grid = TileGrid(transposed);
   float largest = 0.0f;
-  for (int64_t sample = blockIdx.y; sample < batch; sample += gridDim.y)
-  for (int neuron = blockIdx.x * blockDim.x + threadIdx.x;
-       neuron < neurons; neuron += blockDim.x * gridDim.x) {
+  for (int64_t sample = grid.sample_block; sample < batch; sample += grid.sample_blocks)
+  for (int neuron = grid.neuron_block * blockDim.x + threadIdx.x;
+       neuron < neurons; neuron += blockDim.x * grid.neuron_blocks) {
     const NeuronConstants<Basis> kn(k, neuron);
     const int64_t i = sample * neurons + neuron;
     const bool blocked = masks.Blocked(i, sample, neuron);
@@ -630,18 +726,6 @@ __global__ void BackwardKernelTiled(int64_t count, int neurons, int n_basis,
     }
   }
   if (abs_max) StoreAbsMax(largest, abs_max);
-}
-
-// The largest finite |input_grad| as float bits, as the recurrent backward's
-// AbsMaxFiniteKernel computes it (a max is order-independent, so the bound is
-// the same bit for bit). For the generic backward, which does not fuse it.
-template <typename T>
-__global__ void GlifAbsMaxFiniteKernel(int64_t elements, const T* values, unsigned int* result) {
-  float largest = 0.0f;
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x)
-    largest = LargerFinite(largest, F(values[index]));
-  StoreAbsMax(largest, result);
 }
 
 // The float4 loads need a whole, 16-byte aligned coefficient block.
@@ -788,12 +872,15 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
         else return ForwardKernel<T, R, 0>;
       }();
       dim3 blocks;
-      int threads;
+      int threads, neuron_blocks = 1;
+      bool transposed = false;
       if constexpr (B > 0) {
         auto cfg = GetGpuLaunchConfigFixedBlockSize(
             neurons, d, kernel, 0, kTileThreads);
-        blocks = dim3(cfg.block_count,
-                      (v.dim_size(0) + kTileBatch - 1) / kTileBatch);
+        const unsigned tiles = (v.dim_size(0) + kTileBatch - 1) / kTileBatch;
+        transposed = TransposedTileGrid(neurons, tiles);
+        blocks = transposed ? dim3(tiles, cfg.block_count) : dim3(cfg.block_count, tiles);
+        neuron_blocks = cfg.block_count;
         threads = cfg.thread_per_block;
       } else {
         auto cfg = GetGpuLaunchConfig(v.NumElements(), d);
@@ -814,7 +901,7 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
       }
       // One partial per (sample, block) for the tiled kernel, one per
       // sample (accumulated atomically, so zeroed first) for the generic one.
-      const int parts = B > 0 ? static_cast<int>(blocks.x) : 1;
+      const int parts = B > 0 ? neuron_blocks : 1;
       float* partial_data = nullptr;
       if (penalty_) {
         TF_RETURN_IF_ERROR(c->allocate_temp(
@@ -828,7 +915,8 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
       }
       auto launch_kernel = [&](auto... tail) {
         if constexpr (B > 0)
-          return GpuLaunchKernel(kernel, blocks, threads, 0, d.stream(), tail..., bkg, stage);
+          return GpuLaunchKernel(kernel, blocks, threads, 0, d.stream(), tail..., bkg, stage,
+                                 transposed);
         else return GpuLaunchKernel(kernel, blocks, threads, 0, d.stream(), tail...);
       };
       TF_RETURN_IF_ERROR(launch_kernel(
@@ -868,21 +956,15 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
       return pack_masks_ ? launch_masks(tag, vec, std::true_type{})
                          : launch_masks(tag, vec, std::false_type{});
     };
-    using Scalar = std::false_type;
-    if (basis == 3 && penalty_) {
-      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 3>{}, Scalar{}));
-    } else if (basis == 5 && penalty_) {
-      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 5>{}, Scalar{}));
-    } else if (basis == kBasis &&
-               RowsAligned<T>(basis, {c->input(4).data(), psc.data(), c->input(6).data(),
-                                      orise->data(), opsc->data()},
-                              {c->input(3).data(), oa->data()})) {
-      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 4>{}, std::true_type{}));
-    } else if (basis == kBasis) {
-      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 4>{}, Scalar{}));
-    } else {
-      OP_REQUIRES_OK(c, launch(std::integral_constant<int, 0>{}, Scalar{}));
-    }
+    OP_REQUIRES_OK(c, DispatchBasis(basis, [&](auto tag) {
+      if constexpr (decltype(tag)::value > 0) {
+        if (RowsAligned<T, decltype(tag)::value>(
+                {c->input(4).data(), psc.data(), c->input(6).data(), orise->data(), opsc->data()},
+                {c->input(3).data(), oa->data()}))
+          return launch(tag, std::true_type{});
+      }
+      return launch(tag, std::false_type{});
+    }));
   }
  private:
   bool hard_; bool emit_voltage_; bool emit_refractory_; bool pack_masks_;
@@ -957,10 +1039,6 @@ template <typename T, bool Packed> class BackwardOp : public OpKernel {
     OP_REQUIRES(c, !penalty_ || (c->input(22).NumElements() == new_v.dim_size(0) &&
                                  c->input(23).NumElements() == 1),
                 errors::InvalidArgument("grad_penalty_acc must be [batch, 1] and inverse_neurons a scalar"));
-    // Other basis widths take the generic kernel, which reads dense masks.
-    const bool tiled = basis == kBasis;
-    OP_REQUIRES(c, !Packed || tiled,
-                errors::Unimplemented("packed masks need four synaptic bases"));
     Tensor *zg, *vg, *ag, *rg, *pg, *ig;
     OP_REQUIRES_OK(c, c->allocate_output(0, new_v.shape(), &zg));
     OP_REQUIRES_OK(c, c->allocate_output(1, new_v.shape(), &vg));
@@ -976,7 +1054,7 @@ template <typename T, bool Packed> class BackwardOp : public OpKernel {
       OP_REQUIRES(c, cudaMemsetAsync(abs_max, 0, sizeof(unsigned int), d.stream()) == cudaSuccess,
                   errors::Internal("abs-max memset failed"));
     // The arguments after the masks, shared by every kernel.
-    auto launch_with = [&](auto kernel, dim3 blocks, int threads, auto masks) {
+    auto launch_with = [&](auto kernel, dim3 blocks, int threads, auto masks, auto... tile_args) {
       return GpuLaunchKernel(kernel,
         blocks, threads, 0, d.stream(),
         new_v.NumElements(), neurons, grise.dim_size(1) / neurons, masks,
@@ -992,55 +1070,45 @@ template <typename T, bool Packed> class BackwardOp : public OpKernel {
         zg->flat<T>().data(), vg->flat<float>().data(),
         ag->flat<float>().data(), rg->flat<T>().data(),
         pg->flat<T>().data(), ig->flat<T>().data(), penalty_,
-        c->input(22).flat<float>().data(), c->input(23).flat<float>().data(), abs_max);
+        c->input(22).flat<float>().data(), c->input(23).flat<float>().data(), abs_max,
+        tile_args...);
     };
-    auto launch_tiled = [&](auto vec, auto word_bits) {
-      constexpr int Bits = decltype(word_bits)::value;
-      auto kernel = BackwardKernelTiled<T, kBasis, decltype(vec)::value, Bits>;
-      auto cfg = GetGpuLaunchConfigFixedBlockSize(neurons, d, kernel, 0, kTileThreads);
-      const int64_t rows = std::min<int64_t>(new_v.dim_size(0), 65535);
-      return launch_with(kernel, dim3(cfg.block_count, rows),
-                         cfg.thread_per_block,
-                         SpikeMasks<T, Bits>{prev_z.data(), c->input(2).data(),
-                                             static_cast<int>(words)});
-    };
-    auto launch_masks = [&](auto vec) {
-      if constexpr (Packed) {
-        return word_bits_ == 31 ? launch_tiled(vec, std::integral_constant<int, 31>{})
-                                : launch_tiled(vec, std::integral_constant<int, 32>{});
+    // The tiled kernel for 1 to kMaxTiledBasis bases (B > 0), else the
+    // runtime-basis one; both read dense or packed masks.
+    auto launch_kernel = [&](auto tag, auto vec, auto word_bits) {
+      constexpr int B = decltype(tag)::value, Bits = decltype(word_bits)::value;
+      const SpikeMasks<T, Bits> masks{prev_z.data(), c->input(2).data(), static_cast<int>(words)};
+      if constexpr (B > 0) {
+        auto kernel = BackwardKernelTiled<T, B, decltype(vec)::value, Bits>;
+        auto cfg = GetGpuLaunchConfigFixedBlockSize(neurons, d, kernel, 0, kTileThreads);
+        const int64_t rows = std::min<int64_t>(new_v.dim_size(0), 65535);
+        const bool transposed = TransposedTileGrid(neurons, rows);
+        return launch_with(kernel,
+                           transposed ? dim3(rows, cfg.block_count) : dim3(cfg.block_count, rows),
+                           cfg.thread_per_block, masks, transposed);
       } else {
-        return launch_tiled(vec, std::integral_constant<int, 0>{});
+        auto cfg = GetGpuLaunchConfig(new_v.NumElements(), d);
+        return launch_with(BackwardKernel<T, 0, Bits>, dim3(cfg.block_count),
+                           cfg.thread_per_block, masks);
       }
     };
-    if (!tiled) {
-      auto cfg = GetGpuLaunchConfig(new_v.NumElements(), d);
-      OP_REQUIRES_OK(c, GpuLaunchKernel(BackwardKernel<T, 0>,
-        dim3(cfg.block_count), cfg.thread_per_block, 0, d.stream(),
-        new_v.NumElements(), neurons, grise.dim_size(1) / neurons,
-        prev_z.flat<T>().data(), new_v.flat<float>().data(),
-        c->input(2).flat<bool>().data(), ReadConstants(c, 3),
-        c->input(10).flat<float>().data(), c->input(11).flat<float>().data(),
-        c->input(12).flat<float>().data(), c->input(13).flat<float>().data(),
-        surrogate_, c->input(14).flat<T>().data(), c->input(15).flat<T>().data(),
-        has_prev_grad ? c->input(16).flat<T>().data() : nullptr,
-        c->input(17).flat<float>().data(),
-        c->input(18).flat<float>().data(), grise.flat<T>().data(),
-        c->input(20).flat<T>().data(), c->input(21).flat<T>().data(),
-        hard_, detach_, detach_asc_, emit_voltage_,
-        zg->flat<T>().data(), vg->flat<float>().data(),
-        ag->flat<float>().data(), rg->flat<T>().data(),
-        pg->flat<T>().data(), ig->flat<T>().data(), penalty_,
-        c->input(22).flat<float>().data(), c->input(23).flat<float>().data()));
-      if (abs_max)
-        OP_REQUIRES_OK(c, GpuLaunchKernel(GlifAbsMaxFiniteKernel<T>, 1024, 256, 0, d.stream(),
-                                          ig->NumElements(), ig->flat<T>().data(), abs_max));
-    } else if (RowsAligned<T>(basis, {grise.data(), c->input(20).data(), rg->data(),
-                                      pg->data(), ig->data()},
-                              {c->input(18).data(), ag->data()})) {
-      OP_REQUIRES_OK(c, launch_masks(std::true_type{}));
-    } else {
-      OP_REQUIRES_OK(c, launch_masks(std::false_type{}));
-    }
+    auto launch = [&](auto tag, auto vec) {
+      if constexpr (Packed) {
+        return word_bits_ == 31 ? launch_kernel(tag, vec, std::integral_constant<int, 31>{})
+                                : launch_kernel(tag, vec, std::integral_constant<int, 32>{});
+      } else {
+        return launch_kernel(tag, vec, std::integral_constant<int, 0>{});
+      }
+    };
+    OP_REQUIRES_OK(c, DispatchBasis(basis, [&](auto tag) {
+      if constexpr (decltype(tag)::value > 0) {
+        if (RowsAligned<T, decltype(tag)::value>(
+                {grise.data(), c->input(20).data(), rg->data(), pg->data(), ig->data()},
+                {c->input(18).data(), ag->data()}))
+          return launch(tag, std::true_type{});
+      }
+      return launch(tag, std::false_type{});
+    }));
   }
  private:
   int surrogate_; bool hard_; bool detach_; bool detach_asc_;

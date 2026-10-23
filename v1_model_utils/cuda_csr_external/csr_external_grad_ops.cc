@@ -26,15 +26,15 @@ REGISTER_OP("BkgCsrForward")
       return OkStatus();
     });
 
-// The dense BKG weight gradient from BkgCsrForward's fixed-four incoming CSR:
-// bitwise ExternalCsrWeightBackward's (dense, basis 4, FP16) at every batch the
-// latter sums in a fixed order; below 32, at batches that are not powers of two,
-// where it adds 4-sample tiles with atomics, this adds them in launch order (the
-// latter's usual result). One pass over `current_grad` instead of writing and
+// The dense BKG weight gradient from BkgCsrForward's four-edge incoming CSR:
+// bitwise ExternalCsrWeightBackward's (dense, basis 4) at every batch. In FP16
+// both add the same 4-sample lanes, by the butterfly tree, or in lane order
+// below 32 at batches that are not powers of two; in FP32 both add the same
+// batch tiles in order. One pass over `current_grad` instead of writing and
 // re-reading its [pairs, batch] projection. Edges are written at
 // `incoming_edge_ids`.
 REGISTER_OP("BkgCsrWeightBackward")
-    .Attr("T: {half}")
+    .Attr("T: {half, float}")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Input("activity: T")

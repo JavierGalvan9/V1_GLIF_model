@@ -92,8 +92,8 @@ writes it once, rounded once:
 - **The LGN alone** (`V1CsrForward` with one slot of rows that repeat targets,
   `aggregate_runs`): runs of edges to one target are summed in registers first.
 - **The model's step** (`V1CsrForwardFused`, and `V1CsrForwardFusedResource` in
-  `cuda_csr_resources`): the recurrent history's three delay slots, with the
-  queue records of slots 1 and 2 carried, plus the LGN, summed into one tile
+  `cuda_csr_resources`): the recurrent history's delay slots, with the queue
+  records of every slot but the newest carried, plus the LGN, summed into one tile
   before the single rounding. This skips the LGN pass's read and rewrite of the
   currents and the merged active-row queue. The active rows come straight from
   the slots' records. `cuda_csr_external.calculate_recurrent_and_external_currents`
@@ -106,8 +106,9 @@ writes it once, rounded once:
 |---|---|
 | LGN alone: one slot of target-repeating rows, FP16 or FP32, any batch | LGN sweep |
 | recurrent history of three slots with carried records + LGN, FP16 or FP32, any batch, tensor or resource connectivities | fused sweep |
-| fused op with other slot counts or without carried records | recurrent `TiledForwardKernel`, then the LGN sweep accumulating onto it |
-| recurrent history alone | `TiledForwardKernel` (the frozen path) |
+| the same with 2 or 4 to 8 slots, FP16 | fused sweep (slot loops bounded at 8 instead of 3) |
+| fused op with those slot counts in FP32, or without carried records | recurrent `TiledForwardKernel`, then the LGN sweep accumulating onto it |
+| recurrent history alone | `TiledForwardKernel` (the frozen path; also one or three basis columns in FP16) |
 | other basis widths | `ForwardKernel` for both sources, in sequence |
 | a wide grid of more than 2^31 - 1 blocks | the frozen paths |
 

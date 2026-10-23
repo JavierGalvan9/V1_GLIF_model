@@ -198,6 +198,8 @@ parser.add_argument('--backward_mode', default='recorded', choices=['recorded', 
                     help='Training backward mode (see multi_training.py)')
 parser.add_argument('--voltage_offload', default='none', choices=['none', 'raw', 'compressed'],
                     help='Training membrane-record offload with --backward_mode recorded (see multi_training.py)')
+parser.add_argument('--history_offload', default='none', choices=['none', 'raw'],
+                    help='Training packed spike/refractory offload with --backward_mode recorded (see multi_training.py)')
 parser.add_argument('--segmented_rollout', dest='segmented_rollout', action='store_true',
                     help='Evaluation rollout in int32-safe chunks (see osi_dsi_estimator.py)')
 parser.add_argument('--nosegmented_rollout', dest='segmented_rollout', action='store_false')
@@ -278,7 +280,7 @@ def main():
     ]
 
     # evaluation_commands = ["run", "-g", "1", "-G", "L40S", "-m", "80", "-c", "8", "-t", "3:00"]
-    evaluation_commands = ["run", "-g", "1", "-G", "rtxpro6000", "-m", "200", "-c", "8", "-t", "3:00"]
+    evaluation_commands = ["run", "-g", "1", "-m", "200", "-c", "8", "-t", "3:00"]
 
     # Define the training and evaluation script calls
     # training_script = "python multi_training.py "
@@ -304,7 +306,7 @@ def main():
                 'n_gpus', 'grating_batch_size', 'gray_batch_size',
                 'debug_gradients', 'global_clipnorm',
                 'detach_reset', 'detach_asc_reset',
-                'pack_spike_checkpoints', 'backward_mode', 'voltage_offload',
+                'pack_spike_checkpoints', 'backward_mode', 'voltage_offload', 'history_offload',
             } or name.startswith(('rolling_', 'batch_emd_')):
                 continue
 

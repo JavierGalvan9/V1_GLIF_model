@@ -23,13 +23,17 @@ The CUDA backward kernel supports the `triangular`, `gaussian`, and `slayer`
 surrogate gradients selected through `surrogate_gradient`. The legacy
 `pseudo_gauss=True` option remains an alias for `surrogate_gradient="gaussian"`.
 
-The fused operators accept any positive synaptic basis dimension. They select
-the two-sample coefficient-reuse kernels whenever the basis dimension is four;
-other dimensions use the runtime-basis kernels, except that the forward also
-tiles basis three and five when it accumulates the voltage penalty (their
-backward stays on the runtime-basis kernels). Dispatch does not depend on batch
-size. The four-basis path uses 512 threads per block and tiles two
-samples per neuron so it can reuse the four coefficient blocks.
+The fused operators accept any positive synaptic basis dimension. Basis
+dimensions 1 to 8 select the tiled kernels, compiled for each width: the
+forward tiles two samples per neuron so they reuse its coefficient blocks, the
+backward reads dense or bit-packed masks (`FusedGlifStepBackwardPacked`) and
+can fuse the inputs gradient's abs-max bound, and both move the synaptic rows in
+aligned accesses of up to 16 bytes where the widths allow. Wider rows use the
+runtime-basis kernels (packed masks and the bound included). Every path gives
+the same results bit for bit; only the voltage penalty accumulator of the
+runtime-basis forward, which adds atomically, depends on the order. Dispatch
+does not depend on batch size. The tiled kernels use 512 threads per block; the
+fused BKG gather needs four bases.
 
 Builds are architecture-keyed and validated against the active TensorFlow/CUDA
 environment:

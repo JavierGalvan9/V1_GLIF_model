@@ -7,15 +7,18 @@ import os
 import pickle as pkl
 from .cuda_csr_recurrent import (
     MAX_SPIKE_SLOTS,
+    StepGradientLink,
     accumulate_recurrent_weight_gradient,
     build_csr_connectivity,
     calculate_recurrent_csr_currents,
+    spike_activity_masks,
     spike_queue,
 )
 from .cuda_csr_external import (
     build_csr_connectivity as build_external_csr_connectivity,
     calculate_external_csr_currents,
     calculate_recurrent_and_external_currents,
+    external_pair_weights,
 )
 from . import spatial_layout
 from .glif_propagators import membrane_coefficients
@@ -736,10 +739,21 @@ class SpikeHistory(NamedTuple):
     delay slots, newest first, and the queue records of slots 1 to D - 1, which
     the step's recurrent op takes instead of sweeping them
     (calculate_recurrent_csr_currents' `queues`). The op builds only the
-    newest slot's record, which becomes the next step's slot-1 record."""
+    newest slot's record, which becomes the next step's slot-1 record.
+    Within V1Column.activity_masks_scope it also carries every slot's
+    activity masks (bit-cast to float32), for the steps' gradients."""
 
     slots: tuple
     queues: tuple
+    masks: tuple = ()
+
+
+def _carried_masks(slot):
+    """A slot's activity masks as the loop carries them: bit-cast to float32.
+    The gradient saves the masks of every step, and TensorFlow keeps saved
+    uint32 tensors in host memory (each step's masks would cross PCIe twice);
+    StepGradientLink casts the bits back."""
+    return tf.bitcast(spike_activity_masks(slot), tf.float32)
 
 
 def _lgn_activity(cell, x_t):
@@ -1482,7 +1496,40 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
-    def calculate_recurrent_and_input_currents(self, rec_z_buf, queues, x_t):
+    def lgn_pair_weights(self):
+        """The LGN weights' per-pair FP32 sums for the coalesced current sweep
+        (external_pair_weights), or None where the sweep does not take them
+        (it takes them with CUDA currents, in float16 and float32; in float32
+        its max_abs error vs float64 is ~59 % above the plain sweep's, its
+        mean error ~40 % below: accepted)."""
+        if self._synaptic_current_backend != "cuda":
+            return None
+        return external_pair_weights(
+            tf.cast(self.input_weight_values, self.variable_dtype), self.input_csr
+        )
+
+    @contextlib.contextmanager
+    def lgn_pair_weights_scope(self, pair_weights=None):
+        """Within the block, every step's current sweep reads ``pair_weights``
+        (``lgn_pair_weights()``, computed here when None) instead of summing
+        each LGN edge weight. The weights are constant over a rollout, so a
+        rollout computes the sums once; every operator that computes them
+        also builds its own pair table. Inside an enclosing scope this changes
+        nothing: the enclosing rollout's sums stand. The sums only feed the
+        forward; the LGN weight gradient stays per edge."""
+        if getattr(self, "_lgn_pair_weights", None) is not None:
+            yield
+            return
+        if pair_weights is None:
+            pair_weights = self.lgn_pair_weights()
+        # Not a tracked attribute; MirroredStrategy traces replicas one at a time.
+        object.__setattr__(self, "_lgn_pair_weights", pair_weights)
+        try:
+            yield
+        finally:
+            object.__delattr__(self, "_lgn_pair_weights")
+
+    def calculate_recurrent_and_input_currents(self, rec_z_buf, queues, x_t, link=None):
         """``(currents, record)``: calculate_i_rec_with_custom_grad(rec_z_buf,
         queues=queues) with calculate_input_current_from_spikes(x_t) accumulated
         on top, in one CUDA operator for tensor and resource (replicated)
@@ -1500,9 +1547,10 @@ class V1Column(tf.keras.layers.Layer):
             self.input_csr,
             compute_activity_gradient=compute_activity_gradient,
             compute_weight_gradient=self.input_weight_values.trainable,
-            # Set by a runner for the duration of one rollout (see
-            # RecordedAdjointRunner._forward_records); None otherwise.
+            # Set for the duration of one rollout (lgn_pair_weights_scope);
+            # None otherwise.
             external_pair_weights=getattr(self, "_lgn_pair_weights", None),
+            link=link,
         )
 
     def calculate_input_current_from_spikes(self, x_t, initial=None):
@@ -1569,7 +1617,7 @@ class V1Column(tf.keras.layers.Layer):
         """The BKG activity and connectivity when the GLIF op gathers the BKG
         current itself (update_glif_state's `bkg`), else None.
 
-        That needs the CUDA state and current backends, the fixed-four BKG
+        That needs the CUDA state and current backends, the four-edge BKG
         gather, per-tensor (not per-GPU resource) connectivity, no BKG activity
         gradient, and no lr_scale applied after the sources are summed.
         """
@@ -1581,7 +1629,8 @@ class V1Column(tf.keras.layers.Layer):
         if (self._scales_recurrent_inputs
                 or getattr(self, "_compute_bkg_activity_gradient", False)
                 or connectivity.resource_name is not None
-                or not uses_bkg_gather(connectivity, self.synaptic_basis_weights)):
+                or not uses_bkg_gather(connectivity, self.synaptic_basis_weights)
+                or connectivity.n_edges != 4 * connectivity.n_post):
             return None
         return dict(
             activity=tf.stop_gradient(sample_bkg_activity(self, batch_size, noise_step)),
@@ -1663,7 +1712,7 @@ class V1Column(tf.keras.layers.Layer):
 
         return i_in_flat
 
-    def calculate_i_rec_with_custom_grad(self, rec_z_buf, initial=None, queues=None):
+    def calculate_i_rec_with_custom_grad(self, rec_z_buf, initial=None, queues=None, link=None):
         """The recurrent currents; with `queues` (CUDA backend only),
         `(currents, record)` as calculate_recurrent_csr_currents returns them."""
 
@@ -1678,6 +1727,7 @@ class V1Column(tf.keras.layers.Layer):
                 self.recurrent_csr,
                 initial=initial,
                 queues=queues,
+                link=link,
             )
         else:
             i_rec_flat = calculate_synaptic_currents(
@@ -1819,13 +1869,48 @@ class V1Column(tf.keras.layers.Layer):
 
         With CUDA recurrent currents the loop form is a SpikeHistory that also
         carries the queue records of slots 1 to D - 1, built here once per
-        rollout; each step then sweeps only its newest slot.
+        rollout; each step then sweeps only its newest slot. Within
+        activity_masks_scope (and the CUDA state backend) it carries the
+        slots' activity masks too, built here for the initial slots.
         """
         state = tuple(state)
         slots = tuple(tf.split(state[0], self.max_delay, axis=1))
         if self._synaptic_current_backend == "cuda" and 1 < self.max_delay <= MAX_SPIKE_SLOTS:
-            slots = SpikeHistory(slots, tuple(spike_queue(slot) for slot in slots[1:]))
+            masks = (
+                tuple(_carried_masks(slot) for slot in slots)
+                if getattr(self, "_carry_activity_masks", False)
+                and self._state_backend == "cuda"
+                else ()
+            )
+            slots = SpikeHistory(slots, tuple(spike_queue(slot) for slot in slots[1:]), masks)
         return (slots,) + state[1:]
+
+    @contextlib.contextmanager
+    def time_major_sequences_scope(self):
+        """Within the block, the RNN layer's rollouts return their sequences
+        time-major, [time, batch, ...], as the loop stacks them, sparing the
+        batch-major transpose (and its gradient's). For a caller that consumes
+        the sequences itself (CheckpointedStatisticsRunner)."""
+        previous = getattr(self, "_time_major_sequences", False)
+        object.__setattr__(self, "_time_major_sequences", True)
+        try:
+            yield
+        finally:
+            object.__setattr__(self, "_time_major_sequences", previous)
+
+    @contextlib.contextmanager
+    def activity_masks_scope(self):
+        """Within the block, rollouts carry each spike slot's activity masks
+        from step to step (one spike_activity_masks per new slot) for the
+        recurrent backward of each step (StepGradientLink), which then skips
+        its sweep of the slots: same gradients. Only a rollout TensorFlow
+        differentiates uses them: SegmentedRecomputeRunner's replay enters this."""
+        previous = getattr(self, "_carry_activity_masks", False)
+        object.__setattr__(self, "_carry_activity_masks", True)
+        try:
+            yield
+        finally:
+            object.__setattr__(self, "_carry_activity_masks", previous)
 
     def from_loop_state(self, state):
         """Concatenate the delay slots back into the spike history tensor."""
@@ -1890,9 +1975,9 @@ class V1Column(tf.keras.layers.Layer):
         # as the tensor or as its delay slots (see to_loop_state); the step
         # works on the slots, and the next history leaves in the form given.
         z_buf, v, r, asc, psc_rise, psc, noise_step = state[:7]
-        queues = None
+        queues, masks = None, ()
         if isinstance(z_buf, SpikeHistory):
-            z_buf, queues = z_buf.slots, tuple(z_buf.queues)
+            z_buf, queues, masks = z_buf.slots, tuple(z_buf.queues), tuple(z_buf.masks)
         buffered = not isinstance(z_buf, (tuple, list))
         z_slots = (
             tuple(tf.split(z_buf, self.max_delay, axis=1)) if buffered else tuple(z_buf)
@@ -1911,6 +1996,21 @@ class V1Column(tf.keras.layers.Layer):
             if self._track_voltage_penalty
             else None
         )
+        # When TensorFlow differentiates the step, the GLIF gradient hands the
+        # recurrent one the bound of the currents' gradient and the slots'
+        # gradients (StepGradientLink). Every other source below adds onto the
+        # recurrent currents or into one add_n, passing their gradient through,
+        # so the GLIF op's input gradient is the recurrent operator's upstream
+        # (times lr_scale when the currents are scaled). The link takes the
+        # scale as read here: its gradient must not read the variable itself.
+        scale = (
+            tf.convert_to_tensor(self._lr_scale) if self._scales_recurrent_inputs else None
+        )
+        link = (
+            StepGradientLink(z_slots, scale, masks)
+            if self._state_backend == "cuda" and self._synaptic_current_backend == "cuda"
+            else None
+        )
         # Accumulate every current source into one buffer. Each CSR operator
         # already scatters with atomics, so seeding it with the previous source's
         # output removes a full pass over a [batch * n_neurons, n_syn_basis]
@@ -1919,10 +2019,10 @@ class V1Column(tf.keras.layers.Layer):
             if queues is not None:
                 # The carried queue records exist only on the CUDA backend.
                 rec_inputs, newest_queue = self.calculate_recurrent_and_input_currents(
-                    z_slots, queues, lgn_input
+                    z_slots, queues, lgn_input, link=link
                 )
             else:
-                rec_inputs = self.calculate_i_rec_with_custom_grad(z_slots)
+                rec_inputs = self.calculate_i_rec_with_custom_grad(z_slots, link=link)
                 rec_inputs = self.calculate_input_current_from_spikes(
                     lgn_input, initial=rec_inputs
                 )
@@ -1935,7 +2035,7 @@ class V1Column(tf.keras.layers.Layer):
                 )
         else:
             fused_bkg = None
-            i_rec = self.calculate_i_rec_with_custom_grad(z_slots, queues=queues)
+            i_rec = self.calculate_i_rec_with_custom_grad(z_slots, queues=queues, link=link)
             if queues is not None:
                 i_rec, newest_queue = i_rec
             if self._current_input:
@@ -1950,8 +2050,8 @@ class V1Column(tf.keras.layers.Layer):
         # The master weights are pre-divided by lr_scale, so this restores the
         # requested scale. At lr_scale == 1 it is an identity over ~26 M
         # elements, so do not emit it at all.
-        if self._scales_recurrent_inputs:
-            rec_inputs = rec_inputs * self._lr_scale
+        if scale is not None:
+            rec_inputs = rec_inputs * scale
 
         if self._state_backend == "cuda":
             from .cuda_glif_state import update_glif_state
@@ -1963,7 +2063,7 @@ class V1Column(tf.keras.layers.Layer):
             # still in registers (None when the cell does not track it).
             new_z, exposed_v, transition_state, *advanced = update_glif_state(
                 z_slots, v, r, asc, psc_rise, psc, rec_inputs, cell=self,
-                penalty_acc=voltage_penalty, bkg=fused_bkg,
+                penalty_acc=voltage_penalty, bkg=fused_bkg, link=link,
             )
             new_voltage_penalty = advanced[0] if advanced else None
             (
@@ -2038,7 +2138,10 @@ class V1Column(tf.keras.layers.Layer):
         new_z_buf = tf.concat(new_z_slots, axis=1) if buffered else new_z_slots
         if queues is not None:
             # This step's newest slot is the next step's second one.
-            new_z_buf = SpikeHistory(new_z_slots, (newest_queue,) + queues[:-1])
+            new_z_buf = SpikeHistory(
+                new_z_slots, (newest_queue,) + queues[:-1],
+                ((_carried_masks(new_z_slots[0]),) + masks[:-1]) if masks else (),
+            )
         new_state = (new_z_buf, new_v, new_r, new_asc, new_psc_rise, new_psc, new_noise_step)
         if self._lgn_delay_buffer_width:
             new_state += (new_lgn_buf,)
@@ -2180,8 +2283,15 @@ class HeterogeneousStateRNN(tf.keras.layers.RNN):
 
         A cell with ``to_loop_state``/``from_loop_state`` (V1Column) carries
         its state in that loop form between timesteps and converts at the ends
-        of the loop. Everything else is Keras' own loop.
+        of the loop, and one with ``lgn_pair_weights_scope`` has every step
+        read the per-pair LGN weight sums computed once for the loop (or by
+        an enclosing scope). Everything else is Keras' own loop.
         """
+        pair_weights_scope = getattr(self.cell, "lgn_pair_weights_scope", None)
+        with pair_weights_scope() if pair_weights_scope else contextlib.nullcontext():
+            return self._inner_loop(sequences, initial_state, mask, training)
+
+    def _inner_loop(self, sequences, initial_state, mask, training):
         if mask is not None or self.go_backwards or self.unroll:
             raise NotImplementedError(
                 "HeterogeneousStateRNN runs unmasked, forward, rolled loops only."
@@ -2254,8 +2364,13 @@ class HeterogeneousStateRNN(tf.keras.layers.RNN):
             ]
         else:
             stacked = [collection.stack() for collection in collections]
-        outputs = [swap_batch_time(output) for output in stacked]
-        last_output = [output[:, -1] for output in outputs]
+        if getattr(self.cell, "_time_major_sequences", False):
+            # V1Column.time_major_sequences_scope: the sequences as stacked.
+            outputs = stacked
+            last_output = [output[-1] for output in outputs]
+        else:
+            outputs = [swap_batch_time(output) for output in stacked]
+            last_output = [output[:, -1] for output in outputs]
         return (
             tf.nest.pack_sequence_as(output_zero, last_output),
             tf.nest.pack_sequence_as(output_zero, outputs),
@@ -2585,6 +2700,12 @@ class SegmentedRecomputeRunner:
     (``ON_READ``), so under a distribution strategy each replica returns its own
     partial gradient and the optimizer all-reduces it as usual. The runner is
     not trackable, so the accumulator never reaches a checkpoint.
+
+    Given the core model's V1Column ``cell``, a rollout computes the cell's
+    per-pair LGN weight sums once for all its chunks, forward and replay
+    (``V1Column.lgn_pair_weights_scope``), not once per chunk, and the replay
+    carries the spike slots' activity masks for the recurrent backward
+    (``V1Column.activity_masks_scope``).
     """
 
     _PACKED_SPIKES_PER_WORD = 31
@@ -2597,6 +2718,7 @@ class SegmentedRecomputeRunner:
         differentiate_inputs=True,
         pack_spike_checkpoints=False,
         accumulated_variable=None,
+        cell=None,
     ):
         sequence_length = int(sequence_length)
         chunk_size = int(chunk_size)
@@ -2608,6 +2730,7 @@ class SegmentedRecomputeRunner:
             )
 
         self.core_model = core_model
+        self.cell = cell
         self.sequence_length = sequence_length
         self.chunk_size = chunk_size
         self.differentiate_inputs = bool(differentiate_inputs)
@@ -2744,19 +2867,41 @@ class SegmentedRecomputeRunner:
             sequence = tf.ensure_shape(sequence, output_shape)
         return sequence
 
-    def _forward(self, inputs, initial_state, time_check):
-        sequence_specs = tf.nest.flatten(self.core_model.output)[
-            :self.n_sequence_outputs
-        ]
-        sequence_arrays = tuple(
-            tf.TensorArray(
-                dtype=spec.dtype,
-                size=self.n_chunks,
-                infer_shape=self.remainder_size == 0,
-                clear_after_read=True,
+    def _sequence_collector(self, inputs):
+        """The default chunk collector of _forward: each chunk's sequence
+        outputs into a TensorArray, joined along time at the end."""
+        specs = tf.nest.flatten(self.core_model.output)[:self.n_sequence_outputs]
+
+        def start():
+            return tuple(
+                tf.TensorArray(
+                    dtype=spec.dtype,
+                    size=self.n_chunks,
+                    infer_shape=self.remainder_size == 0,
+                    clear_after_read=True,
+                )
+                for spec in specs
             )
-            for spec in sequence_specs
-        )
+
+        def add(arrays, chunk_index, chunk_start, sequences):
+            return tuple(
+                array.write(chunk_index, value) for array, value in zip(arrays, sequences)
+            )
+
+        def finish(arrays):
+            return tuple(
+                self._assemble_chunks(array, spec, inputs)
+                for array, spec in zip(arrays, specs)
+            )
+
+        return start, add, finish
+
+    def _forward(self, inputs, initial_state, time_check, collector=None):
+        """``(outputs, final state, checkpoints)``. ``collector`` is
+        ``(start, add, finish)``: ``start()`` the loop carry, ``add(carry,
+        chunk_index, chunk_start, sequences)`` it after a chunk, ``finish(carry)``
+        the outputs; by default the sequences themselves (_sequence_collector)."""
+        start, add, finish = collector or self._sequence_collector(inputs)
         state_arrays = tuple(
             tf.TensorArray(
                 dtype=self._checkpoint_dtype(index, value.dtype),
@@ -2766,7 +2911,7 @@ class SegmentedRecomputeRunner:
             for index, value in enumerate(initial_state)
         )
 
-        def run_full_chunk(chunk_index, arrays, states, history):
+        def run_full_chunk(chunk_index, carry, states, history):
             chunk = self._slice_chunk(inputs, chunk_index, self.chunk_size, time_check)
             history = tuple(
                 array.write(chunk_index, self._encode_checkpoint(index, value))
@@ -2775,18 +2920,15 @@ class SegmentedRecomputeRunner:
             flat_outputs = self._run_chunk(chunk, *states)
             chunk_sequences = flat_outputs[:self.n_sequence_outputs]
             next_state = tuple(flat_outputs[self.n_sequence_outputs:])
-            arrays = tuple(
-                array.write(chunk_index, value)
-                for array, value in zip(arrays, chunk_sequences)
-            )
-            return chunk_index + 1, arrays, next_state, history
+            carry = add(carry, chunk_index, chunk_index * self.chunk_size, chunk_sequences)
+            return chunk_index + 1, carry, next_state, history
 
-        _, sequence_arrays, state, state_arrays = tf.while_loop(
-            lambda chunk_index, _arrays, _state, _history: (
+        _, carry, state, state_arrays = tf.while_loop(
+            lambda chunk_index, _carry, _state, _history: (
                 chunk_index < self.n_full_chunks
             ),
             run_full_chunk,
-            (tf.constant(0), sequence_arrays, tuple(initial_state), state_arrays),
+            (tf.constant(0), start(), tuple(initial_state), state_arrays),
             parallel_iterations=1,
         )
 
@@ -2802,16 +2944,10 @@ class SegmentedRecomputeRunner:
             flat_outputs = self._run_chunk(chunk, *state)
             chunk_sequences = flat_outputs[:self.n_sequence_outputs]
             state = tuple(flat_outputs[self.n_sequence_outputs:])
-            sequence_arrays = tuple(
-                array.write(remainder_index, value)
-                for array, value in zip(sequence_arrays, chunk_sequences)
-            )
+            carry = add(carry, remainder_index, self.n_full_chunks * self.chunk_size,
+                        chunk_sequences)
 
-        sequences = tuple(
-            self._assemble_chunks(array, spec, inputs)
-            for array, spec in zip(sequence_arrays, sequence_specs)
-        )
-        return sequences, state, state_arrays
+        return finish(carry), state, state_arrays
 
     def _backward(
         self,
@@ -2821,7 +2957,10 @@ class SegmentedRecomputeRunner:
         sequence_gradients,
         final_state_gradients,
         variables,
+        chunk_gradients=None,
     ):
+        """``chunk_gradients(start, length)``, when given, returns a chunk's
+        sequence gradients in place of slices of ``sequence_gradients``."""
         inputs_are_differentiable = (
             self.differentiate_inputs
             and (inputs.dtype.is_floating or inputs.dtype.is_complex)
@@ -2889,10 +3028,12 @@ class SegmentedRecomputeRunner:
                 tape.watch(tape_variables)
                 recomputed = self._run_chunk(chunk, *boundary_state)
 
-            chunk_sequence_gradients = tuple(
-                None if gradient is None
-                else gradient[:, start:start + chunk_length, ...]
-                for gradient in sequence_gradients
+            chunk_sequence_gradients = (
+                chunk_gradients(start, chunk_length) if chunk_gradients else tuple(
+                    None if gradient is None
+                    else gradient[:, start:start + chunk_length, ...]
+                    for gradient in sequence_gradients
+                )
             )
             state_output_gradients = tuple(
                 output_state_cotangents[index]
@@ -2995,6 +3136,17 @@ class SegmentedRecomputeRunner:
         )
         return input_gradient, initial_state_gradients, variable_gradients
 
+    @contextlib.contextmanager
+    def _rollout_scope(self, pair_weights, replay=False):
+        """The cell's scopes for this rollout's forward (the LGN pair sums)
+        or its replay (also the activity masks)."""
+        with contextlib.ExitStack() as scopes:
+            if self.cell is not None:
+                scopes.enter_context(self.cell.lgn_pair_weights_scope(pair_weights))
+                if replay:
+                    scopes.enter_context(self.cell.activity_masks_scope())
+            yield
+
     def __call__(self, inputs, initial_state):
         time_check = tf.debugging.assert_equal(
             tf.shape(inputs)[1],
@@ -3004,23 +3156,27 @@ class SegmentedRecomputeRunner:
 
         @tf.custom_gradient
         def segmented_rollout(inputs, *initial_state):
-            sequences, state, state_arrays = self._forward(
-                inputs, initial_state, time_check
-            )
+            # The replay sweeps with the forward's own pair sums.
+            pair_weights = None if self.cell is None else self.cell.lgn_pair_weights()
+            with self._rollout_scope(pair_weights):
+                sequences, state, state_arrays = self._forward(
+                    inputs, initial_state, time_check
+                )
             flat_outputs = sequences + state
 
             def grad(*output_gradients, variables=None):
                 sequence_gradients = output_gradients[:self.n_sequence_outputs]
                 final_state_gradients = output_gradients[self.n_sequence_outputs:]
                 variables = tuple(variables or ())
-                input_gradient, state_gradients, variable_gradients = self._backward(
-                    inputs,
-                    state_arrays,
-                    state,
-                    sequence_gradients,
-                    final_state_gradients,
-                    variables,
-                )
+                with self._rollout_scope(pair_weights, replay=True):
+                    input_gradient, state_gradients, variable_gradients = self._backward(
+                        inputs,
+                        state_arrays,
+                        state,
+                        sequence_gradients,
+                        final_state_gradients,
+                        variables,
+                    )
                 argument_gradients = (input_gradient,) + state_gradients
                 if variables:
                     return argument_gradients, list(variable_gradients)

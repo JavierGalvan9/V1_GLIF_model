@@ -238,6 +238,7 @@ def main(_):
                 chunk_size=flags.gradient_checkpoint_chunk_size,
                 differentiate_inputs=False,
                 pack_spike_checkpoints=flags.pack_spike_checkpoints,
+                cell=rsnn_layer.cell,
             )
             print(
                 "Segmented RNN rollout: "

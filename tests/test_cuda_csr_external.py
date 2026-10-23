@@ -144,6 +144,55 @@ def test_fixed_four_bkg_forward_and_gradients(dtype):
     np.testing.assert_allclose(weight_grad, expected[2], rtol=tolerance, atol=tolerance)
 
 
+def _uniform_bkg_fixture(edges_per_post, dtype=np.float32):
+    rng = np.random.default_rng(404 + edges_per_post)
+    n_post = 3
+    indices = np.array(
+        [[post, pre] for post in range(n_post)
+         for pre in rng.choice(100, size=edges_per_post, replace=False)],
+        dtype=np.int64,
+    )
+    types = rng.integers(0, 3, size=len(indices))
+    activity = rng.integers(0, 3, size=(2, 100)).astype(dtype)
+    weights = rng.normal(size=len(indices)).astype(np.float32)
+    basis = rng.normal(size=(3, 4)).astype(dtype)
+    upstream = rng.normal(size=(2 * n_post, 4)).astype(dtype)
+    indices, types, weights = _csr_sorted(indices, types, weights)
+    return indices, types, activity, weights, basis, upstream
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("edges_per_post", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
+def test_uniform_bkg_gather_matches_the_reference_at_any_edge_count(edges_per_post, dtype):
+    """The incoming gather takes any uniform 1 to 8 edges per post; the weight gradient
+    (four-edge fast path only) and the gradients come from the generic kernels."""
+    from v1_model_utils.cuda_csr_external.wrapper import uses_bkg_gather
+
+    np_dtype = np.float16 if dtype == tf.float16 else np.float32
+    fixture = _uniform_bkg_fixture(edges_per_post, np_dtype)
+    indices, types, activity, weights, basis, upstream = fixture
+    connectivity = _connectivity(indices, types, n_pre=100, n_post=3)
+    assert uses_bkg_gather(connectivity, tf.constant(basis, dtype)) == DIRECT_CSR
+    np.testing.assert_array_equal(
+        connectivity.incoming_row_splits,
+        np.arange(0, 3 * edges_per_post + 1, edges_per_post),
+    )
+    activity_tensor = tf.constant(activity, dtype)
+    master_weights = tf.Variable(weights)
+    with tf.GradientTape() as tape:
+        tape.watch(activity_tensor)
+        currents = calculate_external_csr_currents(
+            activity_tensor, master_weights, tf.constant(basis, dtype), connectivity
+        )
+        loss = tf.reduce_sum(currents * tf.constant(upstream, dtype))
+    weight_grad = tape.gradient(loss, master_weights)
+    expected = _reference(*fixture)
+    tolerance = 2e-3 if dtype == tf.float16 else 2e-5
+    np.testing.assert_allclose(currents, expected[0], rtol=tolerance, atol=tolerance)
+    np.testing.assert_allclose(weight_grad, expected[2], rtol=tolerance, atol=tolerance)
+
+
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize("n_basis", [4, 5])
 @pytest.mark.parametrize("batch_size", SPECIALIZED_BATCH_SIZES + RUNTIME_BATCH_SIZES)
@@ -607,17 +656,22 @@ def _two_source_reference(case):
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 @pytest.mark.parametrize("resource_mode", ["0", "1"])
 @pytest.mark.parametrize("batch", [1, 8, 64])
-def test_fused_recurrent_and_lgn_match_the_two_operators(monkeypatch, resource_mode, batch):
+@pytest.mark.parametrize("n_slots", [2, 3, 8])
+def test_fused_recurrent_and_lgn_match_the_two_operators(
+    monkeypatch, resource_mode, batch, n_slots
+):
     """FP16, narrow tiles (batch 1 and 8 on these 6,000 neurons) and wide ones
     (64), with tensor connectivities (V1CsrForwardFused) and GPU-local resources
-    (V1CsrForwardFusedResource): the fused sweep rounds once, so it is at least
-    as accurate as the chained operators; its gradients come from the same
-    backward operators and are bitwise equal (the activity gradient up to that
-    operator's own run-to-run spread), and so is the queue record."""
+    (V1CsrForwardFusedResource), for the production three slots and the other
+    counts the sweep serves in FP16: the fused sweep rounds once, so it is at
+    least as accurate as the chained operators (strictly on average, which shows
+    the sweep ran); its gradients come from the same backward operators and are
+    bitwise equal (the activity gradient up to that operator's own run-to-run
+    spread), and so is the queue record."""
     from v1_model_utils.cuda_csr_external import fusable
 
     monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
-    case = _history_and_lgn(batch, tf.float16)
+    case = _history_and_lgn(batch, tf.float16, n_slots=n_slots)
     assert (case.recurrent.resource_name is not None) == (resource_mode == "1")
     assert fusable(case.slots, case.basis, case.recurrent, (), case.activity, case.lgn)
     fused, fused_record, fused_grads = _two_sources(case, fused=True)
@@ -626,7 +680,7 @@ def test_fused_recurrent_and_lgn_match_the_two_operators(monkeypatch, resource_m
     fused_error = np.abs(fused.astype(np.float64) - reference)
     chained_error = np.abs(chained.astype(np.float64) - reference)
     assert fused_error.max() <= chained_error.max()
-    assert fused_error.mean() <= chained_error.mean()
+    assert fused_error.mean() < chained_error.mean()
     capacity = batch * case.width
     count = int(chained_record[capacity])
     np.testing.assert_array_equal(fused_record[:count], chained_record[:count])
@@ -645,23 +699,34 @@ def test_fused_recurrent_and_lgn_match_the_two_operators(monkeypatch, resource_m
 @pytest.mark.parametrize("resource_mode", ["0", "1"])
 @pytest.mark.parametrize("batch", [1, 8, 64])
 @pytest.mark.parametrize("coalesced", [False, True])
-def test_fused_scalar_lgn_matches_float64(monkeypatch, resource_mode, batch, coalesced):
+@pytest.mark.parametrize("n_slots", [3, 5])
+@pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
+def test_fused_scalar_lgn_matches_float64(monkeypatch, resource_mode, batch, coalesced, n_slots,
+                                          dtype):
     """One LGN synapse type per neuron (the production LGN) takes the scalar
     sweep, whose runs of repeated targets (here up to 20 edges) are split into
-    words of a few edges: within half an FP16 ulp of fp64 plus FP32 slack, at
-    least as accurate as the chained operators, and every gradient and the queue
-    record equal theirs. `coalesced` passes the per-pair weight sums, which
-    both fused operators sweep instead of the runs."""
+    words of a few edges: within half an output ulp of fp64 plus FP32 slack (in
+    FP32, where the sums are the output: 16 FP32 ulps of the largest term), at
+    least as accurate as the chained operators on average (FP32: within 25 %,
+    the accepted trade-off of its scalar sweep), and every gradient and the queue
+    record equal theirs, with three slots or another count. `coalesced` passes
+    the per-pair weight sums, which both fused operators sweep instead of the
+    runs."""
     monkeypatch.setenv("V1_CSR_RESOURCE_MODE", resource_mode)
-    case = _history_and_lgn(batch, tf.float16, scalar_lgn=True)
+    case = _history_and_lgn(batch, dtype, scalar_lgn=True, n_slots=n_slots)
     fused, fused_record, fused_grads = _two_sources(case, fused=True, coalesced=coalesced)
     chained, chained_record, chained_grads = _two_sources(case, fused=False)
     reference = _two_source_reference(case)
     fused_error = np.abs(fused.astype(np.float64) - reference)
     chained_error = np.abs(chained.astype(np.float64) - reference)
-    bound = np.spacing(np.abs(reference).astype(np.float16)).astype(np.float64) / 2
+    if dtype == tf.float16:
+        bound = np.spacing(np.abs(reference).astype(np.float16)).astype(np.float64) / 2
+    else:
+        bound = 16 * np.spacing(np.float32(np.abs(reference).max()))
     assert np.all(fused_error <= bound + 1e-4)
-    assert fused_error.mean() <= chained_error.mean()
+    # FP32 accepts the scalar sweep's mean error within a quarter of the chain's
+    # (production fixture: 40 % below the plain sweep's, but small cases vary).
+    assert fused_error.mean() <= chained_error.mean() * (1 if dtype == tf.float16 else 1.25)
     capacity = batch * case.width
     count = int(chained_record[capacity])
     np.testing.assert_array_equal(fused_record[:count], chained_record[:count])
@@ -679,16 +744,17 @@ def test_fused_scalar_lgn_matches_float64(monkeypatch, resource_mode, batch, coa
 @pytest.mark.parametrize("resource_mode", ["0", "1"])
 @pytest.mark.parametrize("batch, dtype, n_slots, n_basis", [
     (5, tf.float16, 3, 4), (64, tf.float32, 3, 4), (130, tf.float32, 3, 4),
-    (130, tf.float16, 3, 4), (64, tf.float16, 2, 4), (64, tf.float16, 3, 3),
+    (130, tf.float16, 3, 4), (64, tf.float16, 2, 4), (64, tf.float32, 2, 4),
+    (64, tf.float16, 3, 3),
 ])
 def test_fused_operator_matches_float64_on_every_path(
     monkeypatch, resource_mode, batch, dtype, n_slots, n_basis
 ):
     """The fused wrapper (tensor or resource connectivities) and the fused
     operator called directly agree with fp64 on the sweep's configurations
-    (every batch, FP16 and FP32, with three slots and four basis columns) and
-    off them, where the operator runs the two forwards in sequence (two slots,
-    three basis columns), as do the chained operators."""
+    (every batch, FP16 and FP32 with three slots, FP16 with two, four basis
+    columns) and off them, where the operator runs the two forwards in sequence
+    (two slots in FP32, three basis columns), as do the chained operators."""
     from v1_model_utils.cuda_csr_external import fusable
     from v1_model_utils.cuda_csr_external.wrapper import _load_ops
     from v1_model_utils.cuda_csr_recurrent import spike_queue
@@ -823,8 +889,8 @@ def test_fused_step_with_a_dynamic_batch():
         assert np.all(error <= bound + 1e-4)
 
 
-def _bkg_weight_case(batch):
-    """A fixed-four BKG connectivity, Poisson activity and an FP16 upstream."""
+def _bkg_weight_case(batch, dtype=np.float16):
+    """A fixed-four BKG connectivity, Poisson activity and an upstream in ``dtype``."""
     rng = np.random.default_rng(batch)
     n_pre, n_post, n_types = 100, 3001, 15
     posts = np.repeat(np.arange(n_post), 4)
@@ -835,8 +901,8 @@ def _bkg_weight_case(batch):
     indices, types, weights = _csr_sorted(indices, types, weights)
     c = _connectivity(indices, types, n_pre, n_post, sparse_activity=False)
     assert c.incoming_row_splits is not None
-    activity = rng.poisson(1.5, (batch, n_pre)).astype(np.float16)
-    upstream = rng.normal(size=(batch * n_post, 4)).astype(np.float16)
+    activity = rng.poisson(1.5, (batch, n_pre)).astype(dtype)
+    upstream = rng.normal(size=(batch * n_post, 4)).astype(dtype)
     upstream[rng.random(upstream.shape) < 0.1] = -0.0
     basis = rng.normal(size=(n_types, 4)).astype(np.float32)
     return c, indices, types, weights, activity, upstream, basis
@@ -853,54 +919,56 @@ def _compact_weight_gradient(c, weights, activity, upstream, basis):
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 48, 63, 64, 65, 100, 128])
-def test_incoming_bkg_weight_backward_is_bitwise_the_compact_path(batch):
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize(
+    "batch", [1, 2, 3, 4, 5, 8, 12, 16, 24, 31, 32, 48, 63, 64, 65, 100, 128]
+)
+def test_incoming_bkg_weight_backward_is_bitwise_the_compact_path(batch, dtype):
     """BkgCsrWeightBackward reproduces the dense weight gradient bit for bit
-    (FP16, four bases, fixed four incoming edges per post) at every batch whose
-    dense path sums in a fixed order: the compact kernels (powers of two) and
-    the generic direct kernel (other batches above 32)."""
+    (FP16 or FP32, four bases, fixed four incoming edges per post) at every
+    batch: in FP16 both add the same 4-sample lanes, by the same tree (powers
+    of two and above 32) or in lane order (the other batches below 32); in
+    FP32 both add the same batch tiles in order."""
     from v1_model_utils.cuda_csr_external.wrapper import incoming_weight_backward
 
-    c, _, _, weights, activity, upstream, basis = _bkg_weight_case(batch)
+    c, _, _, weights, activity, upstream, basis = _bkg_weight_case(batch, dtype)
     activity, upstream, basis = map(tf.constant, (activity, upstream, basis))
     expected = _compact_weight_gradient(c, weights, activity, upstream, basis)
     actual = incoming_weight_backward(c, activity, upstream, basis)
     assert actual is not None
-    # The populated lanes meet in the same tree; empty lanes add exact zeros,
+    # The populated lanes meet in the same order; empty lanes add exact zeros,
     # which can only turn a -0 into +0.
     np.testing.assert_array_equal(
         (actual.numpy() + 0.0).view(np.uint32), (expected.numpy() + 0.0).view(np.uint32)
     )
-    assert incoming_weight_backward(
-        c, tf.cast(activity, tf.float32), tf.cast(upstream, tf.float32), basis
-    ) is None
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
-@pytest.mark.parametrize("batch", [3, 12, 24, 31])
-def test_incoming_bkg_weight_backward_adds_atomic_batches_in_launch_order(batch):
-    """Below 32, at batches that are not powers of two, the dense path adds its
-    4-sample tiles with atomics; the incoming op adds them in launch order:
-    deterministic, and as close to the FP64 gradient as the dense path."""
-    from v1_model_utils.cuda_csr_external.wrapper import incoming_weight_backward
-
-    c, indices, types, weights, activity, upstream, basis = _bkg_weight_case(batch)
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("batch", [1, 3, 5, 8, 12, 24, 31, 32, 48, 64])
+def test_dense_weight_backward_is_deterministic_and_close_to_float64(batch, dtype):
+    """The dense (compact pair-projected) weight gradient sums in a fixed order
+    at every batch and dtype: repeated calls agree bit for bit, and each edge
+    is within FP32 accumulation error of the FP64 sum."""
+    c, indices, types, weights, activity, upstream, basis = _bkg_weight_case(batch, dtype)
     n_post = c.n_post
     projected = np.einsum(
         "bpr,pr->bp",
         upstream.astype(np.float64).reshape(batch, n_post, 4)[:, indices[:, 0]],
         basis.astype(np.float64)[types],
     )
-    reference = np.sum(projected * activity.astype(np.float64)[:, indices[:, 1]], axis=0)
+    samples = activity.astype(np.float64)[:, indices[:, 1]]
+    reference = (projected * samples).sum(axis=0)
+    magnitude = (np.einsum(
+        "bpr,pr->bp",
+        np.abs(upstream.astype(np.float64)).reshape(batch, n_post, 4)[:, indices[:, 0]],
+        np.abs(basis.astype(np.float64))[types],
+    ) * samples).sum(axis=0)
     activity, upstream, basis = map(tf.constant, (activity, upstream, basis))
-    actual = incoming_weight_backward(c, activity, upstream, basis).numpy()
-    np.testing.assert_array_equal(
-        actual, incoming_weight_backward(c, activity, upstream, basis).numpy()
-    )
-    old = _compact_weight_gradient(c, weights, activity, upstream, basis).numpy()
-    new_error = np.abs(actual - reference)
-    old_error = np.abs(old - reference)
-    # Same terms, different association: equal accuracy up to one FP32 rounding.
-    slack = np.spacing(np.abs(reference).astype(np.float32)).astype(np.float64)
-    assert new_error.max() <= old_error.max() + slack.max()
-    assert new_error.mean() <= old_error.mean() + slack.mean()
+    first = _compact_weight_gradient(c, weights, activity, upstream, basis).numpy()
+    second = _compact_weight_gradient(c, weights, activity, upstream, basis).numpy()
+    np.testing.assert_array_equal(first.view(np.uint32), second.view(np.uint32))
+    # Each term carries the projection's four roundings and the product's,
+    # the sum at most `batch` more: one FP32 eps per operation on |terms|.
+    bound = (batch + 5) * np.finfo(np.float32).eps * magnitude
+    assert np.all(np.abs(first - reference) <= bound)

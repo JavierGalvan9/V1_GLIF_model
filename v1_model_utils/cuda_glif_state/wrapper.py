@@ -119,7 +119,8 @@ def _unpack_words(words, width, word_bits):
 
 
 def update_glif_state(
-    z_history, v, r, asc, psc_rise, psc, rec_inputs, *, cell, penalty_acc=None, bkg=None
+    z_history, v, r, asc, psc_rise, psc, rec_inputs, *, cell, penalty_acc=None, bkg=None,
+    link=None,
 ):
     """Return spikes, the exposed voltage and the six next recurrent state
     tensors, followed by the advanced voltage-penalty accumulator when
@@ -143,7 +144,11 @@ def update_glif_state(
     `bkg` (from V1Column._fused_bkg_inputs) makes the op add the four-edge
     background current to `rec_inputs` itself, bit for bit as BkgCsrForward
     would; the BKG weight gradient is then computed here from the op's input
-    gradient, with the same kernel and metadata BkgCsrForward's gradient uses.
+    gradient, bitwise as BkgCsrForward's gradient computes it.
+
+    `link` is the timestep's StepGradientLink (V1Column.call): once the
+    recurrent operator has accepted it, the gradient hands it the bound of the
+    input gradient and the slots' gradients instead of returning those.
     """
     glif_ops = _load_ops()
     buffered = not isinstance(z_history, (tuple, list))
@@ -231,23 +236,36 @@ def update_glif_state(
             # next history, gets none.
             prev_grad = (_gradient_like(gpass[0], prev_z) if gpass
                          else tf.zeros([0], prev_z.dtype))
-            zg, vg, ag, rg, pg, ig, _ = glif_step_backward(
+            handing_off = link is not None and link.hands_off(history)
+            zg, vg, ag, rg, pg, ig, bound = glif_step_backward(
                 cell, prev_z, new_v, mask, constants, dt, v_th, sigma, amplitude,
                 inverse, _gradient_like(gs, spikes), _gradient_like(gz, spikes),
                 prev_grad, _gradient_like(gv, new_v), _gradient_like(ga, new_asc),
                 _gradient_like(grise, new_rise), _gradient_like(gpsc, new_psc),
                 _gradient_like(gvoltage, exposed), gacc, penalty=penalty,
+                emit_abs_max=handing_off,
             )
             accumulator_grad = gacc if penalty != "none" else None
             bkg_weight_grad = None
             if metadata and bkg["trainable"]:
-                from v1_model_utils.cuda_csr_external.wrapper import _load_ops as external_ops
-                bkg_weight_grad = external_ops()[1].external_csr_weight_backward(
-                    bkg_activity, tf.reshape(ig, [-1, 4]), *metadata[3:8], bkg_basis,
-                    *metadata[8:], sparse_activity=connectivity.sparse_activity,
-                    n_post=connectivity.n_post, n_edges=connectivity.n_edges,
+                from v1_model_utils.cuda_csr_external.wrapper import (
+                    _load_ops as external_ops,
+                    incoming_weight_backward,
                 )
+                upstream = tf.reshape(ig, [-1, 4])
+                bkg_weight_grad = incoming_weight_backward(
+                    connectivity, bkg_activity, upstream, bkg_basis, incoming=metadata[:3]
+                )
+                if bkg_weight_grad is None:
+                    bkg_weight_grad = external_ops()[1].external_csr_weight_backward(
+                        bkg_activity, upstream, *metadata[3:8], bkg_basis,
+                        *metadata[8:], sparse_activity=connectivity.sparse_activity,
+                        n_post=connectivity.n_post, n_edges=connectivity.n_edges,
+                    )
             history_grads = (zg, *gpass[1:], None)[:n_slots]
+            if handing_off:
+                link.hand_off(bound, history_grads)
+                history_grads = (None,) * n_slots
             return ((vg, None, ag, rg, pg, ig, accumulator_grad, None,
                      bkg_weight_grad, None) + (None,) * 7 + history_grads
                     + (None,) * (len(rest) - n_slots))

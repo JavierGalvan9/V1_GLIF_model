@@ -158,11 +158,16 @@ def int32_safe_cast(values, dtype, chunk_size=25,
 require_int32_safe_rnn_output = training_utils.require_int32_safe_rnn_output
 
 
+@tf.function(autograph=False, jit_compile=True)
 def concatenate_stimulus_batches(grating, spontaneous, dtype):
-    """Cast sub-batches before concatenating an int32-unsafe full batch."""
-    grating = int32_safe_cast(grating, dtype)
-    spontaneous = int32_safe_cast(spontaneous, dtype)
-    return tf.concat([grating, spontaneous], axis=0)
+    """Fuse input casts and concatenation without full cast intermediates.
+
+    Mandatory XLA compilation also avoids the stock GPU Cast kernel's int32
+    indexing limit: either sub-batch can exceed 2**31 elements.
+    """
+    return tf.concat(
+        [tf.cast(grating, dtype), tf.cast(spontaneous, dtype)], axis=0
+    )
 
 def validation_rate_loss_from_rates(
     rates_hz, rate_regularizer, annulus_regularizer=None
@@ -201,20 +206,24 @@ def protocol_selectivity_from_rates(rates_hz, angles):
     return tuple(values)
 
 
+@tf.function(autograph=False, experimental_attributes={"_noinline": True})
+def _concat_spike_chunks(chunks):
+    """Keep bounded GPU concat joins from being flattened by Grappler."""
+    return tf.concat(chunks, axis=0)
+
+
 def sample_stateless_bernoulli_batch(
     probability,
     batch_size,
     seed,
-    dtype,
     batch_chunk_size=64,
     full_tensor_element_limit=np.iinfo(np.int32).max,
 ):
-    """Sample a batch without launching a random kernel above int32 size.
+    """Sample Boolean spikes without launching kernels above int32 size.
 
-    The probabilities and uniforms are float32 whatever `dtype` is: float16
+    The probabilities and uniforms are float32: float16
     uniforms take only 1024 values, so P(u < p) would be ceil(1024 p) / 1024
-    (+14% spikes at spontaneous LGN rates). `dtype` is the chunked path's
-    output dtype, as before.
+    (+14% spikes at spontaneous LGN rates). Cast only at the model boundary.
     """
     probability = tf.cast(probability, tf.float32)
     sample_shape = probability.shape
@@ -223,6 +232,7 @@ def sample_stateless_bernoulli_batch(
 
     batch_size = int(batch_size)
     elements_per_sample = sample_shape.num_elements()
+    full_tensor_element_limit = min(int(full_tensor_element_limit), 2**31 - 1)
     if batch_size * elements_per_sample <= full_tensor_element_limit:
         random_uniform = tf.random.stateless_uniform(
             (batch_size, *sample_shape), seed=seed, dtype=tf.float32
@@ -233,6 +243,11 @@ def sample_stateless_bernoulli_batch(
         raise ValueError(
             "Chunked Philox sampling requires a per-sample size divisible by four."
         )
+    if batch_chunk_size <= 0:
+        raise ValueError("batch_chunk_size must be positive.")
+    batch_chunk_size = min(batch_chunk_size, full_tensor_element_limit // elements_per_sample)
+    if batch_chunk_size < 1:
+        raise ValueError("A single probability sample exceeds the element limit.")
     key, counter = tf.raw_ops.StatelessRandomGetKeyCounter(seed=seed)
     algorithm = tf.raw_ops.StatelessRandomGetAlg()
     sampled_chunks = []
@@ -248,7 +263,14 @@ def sample_stateless_bernoulli_batch(
             alg=algorithm,
             dtype=tf.float32,
         )
-        sampled_chunks.append(tf.cast(random_uniform < probability, dtype))
+        sampled_chunks.append(random_uniform < probability)
+    # Axis-0 concat with 16+ inputs takes a GPU kernel with unsafe offsets
+    # above int32 size. Bound the fan-in so every join uses the slice kernel.
+    while len(sampled_chunks) > 8:
+        sampled_chunks = [
+            _concat_spike_chunks(tuple(sampled_chunks[start:start + 8]))
+            for start in range(0, len(sampled_chunks), 8)
+        ]
     return tf.concat(sampled_chunks, axis=0)
 
 
@@ -697,6 +719,7 @@ def main(_):
                 ),
             )
         voltage_offload = flags.voltage_offload
+        history_offload = flags.history_offload
         if backward_mode == "recorded":
             # Training rollouts record minimal forward histories and differentiate
             # them with the recorded adjoint, returning spike summaries instead of
@@ -704,7 +727,8 @@ def main(_):
             # its checkpointed chunks, which is also the fallback.
             segmented_extractor = recorded_adjoint.RecordedAdjointRunner(
                 sequence_and_state_model, rsnn_layer.cell,
-                voltage_offload=voltage_offload, **runner_options,
+                voltage_offload=voltage_offload, history_offload=history_offload,
+                **runner_options,
             )
             unsupported = segmented_extractor.unsupported + (
                 () if flags.use_online_voltage_loss else ("online voltage loss",)
@@ -715,15 +739,17 @@ def main(_):
                     "falling back to checkpointing."
                 )
                 backward_mode = "checkpointing"
-        if backward_mode != "recorded" and voltage_offload != "none":
-            print(
-                f"WARNING: --voltage_offload {voltage_offload} needs --backward_mode recorded; "
-                "ignored."
-            )
-            voltage_offload = "none"
+                segmented_extractor = None
+        if backward_mode != "recorded":
+            for name, mode in (("voltage_offload", voltage_offload),
+                               ("history_offload", history_offload)):
+                if mode != "none":
+                    print(f"WARNING: --{name} {mode} needs --backward_mode recorded; ignored.")
+            voltage_offload = history_offload = "none"
         if segmented_extractor is None and backward_mode == "checkpointing":
-            segmented_extractor = models.SegmentedRecomputeRunner(
-                sequence_and_state_model, **runner_options
+            # Its rollouts return spike statistics too, where the cell's can.
+            segmented_extractor = recorded_adjoint.CheckpointedStatisticsRunner(
+                sequence_and_state_model, rsnn_layer.cell, **runner_options
             )
         if backward_mode == "autodiff":
             require_int32_safe_rnn_output(
@@ -734,11 +760,16 @@ def main(_):
             print(
                 f"Backward mode: {backward_mode}"
                 + (f", voltage offload {voltage_offload}" if backward_mode == "recorded" else "")
+                + (f", history offload {history_offload}" if backward_mode == "recorded" else "")
                 + f" ({segmented_extractor.n_chunks} chunks, "
                 f"chunk_size={segmented_extractor.chunk_size})."
             )
-        # Whether training rollouts return spike summaries (RecordedAdjointRunner).
-        recorded_rollouts = backward_mode == "recorded"
+        # Whether training rollouts return spike summaries (RecordedAdjointRunner,
+        # or CheckpointedStatisticsRunner where the cell's rollout can).
+        recorded_rollouts = backward_mode == "recorded" or (
+            backward_mode == "checkpointing" and segmented_extractor.summarizes
+            and flags.use_online_voltage_loss
+        )
         # State-only model to avoid storing full sequences when only the final state is needed.
         try:
             state_model = models.build_state_only_model(model, rsnn_layer)
@@ -1547,7 +1578,6 @@ def main(_):
             probability,
             int(batch_size),
             seed=seed_helper.next_spontaneous_seed(),
-            dtype=dtype,
         )
 
     def generate_spontaneous_spikes(batch_size):
@@ -1555,7 +1585,6 @@ def main(_):
             spontaneous_prob_base,
             int(batch_size),
             seed=seed_helper.next_spontaneous_seed(),
-            dtype=dtype,
         )
 
     def make_distributed_probability_sampler(batch_size):
@@ -1621,28 +1650,30 @@ def main(_):
             counts = tf.zeros((network["n_nodes"],), tf.float32)
             sampled_chunks = []
             packed_chunks = []
-            for start in range(0, flags.seq_len, chunk_size):
-                end = min(start + chunk_size, flags.seq_len)
-                outputs = tf.nest.flatten(sequence_and_state_model((x[:, start:end], state)))
-                spikes = outputs[0]
-                state = tuple(outputs[n_sequences:])
-                rate_start = max(start, delays[0]) - start
-                rate_end = min(end, flags.seq_len - delays[1]) - start
-                if rate_start < rate_end:
-                    counts += tf.reduce_sum(
-                        tf.cast(spikes[:, rate_start:rate_end], tf.float32), axis=(0, 1)
-                    )
-                if sync_enabled:
-                    sync_start = max(start, sync_loss._t_start_seconds) - start
-                    sync_end = min(end, sync_loss._t_end_seconds) - start
-                    if sync_start < sync_end:
-                        sampled_chunks.append(sync_loss.gather_sampled_traces(
-                            spikes[:, sync_start:sync_end], sample_plan,
-                            tf.range(real_batch_size, dtype=tf.int32)
-                            + tf.cast(tf.distribute.get_replica_context().replica_id_in_sync_group, tf.int32)
-                            * real_batch_size,
-                        ))
-                packed_chunks.append(models._pack_spike_words(spikes[0], 31))
+            # One computation of the LGN pair sums for all the chunks.
+            with rsnn_layer.cell.lgn_pair_weights_scope():
+                for start in range(0, flags.seq_len, chunk_size):
+                    end = min(start + chunk_size, flags.seq_len)
+                    outputs = tf.nest.flatten(sequence_and_state_model((x[:, start:end], state)))
+                    spikes = outputs[0]
+                    state = tuple(outputs[n_sequences:])
+                    rate_start = max(start, delays[0]) - start
+                    rate_end = min(end, flags.seq_len - delays[1]) - start
+                    if rate_start < rate_end:
+                        counts += tf.reduce_sum(
+                            tf.cast(spikes[:, rate_start:rate_end], tf.float32), axis=(0, 1)
+                        )
+                    if sync_enabled:
+                        sync_start = max(start, sync_loss._t_start_seconds) - start
+                        sync_end = min(end, sync_loss._t_end_seconds) - start
+                        if sync_start < sync_end:
+                            sampled_chunks.append(sync_loss.gather_sampled_traces(
+                                spikes[:, sync_start:sync_end], sample_plan,
+                                tf.range(real_batch_size, dtype=tf.int32)
+                                + tf.cast(tf.distribute.get_replica_context().replica_id_in_sync_group, tf.int32)
+                                * real_batch_size,
+                            ))
+                    packed_chunks.append(models._pack_spike_words(spikes[0], 31))
             rates = counts * (
                 1000.0 / (real_batch_size * (flags.seq_len - sum(delays)))
             )
@@ -2580,6 +2611,17 @@ if __name__ == '__main__':
         "op and pinned host RAM per GPU for the whole record (52 MB per step at batch 64 "
         "and 203,816 neurons: ~26 GB at seq_len 500); ignored with a warning in the "
         "other backward modes.",
+    )
+    absl.app.flags.DEFINE_enum(
+        "history_offload",
+        "none",
+        ["none", "raw"],
+        "With --backward_mode recorded, where the bit-packed spike and refractory "
+        "histories live: none (GPU memory) or raw (exact copies to pinned host RAM "
+        "during the forward, prefetched back during the backward). Independent of "
+        "--voltage_offload. Uses the CUDA frame store; recent frames and frames the "
+        "copy engine cannot take stay on the GPU. Requires pinned host RAM for both "
+        "packed histories; ignored with a warning in other backward modes.",
     )
     absl.app.flags.DEFINE_boolean(
         "pack_spike_checkpoints",

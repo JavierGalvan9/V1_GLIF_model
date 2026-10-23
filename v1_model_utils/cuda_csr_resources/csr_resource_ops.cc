@@ -13,7 +13,7 @@ REGISTER_OP("InitializeV1CsrResource")
     .Input("pair_ids: uint32")
     .Input("pair_posts: uint32")
     .Input("pair_types: uint8")
-    // The fixed-four incoming CSR of the BKG forward gather, or four empty
+    // The uniform (1 to 8 edges per post) incoming CSR of the BKG forward gather, or four empty
     // tensors for a connectivity without it.
     .Input("incoming_row_splits: uint32")
     .Input("incoming_pre_ids: uint32")
@@ -232,7 +232,7 @@ REGISTER_OP("ExternalCsrWeightBackwardResource")
 // BkgCsrWeightBackward (cuda_csr_external) reading its incoming CSR from the
 // resource: same kernel, same bits.
 REGISTER_OP("BkgCsrWeightBackwardResource")
-    .Attr("T: {half}")
+    .Attr("T: {half, float}")
     .Attr("n_post: int >= 1")
     .Attr("n_edges: int >= 0")
     .Attr("resource_name: string")

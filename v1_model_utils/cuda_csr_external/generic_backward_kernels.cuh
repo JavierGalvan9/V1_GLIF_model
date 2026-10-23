@@ -33,7 +33,9 @@ __global__ void ProjectGenericPairsKernel(
   }
 }
 
-template <typename T, int kWarps, int kTile>
+// `kLaneOrder` (batches below 32) adds an edge's eight lane partials in lane
+// order, p0 + p1 + ... + p7, instead of by the butterfly tree.
+template <typename T, int kWarps, int kTile, bool kLaneOrder>
 __global__ __launch_bounds__(32 * kWarps) void GenericWeightDirectKernel(
     int64_t batch_size, int64_t n_pre, const T* activity,
     const float* projected, const uint32* pair_ids, const uint32* edge_ids,
@@ -88,14 +90,32 @@ __global__ __launch_bounds__(32 * kWarps) void GenericWeightDirectKernel(
         }
       }
     }
-    ExtButterflyReduce<kPerSlot / 2, 1>(partial, lane);
+    if constexpr (kLaneOrder) {
+      static_assert(kPerSlot == kLanesPerEdge, "one step per lane");
+      // Lane `sub` keeps step `sub`'s sum: every lane reads each step's eight
+      // partials from its slot's lanes in order.
+      float mine = 0.0f;
 #pragma unroll
-    for (int mask = kPerSlot; mask < kLanesPerEdge; mask <<= 1) {
-      partial[0] += __shfl_xor_sync(0xffffffff, partial[0], mask);
-    }
-    const uint32 edge = base + kSlots * target + slot;
-    if (sub < kPerSlot && edge < end) {
-      ExtStoreGrad(weight_grad + V1_EDGE_INDEX(edge), partial[0]);
+      for (int step = 0; step < kPerSlot; ++step) {
+        float sum = __shfl_sync(0xffffffff, partial[step], slot * kLanesPerEdge);
+#pragma unroll
+        for (int source = 1; source < kLanesPerEdge; ++source) {
+          sum += __shfl_sync(0xffffffff, partial[step], slot * kLanesPerEdge + source);
+        }
+        if (sub == step) mine = sum;
+      }
+      const uint32 edge = base + kSlots * sub + slot;
+      if (edge < end) ExtStoreGrad(weight_grad + V1_EDGE_INDEX(edge), mine);
+    } else {
+      ExtButterflyReduce<kPerSlot / 2, 1>(partial, lane);
+#pragma unroll
+      for (int mask = kPerSlot; mask < kLanesPerEdge; mask <<= 1) {
+        partial[0] += __shfl_xor_sync(0xffffffff, partial[0], mask);
+      }
+      const uint32 edge = base + kSlots * target + slot;
+      if (sub < kPerSlot && edge < end) {
+        ExtStoreGrad(weight_grad + V1_EDGE_INDEX(edge), partial[0]);
+      }
     }
   }
 }

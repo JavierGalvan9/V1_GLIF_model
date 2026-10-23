@@ -319,6 +319,104 @@ def overwrite_entries(base, indices, values):
     return _load_ops().v1_overwrite_entries(base, indices, values)
 
 
+def scaled_abs_max_bound(bound, scale):
+    """The abs-max bound (float bits of the largest finite magnitude, as the GLIF
+    backward emits it) of ``values * scale``, from that of ``values``.
+
+    The product is formed by the same compute-dtype multiply as the scaled
+    values, and its rounding is monotone and symmetric, so the largest finite
+    ``|values * scale|`` is ``|bound * scale|`` whenever that is finite. If it
+    overflows, the recurrent backward measures the bound itself.
+    """
+    magnitude = tf.cast(tf.bitcast(bound, tf.float32), scale.dtype) * scale
+    return tf.bitcast(tf.cast(tf.abs(magnitude), tf.float32), tf.uint32)
+
+
+# Whether a StepGradientLink is taken up (read when the gradient is built). Off,
+# the recurrent backward measures its bound and sweeps its slots itself, and
+# TensorFlow adds each operator's gradients: the reference of the bitwise check
+# tests/test_step_gradient_link.py.
+LINK_STEP_GRADIENTS = True
+
+
+class StepGradientLink:
+    """What a timestep's GLIF backward hands to the recurrent backward of the
+    same timestep when TensorFlow differentiates the step (the segmented
+    runner's replay, plain autodiff), as the recorded adjoint passes them
+    directly: the abs-max bound of the currents' gradient and, per spike slot,
+    the slot's gradient through the GLIF op, which the recurrent operator adds
+    as it stores its own (``spike_grad_addends``) instead of TensorFlow adding
+    the two afterwards. The gradients are bitwise the same; the operator skips
+    its abs-max pass and the adds their passes. A link may also carry the
+    slots' activity masks (``spike_activity_masks`` bit-cast to float32,
+    carried by the loop from step to step), which spare the operator its
+    sweep of every slot.
+
+    V1Column.call makes one per step whose GLIF input currents are the
+    recurrent operator's currents (reshaped, other sources accumulated onto
+    them with the gradient passed through, times ``scale`` when given) and no
+    other gradient reaches them. The recurrent wrapper ``accept``s it at
+    forward time when its spike inputs are the link's slots themselves; only
+    then does the GLIF gradient ``hand_off`` (and return no slot gradients).
+    TensorFlow builds the GLIF gradient before the recurrent one (it needs the
+    currents' gradient), and builds the recurrent one whenever a slot gradient
+    is needed (the operator consumes the slots), so ``take`` there receives
+    what this step handed off.
+    """
+
+    def __init__(self, slots, scale=None, masks=()):
+        self.slots = tuple(slots)
+        self.scale = scale
+        self.masks = tuple(masks)
+        self.accepted = False
+        self._handed = None
+
+    def accept(self, spike_values):
+        """Whether the recurrent operator reading ``spike_values`` takes the
+        hand-off (they must be this link's slots, in order)."""
+        self.accepted = self._same_slots(spike_values)
+        return self.accepted
+
+    def hands_off(self, history):
+        """Whether the GLIF gradient of the op whose spike history is
+        ``history`` hands off (and returns no slot gradients)."""
+        return LINK_STEP_GRADIENTS and self.accepted and self._same_slots(history)
+
+    def _same_slots(self, values):
+        return len(values) == len(self.slots) and all(
+            value is slot for value, slot in zip(values, self.slots)
+        )
+
+    def hand_off(self, bound, addends):
+        """The GLIF gradient's abs-max bound of its currents' gradient and one
+        addend per slot (None for a slot it has no gradient for)."""
+        self._handed = (bound, addends)
+
+    def take(self):
+        """The recurrent_backward options: the masks, and what was handed off
+        (once)."""
+        if not LINK_STEP_GRADIENTS:
+            return {}
+        options = (
+            dict(activity_masks=tuple(tf.bitcast(mask, tf.uint32) for mask in self.masks))
+            if self.masks else {}
+        )
+        if self._handed is None:
+            return options
+        bound, addends = self._handed
+        self._handed = None
+        if self.scale is not None:
+            bound = scaled_abs_max_bound(bound, self.scale)
+        return dict(
+            options,
+            abs_max_bound=bound,
+            spike_grad_addends=tuple(
+                tf.zeros([0], slot.dtype) if addend is None else addend
+                for addend, slot in zip(addends, self.slots)
+            ),
+        )
+
+
 def recurrent_backward(
     connectivity, spike_values, current_grad, weight_values, basis_values, dampening_value,
     post_ids, synapse_types, row_splits, edge_ids, nonempty_rows, pair_ids, pair_posts,
@@ -367,7 +465,7 @@ def recurrent_backward(
 
 
 def calculate_recurrent_csr_currents(
-    spikes, weights, basis, dampening, connectivity, initial=None, queues=None
+    spikes, weights, basis, dampening, connectivity, initial=None, queues=None, link=None
 ):
     """Calculate currents plus spike and weight gradients.
 
@@ -388,6 +486,9 @@ def calculate_recurrent_csr_currents(
     previous step's records of slots 0 to D - 2. The result is then
     ``(currents, record)``, with ``record`` the newest slot's, for the next
     step's history. The currents are the same as without ``queues``.
+
+    ``link`` is the timestep's StepGradientLink (V1Column.call), taken up by
+    the backward when the spike slots are its own.
     """
     require_csr_ordered_weights(connectivity, "recurrent connectivity")
     basis = tf.cast(basis, tf.float32)
@@ -413,7 +514,7 @@ def calculate_recurrent_csr_currents(
     if connectivity.resource_name is not None:
         return _calculate_resource_currents(
             slots, weights, basis, dampening, connectivity, initial=initial,
-            queues=queues,
+            queues=queues, link=link,
         )
     ops = _load_ops()
 
@@ -434,6 +535,7 @@ def calculate_recurrent_csr_currents(
         *rest,
     ):
         spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        linked = link is not None and link.accept(spike_values)
         currents, record = ops.v1_csr_forward(
             spike_values,
             weight_values,
@@ -453,6 +555,7 @@ def calculate_recurrent_csr_currents(
                 connectivity, spike_values, current_grad, weight_values, basis_values,
                 dampening_value, post_ids, synapse_types, row_splits, edge_ids,
                 nonempty_rows, pair_ids, pair_posts, pair_types,
+                **(link.take() if linked else {}),
             )
             # `initial` enters the output additively, so the upstream gradient
             # passes straight through. With no accumulator the input is an
@@ -519,7 +622,7 @@ def resource_recurrent_backward(
 
 
 def _calculate_resource_currents(
-    slots, weights, basis, dampening, connectivity, initial=None, queues=None
+    slots, weights, basis, dampening, connectivity, initial=None, queues=None, link=None
 ):
     ops = load_resource_ops()
     queue_args = () if queues is None else tuple(queues)
@@ -529,6 +632,7 @@ def _calculate_resource_currents(
         weight_values, basis_values, dampening_value, initial_values, *rest
     ):
         spike_values, queue_values = rest[:len(slots)], rest[len(slots):]
+        linked = link is not None and link.accept(spike_values)
         currents, record = ops.v1_csr_forward_resource(
             spike_values,
             weight_values,
@@ -543,7 +647,7 @@ def _calculate_resource_currents(
         def grad(current_grad, *_record_grad):
             spike_grads, weight_grad = resource_recurrent_backward(
                 connectivity, spike_values, current_grad, weight_values, basis_values,
-                dampening_value,
+                dampening_value, **(link.take() if linked else {}),
             )
             # `initial` enters the output additively, so the upstream gradient
             # passes straight through. With no accumulator the input is an

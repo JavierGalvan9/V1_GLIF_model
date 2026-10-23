@@ -1,4 +1,5 @@
 import os
+import ctypes.util
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -79,16 +80,45 @@ def _nvml_device_count():
     return pynvml.nvmlDeviceGetCount()
 
 
-def device_memory_gib(gpu_id):
-    """Whole-device (used, free, total) memory in GiB, as nvidia-smi reports it.
-
-    NVML is what nvidia-smi reads, and indexes GPUs the same way, without a
-    subprocess: nvidia-smi took 0.12 s per call on a 10-GPU node, once per GPU
-    per training step. Returns None for an index this process cannot see.
-    """
-    if gpu_id >= _nvml_device_count():
+@functools.cache
+def _nvml_device_handle(gpu_id):
+    """Resolve a TensorFlow logical GPU through CUDA's actual PCI identity."""
+    devices = [
+        device
+        for device in tf.config.get_visible_devices("GPU")
+        for _ in (tf.config.get_logical_device_configuration(device) or [None])
+    ]
+    if gpu_id < 0 or gpu_id >= len(devices):
         return None
-    info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(gpu_id))
+    library = ctypes.util.find_library("cudart")
+    if library is None:
+        return None
+    try:
+        runtime = ctypes.CDLL(library)
+    except OSError:
+        return None
+    pci_id = runtime.cudaDeviceGetPCIBusId
+    pci_id.argtypes = (ctypes.c_char_p, ctypes.c_int, ctypes.c_int)
+    pci_id.restype = ctypes.c_int
+    bus = ctypes.create_string_buffer(32)
+    ordinal = int(devices[gpu_id].name.rsplit(":", 1)[1])
+    if pci_id(bus, len(bus), ordinal) != 0:
+        return None
+    _nvml_device_count()  # Initialize NVML once, after resolving CUDA placement.
+    return pynvml.nvmlDeviceGetHandleByPciBusId(bus.value.decode("ascii"))
+
+
+def device_memory_gib(gpu_id):
+    """Whole-device (used, free, total) GiB for TensorFlow's logical GPU.
+
+    CUDA and NVML ordinals need not agree, especially under scheduler masks.
+    Match by PCI bus ID and cache the handle to avoid per-step subprocesses.
+    Return None when the device cannot be resolved, rather than another GPU.
+    """
+    handle = _nvml_device_handle(gpu_id)
+    if handle is None:
+        return None
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
     return tuple(value / 1024**3 for value in (info.used, info.free, info.total))
 
 
@@ -102,7 +132,7 @@ def printgpu(gpu_id=0):
             f'    TensorFlow GPU {gpu_id} Memory Usage: {current:.2f} GiB, Peak Usage: {peak:.2f} GiB')
         memory = device_memory_gib(gpu_id)
         if memory is None:
-            print(f"    Invalid GPU ID: {gpu_id}. Available GPUs: {_nvml_device_count()}")
+            print(f"    Total GPU {gpu_id} Memory Usage: unavailable (CUDA/NVML mapping unresolved)")
         else:
             used, free, total = memory
             print(

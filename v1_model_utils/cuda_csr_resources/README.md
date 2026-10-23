@@ -28,7 +28,7 @@ recurrent + LGN forward (`V1CsrForwardFusedResource`, which takes both resource
 names and runs the same `FusedForward` and tile sweep as the tensor
 `V1CsrForwardFused`, so replicated runs keep the single-rounding step, with the
 LGN's per-pair weight sums from `V1ExternalPairWeightsResource`), the background
-input's fixed-four forward gather (`BkgCsrForwardResource`, reading the
+input's uniform (1 to 8 edges per post) forward gather (`BkgCsrForwardResource`, reading the
 incoming CSR stored in the resource) and its weight gradient
 (`BkgCsrWeightBackwardResource`, the tensor `BkgCsrWeightBackward` kernel on the
 same incoming CSR), and the external weight-only and activity backward

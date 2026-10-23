@@ -17,12 +17,12 @@ the reverse loop turns back into each timestep's spike gradient.
 
 from typing import NamedTuple
 
+import numpy as np
 import tensorflow as tf
 
 from . import models
 from .cuda_csr_external.wrapper import (
     external_backward,
-    external_pair_weights,
     incoming_weight_backward,
     resource_external_backward,
 )
@@ -31,6 +31,7 @@ from .cuda_csr_recurrent.wrapper import (
     overwrite_entries,
     recurrent_backward,
     resource_recurrent_backward,
+    scaled_abs_max_bound,
     spike_activity_masks,
     spike_slots,
 )
@@ -80,7 +81,13 @@ class _Sampling(NamedTuple):
     entries: int
 
     @classmethod
-    def of(cls, statistics, width):
+    def of(cls, statistics, width, drop_masked=False):
+        """``drop_masked`` keeps only the entries whose mask is non-zero when the
+        masks are known at trace time (else it keeps all). A plan pads every
+        sample to ``max_count`` slots that all point at one neuron, which would
+        pile their (zero) updates onto one address; the dropped entries only add
+        zeros. The kept traces stay contiguous but no longer equal-length, so
+        ``entries`` is 0."""
         ids, masks, traces, offset = [], [], [], 0
         for group in statistics.traces:
             rows, per_trial, max_count = group.neuron_mask.shape
@@ -94,8 +101,15 @@ class _Sampling(NamedTuple):
             ))
             offset += rows * per_trial
         counts = {group.neuron_mask.shape[2] for group in statistics.traces}
-        return cls(tf.concat(ids, 0), tf.concat(masks, 0), tf.concat(traces, 0), offset,
-                   counts.pop() if len(counts) == 1 else 0)
+        entries = counts.pop() if len(counts) == 1 else 0
+        ids, masks, traces = tf.concat(ids, 0), tf.concat(masks, 0), tf.concat(traces, 0)
+        known = [tf.get_static_value(group.neuron_mask) for group in statistics.traces]
+        if drop_masked and all(mask is not None for mask in known):
+            keep = np.flatnonzero(np.concatenate([mask.reshape(-1) for mask in known]))
+            ids, masks, traces = (tf.gather(x, tf.constant(keep, tf.int64))
+                                  for x in (ids, masks, traces))
+            entries = 0
+        return cls(ids, masks, traces, offset, entries)
 
 
 @tf.function(jit_compile=True)
@@ -125,13 +139,18 @@ def _pack_step(spikes, refractory):
 
 
 @tf.function(jit_compile=True)
-def _unpack_frames(packed_spikes, packed_blocked, width, dtype):
-    """Unpack a spike frame and (unless None) a blocked mask."""
-    return (
-        models._unpack_spike_words(packed_spikes, width, dtype, _WORD_BITS),
-        None if packed_blocked is None
-        else models._unpack_spike_words(packed_blocked, width, tf.bool, _WORD_BITS),
-    )
+def _unpack_frame(packed_spikes, width, dtype):
+    """Unpack a spike frame."""
+    return models._unpack_spike_words(packed_spikes, width, dtype, _WORD_BITS)
+
+
+def _run_sums(trace_gradient, sampling, runs):
+    """Each entry's run total of the traces' masked cotangents. The terms are
+    summed in float64 (exact for float16 terms, so the total does not depend on
+    the order the scatter's atomics take) and rounded once."""
+    updates = tf.cast(tf.gather(trace_gradient, sampling.traces) * sampling.mask, tf.float64)
+    summed = tf.math.unsorted_segment_sum(updates, runs, updates.shape[0])
+    return tf.cast(tf.gather(summed, runs), trace_gradient.dtype)
 
 
 @tf.function(jit_compile=True)
@@ -142,9 +161,8 @@ def _add_traces(count_gradient, trace_gradient, sampling, runs, first):
     but -0). Entries that sample one neuron (``runs``, see _duplicate_runs) are
     summed first, as that scatter sums them, and added once, by their run's
     ``first`` entry; the others add +0."""
-    updates = tf.gather(trace_gradient, sampling.traces) * sampling.mask
-    summed = tf.math.unsorted_segment_sum(updates, runs, updates.shape[0])
-    updates = tf.where(first, tf.gather(summed, runs), tf.zeros_like(updates))
+    summed = _run_sums(trace_gradient, sampling, runs)
+    updates = tf.where(first, summed, tf.zeros_like(summed))
     scattered = tf.tensor_scatter_nd_add(
         tf.reshape(count_gradient, [-1]), sampling.ids[:, None], updates
     )
@@ -156,9 +174,8 @@ def _traced_values(count_gradient, trace_gradient, sampling, runs):
     """What _add_traces leaves at the sampled entries: each count cotangent
     plus its run's summed traces (the run's other entries add +0, which
     changes no sum here: the counts' cotangent holds no -0)."""
-    updates = tf.gather(trace_gradient, sampling.traces) * sampling.mask
-    summed = tf.math.unsorted_segment_sum(updates, runs, updates.shape[0])
-    return tf.gather(tf.reshape(count_gradient, [-1]), sampling.ids) + tf.gather(summed, runs)
+    return (tf.gather(tf.reshape(count_gradient, [-1]), sampling.ids)
+            + _run_sums(trace_gradient, sampling, runs))
 
 
 def _duplicate_runs(ids):
@@ -171,19 +188,6 @@ def _duplicate_runs(ids):
     order = tf.cast(order, tf.int64)[:, None]
     return (tf.scatter_nd(order, runs, tf.shape(ids, tf.int64)),
             tf.scatter_nd(order, tf.cast(starts, tf.int64), tf.shape(ids, tf.int64)) > 0)
-
-
-def _scaled_abs_max(bound, scale):
-    """The abs-max bound (float bits of the largest finite magnitude, as the GLIF
-    backward emits it) of ``values * scale``, from that of ``values``.
-
-    The product is formed by the same compute-dtype multiply as the scaled
-    values, and its rounding is monotone and symmetric, so the largest finite
-    ``|values * scale|`` is ``|bound * scale|`` whenever that is finite. If it
-    overflows, the recurrent backward measures the bound itself.
-    """
-    magnitude = tf.cast(tf.bitcast(bound, tf.float32), scale.dtype) * scale
-    return tf.bitcast(tf.cast(tf.abs(magnitude), tf.float32), tf.uint32)
 
 
 def _empty_list(dtype, shape):
@@ -215,8 +219,121 @@ def _pop(handle, like):
     )
 
 
+def _count_dtype(spike_dtype, count_window):
+    """Counts are integers up to the window length: float16 spikes count in
+    float16, exact up to 2048, at half float32's traffic (and the counts'
+    cotangent stays float16, as the sequence's is)."""
+    count_start, count_stop = count_window
+    return (
+        tf.float16 if spike_dtype == tf.float16 and count_stop - count_start <= 2048
+        else tf.float32
+    )
+
+
+def _statistic_outputs(counts, stacked_traces, statistics, spike_dtype):
+    """The rollout's statistics outputs: the counts in the spike dtype, then one
+    [rows * per_trial, window] trace tensor per SampledTraces, from the
+    [length, n_traces] traces of every step."""
+    outputs = (tf.cast(counts, spike_dtype),)
+    offset = 0
+    for group in statistics.traces:
+        rows = (group.rows[1] - group.rows[0]) * group.neuron_mask.shape[1]
+        start, stop = group.window
+        outputs += (tf.transpose(stacked_traces[start:stop, offset:offset + rows]),)
+        offset += rows
+    return outputs
+
+
+def _statistic_cotangents(statistic_gradients, statistics, like, length):
+    """``(count_gradient, traces)``: the counts' cotangent (zeros if None, its
+    -0 made +0 when there are traces, as the dense gradient's adds make it)
+    and, with traces, ``(trace_gradients, sampling, runs, first)``: every
+    step's [length, n_traces] trace cotangents (zero outside their windows),
+    the sampling plan and its duplicate runs; else None."""
+    count_gradient = statistic_gradients[0]
+    if count_gradient is None:
+        count_gradient = tf.zeros_like(like)
+    if not statistics.traces:
+        return count_gradient, None
+    # The dense gradient adds the traces' (zero-padded) gradient at
+    # every step, which turns a -0 into a +0.
+    count_gradient = tf.where(
+        tf.equal(count_gradient, 0), tf.zeros_like(count_gradient), count_gradient
+    )
+    padded = []
+    for group, gradient in zip(statistics.traces, statistic_gradients[1:]):
+        rows, per_trial, _ = group.neuron_mask.shape
+        start, stop = group.window
+        if gradient is None:
+            gradient = tf.zeros([rows * per_trial, stop - start], like.dtype)
+        padded.append(tf.pad(gradient, [[0, 0], [start, length - stop]]))
+    trace_gradients = tf.transpose(tf.concat(padded, axis=0))
+    sampling = _Sampling.of(statistics, like.shape[1], drop_masked=True)
+    runs, first = _duplicate_runs(sampling.ids)
+    return count_gradient, (trace_gradients, sampling, runs, first)
+
+
+def _chunk_indices(sampling, length, batch, width):
+    """The flat index into a chunk's time-major [length, batch, width] spikes of
+    every sampled entry at each of its steps, [length, entries] (int64)."""
+    steps = tf.range(length, dtype=tf.int64)[:, None]
+    rows, neurons = sampling.ids // width, sampling.ids % width
+    return (steps * batch + rows[None]) * width + neurons[None]
+
+
+@tf.function(jit_compile=True)
+def _record_chunk(spikes, counts, counted, sampling):
+    """_record_step for every step of a chunk's time-major [length, batch,
+    width] spikes: the counts plus the counted steps' spikes (``counted``
+    weights the steps by 1 or 0), and the chunk's [length, n_traces] sampled
+    traces. Exact (binary terms, integer sums), so in any order the same values."""
+    counts = counts + tf.reduce_sum(
+        tf.cast(spikes, counts.dtype) * counted[:, None, None], axis=0
+    )
+    if sampling is None:
+        return (counts,)
+    length, batch, width = spikes.shape
+    sampled = tf.gather(
+        tf.reshape(spikes, [-1]), _chunk_indices(sampling, length, batch, width)
+    ) * sampling.mask[None]
+    traces = (
+        tf.reduce_sum(tf.reshape(sampled, [length, sampling.n_traces, sampling.entries]), 2)
+        if sampling.entries
+        else tf.transpose(tf.math.unsorted_segment_sum(
+            tf.transpose(sampled), sampling.traces, sampling.n_traces
+        ))
+    )
+    return counts, traces
+
+
+@tf.function(jit_compile=True)
+def _chunk_cotangent(count_gradient, counted, trace_gradients, sampling, runs, first):
+    """The dense time-major [length, batch, width] spike cotangent of a chunk's steps, each
+    the one RecordedAdjointRunner._spike_cotangents gives (_add_traces of the
+    counts' cotangent where ``counted`` (bool), else of +0); ``trace_gradients``
+    is the chunk's [length, n_traces] slice, or None without traces."""
+    length = counted.shape[0]
+    cotangent = tf.where(
+        counted[:, None, None], count_gradient[None],
+        tf.zeros([], count_gradient.dtype),
+    )
+    if trace_gradients is None:
+        return cotangent
+    updates = tf.gather(trace_gradients, sampling.traces, axis=1) * sampling.mask[None]
+    summed = tf.transpose(tf.math.unsorted_segment_sum(
+        tf.transpose(updates), runs, updates.shape[1]
+    ))
+    updates = tf.where(first[None], tf.gather(summed, runs, axis=1), tf.zeros_like(updates))
+    index = _chunk_indices(sampling, length, *count_gradient.shape)
+    scattered = tf.tensor_scatter_nd_add(
+        tf.reshape(cotangent, [-1]), tf.reshape(index, [-1, 1]), tf.reshape(updates, [-1])
+    )
+    return tf.reshape(scattered, cotangent.shape)
+
+
 # How the runner keeps its float32 membrane record (see the runner).
 VOLTAGE_OFFLOAD_MODES = ("none", "raw", "compressed")
+HISTORY_OFFLOAD_MODES = ("none", "raw")
 
 
 class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
@@ -238,6 +355,12 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     take them before the forward ends; the others go out exact, and the
     frames the copy engine cannot take stay on the GPU encoded.
 
+    ``history_offload="raw"`` independently parks the bit-packed spike and
+    refractory records in pinned host memory with the same adaptive copies.
+    Their int32 words remain exact; a bounded spike window serves the reverse
+    loop so every recorded frame is fetched only once. Both options default
+    to "none" and keep records resident when the CUDA store is unavailable.
+
     ``__call__(inputs, initial_state, statistics)`` returns the counts (in the
     spike dtype, like the dense sequence they sum), one [rows * per_trial,
     window] trace tensor per SampledTraces and the final state. Without
@@ -254,12 +377,14 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     _COPY_GROUP = 4
 
     def __init__(self, core_model, cell, sequence_length, chunk_size,
-                 voltage_offload="none", **kwargs):
-        super().__init__(core_model, sequence_length, chunk_size, **kwargs)
+                 voltage_offload="none", history_offload="none", **kwargs):
+        super().__init__(core_model, sequence_length, chunk_size, cell=cell, **kwargs)
         if voltage_offload not in VOLTAGE_OFFLOAD_MODES:
             raise ValueError(f"voltage_offload must be one of {VOLTAGE_OFFLOAD_MODES}.")
-        self.cell = cell
+        if history_offload not in HISTORY_OFFLOAD_MODES:
+            raise ValueError(f"history_offload must be one of {HISTORY_OFFLOAD_MODES}.")
         self.voltage_offload = voltage_offload
+        self.history_offload = history_offload
         self._weight_roles = {
             "recurrent": cell.recurrent_weight_values.value,
             "bkg": cell.bkg_input_weights.value,
@@ -337,38 +462,35 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         words = -(-width // _WORD_BITS)
         # The packed spike frames start with the initial history, oldest first,
         # so z[k] is frame k + max_delay.
-        frames = _empty_list(tf.int32, [batch, words])
-        for slot in reversed(history):
-            frames = _push(frames, models._pack_spike_words(slot, _WORD_BITS))
-        store = self._voltage_store(batch, width)
+        spike_store = self._frame_store("spikes", self.history_offload != "none", batch, words)
+        blocked_store = self._frame_store("blocked", self.history_offload != "none", batch, words)
+        frames = tf.zeros([0]) if spike_store else _empty_list(tf.int32, [batch, words])
+        for index, slot in enumerate(reversed(history)):
+            if spike_store and index >= length:
+                break
+            packed = models._pack_spike_words(slot, _WORD_BITS)
+            if spike_store:
+                with tf.control_dependencies([frames]):
+                    frames = frame_store.offload_frame(
+                        packed, index, spike_store, length, length - self._PREFETCH,
+                        self._COPY_GROUP, codec="raw",
+                    )
+            else:
+                frames = _push(frames, packed)
+        store = self._frame_store("voltages", self.voltage_offload != "none", batch, width)
         voltages = tf.zeros([0]) if store else _empty_list(tf.float32, [batch, width])
         # Frames from resident_from on stay on the GPU.
         resident_from = length - self._PREFETCH
-        blocked = _empty_list(tf.int32, [batch, words])
+        blocked = tf.zeros([0]) if blocked_store else _empty_list(tf.int32, [batch, words])
         sampling = _Sampling.of(statistics, width) if statistics.traces else None
         traces = (tf.TensorArray(spike_dtype, size=length),) if sampling else ()
-        # Counts are integers up to the window length: float16 spikes count in
-        # float16, exact up to 2048, at half float32's traffic (and the counts'
-        # cotangent stays float16, as the sequence's is). Whether each step is
-        # counted is a device constant: a host scalar would be copied every step.
+        # Whether each step is counted is a device constant: a host scalar
+        # would be copied every step.
         count_start, count_stop = statistics.count_window
-        count_dtype = (
-            tf.float16 if spike_dtype == tf.float16 and count_stop - count_start <= 2048
-            else tf.float32
-        )
+        count_dtype = _count_dtype(spike_dtype, statistics.count_window)
         counts = tf.zeros([batch, width], count_dtype)
         counted = tf.constant(
             [float(count_start <= time < count_stop) for time in range(length)], count_dtype
-        )
-
-        # The LGN weights are constant over the rollout: their per-pair sums for
-        # the coalesced current sweep are computed once, here, not every step.
-        pair_weights = (
-            external_pair_weights(
-                tf.cast(cell.input_weight_values, cell.variable_dtype), cell.input_csr
-            )
-            if cell._synaptic_current_backend == "cuda" and cell.compute_dtype == "float16"
-            else None
         )
 
         def step(time, states, counts, frames, voltages, blocked, traces):
@@ -395,28 +517,40 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 ) if store
                 else _push(voltages, voltage)
             )
-            return (time + 1, new_states, counts, _push(frames, packed_spikes),
-                    voltages, _push(blocked, packed_blocked), traces)
+            if spike_store:
+                with tf.control_dependencies([frames]):
+                    frames = tf.cond(
+                        time + cell.max_delay < length,
+                        lambda: frame_store.offload_frame(
+                            packed_spikes, time + cell.max_delay, spike_store, length,
+                            resident_from, self._COPY_GROUP, codec="raw",
+                        ),
+                        lambda: tf.identity(frames),
+                    )
+            else:
+                frames = _push(frames, packed_spikes)
+            if blocked_store:
+                with tf.control_dependencies([blocked]):
+                    blocked = frame_store.offload_frame(
+                        packed_blocked, time, blocked_store, length, resident_from,
+                        self._COPY_GROUP, codec="raw",
+                    )
+            else:
+                blocked = _push(blocked, packed_blocked)
+            return time + 1, new_states, counts, frames, voltages, blocked, traces
 
-        object.__setattr__(cell, "_lgn_pair_weights", pair_weights)
-        try:
+        # The LGN weights are constant over the rollout: their per-pair sums for
+        # the coalesced current sweep are computed once, here, not every step.
+        with cell.lgn_pair_weights_scope():
             _, states, counts, frames, voltages, blocked, traces = tf.while_loop(
                 lambda time, *_: time < length,
                 step,
                 (tf.constant(0), states, counts, frames, voltages, blocked, traces),
                 parallel_iterations=32,
             )
-        finally:
-            object.__delattr__(cell, "_lgn_pair_weights")
-        outputs = (tf.cast(counts, spike_dtype),)
-        if traces:
-            stacked = traces[0].stack()
-            offset = 0
-            for group in statistics.traces:
-                rows = (group.rows[1] - group.rows[0]) * group.neuron_mask.shape[1]
-                start, stop = group.window
-                outputs += (tf.transpose(stacked[start:stop, offset:offset + rows]),)
-                offset += rows
+        outputs = _statistic_outputs(
+            counts, traces[0].stack() if traces else None, statistics, spike_dtype
+        )
         final_state = tuple(cell.from_loop_state(states))
         # Every step's BKG counts for the BKG weight gradient, [length, batch,
         # n_bkg], generated as the replay regenerates them (same seed and
@@ -426,22 +560,25 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             bkg_activity = tf.stop_gradient(models.sample_bkg_activity(
                 cell, batch, initial_state[6], num_steps=length
             ))
-        return outputs, final_state, (frames, voltages, blocked, bkg_activity, store)
+        return outputs, final_state, (
+            frames, voltages, blocked, bkg_activity, (spike_store, blocked_store), store
+        )
 
-    def _voltage_store(self, batch, width):
-        """The host store key of this rollout's membrane record, or None to
+    def _frame_store(self, kind, enabled, batch, width):
+        """The host store key of this rollout's named record, or None to
         keep the record on the GPU. Keys count the rollouts of the outermost
         graph being traced (so retraces reuse their stores) and name the
         frame shape; the op keeps one store per key and GPU."""
-        if (self.voltage_offload == "none" or self._PREFETCH >= self.sequence_length
+        if (not enabled or self._PREFETCH >= self.sequence_length
                 or tf.executing_eagerly() or not frame_store.available()):
             return None
         graph = tf.compat.v1.get_default_graph()
         while getattr(graph, "outer_graph", None) is not None:
             graph = graph.outer_graph
-        count = getattr(graph, "_v1_voltage_stores", 0)
-        graph._v1_voltage_stores = count + 1
-        return f"voltages_{count}_{batch}x{width}"
+        counter = f"_v1_{kind}_stores"
+        count = getattr(graph, counter, 0)
+        setattr(graph, counter, count + 1)
+        return f"{kind}_{count}_{batch}x{width}"
 
     # Backward ------------------------------------------------------------
 
@@ -453,15 +590,9 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         cotangent itself, the next call rewrites only the sampled entries of
         it, in place once the caller has released it."""
         length = self.sequence_length
-        count_gradient = statistic_gradients[0]
-        if count_gradient is None:
-            count_gradient = tf.zeros_like(like)
-        if statistics.traces:
-            # The dense gradient adds the traces' (zero-padded) gradient at
-            # every step, which turns a -0 into a +0.
-            count_gradient = tf.where(
-                tf.equal(count_gradient, 0), tf.zeros_like(count_gradient), count_gradient
-            )
+        count_gradient, traced = _statistic_cotangents(
+            statistic_gradients, statistics, like, length
+        )
         count_start, count_stop = statistics.count_window
 
         def count_gradient_at(time):
@@ -473,18 +604,9 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             )
 
         no_carry = tf.zeros([0], like.dtype)
-        if not statistics.traces:
+        if traced is None:
             return no_carry, lambda time, carry: (count_gradient_at(time), carry)
-        padded = []
-        for group, gradient in zip(statistics.traces, statistic_gradients[1:]):
-            rows, per_trial, _ = group.neuron_mask.shape
-            start, stop = group.window
-            if gradient is None:
-                gradient = tf.zeros([rows * per_trial, stop - start], like.dtype)
-            padded.append(tf.pad(gradient, [[0, 0], [start, length - stop]]))
-        trace_gradients = tf.transpose(tf.concat(padded, axis=0))
-        sampling = _Sampling.of(statistics, like.shape[1])
-        runs, first = _duplicate_runs(sampling.ids)
+        trace_gradients, sampling, runs, first = traced
 
         # Outside its window a trace's cotangent row is zero: adding those
         # +-0 leaves the (zero-free of -0) counts' cotangent unchanged.
@@ -510,7 +632,8 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     def _adjoint(self, inputs, initial_state, final_state, records, statistics,
                  statistic_gradients, state_gradients, variables):
         cell, length, delay = self.cell, self.sequence_length, self.cell.max_delay
-        frames, voltages, blocked, bkg_activity, store = records
+        frames, voltages, blocked, bkg_activity, history_stores, store = records
+        spike_store, blocked_store = history_stores
         final_slots = tf.split(final_state[0], delay, axis=1)
         spike_dtype = final_slots[0].dtype
         width = final_slots[0].shape[1]
@@ -575,8 +698,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                         cell, cell._permute_lgn_input(lgn_frames[:, time, :cell.input_dim])
                     )
                 # The dense BKG gradient's one-pass form (tensor or resource
-                # connectivity), bitwise the same wherever the fallback's order
-                # is fixed.
+                # connectivity, FP16 or FP32), bitwise the fallback's.
                 gradient = incoming_weight_backward(connectivity, values, upstream, basis)
                 if gradient is None and connectivity.resource_name is not None:
                     _, gradient = resource_external_backward(
@@ -598,16 +720,18 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         # The recurrent backward (tensor or resource connectivity) takes the
         # GLIF backward's abs-max of the upstream and the slots' activity masks,
         # carried from step to step like the slots themselves. Both only spare
-        # the operator passes over its inputs: same results.
-        # FusedGlifStepBackwardPacked reads the recorded words directly (four
-        # bases only).
-        packed_glif = cell._n_syn_basis == 4
+        # the operator passes over its inputs: same results. The bound only
+        # scales the FP16 pair projection; with FP32 spikes the operator never
+        # reads it, so it is neither emitted nor passed.
+        emit_bound = spike_dtype == tf.float16
+        # FusedGlifStepBackwardPacked reads the recorded words directly.
 
         def recurrent_spike_gradients(slots, masks, upstream, bound, addends):
             connectivity = cell.recurrent_csr
             slots = spike_slots(slots)
             options = dict(
-                activity_masks=masks, abs_max_bound=bound, spike_grad_addends=addends
+                activity_masks=masks, abs_max_bound=bound if emit_bound else None,
+                spike_grad_addends=addends,
             )
             if connectivity.resource_name is not None:
                 gradients, _ = resource_recurrent_backward(
@@ -625,6 +749,11 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             return gradients
 
         def frame(index):
+            if spike_store:
+                return frame_store.take_frame(
+                    index, spike_store, frames_like,
+                    prefetch=self._PREFETCH, group=self._COPY_GROUP,
+                )
             return tf.raw_ops.TensorListGetItem(
                 input_handle=frames, index=index,
                 element_shape=frames_like.shape, element_dtype=tf.int32,
@@ -633,7 +762,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         def reverse_step(time, voltages, blocked, window, cotangents, partial):
             """Step ``time``'s backward; ``window`` holds z[time - 1 .. time - delay],
             when carried their activity masks, and the spike cotangent's carry."""
-            slots, masks, spike_carry = window
+            slots, masks, spike_carry, packed_slots = window
             history, voltage_g, asc_g, rise_g, psc_g = cotangents
             if store:
                 # After the previous step's GLIF backward (and, at the first
@@ -646,29 +775,38 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                     )
             else:
                 voltages, voltage = _pop(voltages, final_state[1])
-            blocked, packed_blocked = _pop(blocked, frames_like)
+            if blocked_store:
+                with tf.control_dependencies([voltage_g, blocked]):
+                    packed_blocked = frame_store.take_frame(
+                        time, blocked_store, frames_like,
+                        prefetch=self._PREFETCH, group=self._COPY_GROUP,
+                    )
+            else:
+                blocked, packed_blocked = _pop(blocked, frames_like)
             # z[time - 1 - delay], the next step's oldest slot, is frame
             # time - 1; at time 0 the read is unused.
-            oldest, step_blocked = _unpack_frames(
-                frame(tf.maximum(time - 1, 0)), None if packed_glif else packed_blocked,
-                width, spike_dtype,
-            )
+            if spike_store:
+                with tf.control_dependencies([voltage_g, frames]):
+                    oldest_words = tf.cond(
+                        time > 0, lambda: frame(time - 1), lambda: tf.zeros_like(frames_like)
+                    )
+            else:
+                oldest_words = frame(tf.maximum(time - 1, 0))
+            oldest = _unpack_frame(oldest_words, width, spike_dtype)
             spike_cotangent, spike_carry = spike_cotangent_at(time, spike_carry)
             # z[time - 1] is frame time - 1 + delay.
-            prev_z, step_blocked = (
-                (frame(time - 1 + delay), packed_blocked) if packed_glif
-                else (slots[0], step_blocked)
-            )
+            prev_z = packed_slots[0] if spike_store else frame(time - 1 + delay)
             spike_g, voltage_g, asc_g, rise_g, psc_g, input_g, bound = glif_step_backward(
-                cell, prev_z, voltage, step_blocked, constants,
+                cell, prev_z, voltage, packed_blocked, constants,
                 cell._dt, cell.v_th, cell._gauss_std, cell._dampening_factor, inverse,
                 spike_cotangent, history[0], history[1], voltage_g, asc_g,
                 rise_g, psc_g, no_voltage, penalty_gradient, penalty=penalty,
-                emit_abs_max=True, word_bits=_WORD_BITS if packed_glif else None,
+                emit_abs_max=emit_bound, word_bits=_WORD_BITS,
             )
             if cell._scales_recurrent_inputs:
                 input_g = input_g * cell._lr_scale
-                bound = _scaled_abs_max(bound, cell._lr_scale)
+                if emit_bound:
+                    bound = scaled_abs_max_bound(bound, cell._lr_scale)
             upstream = tf.reshape(input_g, [-1, cell._n_syn_basis])
             # Each slot's gradient: the recurrent operator's plus what the next
             # step passed back through the slot it moved into (the GLIF
@@ -690,7 +828,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 # the next step's update holds its only reference.
                 with tf.control_dependencies([spike_g]):
                     spike_carry = tf.identity(spike_carry)
-            return (time - 1, voltages, blocked, (slots[1:] + (oldest,), masks, spike_carry),
+            if packed_slots:
+                packed_slots = packed_slots[1:] + (oldest_words,)
+            return (time - 1, voltages, blocked,
+                    (slots[1:] + (oldest,), masks, spike_carry, packed_slots),
                     (history, voltage_g, asc_g, rise_g, psc_g), partial)
 
         frames_like = tf.zeros([final_slots[0].shape[0], -(-width // _WORD_BITS)], tf.int32)
@@ -702,11 +843,17 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             self._gradient_or_zeros(state_gradients[index], final_state[index])
             for index in (1, 3, 4, 5)
         )
+        with tf.control_dependencies([frames] if spike_store else []):
+            oldest_words = frame(length - 1)
         slots = tuple(final_slots[1:]) + (
-            models._unpack_spike_words(frame(length - 1), width, spike_dtype, _WORD_BITS),
+            models._unpack_spike_words(oldest_words, width, spike_dtype, _WORD_BITS),
+        )
+        packed_slots = (
+            tuple(models._pack_spike_words(slot, _WORD_BITS) for slot in final_slots[1:])
+            + (oldest_words,) if spike_store else ()
         )
         masks = tuple(spike_activity_masks(slot) for slot in slots)
-        window = (slots, masks, spike_carry)
+        window = (slots, masks, spike_carry, packed_slots)
         totals = tuple(tf.zeros_like(roles[role]) for role in summed)
 
         def reverse_chunk(chunk, voltages, blocked, window, cotangents, totals):
@@ -767,3 +914,113 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     @staticmethod
     def _gradient_or_zeros(gradient, value):
         return tf.zeros_like(value) if gradient is None else gradient
+
+
+class CheckpointedStatisticsRunner(models.SegmentedRecomputeRunner):
+    """The segmented runner (``--backward_mode checkpointing``) whose rollouts,
+    given SpikeStatistics, return those statistics instead of the dense spike
+    sequence, as RecordedAdjointRunner does: each chunk's (time-major,
+    V1Column.time_major_sequences_scope) spikes go into the
+    counts and sampled traces as the forward runs, and each chunk's replay
+    takes the dense spike cotangent its steps would get from the sequence
+    (RecordedAdjointRunner._spike_cotangents' step cotangents, built per chunk).
+    Only the [batch, chunk, neurons] chunk sequence ever exists. The gradients
+    are those the dense rollout gets from the same statistics' gradients.
+
+    ``summarizes`` tells whether the cell's rollout can: the spikes are its only
+    sequence and cover every neuron. Without statistics this is the
+    segmented runner unchanged.
+    """
+
+    def __init__(self, core_model, cell, sequence_length, chunk_size, **kwargs):
+        super().__init__(core_model, sequence_length, chunk_size, cell=cell, **kwargs)
+        self.summarizes = self.n_sequence_outputs == 1 and cell._output_neuron_ids is None
+
+    def __call__(self, inputs, initial_state, statistics=None):
+        if statistics is None:
+            return super().__call__(inputs, initial_state)
+        if not self.summarizes:
+            raise ValueError("This cell's rollout has sequences besides the full spikes.")
+        time_check = tf.debugging.assert_equal(
+            tf.shape(inputs)[1],
+            self.sequence_length,
+            message="Segmented input length does not match sequence_length.",
+        )
+        width = self.cell._n_neurons
+        length = self.sequence_length
+        count_start, count_stop = statistics.count_window
+        counted = [count_start <= time < count_stop for time in range(length)]
+
+        @tf.custom_gradient
+        def statistics_rollout(inputs, *initial_state):
+            spike_dtype = initial_state[0].dtype
+            count_dtype = _count_dtype(spike_dtype, statistics.count_window)
+            sampling = _Sampling.of(statistics, width) if statistics.traces else None
+            # Device constants: host scalars would be copied every chunk.
+            weights = tf.constant([float(c) for c in counted], count_dtype)
+
+            def start():
+                traces = (
+                    (tf.TensorArray(spike_dtype, size=self.n_chunks,
+                                    infer_shape=self.remainder_size == 0),)
+                    if sampling else ()
+                )
+                return tf.zeros([inputs.shape[0], width], count_dtype), traces
+
+            def add(carry, chunk_index, chunk_start, sequences):
+                counts, traces = carry
+                spikes = sequences[0]
+                counts, *values = _record_chunk(
+                    spikes, counts, tf.slice(weights, [chunk_start], [spikes.shape[0]]),
+                    sampling,
+                )
+                return counts, tuple(
+                    array.write(chunk_index, value) for array, value in zip(traces, values)
+                )
+
+            def finish(carry):
+                counts, traces = carry
+                return _statistic_outputs(
+                    counts, traces[0].concat() if traces else None, statistics, spike_dtype
+                )
+
+            pair_weights = self.cell.lgn_pair_weights()
+            with self._rollout_scope(pair_weights), self.cell.time_major_sequences_scope():
+                outputs, state, state_arrays = self._forward(
+                    inputs, initial_state, time_check, collector=(start, add, finish)
+                )
+
+            def grad(*output_gradients, variables=None):
+                n_outputs = len(outputs)
+                count_gradient, traced = _statistic_cotangents(
+                    output_gradients[:n_outputs], statistics,
+                    tf.zeros([inputs.shape[0], width], spike_dtype), length,
+                )
+                in_window = tf.constant(counted)
+
+                def chunk_gradients(chunk_start, chunk_length):
+                    steps = tf.slice(in_window, [chunk_start], [chunk_length])
+                    if traced is None:
+                        return (_chunk_cotangent(count_gradient, steps, None, None, None, None),)
+                    trace_gradients, plan, runs, first = traced
+                    return (_chunk_cotangent(
+                        count_gradient, steps,
+                        tf.slice(trace_gradients, [chunk_start, 0], [chunk_length, -1]),
+                        plan, runs, first,
+                    ),)
+
+                variables = tuple(variables or ())
+                with self._rollout_scope(pair_weights, replay=True), \
+                        self.cell.time_major_sequences_scope():
+                    input_gradient, state_gradients, variable_gradients = self._backward(
+                        inputs, state_arrays, state, (None,), output_gradients[n_outputs:],
+                        variables, chunk_gradients=chunk_gradients,
+                    )
+                argument_gradients = (input_gradient,) + state_gradients
+                if variables:
+                    return argument_gradients, list(variable_gradients)
+                return argument_gradients
+
+            return outputs + state, grad
+
+        return statistics_rollout(inputs, *tuple(initial_state))

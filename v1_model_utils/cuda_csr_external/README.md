@@ -8,10 +8,13 @@ calculate activity gradients and is the intended model configuration.
 
 The basis dimension follows the recurrent implementation: four basis values
 select the compile-time specialization, while every other positive dimension
-uses a dynamic-basis kernel. Backward has static batch variants for 1, 2, 4,
-8, 16, 32, 64, 128 and 256, and for 512 when there are at least 1,024 rows.
-Other batch sizes use runtime fallbacks or
-generic pair-projected kernels. FP32 master-weight gradients retain the original checkpoint edge
+uses a dynamic-basis kernel. In FP16 the dense weight gradient takes the
+compact pair-projected kernels below (four bases: every batch; otherwise
+batches of three and more). FP32 and the remaining FP16 cases take a direct
+kernel that sums each edge in fixed batch tiles (the whole batch at 1, 2, 4, 8
+and 16, 32 samples at 32, 64, 128 and 256, four otherwise), then the tiles in
+order: the order of the atomic kernels it replaced, bit for bit wherever those
+were deterministic. FP32 master-weight gradients retain the original checkpoint edge
 order; CSR identifiers are `uint32` and synapse types are `uint8`. Every
 operator takes the synaptic basis in FP32. The LGN forward goes through the
 recurrent `V1CsrForward`, so it gets the device-built active-row queue and the
@@ -89,6 +92,10 @@ With the four-column basis, the activity gradient and the dense weight gradient 
 per edge, then runs a packed batch-lane row kernel over the result. A lane holds
 four consecutive FP32 batch samples, so an edge needs eight lanes, a warp covers
 four edge slots, and one 16-byte load serves all of them. Everything stays FP32.
+The weight gradient adds an edge's lanes by a butterfly tree, except at batches
+below 32 that are not powers of two, where it adds them in lane order: the
+order the atomic 4-sample tiles it replaced usually landed in, now fixed
+(`Experiments/kernel_generic_20261022/tracks/batch/NOTES.md`).
 
 `blockIdx.y` splits a CSR row across blocks, which the BKG population needs: it
 has 100 non-empty rows against a resident capacity of about 4,512 blocks, so one

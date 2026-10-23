@@ -440,6 +440,43 @@ def test_forward_aggregates_same_post_runs(use_initial, n_basis, dtype, aggregat
 
 
 @pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
+@pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
+@pytest.mark.parametrize("n_basis", [1, 3])
+@pytest.mark.parametrize("use_initial", [False, True])
+def test_narrow_basis_forward_rounds_once(use_initial, n_basis, dtype):
+    """Rows that never repeat a target take the tiled forward at one or three
+    basis columns too (in FP16): its FP32 tile is rounded once, so every current
+    is within half a step of float64 (plus FP32 slack), which the per-edge FP16
+    atomics of the scatter kernel are not."""
+    rng = np.random.default_rng(11)
+    n_pre, n_post, n_types, batch = 3000, 12000, 5, 8
+    flat = np.unique(rng.integers(0, n_pre * n_post, 200_000))
+    indices = np.stack((flat % n_post, flat // n_post), axis=1).astype(np.int64)
+    synapse_types = rng.integers(0, n_types, indices.shape[0]).astype(np.int64)
+    weights = rng.normal(size=indices.shape[0]).astype(np.float32)
+    indices, synapse_types, weights = _csr_sorted(indices, synapse_types, weights)
+    connectivity = _connectivity(indices, synapse_types, n_pre, n_post)
+    assert not connectivity.repeats_targets
+    np_dtype = dtype.as_numpy_dtype
+    spikes = (rng.random((batch, n_pre)) < 0.3).astype(np_dtype)
+    basis = rng.normal(size=(n_types, n_basis)).astype(np.float32)
+    seed = rng.normal(size=(batch * n_post, n_basis)).astype(np_dtype)
+    currents = calculate_recurrent_csr_currents(
+        tf.constant(spikes), tf.Variable(weights), tf.constant(basis), 0.37,
+        connectivity, initial=tf.constant(seed) if use_initial else None,
+    ).numpy()
+    expected = _float64_forward(
+        indices, synapse_types, spikes.astype(np.float64), weights, basis, n_post
+    ) + (seed if use_initial else 0.0)
+    error = np.abs(currents.astype(np.float64) - expected)
+    if dtype == tf.float16:
+        bound = np.spacing(np.abs(expected).astype(np.float16)).astype(np.float64) / 2
+        assert np.all(error <= bound + 1e-4)
+    else:
+        np.testing.assert_allclose(currents, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not tf.config.list_physical_devices("GPU"), reason="CUDA GPU required")
 def test_forward_basis_reaches_the_kernel_in_fp32():
     """A basis value FP16 cannot represent must not be rounded on the way in."""
     indices, synapse_types, spikes, weights, _, _ = _fixture(32, 4)
