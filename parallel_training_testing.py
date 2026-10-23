@@ -255,7 +255,8 @@ def scheduler_command(flags, script, job_name, log_name, gpus, cpus, memory_gb, 
         "sbatch", "-A", "uib_focosineu_acc", "--qos", flags.qos,
         f"--gres={gres}", "-c", str(cpus), f"--mem={memory_gb}G",
         # Like `run`, the wall time is given as hours:minutes.
-        "-t", f"{walltime}:00", f"--export=ALL,{threads}",
+        # Unbuffered output keeps the logs live, as `run`'s `srun -u` does.
+        "-t", f"{walltime}:00", f"--export=ALL,PYTHONUNBUFFERED=1,{threads}",
     ]
     if dependency:
         command.append(f"--dependency=afterok:{dependency}")
