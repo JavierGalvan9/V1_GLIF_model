@@ -2,16 +2,13 @@
 
 import contextlib
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 
 import tensorflow as tf
 
-from v1_model_utils.cuda_glif_state.build import build_flags_for
-from v1_model_utils.cuda_operator_cache import ensure_artifact
+from v1_model_utils.cuda_glif_state.build import LIBRARY
 
 
-HERE = Path(__file__).resolve().parent
 _GLIF_OPS = None
 # Per thread, because MirroredStrategy traces every replica in its own thread:
 # a replica's GLIF step must only ever fill its own record.
@@ -54,18 +51,7 @@ def _gradient_like(gradient, output):
 def _load_ops():
     global _GLIF_OPS
     if _GLIF_OPS is None:
-        glif = ensure_artifact(
-            HERE,
-            "glif_state_ops",
-            sources=(
-                HERE / "build.py",
-                HERE / "glif_state_ops.cc",
-                HERE / "glif_state_ops.cu.cc",
-            ),
-            build_module="v1_model_utils.cuda_glif_state.build",
-            build_flags=build_flags_for,
-        )
-        _GLIF_OPS = tf.load_op_library(str(glif))
+        _GLIF_OPS = tf.load_op_library(str(LIBRARY.ensure()))
     return _GLIF_OPS
 
 

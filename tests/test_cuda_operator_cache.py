@@ -1,11 +1,13 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from v1_model_utils import cuda_operator_cache
+from v1_model_utils import cuda_operator_cache, cuda_prebuild
 
 
 class EnsureArtifactTest(unittest.TestCase):
@@ -108,6 +110,38 @@ class EnsureArtifactTest(unittest.TestCase):
                 )
             )
             self.assertIn("source_digest", metadata)
+
+
+class ParallelBuildTest(unittest.TestCase):
+    def test_build_commands_finish_before_a_failure_is_raised(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "done"
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                cuda_operator_cache.run_build_commands(
+                    ["false"], ["sh", "-c", f"sleep 0.2 && touch {marker}"]
+                )
+            self.assertEqual(raised.exception.cmd, ["false"])
+            self.assertTrue(marker.exists())
+
+    def test_prebuild_builds_every_library_and_collects_failures(self):
+        built = []
+
+        def library(stem, error=None):
+            def ensure(architecture):
+                built.append((stem, architecture))
+                if error is not None:
+                    raise error
+            return SimpleNamespace(stem=stem, ensure=ensure)
+
+        failure = RuntimeError("nvcc failed")
+        failures = cuda_prebuild.prebuild(
+            "sm_120",
+            jobs=2,
+            libraries=(library("a"), library("b", failure), library("c")),
+        )
+
+        self.assertEqual(failures, {"b": failure})
+        self.assertCountEqual(built, [("a", "120"), ("b", "120"), ("c", "120")])
 
 
 if __name__ == "__main__":

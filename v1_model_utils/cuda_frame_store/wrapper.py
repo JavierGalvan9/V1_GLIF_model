@@ -1,16 +1,12 @@
 """Park a sequence of GPU frames in pinned host memory (see frame_store_ops.cc)."""
 
-from pathlib import Path
 import warnings
 
 import tensorflow as tf
 
-from v1_model_utils.cuda_operator_cache import ensure_artifact
-
-from .build import BUILD_FLAGS
+from .build import LIBRARY
 
 
-HERE = Path(__file__).resolve().parent
 _OPS = None
 _UNAVAILABLE = False
 
@@ -18,15 +14,7 @@ _UNAVAILABLE = False
 def _load_ops():
     global _OPS
     if _OPS is None:
-        library = ensure_artifact(
-            HERE,
-            "frame_store_ops",
-            sources=(HERE / "build.py", HERE / "frame_store_ops.cc", HERE / "frame_store_ops.cu.cc",
-                     HERE / "tq_codec.cu.h"),
-            build_module="v1_model_utils.cuda_frame_store.build",
-            build_flags=BUILD_FLAGS,
-        )
-        _OPS = tf.load_op_library(str(library))
+        _OPS = tf.load_op_library(str(LIBRARY.ensure()))
     return _OPS
 
 

@@ -3,16 +3,16 @@
 import argparse
 import os
 from pathlib import Path
-import shlex
-import subprocess
 
 import tensorflow as tf
 
 from v1_model_utils.cuda_operator_cache import (
+    OperatorLibrary,
     active_gpu_architecture,
     artifact_path,
     normalize_architecture,
     resolve_cuda_build_toolchain,
+    run_build_commands,
     temporary_build_directory,
     write_build_metadata,
 )
@@ -22,6 +22,7 @@ from v1_model_utils.cuda_csr_config import DIRECT_CSR, architecture_kernel_flags
 
 
 HERE = Path(__file__).resolve().parent
+PACKAGE = HERE.parent
 BUILD_FLAGS = (
     "-DV1_EXTERNAL_THREADS=1024",
     "-DV1_EXTERNAL_BATCH32_TILE=32",
@@ -36,9 +37,19 @@ def build_flags_for(architecture):
     return (*BUILD_FLAGS, *architecture_kernel_flags(architecture))
 
 
-def _run(command):
-    print(shlex.join(str(part) for part in command), flush=True)
-    subprocess.run([str(part) for part in command], check=True)
+LIBRARY = OperatorLibrary(
+    HERE,
+    "csr_external_grad_ops",
+    sources=(
+        HERE / "build.py",
+        HERE / "csr_external_grad_ops.cc",
+        HERE / "csr_external_grad_ops.cu.cc",
+        HERE / "generic_backward_kernels.cuh",
+        PACKAGE / "cuda_csr_recurrent/event_weight_grad.cuh",
+    ),
+    build_module="v1_model_utils.cuda_csr_external.build",
+    build_flags=build_flags_for,
+)
 
 
 def main():
@@ -64,7 +75,7 @@ def main():
         cc_object = workspace / "csr_external_grad_ops.cc.o"
         cu_object = workspace / "csr_external_grad_ops.cu.o"
         temporary_output = workspace / output.name
-        _run(
+        run_build_commands(
             [
                 cxx,
                 "-std=c++17",
@@ -75,9 +86,7 @@ def main():
                 "-o",
                 cc_object,
                 *compile_flags,
-            ]
-        )
-        _run(
+            ],
             [
                 nvcc,
                 "-std=c++17",
@@ -97,7 +106,7 @@ def main():
                 *compile_flags,
             ]
         )
-        _run(
+        run_build_commands(
             [
                 cxx,
                 "-shared",

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -328,6 +329,47 @@ def ensure_artifact(
                     "the active TensorFlow/CUDA environment or build flags."
                 )
     return output
+
+
+@dataclass(frozen=True)
+class OperatorLibrary:
+    """One cached operator library: the inputs of its cache key and its builder.
+
+    ``build_flags`` is a tuple, or a callable of the architecture when the
+    flags depend on it.
+    """
+
+    directory: Path
+    stem: str
+    sources: tuple
+    build_module: str
+    build_flags: object = ()
+    build_args: tuple = ()
+
+    def ensure(self, architecture=None):
+        """Return the fresh library for ``architecture``, building it if needed."""
+        return ensure_artifact(
+            self.directory,
+            self.stem,
+            sources=self.sources,
+            build_module=self.build_module,
+            architecture=architecture,
+            build_flags=self.build_flags,
+            build_args=self.build_args,
+        )
+
+
+def run_build_commands(*commands):
+    """Run independent compiler commands concurrently; raise if any fails."""
+    commands = [[str(part) for part in command] for command in commands]
+    for command in commands:
+        print(shlex.join(command), flush=True)
+    # Wait for every process before raising, so none outlives its workspace.
+    processes = [subprocess.Popen(command) for command in commands]
+    returncodes = [process.wait() for process in processes]
+    for command, returncode in zip(commands, returncodes):
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, command)
 
 
 def resolve_artifact(directory, stem):

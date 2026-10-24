@@ -300,6 +300,10 @@ def main(_):
     from v1_model_utils import load_sparse, models, other_v1_utils, recorded_adjoint
     from v1_model_utils import optimizers as optimizer_utils
 
+    from v1_model_utils.cuda_prebuild import prebuild_for_run
+
+    # Build the missing CUDA operator libraries together rather than one by one on first use.
+    prebuild_for_run()
     # Configure seed for reproducibility
     tf_utils.configure_reproducibility(flags.seed)
     # Configure TensorFlow optimization options that have proven to be beneficial for our model and training setup. These options can improve the performance of the model by optimizing the computational graph and memory usage.

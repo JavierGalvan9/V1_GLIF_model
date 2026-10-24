@@ -2,7 +2,6 @@
 
 import contextlib
 from dataclasses import dataclass
-from pathlib import Path
 import threading
 
 import numpy as np
@@ -10,8 +9,7 @@ import tensorflow as tf
 
 from v1_model_utils import csr_order
 from .canonical_projection import canonical_pairs
-from v1_model_utils.cuda_operator_cache import ensure_artifact
-from v1_model_utils.cuda_csr_recurrent.build import build_flags_for, DIRECT_CSR
+from v1_model_utils.cuda_csr_recurrent.build import DIRECT_CSR, LIBRARY
 from v1_model_utils.cuda_csr_resources import (
     initialize_resource,
     load_ops as load_resource_ops,
@@ -136,20 +134,7 @@ def to_original_order(values, connectivity):
 def _load_ops():
     global _OPS
     if _OPS is None:
-        directory = Path(__file__).parent
-        library = ensure_artifact(
-            directory,
-            "csr_recurrent_ops",
-            sources=(
-                directory / "build.py",
-                directory / "csr_recurrent_ops.cc",
-                directory / "csr_recurrent_ops.cu.cc",
-                directory / "event_weight_grad.cuh",
-            ),
-            build_module="v1_model_utils.cuda_csr_recurrent.build",
-            build_flags=build_flags_for,
-        )
-        _OPS = tf.load_op_library(str(library))
+        _OPS = tf.load_op_library(str(LIBRARY.ensure()))
     return _OPS
 
 

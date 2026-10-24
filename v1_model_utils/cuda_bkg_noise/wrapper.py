@@ -1,15 +1,12 @@
 """Device-side background Poisson counts (see bkg_noise_ops.cc)."""
 
-from pathlib import Path
 import warnings
 
 import tensorflow as tf
 
-from v1_model_utils.cuda_operator_cache import ensure_artifact
+from .build import LIBRARY
 
 
-HERE = Path(__file__).resolve().parent
-BUILD_FLAGS = ("--expt-relaxed-constexpr",)
 _OPS = None
 _UNAVAILABLE = False
 
@@ -17,14 +14,7 @@ _UNAVAILABLE = False
 def _load_ops():
     global _OPS
     if _OPS is None:
-        library = ensure_artifact(
-            HERE,
-            "bkg_noise_ops",
-            sources=(HERE / "build.py", HERE / "bkg_noise_ops.cc", HERE / "bkg_noise_ops.cu.cc"),
-            build_module="v1_model_utils.cuda_bkg_noise.build",
-            build_flags=BUILD_FLAGS,
-        )
-        _OPS = tf.load_op_library(str(library))
+        _OPS = tf.load_op_library(str(LIBRARY.ensure()))
     return _OPS
 
 

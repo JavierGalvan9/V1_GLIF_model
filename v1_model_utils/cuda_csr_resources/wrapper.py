@@ -2,13 +2,11 @@
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
 import uuid
 
 import tensorflow as tf
 
-from v1_model_utils.cuda_operator_cache import ensure_artifact
-from v1_model_utils.cuda_csr_resources.build import build_flags_for
+from v1_model_utils.cuda_csr_resources.build import LIBRARY
 
 
 _OPS = None
@@ -47,29 +45,7 @@ def load_ops():
     """Load the architecture-matched resource-current operator library."""
     global _OPS
     if _OPS is None:
-        directory = Path(__file__).parent
-        library = ensure_artifact(
-            directory,
-            "csr_resource_ops",
-            sources=(
-                directory / "csr_resource_ops.cc",
-                directory / "csr_resource_ops.cu.cc",
-                directory / "build.py",
-                directory.parent
-                / "cuda_csr_recurrent/csr_recurrent_ops.cc",
-                directory.parent
-                / "cuda_csr_recurrent/csr_recurrent_ops.cu.cc",
-                directory.parent
-                / "cuda_csr_recurrent/event_weight_grad.cuh",
-                directory.parent
-                / "cuda_csr_external/csr_external_grad_ops.cu.cc",
-                directory.parent
-                / "cuda_csr_external/generic_backward_kernels.cuh",
-            ),
-            build_module="v1_model_utils.cuda_csr_resources.build",
-            build_flags=build_flags_for,
-        )
-        _OPS = tf.load_op_library(str(library))
+        _OPS = tf.load_op_library(str(LIBRARY.ensure()))
     return _OPS
 
 

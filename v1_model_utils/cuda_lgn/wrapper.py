@@ -5,35 +5,23 @@ sample (the temporal responses R, the corner weights, the separable filter
 taps) is computed here once, in float64, from the float32 LGN constants.
 """
 
-from pathlib import Path
 import warnings
 
 import numpy as np
 from scipy.signal import correlate2d
 import tensorflow as tf
 
-from v1_model_utils.cuda_operator_cache import ensure_artifact
+from v1_model_utils.cuda_lgn.build import LIBRARIES
 from v1_model_utils.tf_utils import replica_local_constant
 
 
-HERE = Path(__file__).resolve().parent
-BUILD_FLAGS = ("--expt-relaxed-constexpr",)
 GRATING, MOVIE = "lgn_grating_ops", "lgn_movie_ops"
 _OPS = {}
 
 
 def _load_ops(stem=GRATING):
     if stem not in _OPS:
-        library = ensure_artifact(
-            HERE,
-            stem,
-            sources=(HERE / "build.py", HERE / "lgn_common.cuh", HERE / f"{stem}.cc",
-                     HERE / f"{stem}.cu.cc"),
-            build_module="v1_model_utils.cuda_lgn.build",
-            build_flags=BUILD_FLAGS,
-            build_args=("--stem", stem),
-        )
-        _OPS[stem] = tf.load_op_library(str(library))
+        _OPS[stem] = tf.load_op_library(str(LIBRARIES[stem].ensure()))
     return _OPS[stem]
 
 
