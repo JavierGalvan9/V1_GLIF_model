@@ -27,6 +27,12 @@ inside the prefetch window, or when the CUDA store is unavailable, the records
 remain on the GPU. Training warns and ignores the option in other backward
 modes; evaluation commands do not receive it.
 
+Packed spike histories use `uint32` bit views while crossing TensorFlow
+conditionals and the backward delay-window loop. TensorFlow's GPU control-flow
+kernels keep `int32` tensors in host memory, which would introduce extra,
+synchronous frame transfers. The store and spike kernels still receive the
+original `int32` bits; these views do not change the packed format or gradients.
+
 ## Modes
 
 - `raw`: frames are copied exactly, so the gradients are bitwise those of the

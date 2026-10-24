@@ -313,9 +313,13 @@ def test_adaptive_codec_encodes_what_the_link_cannot_take(link, low, high, capfd
     on a link far faster than the forward, all on a 0 GB/s link, and a mix
     (raw and encoded interleaved) on a link that takes ~75 % of the raw
     stream in the forward's time. The forward's frame rate and the encoded
-    length come from a first rollout of the same store."""
+    length come from a calibration rollout of the same, warmed store."""
     monkeypatch.setenv("V1_FRAME_STORE_STATS", "1")
     length, shape, key = 120, (64, 20000), f"test_adaptive_{link}"
+    if link == "fit":
+        # Allocate the store and warm the kernels before calibrating the link.
+        # The first rollout's cold frame rate understates the steady workload.
+        _adaptive_rollout(key, length, shape, capfd)
     first, _ = _adaptive_rollout(key, length, shape, capfd)
     if link == "fit":
         # The link carries 0.75 of the raw bytes the forward produces (the

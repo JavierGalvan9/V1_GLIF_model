@@ -518,11 +518,15 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 else _push(voltages, voltage)
             )
             if spike_store:
+                # Int32 control-flow inputs live on the host in TensorFlow.
+                # Carry the same bits on the GPU; the store still takes int32.
+                packed_spikes = tf.bitcast(packed_spikes, tf.uint32)
                 with tf.control_dependencies([frames]):
                     frames = tf.cond(
                         time + cell.max_delay < length,
                         lambda: frame_store.offload_frame(
-                            packed_spikes, time + cell.max_delay, spike_store, length,
+                            tf.bitcast(packed_spikes, tf.int32),
+                            time + cell.max_delay, spike_store, length,
                             resident_from, self._COPY_GROUP, codec="raw",
                         ),
                         lambda: tf.identity(frames),
@@ -750,10 +754,13 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
 
         def frame(index):
             if spike_store:
-                return frame_store.take_frame(
+                words = frame_store.take_frame(
                     index, spike_store, frames_like,
                     prefetch=self._PREFETCH, group=self._COPY_GROUP,
                 )
+                # Both the conditional result and the delay-window loop carry
+                # must stay on the GPU, unlike int32 control-flow tensors.
+                return tf.bitcast(words, tf.uint32)
             return tf.raw_ops.TensorListGetItem(
                 input_handle=frames, index=index,
                 element_shape=frames_like.shape, element_dtype=tf.int32,
@@ -788,14 +795,19 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             if spike_store:
                 with tf.control_dependencies([voltage_g, frames]):
                     oldest_words = tf.cond(
-                        time > 0, lambda: frame(time - 1), lambda: tf.zeros_like(frames_like)
+                        time > 0, lambda: frame(time - 1),
+                        lambda: tf.zeros_like(packed_slots[0]),
                     )
             else:
                 oldest_words = frame(tf.maximum(time - 1, 0))
-            oldest = _unpack_frame(oldest_words, width, spike_dtype)
+            oldest = _unpack_frame(
+                tf.bitcast(oldest_words, tf.int32) if spike_store else oldest_words,
+                width, spike_dtype,
+            )
             spike_cotangent, spike_carry = spike_cotangent_at(time, spike_carry)
             # z[time - 1] is frame time - 1 + delay.
-            prev_z = packed_slots[0] if spike_store else frame(time - 1 + delay)
+            prev_z = (tf.bitcast(packed_slots[0], tf.int32) if spike_store
+                      else frame(time - 1 + delay))
             spike_g, voltage_g, asc_g, rise_g, psc_g, input_g, bound = glif_step_backward(
                 cell, prev_z, voltage, packed_blocked, constants,
                 cell._dt, cell.v_th, cell._gauss_std, cell._dampening_factor, inverse,
@@ -846,10 +858,14 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         with tf.control_dependencies([frames] if spike_store else []):
             oldest_words = frame(length - 1)
         slots = tuple(final_slots[1:]) + (
-            models._unpack_spike_words(oldest_words, width, spike_dtype, _WORD_BITS),
+            models._unpack_spike_words(
+                tf.bitcast(oldest_words, tf.int32) if spike_store else oldest_words,
+                width, spike_dtype, _WORD_BITS,
+            ),
         )
         packed_slots = (
-            tuple(models._pack_spike_words(slot, _WORD_BITS) for slot in final_slots[1:])
+            tuple(tf.bitcast(models._pack_spike_words(slot, _WORD_BITS), tf.uint32)
+                  for slot in final_slots[1:])
             + (oldest_words,) if spike_store else ()
         )
         masks = tuple(spike_activity_masks(slot) for slot in slots)
