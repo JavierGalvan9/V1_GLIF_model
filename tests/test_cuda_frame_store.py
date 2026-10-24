@@ -321,13 +321,22 @@ def test_adaptive_codec_encodes_what_the_link_cannot_take(link, low, high, capfd
         # The first rollout's cold frame rate understates the steady workload.
         _adaptive_rollout(key, length, shape, capfd)
     first, _ = _adaptive_rollout(key, length, shape, capfd)
-    if link == "fit":
+    link_fit = link == "fit"
+    if link_fit:
         # The link carries 0.75 of the raw bytes the forward produces (the
         # projection counts on 0.9 of it).
         frame_bytes = 4 * np.prod(shape)
         link = str(0.75 / 0.9 * float(first["frames_per_s"]) * frame_bytes / 1e9)
     monkeypatch.setenv("V1_FRAME_STORE_LINK_GBPS", link)
     stats, error = _adaptive_rollout(key, length, shape, capfd)
+    if link_fit:
+        # The projection assumes the calibrated frame rate. A rollout that
+        # stalls (the host or the GPU preempted: ~50x slower than the
+        # calibration) encodes nearly every frame, as it should; measure again.
+        for _ in range(2):
+            if float(stats["frames_per_s"]) >= 0.4 * float(first["frames_per_s"]):
+                break
+            stats, error = _adaptive_rollout(key, length, shape, capfd)
     assert error <= TQ_ERROR
     encoded, offloaded = int(stats["encoded"]), length
     assert low * offloaded <= encoded <= high * offloaded, stats
@@ -446,10 +455,13 @@ def test_tq_retake_rebuilds_the_chain(capfd, monkeypatch):
 
 
 def test_tq_chain_across_raw_encoded_host_and_gpu_frames(capfd, monkeypatch):
-    """52 MB drifting frames produced faster than PCIe, every frame chosen for
-    encoding into a ring of two frames: frames go out encoded or (ring full)
-    raw, others stay on the GPU packed or raw, and the reverse chain crosses
-    all of them; a second pass takes frames 7 .. 0 again from the host."""
+    """52 MB drifting frames, every frame chosen for encoding into a ring of two
+    frames: frames go out encoded or, when the ring is full, raw; others stay
+    on the GPU packed or raw, and the reverse chain crosses all of them; a
+    second pass takes frames 7 .. 0 again from the host. Whether the ring ever
+    fills depends on the copy engine keeping up with the forward (TQ frames
+    leave one by one, as soon as encoded): on a fast link it never does, so
+    the full ring is checked by test_tq_full_ring, not here."""
     monkeypatch.setenv("V1_FRAME_STORE_STATS", "1")
     monkeypatch.setenv("V1_FRAME_STORE_LINK_GBPS", "0")
     monkeypatch.setenv("V1_FRAME_STORE_RING_FRAMES", "2")
@@ -457,7 +469,7 @@ def test_tq_chain_across_raw_encoded_host_and_gpu_frames(capfd, monkeypatch):
                                   resident_from=22, again=8, walk=True)
     assert error == 0.0
     stats = _stats(capfd)
-    assert int(stats["encoded"]) >= 1 and int(stats["ring_full"]) >= 1
+    assert int(stats["encoded"]) >= 1 and int(stats["chain_walks"]) >= 1
     # A frame the reverse takes (or the forward's end keeps) before its encode
     # finished stays raw and is in neither count.
     assert int(stats["encoded"]) + int(stats["ring_full"]) <= 22
