@@ -17,9 +17,33 @@ template <typename T> __device__ T V(float x) { return static_cast<T>(x); }
 // 1 to kMaxTiledBasis bases (wider rows take the runtime-basis kernels).
 constexpr int kBasis = 4;
 constexpr int kMaxTiledBasis = 8;
-// Samples per forward thread (sharing the neuron constants in registers).
-constexpr int kTileBatch = 2;
+// The tiled kernels' shape. build.py's architecture_kernel_flags sets these
+// macros per target architecture, for the host code too, so the launches
+// match the kernels; the defaults are the shape every architecture had before
+// (sm_100 values and measurements: talaia_b200_20261023/tracks/glif100).
+// V1_GLIF_FORWARD_TILE: samples per forward thread (sharing the neuron
+// constants in registers).
+// V1_GLIF_FORWARD_MIN_BLOCKS: the resident kTileThreads-thread forward blocks
+// per SM its register allocation must allow.
+// V1_GLIF_FORWARD_EARLY_LOADS: every load of an element ahead of its first
+// store (see ForwardKernelTiled).
+// V1_GLIF_BACKWARD_THREADS: threads per backward block (the forward's stay
+// kTileThreads: its penalty partition depends on them).
+#ifndef V1_GLIF_FORWARD_TILE
+#define V1_GLIF_FORWARD_TILE 2
+#endif
+#ifndef V1_GLIF_FORWARD_MIN_BLOCKS
+#define V1_GLIF_FORWARD_MIN_BLOCKS 1
+#endif
+#ifndef V1_GLIF_FORWARD_EARLY_LOADS
+#define V1_GLIF_FORWARD_EARLY_LOADS 0
+#endif
+#ifndef V1_GLIF_BACKWARD_THREADS
+#define V1_GLIF_BACKWARD_THREADS 512
+#endif
+constexpr int kTileBatch = V1_GLIF_FORWARD_TILE;
 constexpr int kTileThreads = 512;
+constexpr int kBackwardThreads = V1_GLIF_BACKWARD_THREADS;
 
 // The per-neuron float32 constants both kernels read. Each syn entry is one
 // (neuron, basis) pair, [x, y, z, w] = [syn_decay, psc_initial, psc_factor,
@@ -529,9 +553,15 @@ __global__ void PackMasksKernel(int64_t rows, int neurons, const T* spikes, cons
 // synaptic and ASC rows in aligned accesses (LoadRow); a null refractory_out
 // skips that output; Pack also writes the packed masks.
 // Launched with kTileThreads threads; the bound keeps the register allocation
-// (with the fused penalty and BKG gather) within one 512-thread block per SM.
+// (with the fused penalty and BKG gather) within ForwardMinBlocks 512-thread
+// blocks per SM: V1_GLIF_FORWARD_MIN_BLOCKS, except for the dense-mask fp32
+// forward, which spills too much under a raised bound (sm_100: 21 % slower).
+template <typename T, bool Pack> constexpr int ForwardMinBlocks() {
+  return std::is_same<T, float>::value && !Pack ? 1 : V1_GLIF_FORWARD_MIN_BLOCKS;
+}
+
 template <typename T, typename R, int Basis, bool Vec, bool Pack>
-__global__ __launch_bounds__(kTileThreads, 1) void ForwardKernelTiled(int64_t count, int neurons, int n_basis,
+__global__ __launch_bounds__(kTileThreads, ForwardMinBlocks<T, Pack>()) void ForwardKernelTiled(int64_t count, int neurons, int n_basis,
     const T* prev_z, const float* v, const R* r,
     const float* asc, const T* rise, const T* psc,
     const T* inputs, Constants k, const R* t_ref,
@@ -567,8 +597,19 @@ __global__ __launch_bounds__(kTileThreads, 1) void ForwardKernelTiled(int64_t co
     const int64_t i = sample * neurons + neuron;
     const int64_t state_base = i * Basis;
     // The accesses keep the former per-element order: hoisting the constants
-    // or issuing every row load first measured slower under the power cap.
+    // or issuing every row load first measured slower under the RTX PRO 6000's
+    // power cap.
     const float reset = F(prev_z[i]);
+#if V1_GLIF_FORWARD_EARLY_LOADS
+    // Every load of the element ahead of its first store, so that its memory
+    // latency is paid once rather than three times. Same values, same
+    // arithmetic: the results stay bit for bit.
+    const int old_r = static_cast<int>(r[i]), refractory_steps = static_cast<int>(t_ref[neuron]);
+    const float old_v = v[i]; const float decay = k.decay[neuron];
+    const float reset_coeff = k.reset_coeff[neuron], spike_asc = k.asc_spike_factor[neuron];
+    const float asc_decay[2] = {k.asc_decay[2 * neuron], k.asc_decay[2 * neuron + 1]};
+    const float asc_amps[2] = {k.asc_amps[2 * neuron], k.asc_amps[2 * neuron + 1]};
+#endif
     float old_asc[2], old_rise[Basis], old_psc[Basis], input_current[Basis];
     LoadRow<float, 2, Vec>(asc + 2 * i, old_asc);
     // Each current source is convolved with the membrane kernel through its own
@@ -596,6 +637,11 @@ __global__ __launch_bounds__(kTileThreads, 1) void ForwardKernelTiled(int64_t co
     }
     StoreRow<T, Basis, Vec>(new_rise + state_base, next_rise);
     StoreRow<T, Basis, Vec>(new_psc + state_base, next_psc);
+#if V1_GLIF_FORWARD_EARLY_LOADS
+    const int refractory = max(old_r + static_cast<int>(reset) * refractory_steps - 1, 0);
+    float voltage = __fmaf_rn(reset, __fadd_rn(reset_coeff, spike_asc),
+                              __fmaf_rn(decay, old_v, drive));
+#else
     const int refractory = max(static_cast<int>(r[i]) +
         static_cast<int>(reset)*static_cast<int>(t_ref[neuron])-1, 0);
     const float old_v = v[i]; const float decay = k.decay[neuron];
@@ -603,16 +649,23 @@ __global__ __launch_bounds__(kTileThreads, 1) void ForwardKernelTiled(int64_t co
     // The reset and the ASC this spike injects both act within this step.
     float voltage = __fmaf_rn(reset, __fadd_rn(reset_coeff, k.asc_spike_factor[neuron]),
                               __fmaf_rn(decay, old_v, drive));
+#endif
     // A hard reset puts the membrane at v_reset at the spike time instead.
     if (hard_reset)
       voltage = __fmaf_rn(reset, __fmaf_rn(decay, __fsub_rn(rest, old_v), -reset_coeff), voltage);
     if (hard_reset && refractory > 0) voltage = rest;
     const R counter = static_cast<R>(refractory);
     new_v[i] = voltage; new_r[i] = counter;
+#if V1_GLIF_FORWARD_EARLY_LOADS
+    const float next_asc[2] = {
+        __fmaf_rn(asc_decay[0], old_asc[0], __fmul_rn(reset, asc_amps[0])),
+        __fmaf_rn(asc_decay[1], old_asc[1], __fmul_rn(reset, asc_amps[1]))};
+#else
     const float next_asc[2] = {
         __fmaf_rn(k.asc_decay[2 * neuron], old_asc[0], __fmul_rn(reset, k.asc_amps[2 * neuron])),
         __fmaf_rn(k.asc_decay[2 * neuron + 1], old_asc[1],
                   __fmul_rn(reset, k.asc_amps[2 * neuron + 1]))};
+#endif
     StoreRow<float, 2, Vec>(new_asc + 2 * i, next_asc);
     // The threshold reads the membrane still in registers.
     const bool blocked = counter > 0;
@@ -633,7 +686,7 @@ __global__ __launch_bounds__(kTileThreads, 1) void ForwardKernelTiled(int64_t co
 
 // One sample per blockIdx.y (grid-strided beyond 65535 samples): unlike the
 // forward, the backward measured faster without sharing the neuron constants
-// across samples. Launched with kTileThreads threads (at most 94 registers
+// across samples. Launched with kBackwardThreads threads (at most 94 registers
 // up to kMaxTiledBasis bases on sm_120; a launch bound would change the
 // four-basis register allocation).
 template <typename T, int Basis, bool Vec, int WordBits>
@@ -879,8 +932,15 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
             neurons, d, kernel, 0, kTileThreads);
         const unsigned tiles = (v.dim_size(0) + kTileBatch - 1) / kTileBatch;
         transposed = TransposedTileGrid(neurons, tiles);
-        blocks = transposed ? dim3(tiles, cfg.block_count) : dim3(cfg.block_count, tiles);
-        neuron_blocks = cfg.block_count;
+        // The penalty is summed per (sample, neuron block), so the neuron
+        // partition must not follow a raised occupancy: it stays at one block
+        // per SM, what one resident block per SM gave (every tiled forward
+        // uses more than 64 registers then), and the extra resident blocks
+        // come from the sample tiles.
+        neuron_blocks = V1_GLIF_FORWARD_MIN_BLOCKS > 1
+                            ? std::min(cfg.block_count, d.getNumGpuMultiProcessors())
+                            : cfg.block_count;
+        blocks = transposed ? dim3(tiles, neuron_blocks) : dim3(neuron_blocks, tiles);
         threads = cfg.thread_per_block;
       } else {
         auto cfg = GetGpuLaunchConfig(v.NumElements(), d);
@@ -1080,7 +1140,7 @@ template <typename T, bool Packed> class BackwardOp : public OpKernel {
       const SpikeMasks<T, Bits> masks{prev_z.data(), c->input(2).data(), static_cast<int>(words)};
       if constexpr (B > 0) {
         auto kernel = BackwardKernelTiled<T, B, decltype(vec)::value, Bits>;
-        auto cfg = GetGpuLaunchConfigFixedBlockSize(neurons, d, kernel, 0, kTileThreads);
+        auto cfg = GetGpuLaunchConfigFixedBlockSize(neurons, d, kernel, 0, kBackwardThreads);
         const int64_t rows = std::min<int64_t>(new_v.dim_size(0), 65535);
         const bool transposed = TransposedTileGrid(neurons, rows);
         return launch_with(kernel,

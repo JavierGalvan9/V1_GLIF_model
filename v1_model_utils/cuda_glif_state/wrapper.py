@@ -7,11 +7,11 @@ from types import SimpleNamespace
 
 import tensorflow as tf
 
+from v1_model_utils.cuda_glif_state.build import build_flags_for
 from v1_model_utils.cuda_operator_cache import ensure_artifact
 
 
 HERE = Path(__file__).resolve().parent
-BUILD_FLAGS = ("--expt-relaxed-constexpr",)
 _GLIF_OPS = None
 # Per thread, because MirroredStrategy traces every replica in its own thread:
 # a replica's GLIF step must only ever fill its own record.
@@ -63,7 +63,7 @@ def _load_ops():
                 HERE / "glif_state_ops.cu.cc",
             ),
             build_module="v1_model_utils.cuda_glif_state.build",
-            build_flags=BUILD_FLAGS,
+            build_flags=build_flags_for,
         )
         _GLIF_OPS = tf.load_op_library(str(glif))
     return _GLIF_OPS

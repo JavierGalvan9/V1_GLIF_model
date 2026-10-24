@@ -33,7 +33,11 @@ runtime-basis kernels (packed masks and the bound included). Every path gives
 the same results bit for bit; only the voltage penalty accumulator of the
 runtime-basis forward, which adds atomically, depends on the order. Dispatch
 does not depend on batch size. The tiled kernels use 512 threads per block; the
-fused BKG gather needs four bases.
+fused BKG gather needs four bases. `build.ARCHITECTURE_FLAGS` reshapes them per
+compute capability through the `V1_GLIF_*` macros: sm_100 (B200) tiles four
+samples per forward thread, keeps two forward blocks per SM, loads the forward
+state up front and runs 128-thread backward blocks, with the same results bit
+for bit. Other architectures compile the defaults.
 
 Builds are architecture-keyed and validated against the active TensorFlow/CUDA
 environment:
