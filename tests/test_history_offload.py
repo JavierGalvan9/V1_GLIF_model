@@ -95,13 +95,22 @@ class _FrameStore:
                     tf.Variable(tf.zeros((capacity,), tf.int32)),
                 ))
 
-    def offload_frame(self, value, index, key, capacity, *args, codec):
+    def offload_frame(self, value, index, key, capacity, *args, codec, drop_outside=False):
         assert codec == "raw"
         assert value.dtype == tf.int32
         if key not in self.stores:
             self.stores[key] = self.resources[key.split("_")[0]].pop()
         data, written, taken = self.stores[key]
         assert data.shape == (capacity, *value.shape)
+        if drop_outside:  # the op records nothing outside [0, capacity)
+            index = tf.convert_to_tensor(index)
+            return tf.cond((index >= 0) & (index < capacity),
+                           lambda: self._write(value, index, data, written, taken),
+                           lambda: tf.zeros([0]))
+        return self._write(value, index, data, written, taken)
+
+    @staticmethod
+    def _write(value, index, data, written, taken):
         reset = tf.cond(
             tf.equal(index, 0),
             lambda: (written.assign(tf.zeros_like(written)), taken.assign(tf.zeros_like(taken))),
@@ -115,7 +124,11 @@ class _FrameStore:
         with tf.control_dependencies(updates):
             return tf.zeros([0])
 
-    def take_frame(self, index, key, like, **kwargs):
+    def take_frame(self, index, key, like, zero_before_start=False, **kwargs):
+        if zero_before_start:  # the op returns zeros before frame 0
+            return tf.cond(tf.convert_to_tensor(index) >= 0,
+                           lambda: self.take_frame(index, key, like),
+                           lambda: tf.zeros(like.shape, like.dtype))
         data, written, taken = self.stores[key]
         checks = (tf.debugging.assert_equal(written[index], 1),
                   tf.debugging.assert_equal(taken[index], 0))
@@ -257,7 +270,7 @@ def test_voltage_offload_selects_codec(portable_backend, monkeypatch, mode, code
                         lambda name, enabled, *args: name if enabled else None)
     codecs = []
 
-    def offload(value, index, key, *args, codec):
+    def offload(value, index, key, *args, codec, drop_outside=False):
         assert key == "voltages" and value.dtype == tf.float32
         codecs.append(codec)
         return tf.zeros([0])

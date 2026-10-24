@@ -462,23 +462,62 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         spike_store = self._frame_store("spikes", self.history_offload != "none", batch, words)
         blocked_store = self._frame_store("blocked", self.history_offload != "none", batch, words)
         frames = tf.zeros([0]) if spike_store else _empty_list(tf.int32, [batch, words])
-        for index, slot in enumerate(reversed(history)):
-            if spike_store and index >= length:
-                break
-            packed = models._pack_spike_words(slot, _WORD_BITS)
-            if spike_store:
+        packed_history = [models._pack_spike_words(slot, _WORD_BITS) for slot in reversed(history)]
+        for index, packed in enumerate(packed_history):
+            if not spike_store:
+                frames = _push(frames, packed)
+            elif index < len(packed_history) - 1:  # the last one goes with the first step's
                 with tf.control_dependencies([frames]):
                     frames = frame_store.offload_frame(
                         packed, index, spike_store, length, length - self._PREFETCH,
-                        self._COPY_GROUP, codec="raw",
+                        self._COPY_GROUP, codec="raw", drop_outside=True,
                     )
-            else:
-                frames = _push(frames, packed)
         store = self._frame_store("voltages", self.voltage_offload != "none", batch, width)
         voltages = tf.zeros([0]) if store else _empty_list(tf.float32, [batch, width])
         # Frames from resident_from on stay on the GPU.
         resident_from = length - self._PREFETCH
         blocked = tf.zeros([0]) if blocked_store else _empty_list(tf.int32, [batch, words])
+        # The stores take each step's frames at the start of the next step
+        # (the last step's after the loop). TensorFlow's automatic control
+        # dependencies make every loop variable of the next iteration wait
+        # for the stateful ops of the body: offloading the step's own GLIF
+        # outputs would hold the next step until this one's GLIF op had run
+        # on the host, so the host could no longer queue steps ahead of the
+        # GPU. The previous step's frames are at hand when the step starts.
+        # Packed words cross the loop as uint32 views (int32 loop variables
+        # live in host memory); a disabled store carries an empty placeholder.
+        placeholder = tf.zeros([0])
+        pending = (
+            states[1] if store else placeholder,  # frame -1: dropped
+            tf.bitcast(packed_history[-1], tf.uint32) if spike_store else placeholder,
+            tf.zeros([batch, words], tf.uint32) if blocked_store else placeholder,  # dropped
+        )
+
+        def hand_over(pending, time, frames, voltages, blocked):
+            """Offloads step ``time``'s frames (frames before 0 or past the
+            record's end are dropped by the op, without a tf.cond, whose host
+            predicate would be copied to the GPU every step)."""
+            voltage, spike_words, blocked_words = pending
+            if store:
+                voltages = frame_store.offload_frame(
+                    voltage, time, store, length, resident_from, self._COPY_GROUP,
+                    codec="tq" if self.voltage_offload in ("adaptive", "compressed") else "raw",
+                    drop_outside=True,
+                )
+            if spike_store:
+                with tf.control_dependencies([frames]):
+                    frames = frame_store.offload_frame(
+                        tf.bitcast(spike_words, tf.int32), time + cell.max_delay, spike_store,
+                        length, resident_from, self._COPY_GROUP, codec="raw", drop_outside=True,
+                    )
+            if blocked_store:
+                with tf.control_dependencies([blocked]):
+                    blocked = frame_store.offload_frame(
+                        tf.bitcast(blocked_words, tf.int32), time, blocked_store, length,
+                        resident_from, self._COPY_GROUP, codec="raw", drop_outside=True,
+                    )
+            return frames, voltages, blocked
+
         sampling = _Sampling.of(statistics, width) if statistics.traces else None
         traces = (tf.TensorArray(spike_dtype, size=length),) if sampling else ()
         # Whether each step is counted is a device constant: a host scalar
@@ -490,7 +529,8 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             [float(count_start <= time < count_stop) for time in range(length)], count_dtype
         )
 
-        def step(time, states, counts, frames, voltages, blocked, traces):
+        def step(time, states, counts, frames, voltages, blocked, traces, pending):
+            frames, voltages, blocked = hand_over(pending, time - 1, frames, voltages, blocked)
             # The statistics read the exposed spikes, as the losses read the
             # sequence, so their gradient arrives as the exposed spikes' one.
             # `call`, not Keras' `__call__`: called directly (outside the RNN
@@ -507,48 +547,29 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             )
             counts, *values = _record_step(spikes, counts, counted[time], sampling)
             traces = tuple(array.write(time, value) for array, value in zip(traces, values))
-            voltages = (
-                frame_store.offload_frame(
-                    voltage, time, store, length, resident_from, self._COPY_GROUP,
-                    codec="tq" if self.voltage_offload in ("adaptive", "compressed") else "raw",
-                ) if store
-                else _push(voltages, voltage)
-            )
-            if spike_store:
-                # Int32 control-flow inputs live on the host in TensorFlow.
-                # Carry the same bits on the GPU; the store still takes int32.
-                packed_spikes = tf.bitcast(packed_spikes, tf.uint32)
-                with tf.control_dependencies([frames]):
-                    frames = tf.cond(
-                        time + cell.max_delay < length,
-                        lambda: frame_store.offload_frame(
-                            tf.bitcast(packed_spikes, tf.int32),
-                            time + cell.max_delay, spike_store, length,
-                            resident_from, self._COPY_GROUP, codec="raw",
-                        ),
-                        lambda: tf.identity(frames),
-                    )
-            else:
+            if not store:
+                voltages = _push(voltages, voltage)
+            if not spike_store:
                 frames = _push(frames, packed_spikes)
-            if blocked_store:
-                with tf.control_dependencies([blocked]):
-                    blocked = frame_store.offload_frame(
-                        packed_blocked, time, blocked_store, length, resident_from,
-                        self._COPY_GROUP, codec="raw",
-                    )
-            else:
+            if not blocked_store:
                 blocked = _push(blocked, packed_blocked)
-            return time + 1, new_states, counts, frames, voltages, blocked, traces
+            pending = (
+                voltage if store else pending[0],
+                tf.bitcast(packed_spikes, tf.uint32) if spike_store else pending[1],
+                tf.bitcast(packed_blocked, tf.uint32) if blocked_store else pending[2],
+            )
+            return time + 1, new_states, counts, frames, voltages, blocked, traces, pending
 
         # The LGN weights are constant over the rollout: their per-pair sums for
         # the coalesced current sweep are computed once, here, not every step.
         with cell.lgn_pair_weights_scope():
-            _, states, counts, frames, voltages, blocked, traces = tf.while_loop(
+            _, states, counts, frames, voltages, blocked, traces, pending = tf.while_loop(
                 lambda time, *_: time < length,
                 step,
-                (tf.constant(0), states, counts, frames, voltages, blocked, traces),
+                (tf.constant(0), states, counts, frames, voltages, blocked, traces, pending),
                 parallel_iterations=32,
             )
+        frames, voltages, blocked = hand_over(pending, length - 1, frames, voltages, blocked)
         outputs = _statistic_outputs(
             counts, traces[0].stack() if traces else None, statistics, spike_dtype
         )
@@ -753,10 +774,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             if spike_store:
                 words = frame_store.take_frame(
                     index, spike_store, frames_like,
-                    prefetch=self._PREFETCH, group=self._COPY_GROUP,
+                    prefetch=self._PREFETCH, group=self._COPY_GROUP, zero_before_start=True,
                 )
-                # Both the conditional result and the delay-window loop carry
-                # must stay on the GPU, unlike int32 control-flow tensors.
+                # The delay-window loop carry must stay on the GPU, unlike
+                # int32 control-flow tensors.
                 return tf.bitcast(words, tf.uint32)
             return tf.raw_ops.TensorListGetItem(
                 input_handle=frames, index=index,
@@ -788,13 +809,11 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             else:
                 blocked, packed_blocked = _pop(blocked, frames_like)
             # z[time - 1 - delay], the next step's oldest slot, is frame
-            # time - 1; at time 0 the read is unused.
+            # time - 1; at time 0 the read is unused (the store's zero frame,
+            # not a tf.cond: see hand_over in the forward).
             if spike_store:
                 with tf.control_dependencies([voltage_g, frames]):
-                    oldest_words = tf.cond(
-                        time > 0, lambda: frame(time - 1),
-                        lambda: tf.zeros_like(packed_slots[0]),
-                    )
+                    oldest_words = frame(time - 1)
             else:
                 oldest_words = frame(tf.maximum(time - 1, 0))
             oldest = _unpack_frame(

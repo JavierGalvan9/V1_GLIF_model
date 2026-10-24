@@ -36,7 +36,8 @@ for _op in ("V1FrameStoreOffload", "V1FrameStoreTake"):
     tf.no_gradient(_op)
 
 
-def offload_frame(frame, index, key, capacity, resident_from=None, group=1, codec="raw"):
+def offload_frame(frame, index, key, capacity, resident_from=None, group=1, codec="raw",
+                  drop_outside=False):
     """Hand ``frame`` to slot ``index`` (int32, < ``capacity``) of the host
     store ``key`` of this GPU. Slots at or above ``resident_from`` stay on the
     GPU; the others are copied out in groups of ``group`` as fast as the copy
@@ -45,18 +46,22 @@ def offload_frame(frame, index, key, capacity, resident_from=None, group=1, code
     ``capacity - 1`` stay on the GPU. With ``codec="tq"`` float32 frames go
     out raw while the link keeps up and TQ-pack encoded (lossy, on the grid
     2**-16, error <= 2**-17) as far as the link needs, also while they stay
-    on the GPU. Returns an empty token."""
+    on the GPU. With ``drop_outside`` an index outside [0, ``capacity``)
+    records nothing (in place of a ``tf.cond``, whose host predicate
+    TensorFlow copies to the GPU and waits for). Returns an empty token."""
     return _load_ops().v1_frame_store_offload(
         frame, index, key=key, capacity=capacity,
         resident_from=capacity if resident_from is None else resident_from, group=group,
-        codec=codec,
+        codec=codec, drop_outside=drop_outside,
     )
 
 
-def take_frame(index, key, like, prefetch=0, group=1):
+def take_frame(index, key, like, prefetch=0, group=1, zero_before_start=False):
     """Frame ``index`` of the store ``key`` on this GPU, shaped and typed as
     ``like``; with ``prefetch``, then starts fetching frames index - 1 ..
-    index - prefetch in groups of ``group``."""
+    index - prefetch in groups of ``group``. With ``zero_before_start`` a
+    negative index returns zeros (in place of a ``tf.cond``, as above)."""
     return _load_ops().v1_frame_store_take(
-        index, key=key, T=like.dtype, shape=like.shape, prefetch=prefetch, group=group
+        index, key=key, T=like.dtype, shape=like.shape, prefetch=prefetch, group=group,
+        zero_before_start=zero_before_start,
     )

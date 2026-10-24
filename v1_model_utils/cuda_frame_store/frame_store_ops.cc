@@ -35,6 +35,10 @@ using namespace tensorflow;
 // length and decoded when taken. Other dtypes, and "raw", store the exact
 // bits. The forward never waits for the copies or the encoder: a frame the
 // ring cannot take stays raw.
+// With `drop_outside`, an index outside [0, capacity) records nothing, so a
+// loop can hand over frames before the record's start or past its end without
+// a conditional (whose host predicate TensorFlow copies to the GPU, and waits
+// for, every step).
 // Returns an empty token (a data edge for ordering).
 REGISTER_OP("V1FrameStoreOffload")
     .Attr("T: {float, half, int32}")
@@ -43,6 +47,7 @@ REGISTER_OP("V1FrameStoreOffload")
     .Attr("resident_from: int >= 0")
     .Attr("group: int >= 1 = 1")
     .Attr("codec: {'raw', 'tq'} = 'raw'")
+    .Attr("drop_outside: bool = false")
     .Input("frame: T")
     .Input("index: int32")
     .Output("token: float")
@@ -64,13 +69,15 @@ REGISTER_OP("V1FrameStoreOffload")
 // frame decodes from the reconstructions of the frames after it: those a
 // take handed out are kept while a stored frame below still needs them (until
 // the next rollout for frames not on the host); others are rebuilt from the
-// stored chain.
+// stored chain. With `zero_before_start`, a negative index returns a zero
+// frame (without a conditional, as above) and leaves the store untouched.
 REGISTER_OP("V1FrameStoreTake")
     .Attr("T: {float, half, int32}")
     .Attr("key: string")
     .Attr("shape: shape")
     .Attr("prefetch: int >= 0 = 0")
     .Attr("group: int >= 1 = 1")
+    .Attr("zero_before_start: bool = false")
     .Input("index: int32")
     .Output("frame: T")
     .SetIsStateful()

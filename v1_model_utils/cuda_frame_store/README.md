@@ -36,11 +36,26 @@ inside the prefetch window, or when the CUDA store is unavailable, the records
 remain on the GPU. Training warns and ignores the option in other backward
 modes; evaluation commands do not receive it.
 
-Packed spike histories use `uint32` bit views while crossing TensorFlow
-conditionals and the backward delay-window loop. TensorFlow's GPU control-flow
-kernels keep `int32` tensors in host memory, which would introduce extra,
-synchronous frame transfers. The store and spike kernels still receive the
-original `int32` bits; these views do not change the packed format or gradients.
+Packed spike histories use `uint32` bit views while crossing the backward
+delay-window loop. TensorFlow's GPU control-flow kernels keep `int32` tensors in
+host memory, which would introduce extra, synchronous frame transfers. The store
+and spike kernels still receive the original `int32` bits; these views do not
+change the packed format or gradients.
+
+The rollout loops call the ops without `tf.cond`. Frames outside the record
+(the spike frames of the forward's last `max_delay` steps) are dropped by the
+offload itself (`drop_outside`), and the reverse loop's read before frame 0
+returns zeros (`zero_before_start`). A `tf.cond` inside a GPU loop copies its
+host predicate to the GPU every step, and TensorFlow releases that copy only
+once the compute stream has reached it, so the host ran in lockstep with the GPU.
+
+The forward hands each step's frames to the stores at the start of the next
+step (the last step's after the loop). TensorFlow's automatic control
+dependencies make every loop variable of the next iteration wait for the
+stateful ops of the loop body; offloading the step's own GLIF outputs held the
+next step until this step's GLIF op had run on the host, so the host could not
+queue steps ahead of the GPU. The frames, their order and the stores' memory
+are unchanged.
 
 ## Modes
 
