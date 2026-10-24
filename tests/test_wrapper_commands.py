@@ -80,3 +80,23 @@ def test_printed_commands_parse_in_their_target_scripts(
         # An unquoted empty value would have consumed the following flag.
         restored = result.stdout.strip().splitlines()[-1]
         assert not restored.startswith("restore_from='--"), restored
+
+
+@pytest.mark.parametrize("wrapper", ["parallel_training_testing", "parallel_training_testing_allen"])
+@pytest.mark.parametrize("arguments,expected", [
+    ([], ("none", "none")),
+    (["--voltage_offload", "--history_offload"], ("adaptive", "adaptive")),
+    (["--voltage_offload", "raw", "--history_offload", "none"], ("raw", "none")),
+    (["--voltage_offload=compressed", "--history_offload=raw"], ("compressed", "raw")),
+])
+def test_offload_flags_only_reach_training(wrapper, arguments, expected,
+                                          tmp_path, monkeypatch, capsys):
+    commands = _python_commands(wrapper, arguments, tmp_path, monkeypatch, capsys)
+    assert commands
+    for script, *args in commands:
+        if script == "multi_training.py":
+            assert args[args.index("--voltage_offload") + 1] == expected[0]
+            assert args[args.index("--history_offload") + 1] == expected[1]
+        else:
+            assert "--voltage_offload" not in args
+            assert "--history_offload" not in args

@@ -187,9 +187,10 @@ def _runner(length, mode=None):
 
 @pytest.mark.parametrize("length", [1, 2, 3, 7, 11])
 @pytest.mark.parametrize("rollouts", [1, 2])
-def test_history_offload_matches_resident_adjoint(portable_backend, length, rollouts):
+@pytest.mark.parametrize("mode", ["raw", "adaptive"])
+def test_history_offload_matches_resident_adjoint(portable_backend, length, rollouts, mode):
     portable_backend.prepare(length, rollouts)
-    resident, offloaded = _runner(length, "none"), _runner(length, "raw")
+    resident, offloaded = _runner(length, "none"), _runner(length, mode)
     # Short sequences ordinarily stay resident; exercise transport even at L < delay.
     offloaded._PREFETCH = 0 if length <= offloaded._PREFETCH else offloaded._PREFETCH
     rng = np.random.default_rng(13)
@@ -229,6 +230,7 @@ def test_history_offload_matches_resident_adjoint(portable_backend, length, roll
 
 def test_history_offload_configuration_and_fallbacks(portable_backend, monkeypatch):
     assert _runner(11).history_offload == "none"
+    assert _runner(11).voltage_offload == "none"
     with pytest.raises(ValueError, match="history_offload"):
         _runner(11, "compressed")
     runner = _runner(11, "raw")
@@ -241,3 +243,38 @@ def test_history_offload_configuration_and_fallbacks(portable_backend, monkeypat
         return tf.constant(1)
 
     assert fallback().numpy() == 1
+
+
+@pytest.mark.parametrize("mode,codec", [("raw", "raw"), ("adaptive", "tq"),
+                                       ("compressed", "tq")])
+def test_voltage_offload_selects_codec(portable_backend, monkeypatch, mode, codec):
+    length = 11
+    runner = adjoint.RecordedAdjointRunner(
+        SimpleNamespace(_v1_sequence_output_count=1), _Cell(), length, 4,
+        differentiate_inputs=False, voltage_offload=mode,
+    )
+    monkeypatch.setattr(runner, "_frame_store",
+                        lambda name, enabled, *args: name if enabled else None)
+    codecs = []
+
+    def offload(value, index, key, *args, codec):
+        assert key == "voltages" and value.dtype == tf.float32
+        codecs.append(codec)
+        return tf.zeros([0])
+
+    monkeypatch.setattr(adjoint.frame_store, "offload_frame", offload)
+    state = tuple(tf.zeros((BATCH, size), dtype) for size, dtype in (
+        (WIDTH * DELAY, tf.float32), (WIDTH, tf.float32), (WIDTH, tf.int32),
+        (WIDTH * 2, tf.float32), (WIDTH * 4, tf.float32), (WIDTH * 4, tf.float32),
+        (1, tf.int32),
+    ))
+
+    @tf.function(autograph=False)
+    def run():
+        outputs, _, _ = runner._forward_records(
+            tf.zeros((BATCH, length, WIDTH)), state, adjoint.SpikeStatistics((0, length)),
+        )
+        return outputs
+
+    run()
+    assert codecs and set(codecs) == {codec}

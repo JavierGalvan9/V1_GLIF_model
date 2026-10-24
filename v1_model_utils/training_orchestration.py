@@ -17,6 +17,7 @@ import sys
 import time
 
 from v1_model_utils import gpu_selection
+from v1_model_utils.offload_options import normalize_offload_args
 
 _WORKER_FLAG = "distributed_worker_index"
 _MODE_FLAG = "distributed_mode"
@@ -186,7 +187,7 @@ def plan_training_launch(
     argv, *, environ=None, worker_addresses=None, compute_capabilities=None
 ):
     """Validate CLI distribution settings and return an immutable launch plan."""
-    argv = tuple(argv)
+    argv = normalize_offload_args(argv)
     environ = os.environ if environ is None else environ
     n_gpus = int(_option(argv, "n_gpus", 1))
     if n_gpus < 1:

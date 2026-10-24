@@ -21,6 +21,7 @@ import numpy as np
 import tensorflow as tf
 
 from . import models
+from .offload_options import HISTORY_OFFLOAD_MODES, VOLTAGE_OFFLOAD_MODES
 from .cuda_csr_external.wrapper import (
     external_backward,
     incoming_weight_backward,
@@ -331,17 +332,12 @@ def _chunk_cotangent(count_gradient, counted, trace_gradients, sampling, runs, f
     return tf.reshape(scattered, cotangent.shape)
 
 
-# How the runner keeps its float32 membrane record (see the runner).
-VOLTAGE_OFFLOAD_MODES = ("none", "raw", "compressed")
-HISTORY_OFFLOAD_MODES = ("none", "raw")
-
-
 class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     """A SegmentedRecomputeRunner whose rollouts, given SpikeStatistics, return
     those statistics instead of the spike sequence and differentiate from
     minimal forward records instead of replaying chunks.
 
-    With ``voltage_offload`` "raw" or "compressed" (graph mode, CUDA frame
+    With ``voltage_offload`` "raw" or "adaptive" (graph mode, CUDA frame
     store available) the float32 membrane record, its earliest frames first,
     goes to pinned host memory as the forward runs and comes back ahead of the
     reverse loop (cuda_frame_store). The latest ``_PREFETCH`` frames, which the
@@ -349,13 +345,14 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     engine could not take before the forward ended (the store admits copies as
     earlier ones finish), so the offloaded share adapts to the PCIe bandwidth.
     "raw" copies are exact, so the gradients are those of the GPU-resident
-    record. "compressed" encodes offloaded frames with TQ-pack (lossy, on the
+    record. "adaptive" (also accepted as "compressed") encodes offloaded frames
+    with TQ-pack (lossy, on the
     grid 2**-16: absolute error <= 2**-17 ~= 7.6e-6 per stored value; the live
     forward voltage stays exact) only as far as the link could not otherwise
     take them before the forward ends; the others go out exact, and the
     frames the copy engine cannot take stay on the GPU encoded.
 
-    ``history_offload="raw"`` independently parks the bit-packed spike and
+    ``history_offload="adaptive"`` (also accepted as "raw") parks the bit-packed spike and
     refractory records in pinned host memory with the same adaptive copies.
     Their int32 words remain exact; a bounded spike window serves the reverse
     loop so every recorded frame is fetched only once. Both options default
@@ -513,7 +510,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             voltages = (
                 frame_store.offload_frame(
                     voltage, time, store, length, resident_from, self._COPY_GROUP,
-                    codec="tq" if self.voltage_offload == "compressed" else "raw",
+                    codec="tq" if self.voltage_offload in ("adaptive", "compressed") else "raw",
                 ) if store
                 else _push(voltages, voltage)
             )

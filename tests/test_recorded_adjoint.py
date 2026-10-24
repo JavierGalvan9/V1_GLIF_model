@@ -154,7 +154,7 @@ class RecordedAdjointTest(unittest.TestCase):
         self.assertEqual(bool(stores[0]), runner.voltage_offload != "none")
         self.assertEqual(tuple(map(bool, history_stores[0])),
                          (runner.history_offload != "none",) * 2)
-        lossy = runner.voltage_offload == "compressed"
+        lossy = runner.voltage_offload in ("adaptive", "compressed")
         for name, expected, actual in zip(names, *gradients):
             expected = tf.convert_to_tensor(expected).numpy()
             actual = tf.convert_to_tensor(actual).numpy()

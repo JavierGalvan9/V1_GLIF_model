@@ -13,6 +13,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 
 # The launch plan picks the visible GPUs first, so the cache key names them.
 from v1_model_utils import training_orchestration
+from v1_model_utils.offload_options import HISTORY_OFFLOAD_MODES, VOLTAGE_OFFLOAD_MODES
 from v1_model_utils.training_bootstrap import TRAINING_LAUNCH_PLAN
 
 from v1_model_utils.cuda_caches import configure_cuda_caches
@@ -299,11 +300,11 @@ def main(_):
     import v1_model_utils.loss_functions as losses
     from v1_model_utils import load_sparse, models, other_v1_utils, recorded_adjoint
     from v1_model_utils import optimizers as optimizer_utils
-
     from v1_model_utils.cuda_prebuild import prebuild_for_run
 
     # Build the missing CUDA operator libraries together rather than one by one on first use.
     prebuild_for_run()
+
     # Configure seed for reproducibility
     tf_utils.configure_reproducibility(flags.seed)
     # Configure TensorFlow optimization options that have proven to be beneficial for our model and training setup. These options can improve the performance of the model by optimizing the computational graph and memory usage.
@@ -2605,11 +2606,13 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_enum(
         "voltage_offload",
         "none",
-        ["none", "raw", "compressed"],
+        VOLTAGE_OFFLOAD_MODES,
+        "Bare --voltage_offload enables adaptive mode; omission defaults to none. "
         "With --backward_mode recorded, where its float32 membrane record lives: none "
         "(GPU memory), raw (copied to pinned host memory during the forward, exact, and "
         "prefetched back in the backward; the frames the copy engine cannot take stay on "
-        "the GPU) or compressed (as raw, but frames the PCIe link could not otherwise take "
+        "the GPU) or adaptive (legacy alias: compressed; as raw, but frames the PCIe "
+        "link could not otherwise take "
         "are TQ-pack encoded: LOSSY on the grid 2^-16, |error| <= 7.6e-6 on the stored "
         "voltages only, so gradients are no longer bitwise). Needs the CUDA frame store "
         "op and pinned host RAM per GPU for the whole record (52 MB per step at batch 64 "
@@ -2619,9 +2622,11 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_enum(
         "history_offload",
         "none",
-        ["none", "raw"],
+        HISTORY_OFFLOAD_MODES,
+        "Bare --history_offload enables adaptive mode; omission defaults to none. "
         "With --backward_mode recorded, where the bit-packed spike and refractory "
-        "histories live: none (GPU memory) or raw (exact copies to pinned host RAM "
+        "histories live: none (GPU memory) or adaptive (legacy alias: raw; exact copies "
+        "to pinned host RAM "
         "during the forward, prefetched back during the backward). Independent of "
         "--voltage_offload. Uses the CUDA frame store; recent frames and frames the "
         "copy engine cannot take stay on the GPU. Requires pinned host RAM for both "
