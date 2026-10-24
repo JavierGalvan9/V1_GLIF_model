@@ -133,13 +133,34 @@ Status ReadSpikeSlots(const Tensors& tensors, SpikeMatrix<const T*>* matrix) {
 }
 
 constexpr int kEventThreads = 256;
-constexpr int kEventChunk = kEventThreads;
+// Pass 2's shape is set per architecture (cuda_csr_config): edges per queue
+// item, threads and minimum resident blocks per pass-2 block, and its grid.
+// Each edge keeps one writer and its sample order whatever the shape.
+#ifndef V1_EVENT_CHUNK
+#define V1_EVENT_CHUNK 256
+#endif
+#ifndef V1_EVENT_GRAD_THREADS
+#define V1_EVENT_GRAD_THREADS 256
+#endif
+constexpr int kEventChunk = V1_EVENT_CHUNK;
+constexpr int kEventGradThreads = V1_EVENT_GRAD_THREADS;
+// A minimum of resident blocks only where one is set (V1_EVENT_GRAD_MIN_BLOCKS):
+// even an explicit 1 changes ptxas' register allocation.
+#ifdef V1_EVENT_GRAD_MIN_BLOCKS
+#define V1_EVENT_GRAD_BOUNDS __launch_bounds__(kEventGradThreads, V1_EVENT_GRAD_MIN_BLOCKS)
+#else
+#define V1_EVENT_GRAD_BOUNDS __launch_bounds__(kEventGradThreads)
+#endif
+static_assert(kEventChunk % 32 == 0 && kEventGradThreads % 32 == 0, "whole warps of edges");
 // Fixed consumer grid (188 SMs x 24 blocks on the RTX PRO 6000). Fewer are
 // resident at once, so later blocks start as earlier ones finish; for the event
 // weight gradient this times the same as 2256 to 18048 blocks, and faster than
 // a grid of only the resident blocks. Each block strides the queue and reads its
 // length on the device, so no launch waits for the host to learn a count.
 constexpr int kEventBlocks = 4512;
+#ifndef V1_EVENT_GRAD_BLOCKS
+#define V1_EVENT_GRAD_BLOCKS kEventBlocks
+#endif
 // Batches up to this size carry their active samples as a bit mask in the queue
 // item (two words); a larger batch keeps one mask per row in the queue scratch.
 constexpr int kEventMaskSamples = 64;
@@ -350,14 +371,14 @@ __device__ __forceinline__ float EdgeProjection(const T* grad, const float* type
 // activity * EdgeProjection over the active samples in ascending order, then
 // one write of old + sum.
 template <typename T, int kBasis, bool kRowMasks>
-__global__ __launch_bounds__(kEventThreads) void EventWeightGradWarpKernel(
+__global__ V1_EVENT_GRAD_BOUNDS void EventWeightGradWarpKernel(
     int n_post, int n_basis, SpikeSlots<const T*> slots, const T* current_grad,
     const float* basis, const uint32* post_ids, const uint8* synapse_types,
     const uint32* row_splits, const uint32* edge_ids, const unsigned int* row_masks,
     int mask_words, const unsigned int* queue, const unsigned int* queue_count,
     float* weight_grad) {
   constexpr int kLaneEdges = kEventChunk / 32;
-  constexpr int kWarps = kEventThreads / 32;
+  constexpr int kWarps = kEventGradThreads / 32;
   const int lane = threadIdx.x & 31;
   const int64_t sample_stride = static_cast<int64_t>(n_post) * n_basis;
   const unsigned int total = *queue_count;
@@ -469,7 +490,7 @@ Status LaunchEventWeightGrad(OpKernelContext* context, const SpikeMatrix<const T
   const auto pass2 = item_masks ? EventWeightGradWarpKernel<T, kBasis, false>
                                 : EventWeightGradWarpKernel<T, kBasis, true>;
   return GpuLaunchKernel(
-      pass2, kEventBlocks, kEventThreads, 0, device.stream(),
+      pass2, V1_EVENT_GRAD_BLOCKS, kEventGradThreads, 0, device.stream(),
       n_post, static_cast<int>(basis.dim_size(1)), activity.slots,
       current_grad.flat<T>().data(), basis.flat<float>().data(),
       post_ids.flat<uint32>().data(), synapse_types.flat<uint8>().data(),
