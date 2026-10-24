@@ -2,6 +2,7 @@ import os
 import pickle as pkl
 import json
 import hashlib
+import lz4.frame
 import tensorflow as tf
 import h5py
 import numpy as np
@@ -45,7 +46,8 @@ def v1_cache_path(flags, n_neurons, flag_str):
     key = _digest(
         {"version": _V1_CACHE_VERSION, "config": _v1_cache_config(flags, n_neurons)}
     )[:12]
-    return os.path.join(flags.data_dir, "tf_data", f"V1_network_{flag_str}_{key}.pkl")
+    suffix = ".pkl.lz4" if getattr(flags, "compress_model_cache", False) else ".pkl"
+    return os.path.join(flags.data_dir, "tf_data", f"V1_network_{flag_str}_{key}{suffix}")
 
 
 def _v1_cache_provenance(flags, n_neurons):
@@ -841,9 +843,14 @@ def load_v1(flags, n_neurons, flag_str=''):
     return network, lgn_input, bkg_input
 
 
-# If the model already exist we can load it, or if it does not just save it for future occasions
 def cached_load_v1(flags, n_neurons, flag_str=''):
-    store = False
+    """Restore or build a model, storing the requested plain or LZ4 encoding.
+
+    Changing compression reuses a valid cache without rebuilding the network.
+    Conversion retains the original cache; subsequent runs use the requested
+    encoding directly. Other tf_data caches are unaffected.
+    """
+    store = True
     network, lgn_input, bkg_input = None, None, None
 
     if flag_str == '':
@@ -852,53 +859,60 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
         for name, value in flags.flag_values_dict().items():
             if value != flags[name].default and name in ['n_input', 'core_only', 'connected_selection', 'random_weights', 'uniform_weights']:
                 flag_str += f'_{name}_{value}'
-        # flag_str = f"neurons_{n_neurons}_n_input_{flags.n_input}_s{flags.seed}_c{flags.core_only}_con{flags.connected_selection}_random_weights_{flags.random_weights}_uniform_weights_{flags.uniform_weights}"
-    
-    # file_dir = os.path.split(__file__)[0]
+
     cache_dir = os.path.join(flags.data_dir, "tf_data")
     cache_path = v1_cache_path(flags, n_neurons, flag_str)
+    compressed = getattr(flags, "compress_model_cache", False)
+    alternate_path = cache_path.removesuffix(".lz4") if compressed else cache_path + ".lz4"
     # Caches written before the configuration key was added to the name.
     legacy_path = os.path.join(cache_dir, f"V1_network_{flag_str}.pkl")
-    read_path = cache_path if os.path.exists(cache_path) else legacy_path
     provenance = _v1_cache_provenance(flags, n_neurons)
     print(f"> Looking for cached V1 model in {cache_path}")
 
-    if os.path.exists(read_path):
+    for read_path in (cache_path, alternate_path, legacy_path):
+        if not os.path.exists(read_path):
+            continue
         try:
-            with open(read_path, "rb") as f:
+            cache_open = lz4.frame.open if read_path.endswith(".lz4") else open
+            with cache_open(read_path, "rb") as f:
                 cached = pkl.load(f)
-            if (
+            if not (
                 isinstance(cached, dict)
                 and cached.get("version") == _V1_CACHE_VERSION
                 and cached.get("provenance") == provenance
             ):
-                network, lgn_input, bkg_input = cached["payload"]
-                # The provenance is location-independent, so a data directory
-                # copied to another host or path keeps its caches valid; the
-                # stored data_dir must then follow the current location.
-                network["data_dir"] = flags.data_dir
-                if read_path != cache_path:
-                    os.replace(read_path, cache_path)
-                print(f"> Sucessfully restored V1 model from {read_path}")
-            else:
-                print(f"> Cached V1 model provenance does not match; rebuilding {cache_path}")
-                store = True
+                print(f"> Cached V1 model provenance does not match: {read_path}")
+                del cached
+                continue
+            network, lgn_input, bkg_input = cached["payload"]
+            if network is None or lgn_input is None or bkg_input is None:
+                raise ValueError("Incomplete cached V1 model")
+            # Provenance is location-independent; follow the current data dir.
+            network["data_dir"] = flags.data_dir
         except Exception as e:
             print(e)
-            store = True
-    else:
-        store = True
+            cached = None
+            network, lgn_input, bkg_input = None, None, None
+            continue
+        if read_path == legacy_path and not compressed:
+            os.replace(read_path, cache_path)
+            store = False
+        else:
+            store = read_path != cache_path
+        print(f"> Successfully restored V1 model from {read_path}")
+        break
 
     if lgn_input is None or network is None or bkg_input is None:
         network, lgn_input, bkg_input = load_v1(flags=flags, n_neurons=n_neurons)
 
     if store:
-        # os.makedirs(os.path.join(file_dir, ".cache"), exist_ok=True)
         os.makedirs(cache_dir, exist_ok=True)
         provenance = _v1_cache_provenance(flags, n_neurons)
         temporary_path = f"{cache_path}.{os.getpid()}.tmp"
         try:
-            with open(temporary_path, "wb") as f:
+            cache_open = lz4.frame.open if compressed else open
+            options = {"compression_level": 0} if compressed else {}
+            with cache_open(temporary_path, "wb", **options) as f:
                 pkl.dump(
                     {
                         "version": _V1_CACHE_VERSION,

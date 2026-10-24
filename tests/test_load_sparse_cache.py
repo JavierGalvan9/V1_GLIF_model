@@ -3,6 +3,7 @@ import shutil
 from types import SimpleNamespace
 
 import h5py
+import lz4.frame
 import pytest
 import numpy as np
 
@@ -93,11 +94,12 @@ class _Flags(SimpleNamespace):
         return SimpleNamespace(default=getattr(self, name))
 
 
-def _flags(data_dir, seed):
+def _flags(data_dir, seed, compress_model_cache=False):
     return _Flags(
         data_dir=str(data_dir), neurons=2, n_input=10, core_only=False,
         connected_selection=False, random_weights=False, uniform_weights=False,
         seed=seed, loss_core_radius=400.0, n_output=1, neurons_per_output=1,
+        compress_model_cache=compress_model_cache,
     )
 
 
@@ -122,7 +124,8 @@ def test_cached_load_v1_does_not_reuse_seed_dependent_payload(tmp_path, monkeypa
     assert calls == [1, 2]
 
 
-def test_cached_load_v1_invalidates_payload_when_source_changes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_cached_load_v1_invalidates_payload_when_source_changes(tmp_path, monkeypatch, compressed):
     (tmp_path / "tf_data").mkdir()
     (tmp_path / "network").mkdir()
     source = tmp_path / "network" / "v1_nodes.h5"
@@ -134,7 +137,7 @@ def test_cached_load_v1_invalidates_payload_when_source_changes(tmp_path, monkey
         return {"source": calls[-1]}, {}, {}
 
     monkeypatch.setattr(load_sparse, "load_v1", fake_load)
-    flags = _flags(tmp_path, 1)
+    flags = _flags(tmp_path, 1, compressed)
     load_sparse.cached_load_v1(flags, 2, flag_str="shared")
     source.write_bytes(b"second and changed")
     result = load_sparse.cached_load_v1(flags, 2, flag_str="shared")
@@ -143,7 +146,8 @@ def test_cached_load_v1_invalidates_payload_when_source_changes(tmp_path, monkey
     assert calls == [b"first", b"second and changed"]
 
 
-def test_failed_cache_dump_leaves_no_temporary_file(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_failed_cache_dump_leaves_no_temporary_file(tmp_path, monkeypatch, compressed):
     (tmp_path / "tf_data").mkdir()
     (tmp_path / "network").mkdir()
     monkeypatch.setattr(load_sparse, "load_v1", lambda flags, n_neurons: ({}, {}, {}))
@@ -154,7 +158,7 @@ def test_failed_cache_dump_leaves_no_temporary_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(load_sparse.pkl, "dump", full_disk)
     with pytest.raises(OSError):
-        load_sparse.cached_load_v1(_flags(tmp_path, 1), 2, flag_str="shared")
+        load_sparse.cached_load_v1(_flags(tmp_path, 1, compressed), 2, flag_str="shared")
     assert list((tmp_path / "tf_data").iterdir()) == []
 
 
@@ -174,10 +178,11 @@ def test_alternating_seeds_reuse_their_own_caches(tmp_path, monkeypatch):
     assert calls == [1, 2]
 
 
-def test_matching_legacy_cache_is_renamed_instead_of_rebuilt(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_matching_legacy_cache_is_reused_without_rebuilding(tmp_path, monkeypatch, compressed):
     (tmp_path / "tf_data").mkdir()
     (tmp_path / "network").mkdir()
-    flags = _flags(tmp_path, 1)
+    flags = _flags(tmp_path, 1, compressed)
     legacy = tmp_path / "tf_data" / "V1_network_shared.pkl"
     with open(legacy, "wb") as handle:
         load_sparse.pkl.dump({
@@ -190,11 +195,15 @@ def test_matching_legacy_cache_is_renamed_instead_of_rebuilt(tmp_path, monkeypat
     result = load_sparse.cached_load_v1(flags, 2, flag_str="shared")
 
     assert result[0]["legacy"] is True
-    assert not legacy.exists()
+    assert legacy.exists() == compressed
     assert os.path.exists(load_sparse.v1_cache_path(flags, 2, "shared"))
+    if compressed:
+        with lz4.frame.open(load_sparse.v1_cache_path(flags, 2, "shared"), "rb") as handle:
+            assert load_sparse.pkl.load(handle)["payload"][0]["legacy"] is True
 
 
-def test_cache_restored_from_a_moved_data_dir_points_at_the_new_location(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_cache_restored_from_a_moved_data_dir_points_at_the_new_location(tmp_path, monkeypatch, compressed):
     original = tmp_path / "original"
     (original / "tf_data").mkdir(parents=True)
     (original / "network").mkdir()
@@ -203,7 +212,7 @@ def test_cache_restored_from_a_moved_data_dir_points_at_the_new_location(tmp_pat
         load_sparse, "load_v1",
         lambda flags, n_neurons: ({"data_dir": flags.data_dir}, {}, {}),
     )
-    load_sparse.cached_load_v1(_flags(original, 1), 2, flag_str="shared")
+    load_sparse.cached_load_v1(_flags(original, 1, compressed), 2, flag_str="shared")
 
     # Copying with metadata (as rsync -a does) keeps the provenance valid.
     moved = tmp_path / "moved"
@@ -211,6 +220,91 @@ def test_cache_restored_from_a_moved_data_dir_points_at_the_new_location(tmp_pat
     shutil.rmtree(original)
     monkeypatch.setattr(load_sparse, "load_v1", lambda *args, **kwargs: pytest.fail("rebuilt"))
 
-    result = load_sparse.cached_load_v1(_flags(moved, 1), 2, flag_str="shared")
+    result = load_sparse.cached_load_v1(_flags(moved, 1, compressed), 2, flag_str="shared")
 
     assert result[0]["data_dir"] == str(moved)
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_model_cache_roundtrips_numpy_arrays_without_rebuilding(tmp_path, monkeypatch, compressed):
+    flags = _flags(tmp_path, 1, compressed)
+    weights = np.arange(12, dtype=np.float32).reshape(3, 4)
+    indices = np.array([[0, 1], [2, 3]], dtype=np.int32)
+    monkeypatch.setattr(load_sparse, "load_v1", lambda **kwargs: (
+        {"synapses": {"weights": weights, "indices": indices}}, {}, {},
+    ))
+    load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+    path = load_sparse.v1_cache_path(flags, 2, "shared")
+    with open(path, "rb") as handle:
+        assert (handle.read(4) == b"\x04\x22\x4d\x18") == compressed
+    monkeypatch.setattr(load_sparse, "load_v1", lambda **kwargs: pytest.fail("rebuilt"))
+
+    network, _, _ = load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+
+    for key, expected in (("weights", weights), ("indices", indices)):
+        actual = network["synapses"][key]
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.dtype == expected.dtype
+    assert network["data_dir"] == str(tmp_path)
+
+
+@pytest.mark.parametrize("initial_compressed", [False, True])
+@pytest.mark.parametrize("invalid_preferred", [False, True])
+def test_switching_cache_encoding_reuses_payload_and_preserves_original(
+    tmp_path, monkeypatch, initial_compressed, invalid_preferred
+):
+    flags = _flags(tmp_path, 1, initial_compressed)
+    monkeypatch.setattr(load_sparse, "load_v1", lambda **kwargs: ({"seed": 1}, {}, {}))
+    load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+    original_path = load_sparse.v1_cache_path(flags, 2, "shared")
+    with open(original_path, "rb") as handle:
+        original_bytes = handle.read()
+    original_provenance = load_sparse._v1_cache_provenance(flags, 2)
+    flags.compress_model_cache = not initial_compressed
+    requested_path = load_sparse.v1_cache_path(flags, 2, "shared")
+    if invalid_preferred:
+        with open(requested_path, "wb") as handle:
+            handle.write(b"corrupt cache")
+    monkeypatch.setattr(load_sparse, "load_v1", lambda **kwargs: pytest.fail("rebuilt"))
+
+    assert load_sparse.cached_load_v1(flags, 2, flag_str="shared")[0]["seed"] == 1
+    assert load_sparse.cached_load_v1(flags, 2, flag_str="shared")[0]["seed"] == 1
+
+    assert load_sparse._v1_cache_provenance(flags, 2) == original_provenance
+    with open(original_path, "rb") as handle:
+        assert handle.read() == original_bytes
+    assert os.path.exists(requested_path)
+    assert not list((tmp_path / "tf_data").glob("*.tmp"))
+
+
+def test_missing_compression_flag_preserves_plain_cache_path(tmp_path):
+    flags = _flags(tmp_path, 1)
+    plain_path = load_sparse.v1_cache_path(flags, 2, "shared")
+    del flags.compress_model_cache
+    assert load_sparse.v1_cache_path(flags, 2, "shared") == plain_path
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_failed_replacement_preserves_existing_cache(tmp_path, monkeypatch, compressed):
+    (tmp_path / "network").mkdir()
+    source = tmp_path / "network" / "v1_nodes.h5"
+    source.write_bytes(b"original")
+    flags = _flags(tmp_path, 1, compressed)
+    monkeypatch.setattr(load_sparse, "load_v1", lambda **kwargs: ({}, {}, {}))
+    load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+    cache_path = load_sparse.v1_cache_path(flags, 2, "shared")
+    with open(cache_path, "rb") as handle:
+        original_bytes = handle.read()
+    source.write_bytes(b"changed source")
+
+    def full_disk(payload, handle):
+        handle.write(b"partial")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(load_sparse.pkl, "dump", full_disk)
+    with pytest.raises(OSError):
+        load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+
+    with open(cache_path, "rb") as handle:
+        assert handle.read() == original_bytes
+    assert not list((tmp_path / "tf_data").glob("*.tmp"))

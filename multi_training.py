@@ -2552,6 +2552,10 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean('use_dale_law', True, '')
     # if one wants to use caching, remember to update the caching function
     absl.app.flags.DEFINE_boolean('caching', True, '')
+    absl.app.flags.DEFINE_boolean(
+        'compress_model_cache', False,
+        'Store constructed V1 model caches with LZ4 compression (.pkl.lz4).',
+    )
     # a little confusing.
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     # not used. should be retired.

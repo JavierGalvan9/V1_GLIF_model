@@ -177,6 +177,10 @@ parser.add_argument('--fano_samples', default=512, type=int)
 
 # parser.add_argument('--float16', default=False, action='store_true')
 parser.add_argument('--caching', default=True, action='store_true')
+parser.add_argument(
+    '--compress_model_cache', default=False, action='store_true',
+    help='Store constructed V1 model caches with LZ4 compression (.pkl.lz4).',
+)
 parser.add_argument('--core_only', default=False, action='store_true')
 parser.add_argument('--core_loss', default=False, action='store_true')
 parser.add_argument('--hard_reset', default=False, action='store_true')

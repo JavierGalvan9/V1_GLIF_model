@@ -83,6 +83,23 @@ def test_printed_commands_parse_in_their_target_scripts(
 
 
 @pytest.mark.parametrize("wrapper", ["parallel_training_testing", "parallel_training_testing_allen"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_model_cache_compression_reaches_training_and_evaluation(
+    wrapper, enabled, tmp_path, monkeypatch, capsys
+):
+    arguments = ["--compress_model_cache"] if enabled else []
+    commands = _python_commands(wrapper, arguments, tmp_path, monkeypatch, capsys)
+    assert {command[0] for command in commands} == {
+        "multi_training.py", "osi_dsi_estimator.py"
+    }
+    expected = "--compress_model_cache" if enabled else "--nocompress_model_cache"
+    opposite = "--nocompress_model_cache" if enabled else "--compress_model_cache"
+    for _, *args in commands:
+        assert expected in args
+        assert opposite not in args
+
+
+@pytest.mark.parametrize("wrapper", ["parallel_training_testing", "parallel_training_testing_allen"])
 @pytest.mark.parametrize("arguments,expected", [
     ([], ("none", "none")),
     (["--voltage_offload", "--history_offload"], ("adaptive", "adaptive")),

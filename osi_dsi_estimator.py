@@ -572,6 +572,10 @@ if __name__ == '__main__':
 
     # absl.app.flags.DEFINE_boolean('float16', False, '')
     absl.app.flags.DEFINE_boolean('caching', True, '')
+    absl.app.flags.DEFINE_boolean(
+        'compress_model_cache', False,
+        'Store constructed V1 model caches with LZ4 compression (.pkl.lz4).',
+    )
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     absl.app.flags.DEFINE_boolean('core_loss', False, '')
     absl.app.flags.DEFINE_boolean('all_neuron_rate_loss', False, '')  # whethre you want to enforce rate loss to all neurons
