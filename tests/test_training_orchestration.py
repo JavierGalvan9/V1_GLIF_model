@@ -22,6 +22,19 @@ class TrainingOrchestrationTests(unittest.TestCase):
         self.assertEqual(plan.n_gpus, 1)
         self.assertEqual(plan.per_replica_batch_size, 8)
 
+    def test_repeated_batch_flags_take_the_last_value_as_absl_does(self):
+        plan = training_orchestration.plan_training_launch(
+            [
+                "multi_training.py",
+                "--batch_size", "256", "--grating_batch_size=248", "--gray_batch_size", "8",
+                "--batch_size=32", "--grating_batch_size", "28", "--gray_batch_size=4",
+            ],
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            compute_capabilities=("8.9",),
+        )
+
+        self.assertEqual(plan.per_replica_batch_size, 32)
+
     def test_single_gpu_limits_tensorflow_to_the_first_visible_device(self):
         environ = {"CUDA_VISIBLE_DEVICES": "3,5"}
 

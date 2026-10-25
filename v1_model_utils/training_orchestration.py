@@ -76,15 +76,17 @@ class WorkerProcess:
 
 
 def _option(argv, name, default=None):
+    """Value of ``--name`` in ``argv``; the last occurrence wins, as in absl."""
     option = f"--{name}"
+    found = default
     for index, value in enumerate(argv[1:], start=1):
         if value.startswith(option + "="):
-            return value.split("=", 1)[1]
-        if value == option:
+            found = value.split("=", 1)[1]
+        elif value == option:
             if index + 1 >= len(argv):
                 raise ValueError(f"{option} requires a value")
-            return argv[index + 1]
-    return default
+            found = argv[index + 1]
+    return found
 
 
 def _replace_options(argv, replacements, removals=()):
