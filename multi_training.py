@@ -79,6 +79,22 @@ def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
     return tuple(full_outputs[1:])
 
 
+def run_chunked_gray_state_rollout(state_model, sequence_and_state_model, sample_chunk,
+                                   initial_state, seq_len, chunk_size):
+    """Final state of a gray-screen rollout fed one time chunk at a time.
+
+    ``sample_chunk(start, end)`` returns the model input for ``[start, end)``, so the
+    full [batch, seq_len, n_input] input and its time-major copy never exist at once.
+    """
+    state = tuple(initial_state)
+    for start in range(0, seq_len, chunk_size):
+        x = sample_chunk(start, min(start + chunk_size, seq_len))
+        state = tuple(run_gray_state_rollout(
+            state_model, sequence_and_state_model, (x, *state)
+        ))
+    return state
+
+
 def resolve_stimulus_batch_sizes(batch_size, grating_batch_size, gray_batch_size):
     """Validate and return the per-replica stimulus batch sizes."""
     stimulus_batch_sizes = (grating_batch_size, gray_batch_size)
@@ -1585,13 +1601,6 @@ def main(_):
             seed=seed_helper.next_spontaneous_seed(),
         )
 
-    def generate_spontaneous_spikes(batch_size):
-        return sample_stateless_bernoulli_batch(
-            spontaneous_prob_base,
-            int(batch_size),
-            seed=seed_helper.next_spontaneous_seed(),
-        )
-
     def make_distributed_probability_sampler(batch_size):
         @tf.function
         def distributed_sampler(probability, current_input=False):
@@ -1618,16 +1627,26 @@ def main(_):
     ):
         return probability_samplers[batch_size](probability, current_input)
 
-    def generate_gray_state():
-        x = generate_spontaneous_spikes(real_batch_size)
-        x = int32_safe_cast(x, dtype)
-        init_state = rsnn_layer.cell.zero_state(real_batch_size, dtype=dtype)
-        seed_helper.advance_noise_seed()
-        inputs = [x]
-        inputs.extend(list(init_state))
-        return run_gray_state_rollout(
-            state_model, sequence_and_state_model, tuple(inputs)
+    def sample_input_chunk(probability, start, end):
+        """Model-dtype spikes for one time chunk of a full-batch input.
+
+        Sampling and casting chunk by chunk keeps the gray-state rollout and the
+        validation steps below the training peak at large per-replica batches.
+        """
+        return int32_safe_cast(
+            sample_probability_batch(probability[start:end], real_batch_size), dtype
         )
+
+    def generate_gray_state():
+        initial_state = rsnn_layer.cell.zero_state(real_batch_size, dtype=dtype)
+        seed_helper.advance_noise_seed()
+        # One computation of the LGN pair sums for all the chunks.
+        with rsnn_layer.cell.lgn_pair_weights_scope():
+            return run_chunked_gray_state_rollout(
+                state_model, sequence_and_state_model,
+                lambda start, end: sample_input_chunk(spontaneous_prob_base, start, end),
+                initial_state, flags.seq_len, flags.gradient_checkpoint_chunk_size,
+            )
 
     @tf.function
     def distributed_generate_gray_state():
@@ -1648,18 +1667,20 @@ def main(_):
         chunk_size = flags.gradient_checkpoint_chunk_size
         sync_enabled = hasattr(sync_loss, "gather_sampled_traces")
 
-        def replica_step(x, state, sample_plan):
-            x = int32_safe_cast(x, dtype)
+        def replica_step(probability, state, sample_plan):
             seed_helper.advance_noise_seed()
             state = models.reset_voltage_penalty_state(rsnn_layer.cell, state)
             counts = tf.zeros((network["n_nodes"],), tf.float32)
             sampled_chunks = []
             packed_chunks = []
+            first_trial_chunks = []
             # One computation of the LGN pair sums for all the chunks.
             with rsnn_layer.cell.lgn_pair_weights_scope():
                 for start in range(0, flags.seq_len, chunk_size):
                     end = min(start + chunk_size, flags.seq_len)
-                    outputs = tf.nest.flatten(sequence_and_state_model((x[:, start:end], state)))
+                    x = sample_input_chunk(probability, start, end)
+                    first_trial_chunks.append(x[0])
+                    outputs = tf.nest.flatten(sequence_and_state_model((x, state)))
                     spikes = outputs[0]
                     state = tuple(outputs[n_sequences:])
                     rate_start = max(start, delays[0]) - start
@@ -1686,11 +1707,12 @@ def main(_):
                 tf.concat(sampled_chunks, axis=1) if sync_enabled
                 else tf.zeros((0, 0), tf.float32)
             )
-            return rates, state[-1], sampled, tf.concat(packed_chunks, axis=0)
+            return (rates, state[-1], sampled, tf.concat(packed_chunks, axis=0),
+                    tf.concat(first_trial_chunks, axis=0)[tf.newaxis])
 
         @tf.function
-        def distributed_step(x, state, sample_plan):
-            return strategy.run(replica_step, args=(x, state, sample_plan))
+        def distributed_step(probability, state, sample_plan):
+            return strategy.run(replica_step, args=(probability, state, sample_plan))
 
         return distributed_step
 
@@ -1826,11 +1848,12 @@ def main(_):
         return (combine_replica_rates(rates, counts),
                 sample_weighted_mean(voltage_losses, counts), sync_value, representative)
 
-    def collect_compact_validation_summaries(distributed_x, outputs, keep, sync_loss):
+    def collect_compact_validation_summaries(outputs, keep, sync_loss):
         """Copy only small statistics and packed raster data from each replica."""
         if keep != global_batch_size:
             raise ValueError("Compact validation requires a full distributed batch.")
-        distributed_rates, distributed_voltage, distributed_traces, distributed_packed = outputs
+        (distributed_rates, distributed_voltage, distributed_traces, distributed_packed,
+         distributed_x) = outputs
         sync_enabled = hasattr(sync_loss, "loss_from_sampled_traces")
         per_trial = sync_loss._plan(keep)["per_trial"] if sync_enabled else 0
         rates, voltage_losses, counts, sampled_traces = [], [], [], []
@@ -1868,17 +1891,16 @@ def main(_):
                 sample_weighted_mean(voltage_losses, counts), sync_value, representative)
 
     def run_gray_validation(initial_state):
-        x = distributed_sample_probability_batch(
-            spontaneous_prob_base, per_replica_batch_size
-        )
         if flags.use_online_voltage_loss:
             outputs = compact_gray_step(
-                x, initial_state, validation_sample_plan(spont_sync_loss, global_batch_size)
+                spontaneous_prob_base, initial_state,
+                validation_sample_plan(spont_sync_loss, global_batch_size),
             )
             rates, voltage, sync, representative = collect_compact_validation_summaries(
-                x, outputs, global_batch_size, spont_sync_loss
+                outputs, global_batch_size, spont_sync_loss
             )
         else:
+            x = distributed_sample_probability_batch(spontaneous_prob_base, per_replica_batch_size)
             z, v = distributed_validation_step(x, initial_state)
             rates, voltage, sync, representative = collect_validation_summaries(
                 x, z, v, global_batch_size, spont_sync_loss
@@ -1899,15 +1921,16 @@ def main(_):
         }
 
     def run_osi_dsi_validation(probability, angle, initial_state):
-        x = distributed_sample_probability_batch(probability, per_replica_batch_size)
         if flags.use_online_voltage_loss:
             outputs = compact_evoked_step(
-                x, initial_state, validation_sample_plan(evoked_sync_loss, global_batch_size)
+                probability, initial_state,
+                validation_sample_plan(evoked_sync_loss, global_batch_size),
             )
             rates, voltage, sync, representative = collect_compact_validation_summaries(
-                x, outputs, global_batch_size, evoked_sync_loss
+                outputs, global_batch_size, evoked_sync_loss
             )
         else:
+            x = distributed_sample_probability_batch(probability, per_replica_batch_size)
             z, v = distributed_validation_step(x, initial_state)
             rates, voltage, sync, representative = collect_validation_summaries(
                 x, z, v, global_batch_size, evoked_sync_loss
