@@ -85,10 +85,13 @@ def run_chunked_gray_state_rollout(state_model, sequence_and_state_model, sample
 
     ``sample_chunk(start, end)`` returns the model input for ``[start, end)``, so the
     full [batch, seq_len, n_input] input and its time-major copy never exist at once.
+    Each chunk is sampled after the previous one's state: the samples do not
+    depend on the state, so in a graph they would otherwise all run up front.
     """
     state = tuple(initial_state)
     for start in range(0, seq_len, chunk_size):
-        x = sample_chunk(start, min(start + chunk_size, seq_len))
+        with tf.control_dependencies(state[:1]):
+            x = sample_chunk(start, min(start + chunk_size, seq_len))
         state = tuple(run_gray_state_rollout(
             state_model, sequence_and_state_model, (x, *state)
         ))
@@ -175,9 +178,20 @@ def int32_safe_cast(values, dtype, chunk_size=25,
 require_int32_safe_rnn_output = training_utils.require_int32_safe_rnn_output
 
 
+def model_input_dtype(dtype, compute_lgn_activity_gradient):
+    """The dtype LGN spikes are handed to the model in.
+
+    Bool by default: each time chunk is cast where it enters the model (Keras at
+    the model input, the cell per time step), so no full [batch, seq_len, n_input]
+    copy in the model dtype exists. The LGN activity gradient flows through
+    floating inputs only (models._lgn_activity), so requesting it keeps ``dtype``.
+    """
+    return dtype if compute_lgn_activity_gradient else tf.bool
+
+
 @tf.function(autograph=False, jit_compile=True)
 def concatenate_stimulus_batches(grating, spontaneous, dtype):
-    """Fuse input casts and concatenation without full cast intermediates.
+    """Fuse input casts (if any) and concatenation without full cast intermediates.
 
     Mandatory XLA compilation also avoids the stock GPU Cast kernel's int32
     indexing limit: either sub-batch can exceed 2**31 elements.
@@ -336,6 +350,7 @@ def main(_):
 
     # Configure the dtype policy
     mixed_precision, dtype = tf_utils.configure_policy_and_dtype(flags.dtype)
+    input_dtype = model_input_dtype(dtype, flags.compute_lgn_activity_gradient)
 
     # On one multi-GPU node (including Nuredduna), prefer MirroredStrategy:
     # one process builds the model once and runs a replica on each GPU.
@@ -969,7 +984,7 @@ def main(_):
             return extractor_model((x, state_vars))
 
     def run_extractor(_x, _state_variables):
-        _x = int32_safe_cast(_x, dtype)
+        _x = int32_safe_cast(_x, input_dtype)
         seed_helper.advance_noise_seed()
         _state_variables = models.reset_voltage_penalty_state(
             rsnn_layer.cell, _state_variables
@@ -983,7 +998,7 @@ def main(_):
         Returns one losses.SpikeSummary per group in place of its spike
         sequence, and the voltage-penalty accumulator.
         """
-        _x = int32_safe_cast(_x, dtype)
+        _x = int32_safe_cast(_x, input_dtype)
         seed_helper.advance_noise_seed()
         _state_variables = models.reset_voltage_penalty_state(
             rsnn_layer.cell, _state_variables
@@ -1227,7 +1242,7 @@ def main(_):
     def roll_out_combined(x, y, x_spontaneous, initial_state, trim=True, update_loss_state=True,
                           summarize=False):
 
-        x_concat = concatenate_stimulus_batches(x, x_spontaneous, dtype)
+        x_concat = concatenate_stimulus_batches(x, x_spontaneous, input_dtype)
 
         if summarize:
             (_z_evoked, _z_spont), voltage_source_full = run_extractor_summaries(
@@ -1628,13 +1643,13 @@ def main(_):
         return probability_samplers[batch_size](probability, current_input)
 
     def sample_input_chunk(probability, start, end):
-        """Model-dtype spikes for one time chunk of a full-batch input.
+        """Spikes for one time chunk of a full-batch input (see ``input_dtype``).
 
-        Sampling and casting chunk by chunk keeps the gray-state rollout and the
-        validation steps below the training peak at large per-replica batches.
+        Sampling chunk by chunk keeps the gray-state rollout and the validation
+        steps below the training peak at large per-replica batches.
         """
         return int32_safe_cast(
-            sample_probability_batch(probability[start:end], real_batch_size), dtype
+            sample_probability_batch(probability[start:end], real_batch_size), input_dtype
         )
 
     def generate_gray_state():
@@ -1678,7 +1693,9 @@ def main(_):
             with rsnn_layer.cell.lgn_pair_weights_scope():
                 for start in range(0, flags.seq_len, chunk_size):
                     end = min(start + chunk_size, flags.seq_len)
-                    x = sample_input_chunk(probability, start, end)
+                    # After the previous chunk (see run_chunked_gray_state_rollout).
+                    with tf.control_dependencies(state[:1]):
+                        x = sample_input_chunk(probability, start, end)
                     first_trial_chunks.append(x[0])
                     outputs = tf.nest.flatten(sequence_and_state_model((x, state)))
                     spikes = outputs[0]

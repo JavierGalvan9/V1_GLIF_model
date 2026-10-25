@@ -1984,10 +1984,12 @@ class V1Column(tf.keras.layers.Layer):
         )
         # Afferent delay: the LGN frame that acts on this timestep was emitted
         # `_lgn_delay_steps - 1` steps ago. Newest frame first, as for z_buf.
+        # Bool spike frames (multi_training.model_input_dtype) take the buffer's
+        # dtype as they enter it.
         if self._lgn_delay_buffer_width:
             lgn_buf = state[self._lgn_delay_state_index]
             new_lgn_buf = tf.concat(
-                [lgn_input, lgn_buf[:, :-self.input_dim]], axis=1
+                [tf.cast(lgn_input, lgn_buf.dtype), lgn_buf[:, :-self.input_dim]], axis=1
             )
             lgn_input = lgn_buf[:, -self.input_dim:]
         lgn_input = self._permute_lgn_input(lgn_input)

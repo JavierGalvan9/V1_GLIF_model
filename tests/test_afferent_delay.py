@@ -99,6 +99,23 @@ def test_lgn_delay_shifts_the_input_stream(tmp_path):
     np.testing.assert_allclose(slow_trace[1:], fast_trace[:-1], rtol=1e-5)
 
 
+@pytest.mark.parametrize("lgn_delay", [1.0, 1.7, 3.2])
+def test_bool_spike_frames_match_floating_ones(tmp_path, lgn_delay):
+    # Training hands the cell bool LGN frames (multi_training.model_input_dtype);
+    # the recorded adjoint calls cell.call directly, with no Keras input cast.
+    cell = _cell(tmp_path / "bool", lgn_delay=lgn_delay)
+    traces = {}
+    for dtype in (tf.bool, cell.compute_dtype):
+        state, trace = cell.zero_state(1), []
+        for step in range(6):
+            spikes = tf.cast(tf.fill((1, cell.input_dim), step in {0, 2}), dtype)
+            _, state = cell.call(spikes, state)
+            trace.append(float(tf.reduce_sum(tf.abs(state[4]))))
+        traces[dtype] = trace
+    assert max(traces[tf.bool]) > 0.0
+    np.testing.assert_array_equal(traces[tf.bool], traces[cell.compute_dtype])
+
+
 def test_voltage_penalty_reset_leaves_the_delay_buffer_alone(tmp_path):
     # reset_voltage_penalty_state() zeroes the LAST state element, so the delay
     # buffer must not be appended after the penalty accumulator.

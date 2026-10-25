@@ -81,6 +81,17 @@ class Int32SafeCastTest(unittest.TestCase):
         self.assertEqual(out.dtype, tf.float16)
         self.assertEqual(float(tf.reduce_sum(tf.cast(out, tf.float32))), 2 * 6 * 3)
 
+    def test_inputs_stay_bool_unless_the_lgn_activity_gradient_is_requested(self):
+        self.assertEqual(multi_training.model_input_dtype(tf.float16, False), tf.bool)
+        self.assertEqual(multi_training.model_input_dtype(tf.float16, True), tf.float16)
+        grating = tf.constant([[[True, False, True]]])
+        spontaneous = tf.constant([[[False, True, False]], [[True, True, False]]])
+        out = multi_training.concatenate_stimulus_batches(grating, spontaneous, tf.bool)
+        self.assertEqual(out.dtype, tf.bool)
+        np.testing.assert_array_equal(
+            out.numpy(), tf.concat([grating, spontaneous], axis=0).numpy()
+        )
+
     def test_fused_inputs_preserve_mixed_boolean_and_floating_values(self):
         grating = tf.constant([[[True, False, True]]])
         spontaneous = tf.constant([[[0.25, -1.5, 2.0]], [[0.0, 0.5, 1.0]]])
