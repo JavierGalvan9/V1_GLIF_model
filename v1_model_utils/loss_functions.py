@@ -1645,13 +1645,25 @@ class SynchronizationLoss(Layer):
 
     def loss_from_sampled_traces(self, selected_spikes_sample):
         """Evaluate Fano loss after sampled time chunks have been assembled."""
-        duration_ms = tf.cast(tf.shape(selected_spikes_sample)[1], tf.int32)
+        return self.loss_from_fano_curve(
+            self.pop_fano_tf(selected_spikes_sample),
+            tf.shape(selected_spikes_sample)[1],
+        )
+
+    def loss_from_fano_curve(self, fanos_mean, duration_ms):
+        """Fano loss of a mean Fano curve (one value per bin size).
+
+        Lets a caller average the curves of several conditions before
+        comparing with the experimental curve, which averages over all trials.
+        """
+        duration_ms = tf.cast(duration_ms, tf.int32)
         bin_sizes_mask = self._bin_sizes_ms_tf < duration_ms // 2
         experimental_fanos_mean = tf.boolean_mask(
             self.experimental_fanos_mean, bin_sizes_mask
         )
-        fanos_mean = self.pop_fano_tf(selected_spikes_sample)
-        fanos_mean = tf.boolean_mask(fanos_mean, bin_sizes_mask)
+        fanos_mean = tf.boolean_mask(
+            tf.cast(fanos_mean, self._dtype), bin_sizes_mask
+        )
         # # Calculate MSE between the experimental and calculated Fano factors
         def compute_mse():
             return tf.reduce_mean(tf.square(experimental_fanos_mean - fanos_mean))

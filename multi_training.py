@@ -66,6 +66,9 @@ def update_rate_emas(v1_ema, v1_rates, decay, update_state=True):
         )
 
 
+# Grating phases per protocol direction in validation (fixed, evenly spaced).
+VALIDATION_PHASES = 8
+
 # train_end_data.pkl entries that are running statistics of the trained weights.
 NEURON_STATE_KEYS = ("v1_ema", "rolling_osi_emd_state")
 
@@ -254,6 +257,34 @@ def combine_replica_rates(rates_hz, sample_counts):
     return np.average(rates_hz, axis=0, weights=sample_counts).astype(np.float32)
 
 
+def validation_phase_index(replica_id, batch_size, n_phases):
+    """Grating phase of each of a replica's validation trials.
+
+    Trial i of replica r is trial g = r * batch_size + i of the global batch
+    and takes phase g mod n_phases, so the phases are spread evenly over the
+    global batch whatever the replica count.
+    """
+    trial = tf.cast(replica_id, tf.int32) * batch_size + tf.range(batch_size, dtype=tf.int32)
+    return tf.math.floormod(trial, n_phases)
+
+
+def direction_averaged_validation_losses(rates_by_direction, fano_curves_by_direction,
+                                         rate_loss, sync_loss):
+    """Evoked validation rate and sync losses of the direction-averaged statistics.
+
+    The Neuropixels evoked targets average over all grating trials: each
+    unit's rate over every direction, the Fano curve over every trial. So
+    one rate loss is taken on each neuron's rate averaged over the
+    directions, and one sync loss on the directions' mean Fano curve, not
+    the mean of per-direction losses. ``fano_curves_by_direction`` is None
+    when the sync loss is off.
+    """
+    rate_value = float(rate_loss(np.mean(rates_by_direction, axis=0)))
+    if fano_curves_by_direction is None:
+        return rate_value, 0.0
+    return rate_value, float(sync_loss(np.mean(fano_curves_by_direction, axis=0)))
+
+
 def protocol_selectivity_from_rates(rates_hz, angles):
     """Calculate OSI and DSI from mean rates at each protocol angle."""
     mean_rates = np.asarray(rates_hz)
@@ -282,15 +313,26 @@ def sample_stateless_bernoulli_batch(
     seed,
     batch_chunk_size=64,
     full_tensor_element_limit=np.iinfo(np.int32).max,
+    trial_index=None,
 ):
     """Sample Boolean spikes without launching kernels above int32 size.
 
     The probabilities and uniforms are float32: float16
     uniforms take only 1024 values, so P(u < p) would be ceil(1024 p) / 1024
     (+14% spikes at spontaneous LGN rates). Cast only at the model boundary.
+
+    With ``trial_index`` [batch_size], ``probability`` stacks several
+    per-sample probabilities on its first axis and sample b draws from
+    ``probability[trial_index[b]]``.
     """
     probability = tf.cast(probability, tf.float32)
-    sample_shape = probability.shape
+    sample_shape = probability.shape if trial_index is None else probability.shape[1:]
+
+    def trial_probability(start, stop):
+        if trial_index is None:
+            return probability
+        return tf.gather(probability, trial_index[start:stop])
+
     if sample_shape.rank is None or not sample_shape.is_fully_defined():
         raise ValueError("Bernoulli sampling requires a static per-sample shape.")
 
@@ -301,7 +343,7 @@ def sample_stateless_bernoulli_batch(
         random_uniform = tf.random.stateless_uniform(
             (batch_size, *sample_shape), seed=seed, dtype=tf.float32
         )
-        return random_uniform < probability
+        return random_uniform < trial_probability(0, batch_size)
 
     if elements_per_sample % 4:
         raise ValueError(
@@ -327,7 +369,9 @@ def sample_stateless_bernoulli_batch(
             alg=algorithm,
             dtype=tf.float32,
         )
-        sampled_chunks.append(random_uniform < probability)
+        sampled_chunks.append(
+            random_uniform < trial_probability(start, start + chunk_batch_size)
+        )
     # Axis-0 concat with 16+ inputs takes a GPU kernel with unsafe offsets
     # above int32 size. Bound the fan-in so every join uses the slice kernel.
     while len(sampled_chunks) > 8:
@@ -1627,16 +1671,27 @@ def main(_):
         train_data_set = strategy.distribute_datasets_from_function(get_gratings_dataset_fn())
 
     def sample_probability_batch(probability, batch_size, current_input=False):
-        if current_input:
-            probability = tf.cast(probability, dtype)
-            return tf.broadcast_to(
-                probability * tf.cast(1.3, dtype),
-                (int(batch_size), *probability.shape),
+        """Spikes of a replica's batch (current input: the scaled probability).
+
+        A [n_phases, time, n_input] probability holds the validation grating
+        phases; each trial draws from its own (validation_phase_index).
+        """
+        phase_index = None
+        if probability.shape.rank == 3:
+            phase_index = validation_phase_index(
+                tf.distribute.get_replica_context().replica_id_in_sync_group,
+                int(batch_size), probability.shape[0],
             )
+        if current_input:
+            probability = tf.cast(probability, dtype) * tf.cast(1.3, dtype)
+            if phase_index is not None:
+                return tf.gather(probability, phase_index)
+            return tf.broadcast_to(probability, (int(batch_size), *probability.shape))
         return sample_stateless_bernoulli_batch(
             probability,
             int(batch_size),
             seed=seed_helper.next_spontaneous_seed(),
+            trial_index=phase_index,
         )
 
     def make_distributed_probability_sampler(batch_size):
@@ -1672,7 +1727,18 @@ def main(_):
         steps below the training peak at large per-replica batches.
         """
         return int32_safe_cast(
-            sample_probability_batch(probability[start:end], real_batch_size), input_dtype
+            sample_probability_batch(probability[..., start:end, :], real_batch_size),
+            input_dtype,
+        )
+
+    def distribute_to_replicas(value):
+        """A copy of a host array on every replica's device, as a per-replica value."""
+        copies = []
+        for device in strategy.extended.worker_devices:
+            with tf.device(device):
+                copies.append(tf.identity(value))
+        return strategy.experimental_distribute_values_from_function(
+            lambda context: copies[context.replica_id_in_sync_group]
         )
 
     def generate_gray_state():
@@ -1881,12 +1947,12 @@ def main(_):
                 )
             completed += count
 
-        sync_value = 0.0
+        fano_curve = None
         if sync_enabled:
             traces = tf.convert_to_tensor(np.concatenate(sampled_traces, axis=0))
-            sync_value = float(sync_loss.loss_from_sampled_traces(traces).numpy())
+            fano_curve = sync_loss.pop_fano_tf(traces).numpy()
         return (combine_replica_rates(rates, counts),
-                sample_weighted_mean(voltage_losses, counts), sync_value, representative)
+                sample_weighted_mean(voltage_losses, counts), fano_curve, representative)
 
     def collect_compact_validation_summaries(outputs, keep, sync_loss):
         """Copy only small statistics and packed raster data from each replica."""
@@ -1923,12 +1989,19 @@ def main(_):
                     bits.reshape(1, flags.seq_len, -1)[:, :, :network["n_nodes"]].astype(np.float32),
                 )
             completed += count
-        sync_value = 0.0
+        fano_curve = None
         if sync_enabled:
             traces = tf.convert_to_tensor(np.concatenate(sampled_traces, axis=0))
-            sync_value = float(sync_loss.loss_from_sampled_traces(traces).numpy())
+            fano_curve = sync_loss.pop_fano_tf(traces).numpy()
         return (combine_replica_rates(rates, counts),
-                sample_weighted_mean(voltage_losses, counts), sync_value, representative)
+                sample_weighted_mean(voltage_losses, counts), fano_curve, representative)
+
+    def sync_loss_from_curve(sync_loss, fano_curve):
+        """Sync loss of a population Fano curve; 0 when the sync loss is off."""
+        if fano_curve is None:
+            return 0.0
+        duration = sync_loss._t_end_seconds - sync_loss._t_start_seconds
+        return float(sync_loss.loss_from_fano_curve(fano_curve, duration).numpy())
 
     def run_gray_validation(initial_state):
         if flags.use_online_voltage_loss:
@@ -1936,13 +2009,13 @@ def main(_):
                 spontaneous_prob_base, initial_state,
                 validation_sample_plan(spont_sync_loss, global_batch_size),
             )
-            rates, voltage, sync, representative = collect_compact_validation_summaries(
+            rates, voltage, fano_curve, representative = collect_compact_validation_summaries(
                 outputs, global_batch_size, spont_sync_loss
             )
         else:
             x = distributed_sample_probability_batch(spontaneous_prob_base, per_replica_batch_size)
             z, v = distributed_validation_step(x, initial_state)
-            rates, voltage, sync, representative = collect_validation_summaries(
+            rates, voltage, fano_curve, representative = collect_validation_summaries(
                 x, z, v, global_batch_size, spont_sync_loss
             )
         return {
@@ -1956,7 +2029,8 @@ def main(_):
                 ).numpy()
             ),
             "spont_voltage_loss": voltage,
-            "spont_sync_loss": sync,
+            "spont_fano_curve": fano_curve,
+            "spont_sync_loss": sync_loss_from_curve(spont_sync_loss, fano_curve),
             "representative": representative,
         }
 
@@ -1966,13 +2040,13 @@ def main(_):
                 probability, initial_state,
                 validation_sample_plan(evoked_sync_loss, global_batch_size),
             )
-            rates, voltage, sync, representative = collect_compact_validation_summaries(
+            rates, voltage, fano_curve, representative = collect_compact_validation_summaries(
                 outputs, global_batch_size, evoked_sync_loss
             )
         else:
             x = distributed_sample_probability_batch(probability, per_replica_batch_size)
             z, v = distributed_validation_step(x, initial_state)
-            rates, voltage, sync, representative = collect_validation_summaries(
+            rates, voltage, fano_curve, representative = collect_validation_summaries(
                 x, z, v, global_batch_size, evoked_sync_loss
             )
         representative = (
@@ -1980,16 +2054,8 @@ def main(_):
         )
         return {
             "evoked_rates": rates,
-            "evoked_rate_loss": float(
-                validation_rate_loss_from_rates(
-                    rates,
-                    evoked_rate_regularizer,
-                    annulus_evoked_rate_regularizer
-                    if annulus_mask is not None else None,
-                ).numpy()
-            ),
             "evoked_voltage_loss": voltage,
-            "evoked_sync_loss": sync,
+            "evoked_fano_curve": fano_curve,
             "representative": representative,
         }
 
@@ -2014,34 +2080,67 @@ def main(_):
             *tuple(tf.constant(value, dtype=tf.float32) for value in metric_values)
         )
 
-    def run_protocol_validation():
+    def run_protocol_validation(epoch):
         initial_state = distributed_generate_gray_state()
         spont_result = run_gray_validation(initial_state)
         evoked_rates_by_angle = []
-        evoked_rate_losses = []
         evoked_voltage_losses = []
-        evoked_sync_losses = []
+        evoked_fano_curves = []
         representative_evoked = None
 
         for angle in protocol_angles:
+            # Trial g of the global batch shows phase g mod VALIDATION_PHASES.
             result = run_osi_dsi_validation(
-                osi_dsi_lgn_probabilities[int(angle)],
+                distribute_to_replicas(protocol_lgn_probabilities[int(angle)]),
                 float(angle),
                 initial_state,
             )
             evoked_rates_by_angle.append(result["evoked_rates"])
-            evoked_rate_losses.append(result["evoked_rate_loss"])
             evoked_voltage_losses.append(result["evoked_voltage_loss"])
-            evoked_sync_losses.append(result["evoked_sync_loss"])
+            evoked_fano_curves.append(result["evoked_fano_curve"])
             if representative_evoked is None:
                 x_rep, z_rep, y_rep = result["representative"]
                 representative_evoked = (x_rep, z_rep, y_rep)
 
         evoked_rates = np.stack(evoked_rates_by_angle, axis=0)
+        evoked_fano_curves = (
+            None if evoked_fano_curves[0] is None else np.stack(evoked_fano_curves, axis=0)
+        )
         # `core_mask` is None when every neuron already lies inside the core.
         osi_mask = None if core_mask is None else np.asarray(core_mask, dtype=bool)
-        osi_rates = evoked_rates if osi_mask is None else evoked_rates[:, osi_mask]
+        neuron_slice = slice(None) if osi_mask is None else osi_mask
+        osi_rates = evoked_rates[:, neuron_slice]
         osi, dsi = protocol_selectivity_from_rates(osi_rates, protocol_angles)
+        # Responsiveness cutoff of the Neuropixels targets, osi_dsi_estimator and
+        # the training loss: no OSI/DSI below 0.5 Hz at the preferred direction
+        # (here the best of the 8 protocol directions; in training, the best of
+        # the batch's gratings binned into those directions).
+        preferred_rates = osi_rates.max(axis=0)
+        osi[preferred_rates < 0.5] = np.nan
+        dsi[preferred_rates < 0.5] = np.nan
+        if _TRAINING_LAUNCH_PLAN.is_chief:
+            directory = os.path.join(logdir, "Validation_osi_dsi")
+            os.makedirs(directory, exist_ok=True)
+            fano_arrays = {} if evoked_fano_curves is None else dict(
+                evoked_fano_curves=evoked_fano_curves,
+                spont_fano_curve=spont_result["spont_fano_curve"],
+                fano_bin_sizes_ms=np.asarray(evoked_sync_loss._bin_sizes_ms),
+                evoked_fano_target=evoked_sync_loss.experimental_fanos_mean.numpy(),
+                spont_fano_target=spont_sync_loss.experimental_fanos_mean.numpy(),
+            )
+            # Arrays are in runtime neuron order; node_ids holds each entry's
+            # canonical (network file) id.
+            np.savez(
+                os.path.join(directory, f"Epoch_{epoch}.npz"),
+                osi=osi, dsi=dsi, preferred_rates=preferred_rates,
+                evoked_rates=osi_rates.mean(axis=0),
+                rates_by_angle=osi_rates.astype(np.float32),
+                tuning_angle=np.asarray(network["tuning_angle"])[neuron_slice],
+                spont_rates=np.asarray(spont_result["spont_rates"])[neuron_slice],
+                node_ids=neuron_layout.new_to_old[neuron_slice],
+                pop_names=other_v1_utils.pop_names(network, data_dir=flags.data_dir)[neuron_slice],
+                **fano_arrays,
+            )
 
         cell_type_populations_ids = losses.get_population_neuron_ids(
             network,
@@ -2049,9 +2148,17 @@ def main(_):
             core_mask=core_mask,
             reindex_selected=False,
         )
-        rate_loss = (
-            float(np.mean(evoked_rate_losses)) + float(spont_result["spont_rate_loss"])
+        evoked_rate_loss, evoked_sync_loss_value = direction_averaged_validation_losses(
+            evoked_rates,
+            evoked_fano_curves,
+            lambda rates: validation_rate_loss_from_rates(
+                rates,
+                evoked_rate_regularizer,
+                annulus_evoked_rate_regularizer if annulus_mask is not None else None,
+            ).numpy(),
+            lambda curve: sync_loss_from_curve(evoked_sync_loss, curve),
         )
+        rate_loss = evoked_rate_loss + float(spont_result["spont_rate_loss"])
 
         osi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
         dsi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
@@ -2079,9 +2186,7 @@ def main(_):
         voltage_loss = (
             float(np.mean(evoked_voltage_losses)) + float(spont_result["spont_voltage_loss"])
         )
-        sync_loss = (
-            float(np.mean(evoked_sync_losses)) + float(spont_result["spont_sync_loss"])
-        )
+        sync_loss = evoked_sync_loss_value + float(spont_result["spont_sync_loss"])
 
         regularizer_loss = 0.
         if flags.train_recurrent and flags.recurrent_weight_regularization > 0:
@@ -2132,20 +2237,18 @@ def main(_):
     protocol_angles = np.asarray(tuple(range(0, 360, 45)), dtype=np.int32)
     protocol_target_df = load_neuropixels_targets(flags.neuropixels_df)
 
-    osi_dsi_lgn_probabilities = stim_dataset.load_or_compute_osi_dsi_lgn_probabilities(
+    # Host arrays [VALIDATION_PHASES, seq_len, n_input] float32 per direction;
+    # each direction goes to the GPUs only while it is validated.
+    protocol_lgn_probabilities = stim_dataset.load_or_compute_protocol_phase_lgn_probabilities(
         seq_len=flags.seq_len,
         pre_delay=delays[0],
         post_delay=delays[1],
         n_input=flags.n_input,
         data_dir=flags.data_dir,
         rotation=flags.rotation,
-        seed=flags.seed,
-        output_dtype=tf.float32,  # sampled in float32 (sample_stateless_bernoulli_batch)
         angles=protocol_angles,
-        strategy=strategy,
+        n_phases=VALIDATION_PHASES,
         bmtk_compat=flags.bmtk_compat_lgn,
-        current_input=flags.current_input,
-        cache_prefix="protocol_validation_lgn_probabilities",
         lgn_backend=flags.lgn_backend,
     )
 
@@ -2360,7 +2463,7 @@ def main(_):
             v1_spikes_spont_val,
             protocol_selectivity,
             protocol_rates,
-        ) = run_protocol_validation()
+        ) = run_protocol_validation(epoch + 1)
         print(f"Validation protocol wall time: {time() - validation_started:.2f}s", flush=True)
 
         epoch_values = list(read_train_metrics().numpy())

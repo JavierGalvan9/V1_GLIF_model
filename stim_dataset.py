@@ -667,6 +667,61 @@ def load_or_compute_osi_dsi_lgn_probabilities(
     }
 
 
+def load_or_compute_protocol_phase_lgn_probabilities(
+    seq_len,
+    pre_delay,
+    post_delay,
+    n_input=17400,
+    data_dir='GLIF_network_nll',
+    rotation='cw',
+    angles=None,
+    n_phases=8,
+    bmtk_compat=True,
+    lgn_backend='grating',
+):
+    """LGN spike probabilities of the validation gratings, ``n_phases`` per direction.
+
+    Returns {angle: float32 array [n_phases, seq_len, n_input]}, on the host,
+    for the phases 360 k / n_phases (k = 0 .. n_phases - 1). The phases are
+    fixed, so every validation sees the same stimuli; together they cover
+    the 2 Hz drift cycle that one phase per direction would see a single
+    part of through the response window. Cached in ``<data_dir>/tf_data``.
+    """
+    if angles is None:
+        angles = np.arange(0, 360, 45)
+    angle_key = "-".join(str(int(angle)) for angle in angles)
+    cache_file = os.path.join(
+        data_dir, "tf_data",
+        f"protocol_phase_lgn_probabilities_{GRATING_LGN_VERSION}_n_input_{n_input}_"
+        f"seqlen_{int(seq_len)}_pre_{int(pre_delay)}_post_{int(post_delay)}_"
+        f"rotation_{rotation}_phases_{int(n_phases)}_angles_{angle_key}.pkl",
+    )
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            probabilities = pkl.load(f)
+        print("Loaded cached validation grating LGN probabilities.")
+        return probabilities
+
+    grating = DriftingGratingLGN(
+        int(seq_len), int(pre_delay), int(post_delay), n_input=n_input, data_dir=data_dir,
+        rotation=rotation, bmtk_compat=bmtk_compat, dtype=tf.float32, lgn_backend=lgn_backend,
+    )
+    phases = 360.0 * np.arange(n_phases) / n_phases
+    probabilities = {}
+    for angle in angles:
+        t0 = time()
+        probabilities[int(angle)] = np.stack([
+            (-tf.math.expm1(-grating.firing_rates(float(angle), float(phase)) / 1000.0)).numpy()
+            for phase in phases
+        ]).astype(np.float32)
+        print(f"Validation gratings at {int(angle)} deg: {time() - t0:.2f}s")
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    with open(cache_file, "wb") as f:
+        pkl.dump(probabilities, f, protocol=pkl.HIGHEST_PROTOCOL)
+    print("Validation grating LGN probabilities created and cached.")
+    return probabilities
+
+
 ### NATURAL SCENES STIMULUS GENERATION ###
 def load_via_allensdk(cache_dir: Path, experiment_id: int = 501498760) -> np.ndarray:
     """
