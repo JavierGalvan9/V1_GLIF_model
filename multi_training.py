@@ -700,7 +700,7 @@ def main(_):
                                                          data_dir=flags.data_dir,
                                                          rolling_decay=flags.rolling_decay,
                                                          rolling_target_sample_ess=flags.rolling_target_sample_ess,
-                                                         rolling_batch_size=grating_batch_size,
+                                                         rolling_batch_size=global_grating_batch_size,
                                                          rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                          rolling_warmup=flags.rolling_warmup,
                                                          batch_emd_alignment_weight=flags.batch_emd_alignment_weight)
@@ -726,7 +726,7 @@ def main(_):
                                                                      data_dir=flags.data_dir,
                                                                      rolling_decay=flags.rolling_decay,
                                                                      rolling_target_sample_ess=flags.rolling_target_sample_ess,
-                                                                     rolling_batch_size=grating_batch_size,
+                                                                     rolling_batch_size=global_grating_batch_size,
                                                                      rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                                      rolling_warmup=flags.rolling_warmup,
                                                                      batch_emd_alignment_weight=flags.batch_emd_alignment_weight)

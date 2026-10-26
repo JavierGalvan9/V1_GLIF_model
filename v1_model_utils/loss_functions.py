@@ -1072,8 +1072,22 @@ def compare_rate_mask_population_ids(network, data_dir="GLIF_network", core_mask
 
 # Version tag of `OrientationSelectivityLoss.get_rolling_state`. 2: rolling_osi_emd
 # averages raw rates (no v1_ema normalizer); one row per replica copy; neuron
-# arrays are network-sized (zeros outside the loss's neurons).
-ROLLING_STATE_FORMAT = 2
+# arrays are network-sized (zeros outside the loss's neurons). 3: moments
+# pooled across replicas (identical copies; decay from the global batch).
+ROLLING_STATE_FORMAT = 3
+
+
+def replica_sum(value):
+    """Sum ``value`` over the MirroredStrategy replicas; identity on one replica.
+
+    Differentiable: the gradient of a cross-replica SUM is the SUM of the
+    replicas' cotangents, so every replica's rates receive the gradient of
+    every replica's (identical) pooled loss.
+    """
+    context = tf.distribute.get_replica_context()
+    if context is None or context.num_replicas_in_sync == 1:
+        return value
+    return context.all_reduce(tf.distribute.ReduceOp.SUM, value)
 
 
 def _variable_copies(variable):
@@ -2095,7 +2109,9 @@ class OrientationSelectivityLoss:
         """Return the EMA state with one leading row per replica copy.
 
         Under MirroredStrategy the state variables have aggregation NONE, so
-        each replica's assign writes only its own copy; every copy is saved.
+        each replica's assign writes only its own copy. The moments are pooled
+        across replicas before the update, so the copies are identical; every
+        copy is saved all the same.
         Per-neuron arrays are scattered into network-sized rows (zeros outside
         the loss's neurons), so train_end_data's per-neuron translation between
         neuron layouts (spatial_layout.translate_neuron_state) moves them with
@@ -2304,12 +2320,18 @@ class OrientationSelectivityLoss:
         ori_angle = 2.0 * radians_delta_angle
         dir_angle = radians_delta_angle
 
-        batch_size = tf.cast(tf.shape(rates)[0], dtype=self._dtype)
-        ori_batch_real = tf.reduce_mean(rates * tf.math.cos(ori_angle), axis=0)
-        ori_batch_imag = tf.reduce_mean(rates * tf.math.sin(ori_angle), axis=0)
-        dir_batch_real = tf.reduce_mean(rates * tf.math.cos(dir_angle), axis=0)
-        dir_batch_imag = tf.reduce_mean(rates * tf.math.sin(dir_angle), axis=0)
-        den_batch = tf.reduce_mean(rates, axis=0)
+        # Batch means over every replica's gratings: one pooled estimate, so all
+        # replica copies of the state stay identical.
+        batch_size = replica_sum(tf.cast(tf.shape(rates)[0], dtype=self._dtype))
+        ori_batch_real, ori_batch_imag, dir_batch_real, dir_batch_imag, den_batch = tf.unstack(
+            replica_sum(tf.stack([
+                tf.reduce_sum(rates * tf.math.cos(ori_angle), axis=0),
+                tf.reduce_sum(rates * tf.math.sin(ori_angle), axis=0),
+                tf.reduce_sum(rates * tf.math.cos(dir_angle), axis=0),
+                tf.reduce_sum(rates * tf.math.sin(dir_angle), axis=0),
+                tf.reduce_sum(rates, axis=0),
+            ])) / tf.maximum(batch_size, self._rolling_epsilon)
+        )
 
         new_ori_real = self._rolling_decay * self._rolling_ori_real + self._rolling_one_minus_decay * ori_batch_real
         new_ori_imag = self._rolling_decay * self._rolling_ori_imag + self._rolling_one_minus_decay * ori_batch_imag
@@ -2474,15 +2496,20 @@ class OrientationSelectivityLoss:
     ):
         """Return phase-anchored real and imaginary selectivity components.
 
+        The sums run over every replica's gratings (``replica_sum``), so the
+        estimate draws on the global batch whatever the replica count.
+
         Keeping the sign of the real component is essential: it distinguishes the wired preference from an
         orientation reversal (90 degrees for OSI, 180 degrees for DSI).
         """
         phase = tf.cast(harmonic, self._dtype) * radians_delta_angle
-        total = tf.reduce_sum(rates, axis=0)
+        total, real, imag = tf.unstack(replica_sum(tf.stack([
+            tf.reduce_sum(rates, axis=0),
+            tf.reduce_sum(rates * tf.math.cos(phase), axis=0),
+            tf.reduce_sum(rates * tf.math.sin(phase), axis=0),
+        ])))
         safe_total = tf.maximum(total, self._rolling_epsilon)
-        real = tf.reduce_sum(rates * tf.math.cos(phase), axis=0) / safe_total
-        imag = tf.reduce_sum(rates * tf.math.sin(phase), axis=0) / safe_total
-        return real, imag
+        return real / safe_total, imag / safe_total
 
     def _batch_signed_osi_dsi_components(self, rates, angle, normalizer=None):
         """Return signed, phase-anchored OSI and DSI components for the loss."""
@@ -2519,18 +2546,19 @@ class OrientationSelectivityLoss:
         Selectivity estimated from a few spikes is noise (one spike reads as
         OSI = DSI = 1), so neurons below the responsiveness cutoff of the
         Neuropixels targets are excluded. The preferred-direction rate bins the
-        batch's gratings into the 8 protocol directions (45-degree bins centred
-        on 0, 45, ..., 315), the Neuropixels/validation criterion. The mask is
+        batch's gratings (all replicas') into the 8 protocol directions
+        (45-degree bins centred on 0, 45, ..., 315), the Neuropixels/validation
+        criterion. The mask is
         intentionally non-differentiable; the firing-rate loss, not the OSI/DSI
         loss, is responsible for activating silent neurons.
         """
         direction_bin = tf.math.floormod(
             tf.cast(tf.round(tf.reshape(tf.cast(angle, self._dtype), [-1]) / 45.0), tf.int32), 8
         )
-        bin_rates = tf.math.unsorted_segment_sum(rates, direction_bin, 8)
-        bin_counts = tf.math.unsorted_segment_sum(
+        bin_rates = replica_sum(tf.math.unsorted_segment_sum(rates, direction_bin, 8))
+        bin_counts = replica_sum(tf.math.unsorted_segment_sum(
             tf.ones_like(direction_bin, dtype=self._dtype), direction_bin, 8
-        )
+        ))
         preferred_rates = tf.reduce_max(
             bin_rates / tf.maximum(bin_counts, 1.0)[:, tf.newaxis], axis=0
         )
@@ -2582,8 +2610,8 @@ class OrientationSelectivityLoss:
                 # not repeatedly favor neurons with particular network indices.
                 # Shuffle indices and gather: tf.random.shuffle on the values
                 # has no gradient and would silently zero the whole EMD term.
-                # The seed comes from the values, so the permutation is
-                # reproducible and identical wherever the same values are seen.
+                # The seed comes from the pooled values, so every replica draws
+                # the same permutation and computes the same loss.
                 permutation = tf.random.experimental.stateless_shuffle(
                     tf.range(n_active),
                     seed=tf.stack([
