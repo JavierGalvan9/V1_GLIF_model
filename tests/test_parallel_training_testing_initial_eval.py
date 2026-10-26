@@ -47,6 +47,28 @@ def test_history_offload_reaches_training_only(mode, tmp_path, monkeypatch, caps
     assert all("--history_offload" not in command for command in evaluation)
 
 
+@pytest.mark.parametrize("arguments, training_flag", [
+    ([], "--stratified_grating_angles"),
+    (["--nostratified_grating_angles"], "--nostratified_grating_angles"),
+])
+def test_osi_defaults_and_stratification_switch(arguments, training_flag, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", [
+        "parallel_training_testing.py", "--neurons", "66652", "--n_runs", "2",
+        "--results_dir", str(tmp_path), "--print_only", *arguments,
+    ])
+    wrapper.main()
+    commands = [shlex.split(shlex.split(line)[-1]) for line in capsys.readouterr().out.splitlines()
+                if line.startswith("run ")]
+    training = [command for command in commands if command[1] == "multi_training.py"]
+    evaluation = [command for command in commands if command[1] == "osi_dsi_estimator.py"]
+    assert training and evaluation
+    for command in training:
+        assert training_flag in command
+        assert command[command.index("--osi_loss_method") + 1] == "batch_osi_emd"
+        assert float(command[command.index("--osi_cost") + 1]) == 2.0
+    assert all("stratified_grating_angles" not in " ".join(command) for command in evaluation)
+
+
 def test_history_offload_defaults_to_none():
     assert wrapper.parser.parse_args([]).history_offload == "none"
 

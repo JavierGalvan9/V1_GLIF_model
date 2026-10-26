@@ -15,6 +15,7 @@ import unittest
 import numpy as np
 import tensorflow as tf
 
+from stim_dataset import stratify_angles
 from v1_model_utils.loss_functions import OrientationSelectivityLoss
 
 WINDOW_MS = 500.0
@@ -437,6 +438,24 @@ class BatchOsiEstimatorTest(unittest.TestCase):
 
         self.assertLess(float(compiled_loss(one_active).numpy()), 1e-5)
         self.assertLess(float(compiled_loss(two_active).numpy()), 1e-5)
+
+
+class StratifiedAnglesTest(unittest.TestCase):
+    def test_one_angle_per_equal_width_bin(self):
+        """Every bin of width 360 / batch holds exactly one grating angle."""
+        for dtype, batch in ((tf.float32, 248), (tf.float16, 248), (tf.float32, 7)):
+            uniform = tf.random.stateless_uniform(
+                (batch, 1), seed=(3, 4), maxval=360.0, dtype=tf.float32
+            )
+            angles = stratify_angles(tf.cast(uniform, dtype))
+            self.assertEqual(angles.dtype, dtype)
+            values = angles.numpy().astype(np.float64)[:, 0]
+            self.assertTrue(np.all(np.isfinite(values)))
+            bins = np.floor(values * batch / 360.0).astype(int)
+            # float16 rounds angles near a bin edge (spacing 0.25 deg near 360).
+            tolerance = 1 if dtype == tf.float16 else 0
+            self.assertLessEqual(np.abs(bins - np.arange(batch)).max(), tolerance)
+            self.assertTrue(np.all((values >= 0.0) & (values <= 360.0)))
 
 
 if __name__ == "__main__":

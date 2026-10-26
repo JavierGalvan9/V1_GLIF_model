@@ -361,6 +361,19 @@ def generate_drifting_grating_parameters(seed, dtype=tf.float32):
             .with_options(data_options))
 
 
+def stratify_angles(orientation):
+    """Spread a batch of uniform [0, 360) angles one per equal-width bin.
+
+    Each draw becomes the jitter inside its own bin of width 360 / batch, so
+    every batch covers the circle evenly while the angles stay continuous.
+    Computed in float32: 360 * batch overflows float16.
+    """
+    n_bins = tf.shape(orientation)[0]
+    bins = tf.cast(tf.range(n_bins), tf.float32)[:, tf.newaxis]
+    stratified = (tf.cast(orientation, tf.float32) + 360.0 * bins) / tf.cast(n_bins, tf.float32)
+    return tf.cast(stratified, orientation.dtype)
+
+
 def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8,
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,

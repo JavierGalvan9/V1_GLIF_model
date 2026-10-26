@@ -56,12 +56,12 @@ parser.add_argument('--lr_cosine_steps', default=880, type=int)
 parser.add_argument('--rate_cost', default=10000., type=float)
 parser.add_argument('--voltage_cost', default=1., type=float)
 parser.add_argument('--sync_cost', default=1.5, type=float)
-parser.add_argument('--osi_cost', default=20., type=float)
+parser.add_argument('--osi_cost', default=2., type=float)
 parser.add_argument('--annulus_loss_weight', default=0.1, type=float)
 parser.add_argument('--osi_loss_subtraction_ratio', default=0., type=float)
 parser.add_argument(
     '--osi_loss_method',
-    default='crowd_osi',
+    default='batch_osi_emd',
     type=str,
     choices=[
         'crowd_osi',
@@ -154,6 +154,18 @@ parser.add_argument('--n_epochs', default=75, type=int)
 parser.add_argument('--batch_size', default=2, type=int)
 parser.add_argument('--grating_batch_size', default=1, type=int)
 parser.add_argument('--gray_batch_size', default=1, type=int)
+parser.add_argument(
+    '--stratified_grating_angles',
+    dest='stratified_grating_angles',
+    action='store_true',
+    help='Draw each replica batch of grating angles one per equal-width bin of 360 / batch.',
+)
+parser.add_argument(
+    '--nostratified_grating_angles',
+    dest='stratified_grating_angles',
+    action='store_false',
+)
+parser.set_defaults(stratified_grating_angles=True)
 parser.add_argument('--neurons', default=0, type=int)
 parser.add_argument('--steps_per_epoch', default=25, type=int)
 parser.add_argument('--val_steps', default=1, type=int)
@@ -365,7 +377,7 @@ def main():
             # osi_dsi_estimator.py does not define training-only batch splits,
             # rolling-loss flags, training debug flags, or the backward options.
             if name in {
-                'n_gpus', 'grating_batch_size', 'gray_batch_size',
+                'n_gpus', 'grating_batch_size', 'gray_batch_size', 'stratified_grating_angles',
                 'debug_gradients', 'global_clipnorm',
                 'detach_reset', 'detach_asc_reset',
                 'pack_spike_checkpoints', 'backward_mode', 'voltage_offload', 'history_offload',

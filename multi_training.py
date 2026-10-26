@@ -1521,11 +1521,16 @@ def main(_):
                 global_grating_batch_size
             )
             pipeline_seed = flags.seed + flags.run_session + 10000 + int(input_context.input_pipeline_id)
-            return (
-                stim_dataset.generate_drifting_grating_parameters(pipeline_seed, dtype=dtype)
-                .batch(batch_size)
-                .prefetch(tf.data.AUTOTUNE)
-            )
+            dataset = stim_dataset.generate_drifting_grating_parameters(
+                pipeline_seed, dtype=dtype
+            ).batch(batch_size)
+            if flags.stratified_grating_angles:
+                dataset = dataset.map(
+                    lambda orientation, phase, spike_seed: (
+                        stim_dataset.stratify_angles(orientation), phase, spike_seed
+                    )
+                )
+            return dataset.prefetch(tf.data.AUTOTUNE)
         return _f
 
     # One generator per replica GPU, with its LGN filters on that GPU, called
@@ -2420,7 +2425,7 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
-    absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
+    absl.app.flags.DEFINE_string('osi_loss_method', 'batch_osi_emd', '')
     absl.app.flags.DEFINE_string('optimizer', 'exp_adam', '')
     absl.app.flags.DEFINE_string('neuropixels_df', 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv',
                                  'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
@@ -2447,7 +2452,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('rate_cost', 10000., '')
     absl.app.flags.DEFINE_float('sync_cost', 1.5, '')
     absl.app.flags.DEFINE_float('voltage_cost', 1., '')
-    absl.app.flags.DEFINE_float('osi_cost', 20., '')
+    absl.app.flags.DEFINE_float('osi_cost', 2., '')
     absl.app.flags.DEFINE_float('annulus_loss_weight', 0.1, '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 0., '')
     absl.app.flags.DEFINE_float(
@@ -2521,6 +2526,10 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_integer(
         'gray_batch_size', 1, 'Gray/spontaneous samples per replica.'
+    )
+    absl.app.flags.DEFINE_boolean(
+        'stratified_grating_angles', True,
+        'Draw each replica batch of grating angles one per equal-width bin of 360 / batch.'
     )
     absl.app.flags.DEFINE_integer(
         'n_gpus', 1, 'Number of visible GPUs to use.'
