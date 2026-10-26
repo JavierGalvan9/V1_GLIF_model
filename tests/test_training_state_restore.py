@@ -1,42 +1,24 @@
-"""train_end_data's running statistics stay paired with the checkpoint they are restored with."""
-import pickle as pkl
-
+"""The running statistics saved beside a checkpoint are restored with it."""
 import numpy as np
+import tensorflow as tf
 
-from multi_training import load_checkpoint_training_state, neuron_state_to_save
-
-
-def _write_run(run, state):
-    (run / "Intermediate_checkpoints").mkdir(parents=True)
-    with open(run / "train_end_data.pkl", "wb") as handle:
-        pkl.dump(state, handle)
-    return str(run / "Intermediate_checkpoints" / "ckpt-3")
+from v1_model_utils import tf_utils
 
 
-def test_state_comes_from_the_run_of_the_restored_checkpoint(tmp_path):
-    source = {"v1_ema": np.full(3, 0.004), "rolling_osi_emd_state": {"core": {"format": 2}}}
-    _write_run(tmp_path / "own_run", {"v1_ema": np.full(3, 0.001)})
-    # --restore_from another run: that run's state, not the session's own logdir.
-    other_checkpoint = _write_run(tmp_path / "other_run", source)
-    loaded = load_checkpoint_training_state(other_checkpoint)
-    np.testing.assert_array_equal(loaded["v1_ema"], source["v1_ema"])
-    assert loaded["rolling_osi_emd_state"] == source["rolling_osi_emd_state"]
+def test_each_checkpoint_keeps_its_own_state_and_deleted_ones_lose_theirs(tmp_path):
+    checkpoint = tf.train.Checkpoint(step=tf.Variable(0))
+    manager = tf.train.CheckpointManager(checkpoint, str(tmp_path / "Best_model"), max_to_keep=2)
+    paths = []
+    for epoch in range(1, 4):
+        paths.append(manager.save(checkpoint_number=epoch))
+        tf_utils.save_checkpoint_neuron_state(manager, paths[-1], {"v1_ema": np.full(3, float(epoch))})
+
+    # A restore of an older (e.g. best) checkpoint gets that checkpoint's state.
+    np.testing.assert_array_equal(tf_utils.load_checkpoint_neuron_state(paths[1])["v1_ema"], 2.0)
+    np.testing.assert_array_equal(tf_utils.load_checkpoint_neuron_state(paths[2])["v1_ema"], 3.0)
+    # The checkpoint the manager deleted takes its state with it.
+    assert tf_utils.load_checkpoint_neuron_state(paths[0]) == {}
+    assert sorted(p.name for p in (tmp_path / "Best_model").glob("*" + tf_utils.NEURON_STATE_SUFFIX)) == [
+        "ckpt-2" + tf_utils.NEURON_STATE_SUFFIX, "ckpt-3" + tf_utils.NEURON_STATE_SUFFIX]
     # No restored checkpoint (fresh weights): no restored statistics either.
-    assert load_checkpoint_training_state(None) == {}
-    assert load_checkpoint_training_state(str(tmp_path / "missing" / "Best_model" / "ckpt-1")) == {}
-
-
-def test_diverged_session_keeps_the_state_of_its_restored_checkpoint():
-    restored = {
-        "v1_ema": np.full(3, 0.002),
-        "rolling_osi_emd_state": {"core": {"weight_sum": np.array([0.5])}},
-        "epoch_metric_values": {"train_loss": [1.0]},
-    }
-    current = {"v1_ema": np.full(3, 0.009), "rolling_osi_emd_state": {"core": {}}}
-    assert neuron_state_to_save(current, restored, diverged=False) is current
-    kept = neuron_state_to_save(current, restored, diverged=True)
-    assert set(kept) == {"v1_ema", "rolling_osi_emd_state"}
-    assert kept["v1_ema"] is restored["v1_ema"]
-    assert kept["rolling_osi_emd_state"] is restored["rolling_osi_emd_state"]
-    # A diverged first session (nothing restored) saves no statistics.
-    assert neuron_state_to_save(current, {}, diverged=True) == {}
+    assert tf_utils.load_checkpoint_neuron_state(None) == {}

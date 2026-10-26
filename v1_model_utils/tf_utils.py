@@ -484,6 +484,31 @@ def make_checkpoint(model, optimizer=None):
     )
 
 
+# Running statistics of the weights (v1_ema, the rolling OSI/DSI EMA) are saved
+# next to each checkpoint, so every restore gets the statistics of its own weights.
+NEURON_STATE_SUFFIX = ".neuron_state.pkl"
+
+
+def save_checkpoint_neuron_state(manager, checkpoint_path, state):
+    """Write ``state`` beside ``checkpoint_path``; drop those of deleted checkpoints."""
+    with open(checkpoint_path + NEURON_STATE_SUFFIX, "wb") as handle:
+        pkl.dump(state, handle)
+    kept = {path + NEURON_STATE_SUFFIX for path in manager.checkpoints}
+    for name in os.listdir(manager.directory):
+        path = os.path.join(manager.directory, name)
+        if name.endswith(NEURON_STATE_SUFFIX) and path not in kept:
+            os.remove(path)
+
+
+def load_checkpoint_neuron_state(checkpoint_path):
+    """The running statistics saved with ``checkpoint_path``; {} without them."""
+    path = f"{checkpoint_path}{NEURON_STATE_SUFFIX}"
+    if not checkpoint_path or not os.path.exists(path):
+        return {}
+    with open(path, "rb") as handle:
+        return pkl.load(handle)
+
+
 def checkpoint_optimizer_identity(checkpoint_directory):
     """Read the recorded optimizer class name, or None for legacy checkpoints."""
     try:

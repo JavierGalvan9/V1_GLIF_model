@@ -2125,7 +2125,7 @@ class OrientationSelectivityLoss:
         across replicas before the update, so the copies are identical; every
         copy is saved all the same.
         Per-neuron arrays are scattered into network-sized rows (zeros outside
-        the loss's neurons), so train_end_data's per-neuron translation between
+        the loss's neurons), so the checkpoint neuron state's translation between
         neuron layouts (spatial_layout.translate_neuron_state) moves them with
         their neurons even when the loss covers only the core.
         """

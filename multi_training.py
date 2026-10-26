@@ -29,7 +29,6 @@ import numpy as np
 import pandas as pd
 import statistics
 import tensorflow as tf
-import pickle as pkl
 from time import strftime, time
 import logging
 from v1_model_utils import tf_utils
@@ -69,37 +68,6 @@ def update_rate_emas(v1_ema, v1_rates, decay, update_state=True):
 # Grating phases per protocol direction in validation (fixed, evenly spaced).
 VALIDATION_PHASES = 8
 
-# train_end_data.pkl entries that are running statistics of the trained weights.
-NEURON_STATE_KEYS = ("v1_ema", "rolling_osi_emd_state")
-
-
-def load_checkpoint_training_state(checkpoint_path):
-    """The train_end_data saved with a restored checkpoint; {} without one.
-
-    A run that writes ``<run>/<subdir>/ckpt-N`` saves its running statistics
-    (v1_ema, the rolling OSI/DSI EMA) to ``<run>/train_end_data.pkl`` at the
-    same time, so reading them from the checkpoint's run pairs them with the
-    restored weights, also for ``--restore_from`` another run. Training from
-    scratch starts them fresh.
-    """
-    if not checkpoint_path:
-        return {}
-    path = os.path.join(os.path.dirname(os.path.dirname(checkpoint_path)), "train_end_data.pkl")
-    if not os.path.exists(path):
-        return {}
-    with open(path, "rb") as handle:
-        return pkl.load(handle)
-
-
-def neuron_state_to_save(current_state, restored_state, diverged):
-    """Running statistics to write to train_end_data.pkl at the end of a session.
-
-    A diverged session leaves the intermediate checkpoint as it was restored,
-    so it keeps the statistics restored with it: a retry restores both, paired.
-    """
-    if not diverged:
-        return current_state
-    return {key: restored_state[key] for key in NEURON_STATE_KEYS if key in restored_state}
 
 
 def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
@@ -698,15 +666,15 @@ def main(_):
         ema_decay = 0.95
         # Initialize exponential moving averages for V1 and LM firing rates
         # Stored canonical, like checkpoints; move it into the runtime layout.
-        train_end_data = spatial_layout.translate_neuron_state(
-            neuron_layout, load_checkpoint_training_state(_checkpoint_directory),
+        restored_neuron_state = spatial_layout.translate_neuron_state(
+            neuron_layout, tf_utils.load_checkpoint_neuron_state(_checkpoint_directory),
             to_runtime=True,
         )
         # 3 Hz is near the average FR of cortex.
         default_v1_ema = tf.constant(
             0.003, shape=(network["n_nodes"],), dtype=tf.float32
         )
-        restored_v1_ema = train_end_data.get("v1_ema")
+        restored_v1_ema = restored_neuron_state.get("v1_ema")
         if restored_v1_ema is None:
             v1_ema_value = default_v1_ema
         else:
@@ -790,7 +758,7 @@ def main(_):
             except ValueError as exc:
                 print(f"Warning: could not restore {flags.osi_loss_method} state for {label}: {exc}")
 
-        rolling_state_payload = train_end_data.get("rolling_osi_emd_state", {})
+        rolling_state_payload = restored_neuron_state.get("rolling_osi_emd_state", {})
         if isinstance(rolling_state_payload, dict):
             _restore_rolling_state(OSI_DSI_Loss, rolling_state_payload.get("core"), "core")
             if annulus_mask is not None:
@@ -2229,9 +2197,20 @@ def main(_):
                    'train_regularizer_loss', 'train_osi_dsi_loss', 'train_sync_loss', 'val_loss',
                    'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_osi_dsi_loss', 'val_sync_loss']
 
+    def current_neuron_state():
+        """Running statistics of the current weights, saved with every checkpoint."""
+        state = {'v1_ema': np.asarray(v1_ema.read_value())}
+        if flags.osi_loss_method == "rolling_osi_emd":
+            rolling_state = {"core": OSI_DSI_Loss.get_rolling_state()}
+            if annulus_mask is not None:
+                rolling_state["annulus"] = annulus_OSI_DSI_Loss.get_rolling_state()
+            state["rolling_osi_emd_state"] = rolling_state
+        return state
+
     callbacks = Callbacks(network, lgn_input, bkg_input, model, optimizer, flags, logdir, strategy,
                           metric_keys, pre_delay=delays[0], post_delay=delays[1], model_variables_init=model_variables_dict,
-                          checkpoint=checkpoint, spontaneous_training=flags.spontaneous_training,
+                          checkpoint=checkpoint, neuron_state=current_neuron_state,
+                          spontaneous_training=flags.spontaneous_training,
                           write_outputs=_TRAINING_LAUNCH_PLAN.is_chief)
 
     protocol_angles = np.asarray(tuple(range(0, 360, 45)), dtype=np.int32)
@@ -2509,16 +2488,7 @@ def main(_):
         reset_train_metrics()
         distributed_reset_validation_metrics()
 
-    normalizers = {'v1_ema': np.asarray(v1_ema.read_value())}
-    if flags.osi_loss_method == "rolling_osi_emd":
-        rolling_state = {"core": OSI_DSI_Loss.get_rolling_state()}
-        if annulus_mask is not None:
-            rolling_state["annulus"] = annulus_OSI_DSI_Loss.get_rolling_state()
-        normalizers["rolling_osi_emd_state"] = rolling_state
-    callbacks.on_train_end(
-        metric_values,
-        normalizers=neuron_state_to_save(normalizers, train_end_data, callbacks.diverged),
-    )
+    callbacks.on_train_end(metric_values)
 
 
 if __name__ == '__main__':
