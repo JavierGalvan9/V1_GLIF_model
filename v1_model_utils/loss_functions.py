@@ -1795,16 +1795,12 @@ class OrientationSelectivityLoss:
         self._rolling_max_gradient_scale = tf.constant(
             rolling_max_gradient_scale, dtype=self._dtype
         )
-        self._adaptative_scale_min = tf.constant(0.4, dtype=self._dtype)
-        self._adaptative_scale_max = tf.constant(1.0, dtype=self._dtype)
-        self._adaptative_shrink_k = tf.constant(20.0, dtype=self._dtype)
         if (
             self._core_mask is not None
             and self._method in (
                 "crowd_spikes",
                 "crowd_osi",
                 "rolling_osi_emd",
-                "adaptative_crowd_osi",
                 "batch_osi_emd",
             )
         ):
@@ -1824,19 +1820,6 @@ class OrientationSelectivityLoss:
             self._initialize_crowd_targets()
             self._rolling_epsilon = tf.constant(rolling_epsilon, dtype=self._dtype)
 
-        elif self._method == "adaptative_crowd_osi":
-            self._initialize_crowd_targets(include_experimental_counts=True)
-            resolved_decay = self._resolve_rolling_decay(
-                rolling_decay=rolling_decay,
-                rolling_batch_size=rolling_batch_size,
-                rolling_target_sample_ess=rolling_target_sample_ess,
-                rolling_max_decay=rolling_max_decay,
-            )
-            self._rolling_decay = tf.constant(resolved_decay, dtype=self._dtype)
-            self._rolling_one_minus_decay = tf.constant(1.0 - resolved_decay, dtype=self._dtype)
-            self._rolling_epsilon = tf.constant(rolling_epsilon, dtype=self._dtype)
-            self._initialize_rolling_state_variables(len(self._tuning_angles))
-
         elif self._method == "rolling_osi_emd":
             resolved_decay = self._resolve_rolling_decay(
                 rolling_decay=rolling_decay,
@@ -1854,7 +1837,7 @@ class OrientationSelectivityLoss:
             self._initialize_emd_targets()
 
     def _uses_rolling_state(self):
-        return self._method in ("rolling_osi_emd", "adaptative_crowd_osi")
+        return self._method == "rolling_osi_emd"
 
     def _resolve_rolling_decay(
         self,
@@ -1969,7 +1952,7 @@ class OrientationSelectivityLoss:
 
         return osi_dsi_exp_dict
 
-    def _initialize_crowd_targets(self, include_experimental_counts=False):
+    def _initialize_crowd_targets(self):
         self._target_osi_dsi = self.get_neuropixels_osi_dsi()
         self._min_rates_threshold = tf.constant(0.0005, dtype=self._dtype)
 
@@ -1978,15 +1961,12 @@ class OrientationSelectivityLoss:
         osi_target_values = []
         dsi_target_values = []
         cell_type_count = []
-        experimental_cell_type_count = []
 
         for node_type_id, (_key, value) in enumerate(self._target_osi_dsi.items()):
             node_ids = value["ids"]
             osi_target_values.append(value["OSI"])
             dsi_target_values.append(value["DSI"])
             cell_type_count.append(len(node_ids))
-            if include_experimental_counts:
-                experimental_cell_type_count.append(len(value["OSI_values"]))
             # update the ndoe_type_ids tensor in positions node_ids with the node_type_id
             # self.node_type_ids = tf.tensor_scatter_nd_update(self.node_type_ids, indices=tf.expand_dims(node_ids, axis=1), updates=tf.fill(tf.shape(node_ids), node_type_id))
             node_type_ids[node_ids] = node_type_id
@@ -1996,10 +1976,6 @@ class OrientationSelectivityLoss:
         self.cell_type_count = tf.constant(cell_type_count, dtype=self._dtype)
         self.node_type_ids = tf.constant(node_type_ids, dtype=tf.int32)
         self._n_node_types = len(self._target_osi_dsi)
-        if include_experimental_counts:
-            self.experimental_cell_type_count = tf.constant(
-                experimental_cell_type_count, dtype=self._dtype
-            )
 
     def _initialize_rolling_state_variables(self, n_nodes):
         zeros = tf.zeros((n_nodes,), dtype=self._dtype)
@@ -2460,112 +2436,6 @@ class OrientationSelectivityLoss:
             warmup_scale,
         )
 
-    def _adaptative_rolling_moments(self, rates, radians_delta_angle, update_state=True):
-        if not update_state:
-            return (
-                self._rolling_ori_real,
-                self._rolling_ori_imag,
-                self._rolling_dir_real,
-                self._rolling_dir_imag,
-                self._rolling_denominator,
-            )
-
-        (
-            new_ori_real,
-            new_ori_imag,
-            new_dir_real,
-            new_dir_imag,
-            new_denominator,
-            new_weight_sum,
-            new_weight_sq_sum,
-        ) = self._compute_rolling_moment_values(
-            rates, radians_delta_angle
-        )
-        self._rolling_ori_real.assign(tf.stop_gradient(new_ori_real))
-        self._rolling_ori_imag.assign(tf.stop_gradient(new_ori_imag))
-        self._rolling_dir_real.assign(tf.stop_gradient(new_dir_real))
-        self._rolling_dir_imag.assign(tf.stop_gradient(new_dir_imag))
-        self._rolling_denominator.assign(tf.stop_gradient(new_denominator))
-        self._rolling_weight_sum.assign(tf.stop_gradient(new_weight_sum))
-        self._rolling_weight_sq_sum.assign(tf.stop_gradient(new_weight_sq_sum))
-        return new_ori_real, new_ori_imag, new_dir_real, new_dir_imag, new_denominator
-
-    def _segment_mean_by_cell_type(self, values):
-        return tf.math.unsorted_segment_mean(
-            values,
-            self.node_type_ids,
-            num_segments=self._n_node_types,
-        )
-
-    def _adaptative_scale_from_moments(self, real, imag, denominator):
-        safe_denominator = tf.maximum(denominator, self._min_rates_threshold)
-        single_neuron_selectivity = (
-            self._smoothed_vector_magnitude(real, imag) / safe_denominator
-        )
-        mean_single_selectivity = self._segment_mean_by_cell_type(
-            single_neuron_selectivity
-        )
-
-        crowd_real = self._segment_mean_by_cell_type(real)
-        crowd_imag = self._segment_mean_by_cell_type(imag)
-        crowd_denominator = tf.maximum(
-            self._segment_mean_by_cell_type(denominator),
-            self._min_rates_threshold,
-        )
-        crowd_selectivity = (
-            self._smoothed_vector_magnitude(crowd_real, crowd_imag)
-            / crowd_denominator
-        )
-
-        one = tf.ones_like(mean_single_selectivity)
-        raw_scale = tf.where(
-            mean_single_selectivity > self._rolling_epsilon,
-            crowd_selectivity / tf.maximum(mean_single_selectivity, self._rolling_epsilon),
-            one,
-        )
-        clipped_scale = tf.clip_by_value(
-            raw_scale, self._adaptative_scale_min, self._adaptative_scale_max
-        )
-
-        model_weights = tf.maximum(self.cell_type_count, self._rolling_epsilon)
-        global_scale = (
-            tf.reduce_sum(clipped_scale * model_weights)
-            / tf.reduce_sum(model_weights)
-        )
-        shrink_weight = (
-            self.experimental_cell_type_count
-            / (self.experimental_cell_type_count + self._adaptative_shrink_k)
-        )
-        shrunk_scale = (
-            shrink_weight * clipped_scale
-            + (1.0 - shrink_weight) * global_scale
-        )
-        return tf.stop_gradient(
-            tf.clip_by_value(
-                shrunk_scale,
-                self._adaptative_scale_min,
-                self._adaptative_scale_max,
-            )
-        )
-
-    def _adaptative_target_scales(self, rates, radians_delta_angle, update_state=True):
-        (
-            ori_real,
-            ori_imag,
-            dir_real,
-            dir_imag,
-            denominator,
-        ) = self._adaptative_rolling_moments(
-            rates, radians_delta_angle, update_state=update_state
-        )
-        osi_scale = self._adaptative_scale_from_moments(
-            ori_real, ori_imag, denominator
-        )
-        dsi_scale = self._adaptative_scale_from_moments(
-            dir_real, dir_imag, denominator
-        )
-        return osi_scale, dsi_scale
-
     @tf.function # jit compile is not used here because it converts the spikes to float32 before summing, which can cause memory issues for large spike tensors.
     def rates_per_sample_from_spikes(self, spikes, trim=True):
         """Return full-population rates with shape ``[batch, neurons]``."""
@@ -2628,35 +2498,6 @@ class OrientationSelectivityLoss:
         total_loss = (numerator / denominator) * self._osi_cost
 
         return total_loss
-
-    def adaptative_crowd_osi_loss_from_rates(
-        self, rates, angle, normalizer=None, update_state=True
-    ):
-        rates = self._prepare_rates(rates, normalizer)
-        radians_delta_angle = self._radians_delta_angle(angle)
-        batch_size = tf.shape(rates)[0]
-        osi_real_type, osi_imag_type, dsi_real_type, dsi_imag_type = self._compute_crowd_moment_core(
-            rates,
-            radians_delta_angle,
-            batch_size,
-            self.node_type_ids,
-            self._n_node_types,
-        )
-        osi_scale, dsi_scale = self._adaptative_target_scales(
-            rates, radians_delta_angle, update_state=update_state
-        )
-
-        osi_loss_type = tf.math.square(
-            osi_real_type - osi_scale * self.osi_target_values
-        ) + tf.math.square(osi_imag_type)
-        dsi_loss_type = tf.math.square(
-            dsi_real_type - dsi_scale * self.dsi_target_values
-        ) + tf.math.square(dsi_imag_type)
-
-        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)
-        denominator = tf.reduce_sum(self.cell_type_count)
-
-        return (numerator / denominator) * self._osi_cost
 
     def _batch_signed_selectivity_components(
         self, rates, radians_delta_angle, harmonic
@@ -2880,13 +2721,6 @@ class OrientationSelectivityLoss:
             return self.crowd_osi_loss_from_rates(
                 rates, angle, normalizer=normalizer
             )
-        if self._method == "adaptative_crowd_osi":
-            return self.adaptative_crowd_osi_loss_from_rates(
-                rates,
-                angle,
-                normalizer=normalizer,
-                update_state=update_state,
-            )
         if self._method == "rolling_osi_emd":
             return self.rolling_osi_emd_loss_from_rates(
                 rates,
@@ -2906,17 +2740,6 @@ class OrientationSelectivityLoss:
         rates = self.rates_per_sample_from_spikes(spikes, trim=False)
         return self.crowd_osi_loss_from_rates(
             rates, angle, normalizer=normalizer
-        )
-
-    def adaptative_crowd_osi_loss(
-        self, spikes, angle, normalizer=None, update_state=True
-    ):
-        rates = self.rates_per_sample_from_spikes(spikes, trim=False)
-        return self.adaptative_crowd_osi_loss_from_rates(
-            rates,
-            angle,
-            normalizer=normalizer,
-            update_state=update_state,
         )
 
     def rolling_osi_emd_loss(
@@ -2942,7 +2765,6 @@ class OrientationSelectivityLoss:
     ):
         if self._method in (
             "crowd_osi",
-            "adaptative_crowd_osi",
             "rolling_osi_emd",
             "batch_osi_emd",
         ):

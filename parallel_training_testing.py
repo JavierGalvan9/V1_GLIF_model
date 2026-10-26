@@ -65,7 +65,6 @@ parser.add_argument(
     type=str,
     choices=[
         'crowd_osi',
-        'adaptative_crowd_osi',
         'rolling_osi_emd',
         'batch_osi_emd',
         'crowd_spikes',

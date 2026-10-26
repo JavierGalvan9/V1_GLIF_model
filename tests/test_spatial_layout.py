@@ -214,7 +214,7 @@ def test_neuron_state_translation_round_trips_nested_payloads():
         "v1_ema": np.linspace(0, 1, N_NODES),
         "min_val_loss": 0.5,
         "epoch_metric_values": {"rate": [1.0, 2.0, 3.0]},
-        "adaptative_crowd_osi_state": {
+        "rolling_osi_emd_state": {
             "core": {
                 "ori_real": np.arange(N_NODES, dtype=np.float32),
                 "weight_sum": 12.0,
@@ -226,21 +226,21 @@ def test_neuron_state_translation_round_trips_nested_payloads():
         runtime["v1_ema"], payload["v1_ema"][layout.new_to_old]
     )
     assert np.array_equal(
-        runtime["adaptative_crowd_osi_state"]["core"]["ori_real"],
-        payload["adaptative_crowd_osi_state"]["core"]["ori_real"][layout.new_to_old],
+        runtime["rolling_osi_emd_state"]["core"]["ori_real"],
+        payload["rolling_osi_emd_state"]["core"]["ori_real"][layout.new_to_old],
     )
     # Non neuron-aligned entries pass through untouched.
     assert runtime["min_val_loss"] == 0.5
     assert runtime["epoch_metric_values"]["rate"] == [1.0, 2.0, 3.0]
-    assert runtime["adaptative_crowd_osi_state"]["core"]["weight_sum"] == 12.0
+    assert runtime["rolling_osi_emd_state"]["core"]["weight_sum"] == 12.0
 
     canonical = spatial_layout.translate_neuron_state(
         layout, runtime, to_runtime=False
     )
     assert np.allclose(canonical["v1_ema"], payload["v1_ema"])
     assert np.allclose(
-        canonical["adaptative_crowd_osi_state"]["core"]["ori_real"],
-        payload["adaptative_crowd_osi_state"]["core"]["ori_real"],
+        canonical["rolling_osi_emd_state"]["core"]["ori_real"],
+        payload["rolling_osi_emd_state"]["core"]["ori_real"],
     )
 
 

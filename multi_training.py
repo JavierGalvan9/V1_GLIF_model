@@ -706,10 +706,7 @@ def main(_):
             # model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
         def _restore_rolling_state(loss_obj, state, label):
-            if flags.osi_loss_method not in (
-                "rolling_osi_emd",
-                "adaptative_crowd_osi",
-            ) or not state:
+            if flags.osi_loss_method != "rolling_osi_emd" or not state:
                 return
             try:
                 if loss_obj.set_rolling_state(state):
@@ -717,15 +714,7 @@ def main(_):
             except ValueError as exc:
                 print(f"Warning: could not restore {flags.osi_loss_method} state for {label}: {exc}")
 
-        rolling_state_key = None
-        if flags.osi_loss_method == "rolling_osi_emd":
-            rolling_state_key = "rolling_osi_emd_state"
-        elif flags.osi_loss_method == "adaptative_crowd_osi":
-            rolling_state_key = "adaptative_crowd_osi_state"
-
-        rolling_state_payload = (
-            train_end_data.get(rolling_state_key, {}) if rolling_state_key else {}
-        )
+        rolling_state_payload = train_end_data.get("rolling_osi_emd_state", {})
         if isinstance(rolling_state_payload, dict):
             core_state = rolling_state_payload.get("core")
             if core_state is None and "ori_real" in rolling_state_payload:
@@ -2384,14 +2373,11 @@ def main(_):
         distributed_reset_validation_metrics()
 
     normalizers = {'v1_ema': np.asarray(v1_ema.read_value())}
-    if flags.osi_loss_method in ("rolling_osi_emd", "adaptative_crowd_osi"):
+    if flags.osi_loss_method == "rolling_osi_emd":
         rolling_state = {"core": OSI_DSI_Loss.get_rolling_state()}
         if annulus_mask is not None:
             rolling_state["annulus"] = annulus_OSI_DSI_Loss.get_rolling_state()
-        if flags.osi_loss_method == "rolling_osi_emd":
-            normalizers["rolling_osi_emd_state"] = rolling_state
-        else:
-            normalizers["adaptative_crowd_osi_state"] = rolling_state
+        normalizers["rolling_osi_emd_state"] = rolling_state
     callbacks.on_train_end(metric_values, normalizers=normalizers)
 
 
