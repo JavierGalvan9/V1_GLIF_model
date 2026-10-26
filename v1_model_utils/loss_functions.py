@@ -2536,20 +2536,29 @@ class OrientationSelectivityLoss:
         )
         return osi_real, osi_imag, dsi_real, dsi_imag
 
-    def _resample_tensor_distribution(self, sorted_values, n_samples):
-        """Linearly resample a sorted empirical distribution to a dynamic size."""
-        source_size = tf.shape(sorted_values)[0]
-        positions = tf.linspace(
-            tf.zeros((), dtype=self._dtype),
-            tf.cast(source_size - 1, self._dtype),
-            n_samples,
+    @staticmethod
+    def _resampled_targets(empirical, segment, rank, n_samples):
+        """Value of each segment's sorted ``empirical`` sample, linearly resampled
+        to ``n_samples[segment]`` quantiles, at quantile ``rank``.
+
+        Same arithmetic as ``tf.linspace(0, size - 1, n)``: ``rank * step``
+        inside, the exact end points at both ends.
+        """
+        dtype = empirical.values.dtype
+        sizes = tf.gather(tf.cast(empirical.row_lengths(), rank.dtype), segment)
+        last = tf.cast(sizes - 1, dtype)
+        count = tf.gather(n_samples, segment)
+        step = last / tf.cast(tf.maximum(count - 1, 1), dtype)
+        positions = tf.where(
+            (rank == count - 1) & (count > 1), last, tf.cast(rank, dtype) * step
         )
-        lower = tf.cast(tf.floor(positions), tf.int32)
-        upper = tf.minimum(lower + 1, source_size - 1)
-        weight = positions - tf.cast(lower, self._dtype)
+        lower = tf.cast(tf.floor(positions), sizes.dtype)
+        upper = tf.minimum(lower + 1, sizes - 1)
+        weight = positions - tf.cast(lower, dtype)
+        offsets = tf.gather(tf.cast(empirical.row_starts(), rank.dtype), segment)
         return (
-            tf.gather(sorted_values, lower) * (1.0 - weight)
-            + tf.gather(sorted_values, upper) * weight
+            tf.gather(empirical.values, offsets + lower) * (1.0 - weight)
+            + tf.gather(empirical.values, offsets + upper) * weight
         )
 
     def _preferred_direction_active(self, rates, angle):
@@ -2576,6 +2585,35 @@ class OrientationSelectivityLoss:
         )
         return tf.stop_gradient(preferred_rates >= self._min_rates_threshold)
 
+    @staticmethod
+    def _segment_sort_order(values, segment, tiebreak):
+        """Indices sorting ``values`` by (segment, value, tiebreak) in one sort.
+
+        One int64 key per element: the segment in bits 52+, the float's
+        order-preserving 32-bit image in bits 20-51, ``tiebreak`` (< 2**20)
+        below. Exact for any finite float32; -0.0 is mapped to +0.0 first.
+        """
+        bits = tf.cast(tf.bitcast(values + 0.0, tf.int32), tf.int64)
+        ordered = tf.where(bits < 0, tf.bitwise.bitwise_xor(bits, 0x7FFFFFFF), bits) + 2**31
+        keys = tf.bitwise.bitwise_or(
+            tf.bitwise.bitwise_or(
+                tf.bitwise.left_shift(segment, 52), tf.bitwise.left_shift(ordered, 20)
+            ),
+            tiebreak,
+        )
+        return tf.argsort(keys, stable=True)
+
+    @staticmethod
+    def _hash_tiebreak(index, seed):
+        """20-bit integer hash of (``index``, ``seed``), all int64 on the device."""
+        mask = 0xFFFFFFFF
+        x = tf.bitwise.bitwise_and(tf.bitwise.bitwise_xor(index, seed), mask)
+        for shift, multiplier in ((16, 0x7FEB352D), (15, 0x846CA68B)):
+            x = tf.bitwise.bitwise_xor(x, tf.bitwise.right_shift(x, shift))
+            x = tf.bitwise.bitwise_and(x * multiplier, mask)
+        x = tf.bitwise.bitwise_xor(x, tf.bitwise.right_shift(x, 16))
+        return tf.bitwise.right_shift(x, 12)
+
     @tf.function(jit_compile=False)
     def _signed_selectivity_emd_loss(
         self, osi_real, osi_imag, dsi_real, dsi_imag, active
@@ -2585,75 +2623,68 @@ class OrientationSelectivityLoss:
         Only ``active`` neurons enter; each type's Neuropixels sample is
         resampled to its active count, and types without an active neuron are
         left out of the population-weighted average.
+
+        All cell types are handled at once, with fixed shapes and no host
+        round trip: one segment-major sort per component orders every type's
+        active neurons, and inactive neurons sort into a trailing segment.
         """
-        alignment = tf.constant(
-            self._batch_emd_alignment_weight, dtype=self._dtype
+        dtype = self._dtype
+        n_types = tf.cast(self._n_node_types, tf.int64)
+        neuron_ids = self._emd_group_indices.values
+        cell_type = tf.cast(self._emd_group_indices.value_rowids(), tf.int64)
+        group_active = tf.gather(active, neuron_ids)
+        segment = tf.where(group_active, cell_type, n_types)
+        n_segments = n_types + 1
+        counts = tf.math.unsorted_segment_sum(
+            tf.ones_like(segment), segment, n_segments
         )
-        losses = tf.TensorArray(self._dtype, size=self._n_node_types)
-        valid_types = tf.TensorArray(self._dtype, size=self._n_node_types)
+        n_active = counts[:-1]
+        safe_n_active = tf.cast(tf.maximum(n_active, 1), dtype)
+        active_weight = tf.cast(group_active, dtype)
 
-        for i in tf.range(self._n_node_types):
-            indices = self._emd_group_indices[i]
-            group_active = tf.gather(active, indices)
-            n_active = tf.math.count_nonzero(group_active, dtype=tf.int32)
+        def type_sums(values):
+            return tf.math.unsorted_segment_sum(values, segment, n_segments)[:-1]
 
-            def active_type_loss():
-                current_osi_real = tf.boolean_mask(
-                    tf.gather(osi_real, indices), group_active
-                )
-                current_dsi_real = tf.boolean_mask(
-                    tf.gather(dsi_real, indices), group_active
-                )
-                current_osi_imag = tf.boolean_mask(
-                    tf.gather(osi_imag, indices), group_active
-                )
-                current_dsi_imag = tf.boolean_mask(
-                    tf.gather(dsi_imag, indices), group_active
-                )
-                osi_target = self._resample_tensor_distribution(
-                    self._osi_empirical_distributions[i], n_active
-                )
-                dsi_target = self._resample_tensor_distribution(
-                    self._dsi_empirical_distributions[i], n_active
-                )
-                # Sorting is permutation invariant in the forward pass, but its
-                # gradient must assign tied values to individual target ranks.
-                # Shuffle first so that this otherwise arbitrary assignment does
-                # not repeatedly favor neurons with particular network indices.
-                # Shuffle indices and gather: tf.random.shuffle on the values
-                # has no gradient and would silently zero the whole EMD term.
-                # The seed comes from the pooled values, so every replica draws
-                # the same permutation and computes the same loss.
-                permutation = tf.random.experimental.stateless_shuffle(
-                    tf.range(n_active),
-                    seed=tf.stack([
-                        i,
-                        tf.bitcast(tf.cast(tf.reduce_sum(tf.stop_gradient(current_osi_real)), tf.float32), tf.int32),
-                    ]),
-                )
-                shuffled_osi_real = tf.gather(current_osi_real, permutation)
-                shuffled_dsi_real = tf.gather(current_dsi_real, permutation)
-                return (
-                    tf.reduce_mean(tf.abs(tf.sort(shuffled_osi_real) - osi_target))
-                    + tf.reduce_mean(tf.abs(tf.sort(shuffled_dsi_real) - dsi_target))
-                    + alignment
-                    * (
-                        tf.reduce_mean(tf.abs(current_osi_imag))
-                        + tf.reduce_mean(tf.abs(current_dsi_imag))
-                    )
-                )
+        # Sorting is permutation invariant in the forward pass, but its
+        # gradient must assign tied values to individual target ranks. Ties are
+        # broken by a hash of the neuron's position, seeded with the pooled
+        # values, so the assignment does not repeatedly favor particular
+        # neurons and every replica computes the same loss.
+        gathered_osi_real = tf.gather(osi_real, neuron_ids)
+        seed = tf.cast(tf.bitcast(tf.cast(tf.reduce_sum(
+            tf.stop_gradient(gathered_osi_real) * active_weight), tf.float32), tf.int32), tf.int64)
+        position = tf.range(tf.size(segment, out_type=tf.int64), dtype=tf.int64)
+        tiebreak = self._hash_tiebreak(position, seed)
+        segment_start = tf.cumsum(counts, exclusive=True)
 
-            zero = tf.reduce_sum(tf.gather(osi_real, indices)) * 0.0
-            losses = losses.write(
-                i, tf.cond(n_active > 0, active_type_loss, lambda: zero)
+        def sorted_emd(values, empirical):
+            order = self._segment_sort_order(values, segment, tiebreak)
+            sorted_segment = tf.gather(segment, order)
+            is_active = sorted_segment < n_types
+            sorted_type = tf.minimum(sorted_segment, n_types - 1)
+            rank = tf.where(
+                is_active, position - tf.gather(segment_start, sorted_type), 0
             )
-            valid_types = valid_types.write(
-                i, tf.cast(n_active > 0, self._dtype)
+            targets = self._resampled_targets(
+                empirical, sorted_type, rank, n_active
             )
+            distance = tf.abs(tf.gather(values, order) - targets)
+            return tf.math.unsorted_segment_sum(
+                tf.where(is_active, distance, tf.zeros_like(distance)),
+                sorted_segment,
+                n_segments,
+            )[:-1] / safe_n_active
 
-        losses = losses.stack()
-        valid_types = valid_types.stack()
-        valid_type_weights = valid_types * self.cell_type_count
+        alignment = tf.constant(self._batch_emd_alignment_weight, dtype=dtype)
+        losses = (
+            sorted_emd(gathered_osi_real, self._osi_empirical_distributions)
+            + sorted_emd(tf.gather(dsi_real, neuron_ids), self._dsi_empirical_distributions)
+            + alignment * (
+                type_sums(tf.abs(tf.gather(osi_imag, neuron_ids)) * active_weight)
+                + type_sums(tf.abs(tf.gather(dsi_imag, neuron_ids)) * active_weight)
+            ) / safe_n_active
+        )
+        valid_type_weights = tf.cast(n_active > 0, dtype) * self.cell_type_count
         return (
             tf.reduce_sum(losses * valid_type_weights)
             / tf.maximum(
