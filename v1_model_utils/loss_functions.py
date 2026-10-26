@@ -2684,8 +2684,7 @@ class OrientationSelectivityLoss:
         dsi_real, dsi_imag = self._batch_signed_selectivity_components(
             rates, radians_delta_angle, 1
         )
-        total_rates = tf.reduce_sum(rates, axis=0)
-        return osi_real, osi_imag, dsi_real, dsi_imag, total_rates
+        return osi_real, osi_imag, dsi_real, dsi_imag
 
     def _resample_tensor_distribution(self, sorted_values, n_samples):
         """Linearly resample a sorted empirical distribution to a dynamic size."""
@@ -2703,35 +2702,39 @@ class OrientationSelectivityLoss:
             + tf.gather(sorted_values, upper) * weight
         )
 
-    @tf.function(jit_compile=False)
-    def batch_osi_emd_loss_from_rates(self, rates, angle, normalizer=None):
-        """Distributional OSI/DSI loss from a single large gratings batch.
+    def _preferred_direction_active(self, rates, angle):
+        """Neurons whose preferred-direction rate reaches the 0.5 Hz cutoff.
 
-        Unlike `rolling_osi_emd`, nothing is carried between steps: with enough
-        gratings samples per batch the per-neuron estimate is usable on its own,
-        so there is no EMA state to checkpoint, no stale-moment gradient rescale
-        and no warmup. The quantity minimised here is, up to the resampling of
-        the target, the same per-cell-type EMD that `equal_cell_type_emd`
-        reports at validation.
-
-        The EMD is applied to the signed real component, while the imaginary
-        component is regularized toward zero. This anchors each neuron to the
-        preferred angle supplied by the LGN projection and prevents magnitude
-        matching from accepting a 90-degree OSI reversal or a 180-degree DSI
-        reversal.
-
-        ``normalizer`` is ignored.
+        Selectivity estimated from a few spikes is noise (one spike reads as
+        OSI = DSI = 1), so neurons below the responsiveness cutoff of the
+        Neuropixels targets are excluded. The preferred-direction rate bins the
+        batch's gratings into the 8 protocol directions (45-degree bins centred
+        on 0, 45, ..., 315), the Neuropixels/validation criterion. The mask is
+        intentionally non-differentiable; the firing-rate loss, not the OSI/DSI
+        loss, is responsible for activating silent neurons.
         """
-        osi_real, osi_imag, dsi_real, dsi_imag, total_rates = (
-            self._batch_signed_osi_dsi_components(
-                rates, angle, normalizer=normalizer
-            )
+        direction_bin = tf.math.floormod(
+            tf.cast(tf.round(tf.reshape(tf.cast(angle, self._dtype), [-1]) / 45.0), tf.int32), 8
         )
-        # Match validation semantics: OSI/DSI is undefined for a neuron that did
-        # not fire, so exclude it from the distribution rather than assigning it
-        # selectivity zero. The mask is intentionally non-differentiable; the
-        # firing-rate loss, not this loss, is responsible for activating it.
-        active = tf.stop_gradient(total_rates > 0.0)
+        bin_rates = tf.math.unsorted_segment_sum(rates, direction_bin, 8)
+        bin_counts = tf.math.unsorted_segment_sum(
+            tf.ones_like(direction_bin, dtype=self._dtype), direction_bin, 8
+        )
+        preferred_rates = tf.reduce_max(
+            bin_rates / tf.maximum(bin_counts, 1.0)[:, tf.newaxis], axis=0
+        )
+        return tf.stop_gradient(preferred_rates >= self._min_rates_threshold)
+
+    @tf.function(jit_compile=False)
+    def _signed_selectivity_emd_loss(
+        self, osi_real, osi_imag, dsi_real, dsi_imag, active
+    ):
+        """Per-cell-type EMD of the signed real components plus |Im| alignment.
+
+        Only ``active`` neurons enter; each type's Neuropixels sample is
+        resampled to its active count, and types without an active neuron are
+        left out of the population-weighted average.
+        """
         alignment = tf.constant(
             self._batch_emd_alignment_weight, dtype=self._dtype
         )
@@ -2766,8 +2769,19 @@ class OrientationSelectivityLoss:
                 # gradient must assign tied values to individual target ranks.
                 # Shuffle first so that this otherwise arbitrary assignment does
                 # not repeatedly favor neurons with particular network indices.
-                shuffled_osi_real = tf.random.shuffle(current_osi_real)
-                shuffled_dsi_real = tf.random.shuffle(current_dsi_real)
+                # Shuffle indices and gather: tf.random.shuffle on the values
+                # has no gradient and would silently zero the whole EMD term.
+                # The seed comes from the values, so the permutation is
+                # reproducible and identical wherever the same values are seen.
+                permutation = tf.random.experimental.stateless_shuffle(
+                    tf.range(n_active),
+                    seed=tf.stack([
+                        i,
+                        tf.bitcast(tf.cast(tf.reduce_sum(tf.stop_gradient(current_osi_real)), tf.float32), tf.int32),
+                    ]),
+                )
+                shuffled_osi_real = tf.gather(current_osi_real, permutation)
+                shuffled_dsi_real = tf.gather(current_dsi_real, permutation)
                 return (
                     tf.reduce_mean(tf.abs(tf.sort(shuffled_osi_real) - osi_target))
                     + tf.reduce_mean(tf.abs(tf.sort(shuffled_dsi_real) - dsi_target))
@@ -2795,6 +2809,36 @@ class OrientationSelectivityLoss:
                 tf.reduce_sum(valid_type_weights), self._rolling_epsilon
             )
         ) * self._osi_cost
+
+    def batch_osi_emd_loss_from_rates(self, rates, angle, normalizer=None):
+        """Distributional OSI/DSI loss from a single large gratings batch.
+
+        Unlike `rolling_osi_emd`, nothing is carried between steps: with enough
+        gratings samples per batch the per-neuron estimate is usable on its own,
+        so there is no EMA state to checkpoint, no stale-moment gradient rescale
+        and no warmup. The quantity minimised here is, up to the resampling of
+        the target, the same per-cell-type EMD that `equal_cell_type_emd`
+        reports at validation.
+
+        The EMD is applied to the signed real component, while the imaginary
+        component is regularized toward zero. This anchors each neuron to the
+        preferred angle supplied by the LGN projection and prevents magnitude
+        matching from accepting a 90-degree OSI reversal or a 180-degree DSI
+        reversal.
+
+        ``normalizer`` is ignored.
+        """
+        osi_real, osi_imag, dsi_real, dsi_imag = (
+            self._batch_signed_osi_dsi_components(
+                rates, angle, normalizer=normalizer
+            )
+        )
+        active = self._preferred_direction_active(
+            self._prepare_rates(rates, None), angle
+        )
+        return self._signed_selectivity_emd_loss(
+            osi_real, osi_imag, dsi_real, dsi_imag, active
+        )
 
     def rolling_osi_emd_loss_from_rates(
         self, rates, angle, normalizer=None, update_state=True
