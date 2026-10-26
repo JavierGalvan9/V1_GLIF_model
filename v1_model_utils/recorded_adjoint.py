@@ -382,6 +382,11 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             raise ValueError(f"history_offload must be one of {HISTORY_OFFLOAD_MODES}.")
         self.voltage_offload = voltage_offload
         self.history_offload = history_offload
+        # Orders this runner's frame-store ops per replica (see order_variable).
+        self._store_order = (
+            frame_store.order_variable()
+            if voltage_offload != "none" or history_offload != "none" else None
+        )
         self._weight_roles = {
             "recurrent": cell.recurrent_weight_values.value,
             "bkg": cell.bkg_input_weights.value,
@@ -471,6 +476,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                     frames = frame_store.offload_frame(
                         packed, index, spike_store, length, length - self._PREFETCH,
                         self._COPY_GROUP, codec="raw", drop_outside=True,
+                        order=self._store_order.handle,
                     )
         store = self._frame_store("voltages", self.voltage_offload != "none", batch, width)
         voltages = tf.zeros([0]) if store else _empty_list(tf.float32, [batch, width])
@@ -503,18 +509,21 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                     voltage, time, store, length, resident_from, self._COPY_GROUP,
                     codec="tq" if self.voltage_offload in ("adaptive", "compressed") else "raw",
                     drop_outside=True,
+                    order=self._store_order.handle,
                 )
             if spike_store:
                 with tf.control_dependencies([frames]):
                     frames = frame_store.offload_frame(
                         tf.bitcast(spike_words, tf.int32), time + cell.max_delay, spike_store,
                         length, resident_from, self._COPY_GROUP, codec="raw", drop_outside=True,
+                        order=self._store_order.handle,
                     )
             if blocked_store:
                 with tf.control_dependencies([blocked]):
                     blocked = frame_store.offload_frame(
                         tf.bitcast(blocked_words, tf.int32), time, blocked_store, length,
                         resident_from, self._COPY_GROUP, codec="raw", drop_outside=True,
+                        order=self._store_order.handle,
                     )
             return frames, voltages, blocked
 
@@ -775,6 +784,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 words = frame_store.take_frame(
                     index, spike_store, frames_like,
                     prefetch=self._PREFETCH, group=self._COPY_GROUP, zero_before_start=True,
+                    order=self._store_order.handle,
                 )
                 # The delay-window loop carry must stay on the GPU, unlike
                 # int32 control-flow tensors.
@@ -797,6 +807,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                     voltage = frame_store.take_frame(
                         time, store, final_state[1],
                         prefetch=self._PREFETCH, group=self._COPY_GROUP,
+                        order=self._store_order.handle,
                     )
             else:
                 voltages, voltage = _pop(voltages, final_state[1])
@@ -805,6 +816,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                     packed_blocked = frame_store.take_frame(
                         time, blocked_store, frames_like,
                         prefetch=self._PREFETCH, group=self._COPY_GROUP,
+                        order=self._store_order.handle,
                     )
             else:
                 blocked, packed_blocked = _pop(blocked, frames_like)

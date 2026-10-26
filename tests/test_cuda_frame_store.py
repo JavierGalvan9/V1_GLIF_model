@@ -24,6 +24,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Orders the store ops (wrapper.order_variable); its value is never read.
+ORDER = cuda_frame_store.order_variable()
+
+
 def _frames(length, shape, dtype, seed):
     rng = np.random.default_rng(seed)
     if dtype == tf.int32:
@@ -86,7 +90,7 @@ def _round_trip(frames, key, prefetch, group=1, resident_from=None, codec="raw")
         def step(time, token):
             return time + 1, cuda_frame_store.offload_frame(
                 tf.identity(tf.constant(frames)[time]), time, key, length, resident_from, group,
-                codec=_op(codec),
+                codec=_op(codec), order=ORDER.handle,
             )
         return tf.while_loop(lambda time, _: time < length, step,
                              (tf.constant(0), tf.zeros([0])), parallel_iterations=8)[1]
@@ -95,7 +99,7 @@ def _round_trip(frames, key, prefetch, group=1, resident_from=None, codec="raw")
     def reverse(token):
         def step(time, token, taken):
             with tf.control_dependencies([token]):
-                frame = cuda_frame_store.take_frame(time, key, like, prefetch=prefetch, group=group)
+                frame = cuda_frame_store.take_frame(time, key, like, prefetch=prefetch, group=group, order=ORDER.handle)
             return time - 1, token, taken.write(length - 1 - time, frame)
         taken = tf.TensorArray(like.dtype, size=length)
         return tf.while_loop(lambda time, *_: time >= 0, step,
@@ -181,7 +185,7 @@ def _generated_round_trip(key, length, shape, codec, group=4, resident_from=None
     def reverse_loop(first, token):
         def step(time, token, error):
             with tf.control_dependencies([token]):
-                taken = cuda_frame_store.take_frame(time, key, like, prefetch=prefetch, group=group)
+                taken = cuda_frame_store.take_frame(time, key, like, prefetch=prefetch, group=group, order=ORDER.handle)
             error = tf.maximum(error, distance(taken, time))
             # The next take waits for this step's work.
             return time - 1, tf.zeros([0]) * error, error
@@ -192,7 +196,7 @@ def _generated_round_trip(key, length, shape, codec, group=4, resident_from=None
     def cycle():
         def step(time, token):
             return time + 1, cuda_frame_store.offload_frame(
-                frame(time), time, key, length, resident_from, group, codec=_op(codec)
+                frame(time), time, key, length, resident_from, group, codec=_op(codec), order=ORDER.handle,
             )
         token = tf.while_loop(lambda time, _: time < length, step,
                               (tf.constant(0), tf.zeros([0])), parallel_iterations=4)[1]
@@ -235,9 +239,9 @@ def test_take_right_after_the_offload(codec):
     def immediate():
         frame = tf.random.stateless_normal(shape, [5, 0])
         token = cuda_frame_store.offload_frame(frame, tf.constant(0), f"test_now_{codec}", 1,
-                                               codec=_op(codec))
+                                               codec=_op(codec), order=ORDER.handle)
         with tf.control_dependencies([token]):
-            taken = cuda_frame_store.take_frame(tf.constant(0), f"test_now_{codec}", frame)
+            taken = cuda_frame_store.take_frame(tf.constant(0), f"test_now_{codec}", frame, order=ORDER.handle)
         return tf.reduce_max(tf.abs(taken - frame))
 
     with tf.device("/GPU:0"):
@@ -261,7 +265,7 @@ def test_frames_the_copy_engine_cannot_take_stay_on_the_gpu(codec, capfd, monkey
     def forward():
         def step(time, token):
             return time + 1, cuda_frame_store.offload_frame(frame(time), time, key, length,
-                                                            codec=_op(codec))
+                                                            codec=_op(codec), order=ORDER.handle)
         return tf.while_loop(lambda time, _: time < length, step,
                              (tf.constant(0), tf.zeros([0])))[1]
 
@@ -269,7 +273,7 @@ def test_frames_the_copy_engine_cannot_take_stay_on_the_gpu(codec, capfd, monkey
     def reverse(token):
         def step(time, token, mismatches):
             with tf.control_dependencies([token]):
-                taken = cuda_frame_store.take_frame(time, key, like, prefetch=2)
+                taken = cuda_frame_store.take_frame(time, key, like, prefetch=2, order=ORDER.handle)
             if _op(codec) == "tq":
                 differs = _tq_distance(taken, frame(time)) > 0.0
             else:
@@ -365,7 +369,7 @@ def test_reused_store_and_second_reverse_pass():
     # always copied out: nothing is in flight when the new layout starts.
     like = tf.zeros((2, 999))
     with tf.device("/GPU:0"):
-        again = cuda_frame_store.take_frame(tf.constant(0), key, like)
+        again = cuda_frame_store.take_frame(tf.constant(0), key, like, order=ORDER.handle)
     np.testing.assert_array_equal(again.numpy(), second[0])
     # The codec changes on the same key (and back): the store reconfigures.
     third = _frames(7, (2, 999), tf.float32, seed=3)
@@ -378,25 +382,25 @@ def test_keys_are_independent():
     b = _frames(3, (2, 64), tf.float32, seed=5)
     with tf.device("/GPU:0"):
         for time in range(3):
-            cuda_frame_store.offload_frame(tf.constant(a[time]), tf.constant(time), "test_a", 3)
-            cuda_frame_store.offload_frame(tf.constant(b[time]), tf.constant(time), "test_b", 3)
+            cuda_frame_store.offload_frame(tf.constant(a[time]), tf.constant(time), "test_a", 3, order=ORDER.handle)
+            cuda_frame_store.offload_frame(tf.constant(b[time]), tf.constant(time), "test_b", 3, order=ORDER.handle)
         like = tf.zeros((2, 64))
         for time in reversed(range(3)):
             np.testing.assert_array_equal(
-                cuda_frame_store.take_frame(tf.constant(time), "test_b", like).numpy(), b[time])
+                cuda_frame_store.take_frame(tf.constant(time), "test_b", like, order=ORDER.handle).numpy(), b[time])
             np.testing.assert_array_equal(
-                cuda_frame_store.take_frame(tf.constant(time), "test_a", like).numpy(), a[time])
+                cuda_frame_store.take_frame(tf.constant(time), "test_a", like, order=ORDER.handle).numpy(), a[time])
 
 
 def test_rejects_bad_requests():
     with tf.device("/GPU:0"):
-        cuda_frame_store.offload_frame(tf.zeros((2, 8)), tf.constant(0), "test_bad", 2)
+        cuda_frame_store.offload_frame(tf.zeros((2, 8)), tf.constant(0), "test_bad", 2, order=ORDER.handle)
         with pytest.raises(tf.errors.InvalidArgumentError, match="outside"):
-            cuda_frame_store.offload_frame(tf.zeros((2, 8)), tf.constant(2), "test_bad", 2)
+            cuda_frame_store.offload_frame(tf.zeros((2, 8)), tf.constant(2), "test_bad", 2, order=ORDER.handle)
         with pytest.raises(tf.errors.FailedPreconditionError, match="never offloaded"):
-            cuda_frame_store.take_frame(tf.constant(1), "test_bad", tf.zeros((2, 8)))
+            cuda_frame_store.take_frame(tf.constant(1), "test_bad", tf.zeros((2, 8)), order=ORDER.handle)
         with pytest.raises(tf.errors.InvalidArgumentError, match="expects"):
-            cuda_frame_store.take_frame(tf.constant(0), "test_bad", tf.zeros((2, 9)))
+            cuda_frame_store.take_frame(tf.constant(0), "test_bad", tf.zeros((2, 9)), order=ORDER.handle)
 
 
 def _drifting_frames(length, shape, seed):
@@ -449,7 +453,7 @@ def test_tq_retake_rebuilds_the_chain(capfd, monkeypatch):
     taken = _round_trip(frames, key, 2, resident_from=7, codec="tq")
     _assert_restored(taken, frames, "tq")
     with tf.device("/GPU:0"):
-        again = cuda_frame_store.take_frame(tf.constant(0), key, tf.zeros((3, 517))).numpy()
+        again = cuda_frame_store.take_frame(tf.constant(0), key, tf.zeros((3, 517)), order=ORDER.handle).numpy()
     np.testing.assert_array_equal(again, _tq_grid(frames[0]))
     assert int(_stats(capfd)["chain_walks"]) >= 1
 

@@ -95,7 +95,7 @@ class _FrameStore:
                     tf.Variable(tf.zeros((capacity,), tf.int32)),
                 ))
 
-    def offload_frame(self, value, index, key, capacity, *args, codec, drop_outside=False):
+    def offload_frame(self, value, index, key, capacity, *args, codec, drop_outside=False, order=None):
         assert codec == "raw"
         assert value.dtype == tf.int32
         if key not in self.stores:
@@ -124,7 +124,7 @@ class _FrameStore:
         with tf.control_dependencies(updates):
             return tf.zeros([0])
 
-    def take_frame(self, index, key, like, zero_before_start=False, **kwargs):
+    def take_frame(self, index, key, like, zero_before_start=False, order=None, **kwargs):
         if zero_before_start:  # the op returns zeros before frame 0
             return tf.cond(tf.convert_to_tensor(index) >= 0,
                            lambda: self.take_frame(index, key, like),
@@ -270,7 +270,7 @@ def test_voltage_offload_selects_codec(portable_backend, monkeypatch, mode, code
                         lambda name, enabled, *args: name if enabled else None)
     codecs = []
 
-    def offload(value, index, key, *args, codec, drop_outside=False):
+    def offload(value, index, key, *args, codec, drop_outside=False, order=None):
         assert key == "voltages" and value.dtype == tf.float32
         codecs.append(codec)
         return tf.zeros([0])

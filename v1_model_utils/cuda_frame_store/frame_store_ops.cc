@@ -9,6 +9,10 @@ using namespace tensorflow;
 // compute stream made with CUDA events (no host synchronization).
 // One store per (GPU, key) lives for the process; the host buffer is
 // allocated by the first offload and reused by every later rollout.
+// Both ops take an unread `order` resource, one per replica: TensorFlow's
+// automatic control dependencies then order a replica's store ops among
+// themselves only. Stateful ops without a resource input join one global
+// chain, which would hold each replica's rollout behind the previous one's.
 // Copies run in groups of `group` frames: one compute-stream event starts a
 // group and one copy event ends it, so the compute stream sees one event
 // record (and, coming back, one wait) per group rather than per frame.
@@ -50,6 +54,7 @@ REGISTER_OP("V1FrameStoreOffload")
     .Attr("drop_outside: bool = false")
     .Input("frame: T")
     .Input("index: int32")
+    .Input("order: resource")
     .Output("token: float")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -79,6 +84,7 @@ REGISTER_OP("V1FrameStoreTake")
     .Attr("group: int >= 1 = 1")
     .Attr("zero_before_start: bool = false")
     .Input("index: int32")
+    .Input("order: resource")
     .Output("frame: T")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
