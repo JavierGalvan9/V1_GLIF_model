@@ -2614,7 +2614,7 @@ class OrientationSelectivityLoss:
         x = tf.bitwise.bitwise_xor(x, tf.bitwise.right_shift(x, 16))
         return tf.bitwise.right_shift(x, 12)
 
-    @tf.function(jit_compile=False)
+    @tf.function(jit_compile=True)
     def _signed_selectivity_emd_loss(
         self, osi_real, osi_imag, dsi_real, dsi_imag, active
     ):
