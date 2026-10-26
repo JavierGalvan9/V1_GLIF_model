@@ -84,22 +84,10 @@ parser.add_argument(
     help='Target effective sample size in samples used when rolling_decay < 0 (auto mode).',
 )
 parser.add_argument(
-    '--rolling_gradient_correction',
-    dest='rolling_gradient_correction',
-    action='store_true',
-    help='Scale current-batch gradients through the rolling OSI/DSI EMA without changing forward values.',
-)
-parser.add_argument(
-    '--norolling_gradient_correction',
-    dest='rolling_gradient_correction',
-    action='store_false',
-)
-parser.set_defaults(rolling_gradient_correction=False)
-parser.add_argument(
     '--rolling_max_gradient_scale',
     default=20.0,
     type=float,
-    help='Maximum gradient scale used by rolling_gradient_correction.',
+    help='Cap on the 1/(1-decay) gradient scale through the rolling OSI/DSI EMA.',
 )
 parser.add_argument(
     '--rolling_warmup',

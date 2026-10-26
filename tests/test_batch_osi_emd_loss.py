@@ -45,14 +45,12 @@ def _single_type_loss(tuning_angle, osi_target=0.4, dsi_target=0.0):
     loss = _estimator([tuning_angle], _osi_cost=1.0)
     loss._emd_group_indices = tf.ragged.constant([[0]], dtype=tf.int32)
     loss._n_node_types = tf.constant(1, dtype=tf.int32)
-    loss._osi_target_distributions = tf.ragged.constant(
+    loss._osi_empirical_distributions = tf.ragged.constant(
         [[osi_target]], dtype=tf.float32
     )
-    loss._dsi_target_distributions = tf.ragged.constant(
+    loss._dsi_empirical_distributions = tf.ragged.constant(
         [[dsi_target]], dtype=tf.float32
     )
-    loss._osi_empirical_distributions = loss._osi_target_distributions
-    loss._dsi_empirical_distributions = loss._dsi_target_distributions
     loss.cell_type_count = tf.constant([1.0], dtype=tf.float32)
     return loss
 

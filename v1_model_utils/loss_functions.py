@@ -1070,6 +1070,17 @@ def compare_rate_mask_population_ids(network, data_dir="GLIF_network", core_mask
     return comparison
 
 
+# Version tag of `OrientationSelectivityLoss.get_rolling_state`. 2: rolling_osi_emd
+# averages raw rates (no v1_ema normalizer); one row per replica copy; neuron
+# arrays are network-sized (zeros outside the loss's neurons).
+ROLLING_STATE_FORMAT = 2
+
+
+def _variable_copies(variable):
+    """Per-device components of a distributed variable, or the variable itself."""
+    return tuple(getattr(variable, "values", (variable,)))
+
+
 def compute_rolling_decay_from_sample_ess(batch_size, target_sample_ess, max_decay=0.9999):
     """Compute EMA decay from target effective sample size (ESS) in samples.
 
@@ -1760,7 +1771,6 @@ class OrientationSelectivityLoss:
                  rolling_decay=0.5, rolling_epsilon=1e-6,
                  rolling_target_sample_ess=80.0, rolling_batch_size=None,
                  rolling_max_decay=0.9999,
-                 rolling_gradient_correction=True,
                  rolling_max_gradient_scale=20.0,
                  rolling_warmup=True,
                  batch_emd_alignment_weight=1.0):
@@ -1776,15 +1786,10 @@ class OrientationSelectivityLoss:
         self._tf_pi = tf.constant(np.pi, dtype=dtype)
         self._neuropixels_df = neuropixels_df
         self.data_dir = data_dir
-        self._rolling_gradient_correction = bool(rolling_gradient_correction)
         self._rolling_warmup = bool(rolling_warmup)
         self._batch_emd_alignment_weight = float(batch_emd_alignment_weight)
         self._rolling_target_sample_ess = tf.constant(
             float(rolling_target_sample_ess), dtype=self._dtype
-        )
-        self._rolling_config_batch_size = tf.constant(
-            float(rolling_batch_size) if rolling_batch_size is not None else 1.0,
-            dtype=self._dtype,
         )
         rolling_max_gradient_scale = float(rolling_max_gradient_scale)
         if rolling_max_gradient_scale <= 0.0:
@@ -2002,17 +2007,16 @@ class OrientationSelectivityLoss:
     def _initialize_emd_targets(self):
         """Build the per-cell-type neuron groups and their target OSI/DSI CDFs.
 
-        Shared by every EMD-style method. Each cell type's Neuropixels OSI/DSI
-        sample is resampled onto as many quantiles as the model has neurons of
-        that type, so the EMD reduces to a mean absolute difference between two
-        equally long sorted vectors.
+        Shared by every EMD-style method. Each cell type's sorted Neuropixels
+        OSI/DSI sample is kept whole; the loss resamples it onto as many
+        quantiles as the type has responsive neurons in the batch, so the EMD
+        reduces to a mean absolute difference between two equally long sorted
+        vectors.
         """
         self._target_osi_dsi = self.get_neuropixels_osi_dsi()
         self._min_rates_threshold = tf.constant(0.0005, dtype=self._dtype)
 
         group_indices = []
-        osi_target_values = []
-        dsi_target_values = []
         osi_empirical_values = []
         dsi_empirical_values = []
         cell_type_count = []
@@ -2029,8 +2033,6 @@ class OrientationSelectivityLoss:
                 continue
 
             group_indices.append(node_ids)
-            osi_target_values.append(resample_sorted_distribution(exp_osi, node_ids.size))
-            dsi_target_values.append(resample_sorted_distribution(exp_dsi, node_ids.size))
             osi_empirical_values.append(np.sort(exp_osi))
             dsi_empirical_values.append(np.sort(exp_dsi))
             cell_type_count.append(float(node_ids.size))
@@ -2044,23 +2046,9 @@ class OrientationSelectivityLoss:
         row_splits = np.zeros(len(group_indices) + 1, dtype=np.int32)
         row_splits[1:] = np.cumsum([group.size for group in group_indices], dtype=np.int32)
         flat_indices = np.concatenate(group_indices, axis=0).astype(np.int32, copy=False)
-        flat_osi_targets = np.concatenate(osi_target_values, axis=0).astype(np.float32, copy=False)
-        flat_dsi_targets = np.concatenate(dsi_target_values, axis=0).astype(np.float32, copy=False)
-
-        row_splits_tf = tf.convert_to_tensor(row_splits, dtype=tf.int32)
         self._emd_group_indices = tf.RaggedTensor.from_row_splits(
             tf.convert_to_tensor(flat_indices, dtype=tf.int32),
-            row_splits_tf,
-            validate=False,
-        )
-        self._osi_target_distributions = tf.RaggedTensor.from_row_splits(
-            tf.convert_to_tensor(flat_osi_targets, dtype=self._dtype),
-            row_splits_tf,
-            validate=False,
-        )
-        self._dsi_target_distributions = tf.RaggedTensor.from_row_splits(
-            tf.convert_to_tensor(flat_dsi_targets, dtype=self._dtype),
-            row_splits_tf,
+            tf.convert_to_tensor(row_splits, dtype=tf.int32),
             validate=False,
         )
         osi_empirical_row_splits = np.zeros(len(group_indices) + 1, dtype=np.int32)
@@ -2088,18 +2076,44 @@ class OrientationSelectivityLoss:
         self.cell_type_count = tf.constant(cell_type_count, dtype=self._dtype)
         self._n_node_types = tf.constant(len(group_indices), dtype=tf.int32)
 
+    def _rolling_state_variables(self):
+        return {
+            "ori_real": self._rolling_ori_real,
+            "ori_imag": self._rolling_ori_imag,
+            "dir_real": self._rolling_dir_real,
+            "dir_imag": self._rolling_dir_imag,
+            "denominator": self._rolling_denominator,
+            "weight_sum": self._rolling_weight_sum,
+            "weight_sq_sum": self._rolling_weight_sq_sum,
+        }
+
+    def _network_neuron_mask(self):
+        """The loss's neurons among the network's, in runtime order (None: all)."""
+        return None if self._core_mask is None else np.asarray(self._core_mask, dtype=bool)
+
     def get_rolling_state(self):
+        """Return the EMA state with one leading row per replica copy.
+
+        Under MirroredStrategy the state variables have aggregation NONE, so
+        each replica's assign writes only its own copy; every copy is saved.
+        Per-neuron arrays are scattered into network-sized rows (zeros outside
+        the loss's neurons), so train_end_data's per-neuron translation between
+        neuron layouts (spatial_layout.translate_neuron_state) moves them with
+        their neurons even when the loss covers only the core.
+        """
         if not self._uses_rolling_state():
             return {}
-        return {
-            "ori_real": self._rolling_ori_real.numpy(),
-            "ori_imag": self._rolling_ori_imag.numpy(),
-            "dir_real": self._rolling_dir_real.numpy(),
-            "dir_imag": self._rolling_dir_imag.numpy(),
-            "denominator": self._rolling_denominator.numpy(),
-            "weight_sum": self._rolling_weight_sum.numpy(),
-            "weight_sq_sum": self._rolling_weight_sq_sum.numpy(),
-        }
+        mask = self._network_neuron_mask()
+        state = {}
+        for key, variable in self._rolling_state_variables().items():
+            rows = np.stack([copy.numpy() for copy in _variable_copies(variable)])
+            if mask is not None and rows.ndim == 2:
+                network_rows = np.zeros((rows.shape[0], mask.size), rows.dtype)
+                network_rows[:, mask] = rows
+                rows = network_rows
+            state[key] = rows
+        state["format"] = ROLLING_STATE_FORMAT
+        return state
 
     def set_rolling_state(self, state):
         if not self._uses_rolling_state():
@@ -2110,49 +2124,47 @@ class OrientationSelectivityLoss:
         if not state:
             return False
 
-        state_specs = (
-            ("ori_real", self._rolling_ori_real),
-            ("ori_imag", self._rolling_ori_imag),
-            ("dir_real", self._rolling_dir_real),
-            ("dir_imag", self._rolling_dir_imag),
-            ("denominator", self._rolling_denominator),
-        )
-        for key, variable in state_specs:
+        if state.get("format") != ROLLING_STATE_FORMAT:
+            raise ValueError(
+                f"Rolling state format {state.get('format')} is not "
+                f"{ROLLING_STATE_FORMAT}. Starting a fresh EMA."
+            )
+
+        # Validate everything before writing, so a rejected state leaves the
+        # variables untouched. Rows are replica copies.
+        mask = self._network_neuron_mask()
+        variables = self._rolling_state_variables()
+        values = {}
+        for key, variable in variables.items():
             if key not in state:
                 raise ValueError(f"Rolling state is missing key '{key}'.")
             value = np.asarray(state[key], dtype=self._dtype.as_numpy_dtype)
-            if tuple(value.shape) != tuple(variable.shape):
+            expected = tuple(variable.shape)
+            if expected and mask is not None:
+                expected = (mask.size,)
+            if value.ndim != len(expected) + 1 or value.shape[1:] != expected:
                 raise ValueError(
                     f"Rolling state '{key}' has shape {value.shape}, "
-                    f"expected {tuple(variable.shape)}."
+                    f"expected (replicas, *{expected})."
                 )
-            variable.assign(value)
-        optional_state_specs = (
-            ("weight_sum", self._rolling_weight_sum),
-            ("weight_sq_sum", self._rolling_weight_sq_sum),
-        )
-        for key, variable in optional_state_specs:
-            if key not in state:
-                continue
-            value = np.asarray(state[key], dtype=self._dtype.as_numpy_dtype)
-            if tuple(value.shape) != tuple(variable.shape):
-                raise ValueError(
-                    f"Rolling state '{key}' has shape {value.shape}, "
-                    f"expected {tuple(variable.shape)}."
-                )
-            variable.assign(value)
+            values[key] = value if not expected or mask is None else value[:, mask]
+        n_saved = {value.shape[0] for value in values.values()}
+        if len(n_saved) != 1:
+            raise ValueError(f"Rolling state arrays disagree on the replica count: {n_saved}.")
+        n_saved = n_saved.pop()
+        n_copies = len(_variable_copies(self._rolling_ori_real))
+        if n_saved != n_copies:
+            print(
+                f"Rolling state was saved from {n_saved} replica(s); restoring "
+                f"the first one into all {n_copies}."
+            )
 
-        if "weight_sum" not in state or "weight_sq_sum" not in state:
-            steady_ess_steps = (
-                (1.0 + self._rolling_decay)
-                / tf.maximum(1.0 - self._rolling_decay, self._rolling_epsilon)
-            )
-            steady_weight_sq_sum = 1.0 / tf.maximum(
-                steady_ess_steps * self._rolling_config_batch_size,
-                self._rolling_epsilon,
-            )
-            self._rolling_weight_sum.assign(tf.constant(1.0, dtype=self._dtype))
-            self._rolling_weight_sq_sum.assign(steady_weight_sq_sum)
+        for key, value in values.items():
+            if n_saved == n_copies:
+                for copy, copy_value in zip(_variable_copies(variables[key]), value):
+                    copy.assign(copy_value)
+            else:
+                variables[key].assign(value[0])
         return True
 
     def vonmises_model_fr(self, structure, population):
@@ -2288,11 +2300,6 @@ class OrientationSelectivityLoss:
             tf.reduce_mean(dsi_imag, axis=0),
         )
 
-    def _smoothed_vector_magnitude(self, real, imag):
-        eps_sq = tf.square(self._rolling_epsilon)
-        magnitude = tf.sqrt(tf.square(real) + tf.square(imag) + eps_sq) - self._rolling_epsilon
-        return tf.maximum(magnitude, tf.zeros((), dtype=self._dtype))
-
     def _compute_rolling_moment_values(self, rates, radians_delta_angle):
         ori_angle = 2.0 * radians_delta_angle
         dir_angle = radians_delta_angle
@@ -2332,28 +2339,12 @@ class OrientationSelectivityLoss:
             new_weight_sq_sum,
         )
 
-    @tf.function(jit_compile=False)
-    def _distribution_emd_loss(self, values, target_distributions):
-        emd_losses = tf.TensorArray(self._dtype, size=self._n_node_types)
-        for i in tf.range(self._n_node_types):
-            current_values = tf.gather(values, self._emd_group_indices[i])
-            target_values = target_distributions[i]
-            emd = tf.reduce_mean(tf.abs(tf.sort(current_values) - target_values))
-            emd_losses = emd_losses.write(i, emd)
-        return emd_losses.stack()
-
-    @tf.function(jit_compile=False)
-    def _distribution_zero_l1_loss(self, values):
-        losses = tf.TensorArray(self._dtype, size=self._n_node_types)
-        for i in tf.range(self._n_node_types):
-            current_values = tf.gather(values, self._emd_group_indices[i])
-            losses = losses.write(i, tf.reduce_mean(tf.square(current_values)))
-        return losses.stack()
-
     def _apply_rolling_gradient_correction(self, value):
-        if not self._rolling_gradient_correction:
-            return value
+        """Scale the gradient through the EMA by 1/(1-d) (capped); forward value unchanged.
 
+        Only the (1-d) share of the EMA is differentiable, so without this the
+        current batch would get a (1-d)-times weaker selectivity gradient.
+        """
         scale = tf.minimum(
             1.0 / tf.maximum(self._rolling_one_minus_decay, self._rolling_epsilon),
             self._rolling_max_gradient_scale,
@@ -2400,41 +2391,20 @@ class OrientationSelectivityLoss:
             self._rolling_weight_sum.assign(tf.stop_gradient(new_weight_sum))
             self._rolling_weight_sq_sum.assign(tf.stop_gradient(new_weight_sq_sum))
 
-        gradient_ori_real = self._apply_rolling_gradient_correction(new_ori_real)
-        gradient_ori_imag = self._apply_rolling_gradient_correction(new_ori_imag)
-        gradient_dir_real = self._apply_rolling_gradient_correction(new_dir_real)
-        gradient_dir_imag = self._apply_rolling_gradient_correction(new_dir_imag)
-        gradient_denominator = self._apply_rolling_gradient_correction(new_denominator)
-
-        # Use a smoothed vector norm to avoid NaN gradients at exactly zero activity.
-        # In TF 2.15, grad(sqrt(a^2+b^2)) at a=b=0 can be non-finite.
-        osi_magnitude = self._smoothed_vector_magnitude(
-            gradient_ori_real, gradient_ori_imag
+        # Same per-neuron Z_h = sum r e^{ih dtheta} / sum r as batch_osi_emd,
+        # with both sums replaced by their EMAs (the bias of the zero-initialised
+        # EMA cancels in the ratio).
+        safe_denominator = tf.maximum(
+            self._apply_rolling_gradient_correction(new_denominator),
+            self._rolling_epsilon,
         )
-        dsi_magnitude = self._smoothed_vector_magnitude(
-            gradient_dir_real, gradient_dir_imag
-        )
-
-        safe_denominator = tf.maximum(gradient_denominator, self._min_rates_threshold)
-        osi_real_estimates = gradient_ori_real / safe_denominator
-        osi_imag_estimates = gradient_ori_imag / safe_denominator
-        dsi_real_estimates = gradient_dir_real / safe_denominator
-        dsi_imag_estimates = gradient_dir_imag / safe_denominator
-        osi_estimates = osi_magnitude / safe_denominator
-        dsi_estimates = dsi_magnitude / safe_denominator
         warmup_scale = self._rolling_loss_warmup_scale(
             new_weight_sum, new_weight_sq_sum
         )
-
-        return (
-            osi_estimates,
-            dsi_estimates,
-            osi_real_estimates,
-            osi_imag_estimates,
-            dsi_real_estimates,
-            dsi_imag_estimates,
-            warmup_scale,
-        )
+        return tuple(
+            self._apply_rolling_gradient_correction(moment) / safe_denominator
+            for moment in (new_ori_real, new_ori_imag, new_dir_real, new_dir_imag)
+        ) + (warmup_scale,)
 
     @tf.function # jit compile is not used here because it converts the spikes to float32 before summing, which can cause memory issues for large spike tensors.
     def rates_per_sample_from_spikes(self, spikes, trim=True):
@@ -2684,34 +2654,30 @@ class OrientationSelectivityLoss:
     def rolling_osi_emd_loss_from_rates(
         self, rates, angle, normalizer=None, update_state=True
     ):
-        rates = self._prepare_rates(rates, normalizer)
-        radians_delta_angle = self._radians_delta_angle(angle)
+        """`batch_osi_emd` with the per-neuron moments EMA'd across steps.
+
+        The sums over gratings of r cos/sin(h dtheta) and of r are replaced by
+        their exponential moving averages, so each neuron's selectivity draws
+        on more samples than one batch holds. The responsiveness mask still
+        comes from the current batch alone. ``normalizer`` is ignored: a
+        per-neuron rescaling cancels in each step's Z_h but, varying between
+        steps, would reweight the EMA.
+        """
+        del normalizer
+        rates = self._prepare_rates(rates, None)
         (
-            _osi_magnitude_estimates,
-            _dsi_magnitude_estimates,
-            osi_real_estimates,
-            osi_imag_estimates,
-            dsi_real_estimates,
-            dsi_imag_estimates,
+            osi_real,
+            osi_imag,
+            dsi_real,
+            dsi_imag,
             warmup_scale,
         ) = self._update_rolling_selectivity_estimates(
-            rates, radians_delta_angle, update_state=update_state
+            rates, self._radians_delta_angle(angle), update_state=update_state
         )
-        osi_loss_type = self._distribution_emd_loss(
-            osi_real_estimates, self._osi_target_distributions
-        ) + self._distribution_zero_l1_loss(
-            osi_imag_estimates
+        active = self._preferred_direction_active(rates, angle)
+        return warmup_scale * self._signed_selectivity_emd_loss(
+            osi_real, osi_imag, dsi_real, dsi_imag, active
         )
-        dsi_loss_type = self._distribution_emd_loss(
-            dsi_real_estimates, self._dsi_target_distributions
-        ) + self._distribution_zero_l1_loss(
-            dsi_imag_estimates
-        )
-
-        numerator = tf.reduce_sum((osi_loss_type + dsi_loss_type) * self.cell_type_count)
-        denominator = tf.reduce_sum(self.cell_type_count)
-
-        return warmup_scale * (numerator / denominator) * self._osi_cost
 
     def loss_from_rates(
         self, rates, angle, normalizer=None, update_state=True

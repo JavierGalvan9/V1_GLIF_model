@@ -66,6 +66,39 @@ def update_rate_emas(v1_ema, v1_rates, decay, update_state=True):
         )
 
 
+# train_end_data.pkl entries that are running statistics of the trained weights.
+NEURON_STATE_KEYS = ("v1_ema", "rolling_osi_emd_state")
+
+
+def load_checkpoint_training_state(checkpoint_path):
+    """The train_end_data saved with a restored checkpoint; {} without one.
+
+    A run that writes ``<run>/<subdir>/ckpt-N`` saves its running statistics
+    (v1_ema, the rolling OSI/DSI EMA) to ``<run>/train_end_data.pkl`` at the
+    same time, so reading them from the checkpoint's run pairs them with the
+    restored weights, also for ``--restore_from`` another run. Training from
+    scratch starts them fresh.
+    """
+    if not checkpoint_path:
+        return {}
+    path = os.path.join(os.path.dirname(os.path.dirname(checkpoint_path)), "train_end_data.pkl")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "rb") as handle:
+        return pkl.load(handle)
+
+
+def neuron_state_to_save(current_state, restored_state, diverged):
+    """Running statistics to write to train_end_data.pkl at the end of a session.
+
+    A diverged session leaves the intermediate checkpoint as it was restored,
+    so it keeps the statistics restored with it: a retry restores both, paired.
+    """
+    if not diverged:
+        return current_state
+    return {key: restored_state[key] for key in NEURON_STATE_KEYS if key in restored_state}
+
+
 def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
     """Return warm-up final state, using the full sequence model as fallback."""
     if state_model is not None:
@@ -620,14 +653,11 @@ def main(_):
         # Define the decay factor for the exponential moving average
         ema_decay = 0.95
         # Initialize exponential moving averages for V1 and LM firing rates
-        train_end_data = {}
-        if os.path.exists(os.path.join(logdir, 'train_end_data.pkl')):
-            with open(os.path.join(logdir, 'train_end_data.pkl'), 'rb') as f:
-                train_end_data = pkl.load(f)
-            # Stored canonical, like checkpoints; move it into the runtime layout.
-            train_end_data = spatial_layout.translate_neuron_state(
-                neuron_layout, train_end_data, to_runtime=True
-            )
+        # Stored canonical, like checkpoints; move it into the runtime layout.
+        train_end_data = spatial_layout.translate_neuron_state(
+            neuron_layout, load_checkpoint_training_state(_checkpoint_directory),
+            to_runtime=True,
+        )
         # 3 Hz is near the average FR of cortex.
         default_v1_ema = tf.constant(
             0.003, shape=(network["n_nodes"],), dtype=tf.float32
@@ -671,7 +701,6 @@ def main(_):
                                                          rolling_decay=flags.rolling_decay,
                                                          rolling_target_sample_ess=flags.rolling_target_sample_ess,
                                                          rolling_batch_size=grating_batch_size,
-                                                         rolling_gradient_correction=flags.rolling_gradient_correction,
                                                          rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                          rolling_warmup=flags.rolling_warmup,
                                                          batch_emd_alignment_weight=flags.batch_emd_alignment_weight)
@@ -698,7 +727,6 @@ def main(_):
                                                                      rolling_decay=flags.rolling_decay,
                                                                      rolling_target_sample_ess=flags.rolling_target_sample_ess,
                                                                      rolling_batch_size=grating_batch_size,
-                                                                     rolling_gradient_correction=flags.rolling_gradient_correction,
                                                                      rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                                      rolling_warmup=flags.rolling_warmup,
                                                                      batch_emd_alignment_weight=flags.batch_emd_alignment_weight)
@@ -710,16 +738,17 @@ def main(_):
                 return
             try:
                 if loss_obj.set_rolling_state(state):
-                    print(f"Restored {flags.osi_loss_method} state for {label}.")
+                    weight_sum = loss_obj.get_rolling_state()["weight_sum"]
+                    print(
+                        f"Restored {flags.osi_loss_method} state for {label} "
+                        f"(EMA weight sum per replica: {weight_sum})."
+                    )
             except ValueError as exc:
                 print(f"Warning: could not restore {flags.osi_loss_method} state for {label}: {exc}")
 
         rolling_state_payload = train_end_data.get("rolling_osi_emd_state", {})
         if isinstance(rolling_state_payload, dict):
-            core_state = rolling_state_payload.get("core")
-            if core_state is None and "ori_real" in rolling_state_payload:
-                core_state = rolling_state_payload
-            _restore_rolling_state(OSI_DSI_Loss, core_state, "core")
+            _restore_rolling_state(OSI_DSI_Loss, rolling_state_payload.get("core"), "core")
             if annulus_mask is not None:
                 _restore_rolling_state(
                     annulus_OSI_DSI_Loss,
@@ -2383,7 +2412,10 @@ def main(_):
         if annulus_mask is not None:
             rolling_state["annulus"] = annulus_OSI_DSI_Loss.get_rolling_state()
         normalizers["rolling_osi_emd_state"] = rolling_state
-    callbacks.on_train_end(metric_values, normalizers=normalizers)
+    callbacks.on_train_end(
+        metric_values,
+        normalizers=neuron_state_to_save(normalizers, train_end_data, callbacks.diverged),
+    )
 
 
 if __name__ == '__main__':
@@ -2465,15 +2497,10 @@ if __name__ == '__main__':
         80.0,
         'Target effective sample size in samples used when rolling_decay < 0 (auto mode).',
     )
-    absl.app.flags.DEFINE_boolean(
-        'rolling_gradient_correction',
-        False,
-        'Scale current-batch gradients through the rolling OSI/DSI EMA without changing forward values.',
-    )
     absl.app.flags.DEFINE_float(
         'rolling_max_gradient_scale',
         20.0,
-        'Maximum gradient scale used by rolling_gradient_correction.',
+        'Cap on the 1/(1-decay) gradient scale through the rolling OSI/DSI EMA.',
     )
     absl.app.flags.DEFINE_boolean(
         'rolling_warmup',

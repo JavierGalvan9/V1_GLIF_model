@@ -244,6 +244,20 @@ def test_neuron_state_translation_round_trips_nested_payloads():
     )
 
 
+def test_neuron_state_translation_reorders_rows_of_replica_copies():
+    network, _, _ = _network()
+    layout = spatial_layout.build_layout(network, spatial_layout.MORTON)
+    # Rolling OSI state: one row per replica copy, neurons on the last axis.
+    rows = np.stack([np.linspace(0, 1, N_NODES), np.linspace(1, 2, N_NODES)]).astype(np.float32)
+    payload = {"rolling_osi_emd_state": {"core": {"ori_real": rows, "weight_sum": np.ones(2, np.float32)}}}
+    runtime = spatial_layout.translate_neuron_state(layout, payload, to_runtime=True)
+    state = runtime["rolling_osi_emd_state"]["core"]
+    assert np.array_equal(state["ori_real"], rows[:, layout.new_to_old])
+    assert np.array_equal(state["weight_sum"], np.ones(2, np.float32))
+    canonical = spatial_layout.translate_neuron_state(layout, runtime, to_runtime=False)
+    assert np.array_equal(canonical["rolling_osi_emd_state"]["core"]["ori_real"], rows)
+
+
 def test_delayed_presynaptic_relabelling_keeps_delay_blocks():
     network, _, _ = _network()
     layout = spatial_layout.build_layout(network, spatial_layout.MORTON)

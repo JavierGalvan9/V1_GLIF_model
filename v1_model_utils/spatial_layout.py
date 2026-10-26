@@ -435,10 +435,12 @@ def translate_neuron_state(layout, payload, to_runtime):
             for key, value in payload.items()
         }
     array = np.asarray(payload) if not np.isscalar(payload) else None
-    if array is not None and array.shape == (layout.n_nodes,) and (
+    # The last axis is the neuron axis; leading axes (e.g. one row per
+    # replica copy of the rolling state) are kept.
+    if array is not None and array.ndim in (1, 2) and array.shape[-1] == layout.n_nodes and (
         np.issubdtype(array.dtype, np.floating)
     ):
-        return reorder(array)
+        return reorder(array, axis=-1)
     return payload
 
 
