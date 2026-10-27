@@ -7,6 +7,8 @@ import gc
 from v1_model_utils.toolkit import get_random_identifier
 import numpy as np
 import tensorflow as tf
+from tensorflow.core.protobuf import config_pb2, rewriter_config_pb2
+from tensorflow.python.eager import context
 from packaging import version
 
 
@@ -50,8 +52,24 @@ def configure_gpu_memory_growth():
     return physical_devices
 
 
-def enable_tensorflow_optimizations(enabled=True):
-    """Enable TensorFlow graph optimizations for training and inference."""
+def enable_tensorflow_optimizations(enabled=True, memory_optimizer=True):
+    """Enable TensorFlow graph optimizations for training and inference.
+
+    ``memory_optimizer=False`` turns Grappler's memory optimizer off, which
+    tf.config.optimizer has no option for. When its static estimate of a
+    graph's peak exceeds the GPU, it swaps tensors to host memory and back:
+    at 935,980 neurons it moved 224 GiB per OSI/DSI angle, one swap per
+    timestep, and turning it off took the angle from 13.3 s to 8.9 s.
+    """
+    if not memory_optimizer:
+        tf_context = context.context()
+        if tf_context._config is None:
+            tf_context._config = config_pb2.ConfigProto()
+        tf_context._config.graph_options.rewrite_options.memory_optimization = (
+            rewriter_config_pb2.RewriterConfig.NO_MEM_OPT
+        )
+        # Functions called from now on read the updated configuration.
+        tf_context.function_call_options = None
     # tf.config.optimizer.set_experimental_options(
     #     {"cudnn_use_autotune": bool(enabled)}
     # )
@@ -340,6 +358,15 @@ class DistributedSeedHelper(tf.Module):
 
     def next_spontaneous_seed(self):
         stream_id = self.spontaneous_seed_stream.assign_add(tf.constant(1, dtype=tf.int64))
+        return self.spontaneous_seed(stream_id)
+
+    def spontaneous_seed(self, stream_id):
+        """The seed of this replica's spontaneous draw ``stream_id`` (1-based).
+
+        A host int32 ``stream_id``, under a CPU device scope, keeps the GPU out
+        of the seed: next_spontaneous_seed() casts the GPU stream variable to
+        int32, which lands in host memory, so every draw waits for the GPU.
+        """
         seed_value = stateless_fold_in(
             self.spontaneous_seed_base, tf.cast(stream_id, tf.int32)
         )
@@ -754,16 +781,18 @@ def restore_evaluation_checkpoint(
     if checkpoint_directory is not None:
         print(f'Restoring checkpoint from {checkpoint_directory}...')
 
-        if checkpoint_dtype_mismatch:
+        # Ignored variables differ in shape from the checkpoint (a core-only readout),
+        # so a direct restore would fail on them even at matching dtypes.
+        if checkpoint_dtype_mismatch or runtime_cast_ignored_variables:
             restore_model_with_runtime_dtype_cast(
                 target_model=model,
                 build_model_fn=build_model_fn,
                 checkpoint_directory=checkpoint_directory,
-                checkpoint_dtype_name=checkpoint_model_dtype,
+                checkpoint_dtype_name=checkpoint_model_dtype or flags.dtype,
                 target_dtype_name=flags.dtype,
                 ignored_target_variable_names=runtime_cast_ignored_variables,
             )
-            print('Checkpoint restored via in-memory dtype conversion (no checkpoint re-save).')
+            print('Checkpoint restored via an in-memory copy (no checkpoint re-save).')
         else:
             checkpoint = tf.train.Checkpoint(model=model)
             restore_and_rebase(checkpoint, checkpoint_directory, model)

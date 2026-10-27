@@ -244,7 +244,7 @@ def main():
             # osi_dsi_estimator.py does not define the training batch splits or
             # the backward options.
             if name not in ('grating_batch_size', 'gray_batch_size', 'backward_mode',
-                            'voltage_offload', 'history_offload'):
+                            'pack_spike_checkpoints', 'voltage_offload', 'history_offload'):
                 evaluation_script += argument
 
     job_ids = []
