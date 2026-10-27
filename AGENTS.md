@@ -170,6 +170,7 @@ conda activate neuro_tf221
 ## TalaIA Cluster (BSAI)
 - SSH: `ssh talaia` (`bsai010059@ssh.talaia.uib.cat`, key login only). The login node `login01` has no GPU.
 - Project: `/projects/focosineu/jgalvan/repos/V1_GLIF_model`; Miniforge in `/projects/focosineu/jgalvan/miniforge3`, envs in `/projects/focosineu/jgalvan/envs`. `/scratch` is wiped every 30 days: caches only.
+- Keep experiment folders inside the repository's dedicated `Experiments/` directory: `/projects/focosineu/jgalvan/repos/V1_GLIF_model/Experiments/`.
 - Slurm: account `uib_focosineu_acc`, QoS `normal|test|interactive|scavenger`. GPUs `b200` (8/node), `h200` (2/node), `l40s` (8/node), requested as `--gres=gpu:<type>:N`. Never pass `-p/--partition`: sbatch rejects it and routes GPU jobs to `acc` (3-day limit) itself.
 - Submit from an activated `neuro_tf221` shell in the project path (jobs inherit it), after `mkdir -p Out Error`:
 ```bash
