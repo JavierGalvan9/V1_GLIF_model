@@ -11,6 +11,7 @@ from time import time
 import sys
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 import other_v1_utils
+from v1_model_utils.cache_files import network_cache_name
 # from memory_profiler import profile
 
 
@@ -46,8 +47,9 @@ def v1_cache_path(flags, n_neurons, flag_str):
     key = _digest(
         {"version": _V1_CACHE_VERSION, "config": _v1_cache_config(flags, n_neurons)}
     )[:12]
-    suffix = ".pkl.lz4" if getattr(flags, "compress_model_cache", False) else ".pkl"
-    return os.path.join(flags.data_dir, "tf_data", f"V1_network_{flag_str}_{key}{suffix}")
+    return os.path.join(flags.data_dir, "tf_data", network_cache_name(
+        n_neurons, key, getattr(flags, "compress_model_cache", False)
+    ))
 
 
 def _v1_cache_provenance(flags, n_neurons):
@@ -866,10 +868,18 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
     alternate_path = cache_path.removesuffix(".lz4") if compressed else cache_path + ".lz4"
     # Caches written before the configuration key was added to the name.
     legacy_path = os.path.join(cache_dir, f"V1_network_{flag_str}.pkl")
+    key = _digest(
+        {"version": _V1_CACHE_VERSION, "config": _v1_cache_config(flags, n_neurons)}
+    )[:12]
+    previous_path = os.path.join(cache_dir, f"V1_network_{flag_str}_{key}.pkl")
+    renamed_legacy = os.path.join(cache_dir, network_cache_name(n_neurons, "legacy"))
     provenance = _v1_cache_provenance(flags, n_neurons)
     print(f"> Looking for cached V1 model in {cache_path}")
 
-    for read_path in (cache_path, alternate_path, legacy_path):
+    for read_path in (
+        cache_path, alternate_path, previous_path, previous_path + ".lz4",
+        legacy_path, legacy_path + ".lz4", renamed_legacy, renamed_legacy + ".lz4",
+    ):
         if not os.path.exists(read_path):
             continue
         try:
@@ -894,8 +904,13 @@ def cached_load_v1(flags, n_neurons, flag_str=''):
             cached = None
             network, lgn_input, bkg_input = None, None, None
             continue
-        if read_path == legacy_path and not compressed:
-            os.replace(read_path, cache_path)
+        if read_path != cache_path and read_path.endswith(".lz4") == compressed:
+            try:
+                os.replace(read_path, cache_path)
+            except FileNotFoundError:
+                # Another worker may have migrated the shared cache first.
+                if not os.path.exists(cache_path):
+                    raise
             store = False
         else:
             store = read_path != cache_path

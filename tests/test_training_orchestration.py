@@ -1,4 +1,7 @@
 import json
+import os
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -175,13 +178,13 @@ class TrainingOrchestrationTests(unittest.TestCase):
         running.poll.return_value = None
         running.wait.return_value = -15
 
-        with mock.patch.object(
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             training_orchestration.subprocess,
             "Popen",
             side_effect=[failed, running],
         ):
             exit_code = training_orchestration.launch_worker_processes(
-                plan, enabled=True
+                plan, enabled=True, log_directory=directory
             )
 
         self.assertEqual(exit_code, 9)
@@ -194,6 +197,43 @@ class TrainingOrchestrationTests(unittest.TestCase):
                 environ={"CUDA_VISIBLE_DEVICES": "0,1"},
                 compute_capabilities=("8.6", "8.9"),
             )
+
+
+def test_worker_streams_are_separate_and_launches_do_not_overwrite(tmp_path, monkeypatch, capfd):
+    def worker(name, chief):
+        code = (
+            f"import sys; print('{name} stdout', flush=True); "
+            f"print('{name} stderr', file=sys.stderr, flush=True)"
+        )
+        return training_orchestration.WorkerProcess(
+            (sys.executable, "-c", code), dict(os.environ), chief,
+        )
+
+    specs = (worker("chief", True), worker("secondary", False))
+    monkeypatch.setattr(training_orchestration, "build_worker_processes", lambda *args, **kwargs: specs)
+    for _ in range(2):
+        assert training_orchestration.launch_worker_processes(None, log_directory=tmp_path) == 0
+
+    out_dirs = sorted((tmp_path / "Out").iterdir())
+    err_dirs = sorted((tmp_path / "Error").iterdir())
+    assert len(out_dirs) == len(err_dirs) == 2
+    assert [path.name for path in out_dirs] == [path.name for path in err_dirs]
+    for out_dir, err_dir in zip(out_dirs, err_dirs):
+        assert [path.name for path in out_dir.iterdir()] == ["worker_1.out"]
+        assert [path.name for path in err_dir.iterdir()] == ["worker_1.err"]
+        assert (out_dir / "worker_1.out").read_text() == "secondary stdout\n"
+        assert (err_dir / "worker_1.err").read_text() == "secondary stderr\n"
+    console = capfd.readouterr()
+    assert console.out.count("chief stdout") == 2
+    assert console.err.count("chief stderr") == 2
+    assert "secondary stdout" not in console.out
+    assert "secondary stderr" not in console.err
+
+
+def test_no_workers_create_no_log_directories(tmp_path, monkeypatch):
+    monkeypatch.setattr(training_orchestration, "build_worker_processes", lambda *args, **kwargs: ())
+    assert training_orchestration.launch_worker_processes(None, log_directory=tmp_path) == 0
+    assert list(tmp_path.iterdir()) == []
 
 
 if __name__ == "__main__":

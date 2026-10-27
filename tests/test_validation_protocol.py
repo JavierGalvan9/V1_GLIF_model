@@ -1,6 +1,4 @@
 """Validation protocol: K grating phases per direction, and direction-averaged losses."""
-import os
-
 import numpy as np
 import tensorflow as tf
 
@@ -178,8 +176,9 @@ def test_phase_probabilities_are_cached_per_direction(tmp_path, monkeypatch):
         np.testing.assert_allclose(
             value[:, 0, 0], -np.expm1(-rates / 1000.0), rtol=1e-6
         )
-    (cache_file,) = os.listdir(tmp_path / "tf_data")
-    assert "phases_4" in cache_file
+    (cache_file,) = (tmp_path / "tf_data" / "lgn_probabilities").glob("*.pkl")
+    assert "4phases" in cache_file.name
+    assert cache_file.with_suffix(".json").exists()
 
     _FakeGratingLGN.calls.clear()
     cached = stim_dataset.load_or_compute_protocol_phase_lgn_probabilities(**arguments)

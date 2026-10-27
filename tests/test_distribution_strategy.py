@@ -150,7 +150,7 @@ class LaunchPlanTests(unittest.TestCase):
         self.assertNotIn("TF_CPP_MIN_LOG_LEVEL", workers[0].environ)
         self.assertEqual(workers[1].environ["TF_CPP_MIN_LOG_LEVEL"], "2")
         self.assertTrue(
-            orchestration.worker_log_path(1).endswith("worker_1.log")
+            orchestration.worker_log_path(1, "Out/run_example").endswith("worker_1.out")
         )
 
     def test_mixed_architectures_are_rejected(self):

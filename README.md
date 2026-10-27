@@ -164,8 +164,13 @@ GPUs at 32 per replica the 66,652-neuron model reaches 34.3 samples/s against
 `--distributed_mode` selects how `--n_gpus > 1` executes: `mirrored` (default)
 uses one process, and `multi_worker` forks one process per GPU with
 `MultiWorkerMirroredStrategy`. Multi-worker measured a few percent faster per
-step but builds the network once per GPU in host memory; its non-chief workers
-write to `Distributed_worker_logs/worker_<n>.log`. See
+step but builds the network once per GPU in host memory. Non-chief workers
+write stdout to `Out/run_<unique_id>/worker_<n>.out` and stderr to
+`Error/run_<unique_id>/worker_<n>.err`, relative to the working directory.
+Each launch gets a unique ID shared by its matching `Out` and `Error`
+directories, so separate launches do not overwrite each other's logs. The
+chief keeps the wrapper's existing console logging. The launcher prints each
+worker's log paths. See
 [the distributed-training investigation](docs/distributed-training.md) for the
 findings behind these choices.
 
@@ -258,6 +263,53 @@ architecture-keyed cache. They are built with `nvcc` and the C++ compiler from
 the active Conda environment. Set `V1_CUDA_CACHE_DIR` to override the default
 `~/.cache/v1_glif/cuda` location. Missing or stale operators rebuild
 automatically; intermediate object files are discarded after linking.
+
+### Network and LGN Data Caches
+
+Prepared network data and LGN spike probabilities are cached under
+`<data_dir>/tf_data/`. These caches are separate from trained checkpoints:
+
+```text
+tf_data/
+    v1_network_203816neurons_<hash>.pkl
+    lgn_probabilities/
+        eval_osi_dsi_4s_seed3000_<hash>.pkl
+        validation_8phases_500ms_<hash>.pkl
+        spontaneous_500ms_<hash>.pkl
+```
+
+Network filenames include the neuron count and a configuration hash; runs
+with the same model configuration share a cache regardless of their run
+label. `--compress_model_cache` selects `.pkl.lz4` encoding. Switching encoding
+reuses a valid existing cache and retains the original file.
+
+LGN filenames identify the protocol and sequence duration. For the examples
+above, OSI/DSI evaluation uses 2 seconds of gray screen followed by 2 seconds
+of grating, with one seeded starting phase per direction. Training validation
+uses eight fixed starting phases per direction, each lasting 500 ms. Its
+sequence length follows `--seq_len`; the gray-screen initial state is generated
+separately. Both caches store probabilities rather than sampled spikes.
+
+Each LGN pickle has an adjacent `.json` file containing the settings encoded
+by its configuration hash and the previous filename. Older single-phase
+validation caches use the prefix `validation_single` to distinguish them from
+the current validation protocol.
+
+The loaders still recognize previous cache filenames and migrate them when
+reused. To migrate existing caches across the repository's data directories
+without loading or rewriting their payloads, run:
+
+```bash
+python3 -m v1_model_utils.cache_files GLIF_network_nll_*
+```
+
+Migration preserves distinct configurations and refuses to overwrite an
+existing destination. Network caches without a recoverable configuration hash
+use `v1_network_<count>neurons_legacy.pkl` until a loader validates and reuses
+them. Missing network and LGN probability caches are rebuilt when the relevant
+training or evaluation path needs them; deleting them increases the next run's
+startup work. Preserve the source network data, supporting files, and trained
+checkpoints.
 
 ## Visual Stimuli
 

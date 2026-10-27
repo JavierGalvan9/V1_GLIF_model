@@ -284,6 +284,39 @@ def test_missing_compression_flag_preserves_plain_cache_path(tmp_path):
     assert load_sparse.v1_cache_path(flags, 2, "shared") == plain_path
 
 
+def test_run_labels_share_a_configuration_cache(tmp_path):
+    flags = _flags(tmp_path, 1)
+    path = load_sparse.v1_cache_path(flags, 2, "single")
+    assert path == load_sparse.v1_cache_path(flags, 2, "mirrored")
+    assert os.path.basename(path).startswith("v1_network_2neurons_")
+    assert path != load_sparse.v1_cache_path(_flags(tmp_path, 2), 2, "single")
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("legacy_key", [False, True])
+def test_previous_cache_names_are_reused_without_rebuilding(
+    tmp_path, monkeypatch, compressed, legacy_key
+):
+    flags = _flags(tmp_path, 1, compressed)
+    monkeypatch.setattr(load_sparse, "load_v1", lambda **kwargs: ({"seed": 1}, {}, {}))
+    load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+    path = load_sparse.v1_cache_path(flags, 2, "shared")
+    suffix = ".pkl.lz4" if compressed else ".pkl"
+    key = os.path.basename(path).removesuffix(suffix).rsplit("_", 1)[1]
+    name = f"V1_network_shared_{key}{suffix}" if legacy_key else f"v1_network_2neurons_legacy{suffix}"
+    previous = tmp_path / "tf_data" / name
+    os.rename(path, previous)
+    before = previous.read_bytes()
+    monkeypatch.setattr(load_sparse, "load_v1", lambda **kwargs: pytest.fail("rebuilt"))
+
+    result = load_sparse.cached_load_v1(flags, 2, flag_str="shared")
+
+    assert result[0]["seed"] == 1
+    assert not previous.exists()
+    with open(path, "rb") as handle:
+        assert handle.read() == before
+
+
 @pytest.mark.parametrize("compressed", [False, True])
 def test_failed_replacement_preserves_existing_cache(tmp_path, monkeypatch, compressed):
     (tmp_path / "network").mkdir()

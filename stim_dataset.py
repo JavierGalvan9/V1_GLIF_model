@@ -7,6 +7,7 @@ from time import time
 import tensorflow as tf
 import lgn_model.lgn as lgn_module
 from v1_model_utils import cuda_lgn
+from v1_model_utils.cache_files import lgn_cache_path
 from v1_model_utils.callbacks import printgpu
 # from memory_profiler import profile
 # from pympler.asizeof import asizeof, asized
@@ -543,8 +544,8 @@ def load_or_compute_spontaneous_lgn_probabilities(
 ):
     """Load cached gray-screen LGN spike probabilities or compute and cache them."""
     cache_dir = os.path.join(data_dir, "tf_data")
-    cache_file = os.path.join(
-        cache_dir,
+    cache_file = lgn_cache_path(
+        data_dir,
         f"spontaneous_lgn_probabilities_n_input_{n_input}_seqlen_{seq_len}.pkl",
     )
 
@@ -612,8 +613,8 @@ def load_or_compute_osi_dsi_lgn_probabilities(
         post_delay = int(post_delay or 0)
     angle_key = "-".join(str(int(angle)) for angle in angles)
     current_key = "current" if current_input else "spikes"
-    cache_file = os.path.join(
-        cache_dir,
+    cache_file = lgn_cache_path(
+        data_dir,
         f"{cache_prefix}_{GRATING_LGN_VERSION}_n_input_{n_input}_seqlen_{osi_seq_len}_"
         f"pre_{pre_delay}_post_{post_delay}_rotation_{rotation}_"
         f"seed_{seed}_{current_key}_angles_{angle_key}.pkl",
@@ -685,13 +686,13 @@ def load_or_compute_protocol_phase_lgn_probabilities(
     for the phases 360 k / n_phases (k = 0 .. n_phases - 1). The phases are
     fixed, so every validation sees the same stimuli; together they cover
     the 2 Hz drift cycle that one phase per direction would see a single
-    part of through the response window. Cached in ``<data_dir>/tf_data``.
+    part of through the response window. Cached in ``tf_data/lgn_probabilities``.
     """
     if angles is None:
         angles = np.arange(0, 360, 45)
     angle_key = "-".join(str(int(angle)) for angle in angles)
-    cache_file = os.path.join(
-        data_dir, "tf_data",
+    cache_file = lgn_cache_path(
+        data_dir,
         f"protocol_phase_lgn_probabilities_{GRATING_LGN_VERSION}_n_input_{n_input}_"
         f"seqlen_{int(seq_len)}_pre_{int(pre_delay)}_post_{int(post_delay)}_"
         f"rotation_{rotation}_phases_{int(n_phases)}_angles_{angle_key}.pkl",
