@@ -61,6 +61,21 @@ conda env create -f environment.yml
 conda activate neuro_tf221
 ```
 
+To update an existing environment:
+
+```bash
+conda env update -n neuro_tf221 -f environment.yml
+conda activate neuro_tf221
+python3 -m pip check
+```
+
+The environment includes the Python kernel for analysis notebooks. Register it
+with your notebook editor and select **Python (neuro_tf221)**:
+
+```bash
+python3 -m ipykernel install --user --name neuro_tf221 --display-name "Python (neuro_tf221)"
+```
+
 `environment.yml` is the single source of truth for the environment name and
 the pinned direct dependencies. `neuro_tf221` (TensorFlow 2.21.0 / Keras 3.15.1
 / NumPy 2.5.3 / Python 3.12) is the only supported environment; the older
@@ -76,9 +91,23 @@ Python package versions with:
 ```bash
 python runtime_diagnostics.py
 ```
-The lock records all
-resolved Conda and pip dependencies for exact Linux reproduction; use the
-portable `environment.yml` when resolving for a different platform.
+The lock records all resolved Conda and pip dependencies, including build
+identifiers, for Linux x86_64 reproduction. It has no machine-specific install
+path. To recreate that resolved environment instead of resolving the direct
+dependencies again, use `conda env create -f environment.lock.yml`. Both files
+target the supported Linux/NVIDIA setup.
+
+On hosts without a system CUDA toolkit (including TalaIA), TensorFlow 2.21 may
+fail to find its pip-installed `libcusolver.so.11`. After activating the
+environment, expose that library directory before importing TensorFlow:
+
+```bash
+export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/nvidia/cusolver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Repeat this after activation in a new shell; submitted jobs inherit it. For
+persistent activation/deactivation hooks, see the TalaIA setup in
+[AGENTS.md](AGENTS.md#talaia-cluster-bsai).
 
 Confirm the active TensorFlow and CUDA toolchain before submitting GPU jobs:
 
@@ -113,7 +142,7 @@ To run a short smoke test against the full V1 network, use the network you built
 python osi_dsi_estimator.py --data_dir GLIF_network \
     --results_dir Simulation_results/smoke_osi --neurons 0 --n_trials_per_angle 1 \
     --seq_len 50 --spont_duration 50 --evoked_duration 50 --n_runs 1 --n_epochs 1 \
-    --batch_size 1 --nocalculate_osi_dsi --restore_from ''
+    --batch_size 1 --nocalculate_osi_dsi --restore_from '' --evaluate_untrained
 ```
 
 Parameters:

@@ -1,0 +1,29 @@
+{
+  "status": "passed",
+  "scheduler_job_id": 36795446,
+  "source_run": "talaia:/projects/focosineu/jgalvan/repos/V1_GLIF_model/Simulation_results/v1_203816/b_u05m/Best_model/ckpt-2",
+  "checkpoint": "PRG/checkpoints/crowd_osi_ckpt/ckpt-2",
+  "output_file": "PRG/results/prg_ref_smoke_20261028_100953/simulation_data.hdf5",
+  "stdout": "PRG/Out/prg_ref_smoke_20261028_100953.out",
+  "stderr": "PRG/Error/prg_ref_smoke_20261028_100953.err",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "tensorflow_version": "2.21.0",
+  "inference_dtype": "float32",
+  "hard_reset": true,
+  "seed": 3000,
+  "warmup_ms": 100,
+  "completed_steps": 200,
+  "dt_ms": 1,
+  "shape": [
+    200,
+    66408
+  ],
+  "total_spikes": 54908,
+  "mean_rate_hz": 4.134140465004216,
+  "voltage_min": -1.70703125,
+  "voltage_max": 1.7041015625,
+  "peak_tf_memory_gib": 8.84,
+  "job_state": "COMPLETED",
+  "job_exit_code": "0:0",
+  "job_elapsed": "00:01:40"
+}
