@@ -1,3 +1,6 @@
+# Supported platform: Linux x86_64 with an NVIDIA GPU.
+# Create: conda env create -f environment.yml
+# Update: conda env update -n neuro_tf221 -f environment.yml
 name: neuro_tf221
 channels:
   - conda-forge
@@ -12,14 +15,19 @@ dependencies:
   # TensorFlow loads the host libstdc++ before custom operators. GCC 11 keeps
   # those operators compatible with the Ubuntu 22.04 host ABI.
   - gxx_linux-64=11.4.0
+  # Imported directly by the runtime and used by the analysis notebooks.
+  - packaging=26.3
+  - ipython=9.17.1
+  - ipykernel=7.4.0
   - pip:
       # The TensorFlow 2.21 wheel RUNPATH omits nvidia/cusolver/lib. Hosts
       # without a system CUDA 12 toolkit (TalaIA) then fail to load
       # libcusolver.so.11 and TensorFlow disables every GPU. After creating the
-      # env, add the activation hook described in AGENTS.md (TalaIA section).
+      # env, follow README.md's CUDA library setup instructions on these hosts.
       - tensorflow[and-cuda]==2.21.0
       - keras==3.15.1
       - tensorboard==2.21.0
+      - absl-py==2.5.0
       - numpy==2.5.3
       - numba==0.67.0
       - llvmlite==0.49.0
@@ -29,6 +37,7 @@ dependencies:
       - seaborn==0.13.2
       - statsmodels==0.15.0
       - scikit-learn==1.9.0
+      - networkx==3.6.1
       - tqdm==4.70.0
       # TensorFlow 2.21 requires h5py <3.15.
       - h5py==3.14.0
