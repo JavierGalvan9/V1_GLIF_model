@@ -15,7 +15,6 @@ from v1_model_utils.cuda_caches import configure_cuda_caches
 configure_cuda_caches()  # before CUDA and XLA initialize
 
 import absl
-import copy
 import numpy as np
 import tensorflow as tf
 from time import time
@@ -90,17 +89,7 @@ def main(_):
     else:
         load_fn = load_sparse.load_v1
 
-    # Create a deep copy of flags and override uniform_weights to False
-    # This ensures initial weight distribution is preserved for visualization
-    if flags.uniform_weights:
-        modified_flags = copy.deepcopy(flags)
-        modified_flags.uniform_weights = False
-        load_fn = load_sparse.load_v1  # revert to original load function
-    else:
-        modified_flags = flags
-
-    # Use modified flags for loading network
-    network, lgn_input, bkg_input = load_fn(modified_flags, flags.neurons, flag_str=flag_str)
+    network, lgn_input, bkg_input = load_fn(flags, flags.neurons, flag_str=flag_str)
     print(f"Model files loading: {time()-t0:.2f} seconds\n")
 
     # Renumber neurons for CSR cache locality, then reorder the edges into the
@@ -623,7 +612,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('loss_core_radius', 400.0, '') # 0 is not using core loss
     absl.app.flags.DEFINE_float('plot_core_radius', 400.0, '') # 0 is not using core plot
 
-    absl.app.flags.DEFINE_boolean('hard_reset', False, '')
+    absl.app.flags.DEFINE_boolean('hard_reset', True, 'Clamp voltage to reset during refractoriness; must match training.')
     absl.app.flags.DEFINE_enum(
         "integration_scheme", "exact", ["exact", "euler"],
         "Membrane step integrator; must match the value used for training.")

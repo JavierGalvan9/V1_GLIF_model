@@ -167,3 +167,5 @@ reports/REPORT.pdf
 reports/issue37/
 performance_figures/scaling_20261026/
 issue37/
+PRG/checkpoints/SHA256SUMS
+PRG/SPIKE_STORAGE_ANALYSIS.md
