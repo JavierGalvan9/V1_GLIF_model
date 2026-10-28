@@ -50,7 +50,9 @@ def main(_):
 
     tf_utils.configure_reproducibility(flags.seed)
     # Configure TensorFlow optimization options that have proven to be beneficial for our model and training setup. These options can improve the performance of the model by optimizing the computational graph and memory usage.
-    # Inference keeps no tape, so nothing needs the memory optimizer's swaps.
+    # Grappler's memory optimizer is off: on large networks (~1M neurons) it overestimates the peak of the
+    # per-chunk graph and swaps tensors to host memory every timestep (13.3 vs 8.9 s per angle). Inference
+    # keeps no gradient tape, so those swaps never save memory.
     tf_utils.enable_tensorflow_optimizations(enabled=True, memory_optimizer=False)
 
     # Create the tensorflow datafile for the network
@@ -312,9 +314,14 @@ def main(_):
             lgn_backend=flags.lgn_backend,
         )
 
-    def roll_out(probability, state, first_draw, on_chunk=None):
-        """Final state of a rollout driven by the LGN spike ``probability``
-        [steps, n_input], in rollout chunks whose inputs are the spontaneous
+    def rollout_pieces(probability):
+        """``probability`` [steps, n_input] split into its rollout chunks."""
+        return [probability[start:start + rollout_chunk_size]
+                for start in range(0, probability.shape[0], rollout_chunk_size)]
+
+    def roll_out(pieces, state, first_draw, on_chunk=None):
+        """Final state of a rollout driven by the LGN spike probabilities
+        ``pieces`` (rollout_pieces), in rollout chunks whose inputs are the spontaneous
         draws ``first_draw``, ``first_draw + 1``, ... Each chunk's input is drawn and cast
         only after the previous chunk's state exists: the draws do not depend on
         the state, so in a graph they would otherwise all run, and hold their
@@ -325,12 +332,10 @@ def main(_):
         state = tuple(state)
         # One computation of the LGN pair sums for all the chunks.
         with rsnn_layer.cell.lgn_pair_weights_scope():
-            for draw, start in enumerate(range(0, probability.shape[0], rollout_chunk_size)):
+            for draw, piece in enumerate(pieces):
+                start = draw * rollout_chunk_size
                 with tf.control_dependencies(state[:1]):
-                    x = generate_spontaneous_spikes(
-                        probability[start:start + rollout_chunk_size], per_replica_batch_size,
-                        first_draw + draw,
-                    )
+                    x = generate_spontaneous_spikes(piece, per_replica_batch_size, first_draw + draw)
                 inputs = (tf.cast(x, dtype), state)
                 if on_chunk is None and state_model is not None:
                     state = tuple(tf.nest.flatten(state_model(inputs)))
@@ -361,7 +366,7 @@ def main(_):
 
     def generate_gray_state(first_draw):
         zero_state = rsnn_layer.cell.zero_state(per_replica_batch_size, dtype=dtype)
-        return roll_out(spontaneous_prob, zero_state, first_draw)
+        return roll_out(rollout_pieces(spontaneous_prob), zero_state, first_draw)
 
     @tf.function
     def distributed_generate_gray_state(first_draw):
@@ -428,7 +433,7 @@ def main(_):
         # caller returns the token so the sink is not pruned.
         return tf.numpy_function(sink, args, tf.int32, stateful=False)
 
-    def simulate_chunk(probability, state, first_draw, angle_id, start, store_voltages):
+    def simulate_chunk(pieces, state, first_draw, angle_id, start, store_voltages):
         """One --seq_len chunk of every trial. Each rollout chunk's spikes (and,
         with ``store_voltages``, the first trial's voltage) go to
         the host sinks as soon as the model produces them: the copies and host
@@ -444,13 +449,13 @@ def main(_):
             if store_voltages:
                 stored.append(to_host(store_voltage, sequences[1][0], start + chunk_start))
 
-        state = roll_out(probability, state, first_draw, on_chunk)
+        state = roll_out(pieces, state, first_draw, on_chunk)
         return state, tf.add_n(counts), tf.concat(first_trial, axis=0), tf.stack(stored)
 
     @tf.function
-    def distributed_simulate_chunk(probability, state, first_draw, angle_id, start, store_voltages):
+    def distributed_simulate_chunk(pieces, state, first_draw, angle_id, start, store_voltages):
         return strategy.run(
-            simulate_chunk, args=(probability, state, first_draw, angle_id, start, store_voltages)
+            simulate_chunk, args=(pieces, state, first_draw, angle_id, start, store_voltages)
         )
 
     for angle_id, angle in enumerate(DG_angles):
@@ -462,8 +467,13 @@ def main(_):
         continuing_state = gray_state
         chunk_counts, first_trial_chunks = [], []
         for start in range(0, sim_duration, chunk_size):
+            # Host tensors: the call copies each piece to the GPU while the
+            # previous one is simulated.
+            with tf.device('/CPU:0'):
+                pieces = [tf.constant(piece)
+                          for piece in rollout_pieces(lgn_prob[start:start + chunk_size])]
             continuing_state, count, first_trial, _ = distributed_simulate_chunk(
-                lgn_prob[start:start + chunk_size], continuing_state, tf.constant(next_draw),
+                pieces, continuing_state, tf.constant(next_draw),
                 tf.constant(angle_id), tf.constant(start),
                 voltages is not None and angle_id == 0,
             )

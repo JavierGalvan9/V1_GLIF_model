@@ -596,7 +596,12 @@ def load_or_compute_osi_dsi_lgn_probabilities(
     cache_prefix="osi_dsi_lgn_probabilities",
     lgn_backend='grating',
 ):
-    """Load cached OSI/DSI LGN spike probabilities or compute and cache them."""
+    """Load cached OSI/DSI LGN spike probabilities or compute and cache them.
+
+    Returns {angle: array [osi_seq_len, n_input]} of ``output_dtype``, on the host:
+    the eight angles take 2 GiB at 4000 ms, so each slice goes to the GPU only
+    when it is simulated.
+    """
     if angles is None:
         angles = np.arange(0, 360, 45)
 
@@ -663,7 +668,7 @@ def load_or_compute_osi_dsi_lgn_probabilities(
         print("OSI/DSI dataset created and cached successfully!")
 
     return {
-        angle: tf.convert_to_tensor(probs, dtype=output_dtype)
+        angle: np.asarray(probs, dtype=tf.as_dtype(output_dtype).as_numpy_dtype)
         for angle, probs in lgn_firing_probabilities_dict.items()
     }
 
