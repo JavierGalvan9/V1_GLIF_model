@@ -20,7 +20,7 @@ from tensorflow.core.protobuf import config_pb2, meta_graph_pb2
 from tensorflow.python.grappler import tf_optimizer
 
 import multi_training
-from v1_model_utils import loss_functions
+from v1_model_utils import lgn_input_source, loss_functions
 
 INT32_MAX = 2**31 - 1
 
@@ -136,6 +136,20 @@ class BooleanBernoulliBatchTest(unittest.TestCase):
                 )
                 self.assertEqual(actual.dtype, tf.bool)
                 np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+
+    def test_packed_chunks_hold_the_same_draws(self):
+        """--lgn_input_mode packed packs each chunk as it is drawn."""
+        probability = tf.reshape(tf.linspace(0.0, 1.0, 16), (4, 4))
+        expected = multi_training.sample_stateless_bernoulli_batch(probability, 19, (17, 29))
+        for limit in (32, INT32_MAX):  # chunked, and drawn whole
+            with self.subTest(limit=limit):
+                words = multi_training.sample_stateless_bernoulli_batch(
+                    probability, 19, (17, 29), batch_chunk_size=3, full_tensor_element_limit=limit,
+                    chunk_transform=lgn_input_source.pack_frames,
+                )
+                self.assertEqual(words.dtype, tf.uint32)
+                unpacked = lgn_input_source.PackedFrames(words, 4).materialize((words,), 4)
+                np.testing.assert_array_equal(unpacked.numpy(), expected.numpy())
 
     def test_production_shapes_above_int32_limit_without_allocating(self):
         for batch_size, chunk_size in ((128, 64), (256, 64), (1024, 64), (1024, 1024)):

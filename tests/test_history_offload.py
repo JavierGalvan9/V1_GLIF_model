@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from v1_model_utils import models, recorded_adjoint as adjoint
+from v1_model_utils import lgn_input_source, models, recorded_adjoint as adjoint
 
 
 BATCH, WIDTH, DELAY = 2, 35, 3
@@ -39,6 +39,7 @@ class _Cell:
     _compute_bkg_activity_gradient = False
     _track_voltage_penalty = False
     _lgn_delay_buffer_width = 0
+    input_dim = WIDTH
     _scales_recurrent_inputs = False
     _recurrent_dampening = 1.0
     _dt = 1.0
@@ -222,10 +223,14 @@ def test_history_offload_matches_resident_adjoint(portable_backend, length, roll
         results = []
         for runner in (resident, offloaded):
             for rollout in range(rollouts):
-                outputs, final, records = runner._forward_records(inputs + rollout, state, statistics)
+                source = lgn_input_source.DenseFrames(inputs + rollout)
+                outputs, final, records = runner._forward_records(
+                    lambda time, buffer: source.advance(source.tensors, time, buffer),
+                    source.initial_buffer(), state, statistics,
+                )
                 state_gradients = tuple(tf.ones_like(value) for value in final)
-                gradients, _ = runner._adjoint(
-                    inputs, state, final, records, statistics,
+                _, gradients, _ = runner._adjoint(
+                    source, source.tensors, state, final, records, statistics,
                     (tf.ones_like(outputs[0]),), state_gradients, (),
                 )
                 results.append((outputs, final, tuple(value for value in gradients if value is not None)))
@@ -284,8 +289,10 @@ def test_voltage_offload_selects_codec(portable_backend, monkeypatch, mode, code
 
     @tf.function(autograph=False)
     def run():
+        source = lgn_input_source.DenseFrames(tf.zeros((BATCH, length, WIDTH)))
         outputs, _, _ = runner._forward_records(
-            tf.zeros((BATCH, length, WIDTH)), state, adjoint.SpikeStatistics((0, length)),
+            lambda time, buffer: source.advance(source.tensors, time, buffer),
+            source.initial_buffer(), state, adjoint.SpikeStatistics((0, length)),
         )
         return outputs
 

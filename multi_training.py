@@ -24,6 +24,7 @@ import socket
 # import re
 import concurrent.futures
 import copy
+import functools
 import json
 import numpy as np
 import pandas as pd
@@ -89,16 +90,18 @@ def run_chunked_gray_state_rollout(state_model, sequence_and_state_model, sample
 
     ``sample_chunk(start, end)`` returns the model input for ``[start, end)``, so the
     full [batch, seq_len, n_input] input and its time-major copy never exist at once.
-    Each chunk is sampled after the previous one's state: the samples do not
-    depend on the state, so in a graph they would otherwise all run up front.
+    Each chunk is sampled and rolled out after the previous one's state: the
+    samples and the rollout's weight-derived tensors (about six weight-sized
+    copies per chunk) do not depend on the state, so in a graph every chunk's
+    would otherwise be made up front and stay alive until its chunk runs.
     """
     state = tuple(initial_state)
     for start in range(0, seq_len, chunk_size):
         with tf.control_dependencies(state[:1]):
             x = sample_chunk(start, min(start + chunk_size, seq_len))
-        state = tuple(run_gray_state_rollout(
-            state_model, sequence_and_state_model, (x, *state)
-        ))
+            state = tuple(run_gray_state_rollout(
+                state_model, sequence_and_state_model, (x, *state)
+            ))
     return state
 
 
@@ -282,6 +285,7 @@ def sample_stateless_bernoulli_batch(
     batch_chunk_size=64,
     full_tensor_element_limit=np.iinfo(np.int32).max,
     trial_index=None,
+    chunk_transform=None,
 ):
     """Sample Boolean spikes without launching kernels above int32 size.
 
@@ -292,8 +296,14 @@ def sample_stateless_bernoulli_batch(
     With ``trial_index`` [batch_size], ``probability`` stacks several
     per-sample probabilities on its first axis and sample b draws from
     ``probability[trial_index[b]]``.
+
+    ``chunk_transform`` (e.g. bit-packing) maps each chunk's spikes before the
+    next chunk is drawn, so only one chunk is ever held as spikes; the draws
+    are those of the untransformed sample.
     """
     probability = tf.cast(probability, tf.float32)
+    if chunk_transform is None:
+        chunk_transform = tf.identity
     sample_shape = probability.shape if trial_index is None else probability.shape[1:]
 
     def trial_probability(start, stop):
@@ -311,7 +321,7 @@ def sample_stateless_bernoulli_batch(
         random_uniform = tf.random.stateless_uniform(
             (batch_size, *sample_shape), seed=seed, dtype=tf.float32
         )
-        return random_uniform < trial_probability(0, batch_size)
+        return chunk_transform(random_uniform < trial_probability(0, batch_size))
 
     if elements_per_sample % 4:
         raise ValueError(
@@ -330,16 +340,20 @@ def sample_stateless_bernoulli_batch(
         chunk_counter = counter + tf.constant(
             [start * elements_per_sample // 4, 0], dtype=tf.uint64
         )
-        random_uniform = tf.raw_ops.StatelessRandomUniformV2(
-            shape=tf.constant([chunk_batch_size, *sample_shape]),
-            key=key,
-            counter=chunk_counter,
-            alg=algorithm,
-            dtype=tf.float32,
-        )
-        sampled_chunks.append(
+        # Each chunk's float32 uniforms (4 bytes per output spike) are drawn
+        # only once the previous chunk is sampled: unordered, every chunk's
+        # were alive at once, 4x the output (34 GiB at 1024 x 500 ms).
+        with tf.control_dependencies(sampled_chunks[-1:]):
+            random_uniform = tf.raw_ops.StatelessRandomUniformV2(
+                shape=tf.constant([chunk_batch_size, *sample_shape]),
+                key=key,
+                counter=chunk_counter,
+                alg=algorithm,
+                dtype=tf.float32,
+            )
+        sampled_chunks.append(chunk_transform(
             random_uniform < trial_probability(start, start + chunk_batch_size)
-        )
+        ))
     # Axis-0 concat with 16+ inputs takes a GPU kernel with unsafe offsets
     # above int32 size. Bound the fan-in so every join uses the slice kernel.
     while len(sampled_chunks) > 8:
@@ -373,7 +387,9 @@ def main(_):
     import stim_dataset
     from v1_model_utils.callbacks import Callbacks
     import v1_model_utils.loss_functions as losses
-    from v1_model_utils import load_sparse, models, other_v1_utils, recorded_adjoint
+    from v1_model_utils import (
+        lgn_input_source, load_sparse, models, other_v1_utils, recorded_adjoint
+    )
     from v1_model_utils import optimizers as optimizer_utils
     from v1_model_utils.cuda_prebuild import prebuild_for_run
 
@@ -1028,7 +1044,8 @@ def main(_):
         Returns one losses.SpikeSummary per group in place of its spike
         sequence, and the voltage-penalty accumulator.
         """
-        _x = int32_safe_cast(_x, input_dtype)
+        if not isinstance(_x, lgn_input_source.FrameSource):
+            _x = int32_safe_cast(_x, input_dtype)
         seed_helper.advance_noise_seed()
         _state_variables = models.reset_voltage_penalty_state(
             rsnn_layer.cell, _state_variables
@@ -1233,14 +1250,31 @@ def main(_):
 
         return _loss, _aux
 
+    # --lgn_input_mode: what a step's LGN input is. "halves": the
+    # [batch, seq_len, n_input] bool grating and gray halves; "packed": the
+    # halves bit-packed. The recorded adjoint reads them a frame at a time,
+    # so the full-batch input never exists; any other rollout gets it whole.
+    def stimulus_frames(x):
+        if flags.lgn_input_mode == "packed":
+            return lgn_input_source.PackedFrames(x, flags.n_input)
+        return lgn_input_source.DenseFrames(x)
+
+    def materialize_frames(source):
+        return source.materialize(source.tensors, flags.seq_len)
+
+    def reads_frames(summarize):
+        return summarize and isinstance(segmented_extractor, recorded_adjoint.RecordedAdjointRunner)
+
     def roll_out(x, y, initial_state, spontaneous=False, trim=True, update_loss_state=True,
                  summarize=False):
 
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), initial_state)
+        source = stimulus_frames(x)
+        x = source if reads_frames(summarize) else materialize_frames(source)
         if summarize:
             sync_loss = spont_sync_loss if spontaneous else evoked_sync_loss
             (_z,), voltage_source = run_extractor_summaries(
-                x, initial_state, ((x.shape[0], sync_loss),), trim
+                x, initial_state, ((source.batch, sync_loss),), trim
             )
             _out = None
         else:
@@ -1272,7 +1306,16 @@ def main(_):
     def roll_out_combined(x, y, x_spontaneous, initial_state, trim=True, update_loss_state=True,
                           summarize=False):
 
-        x_concat = concatenate_stimulus_batches(x, x_spontaneous, input_dtype)
+        if reads_frames(summarize):
+            # The recorded rollout reads each step's frame from the two halves.
+            x_concat = lgn_input_source.ConcatFrames(
+                stimulus_frames(x), stimulus_frames(x_spontaneous)
+            )
+        else:
+            x_concat = concatenate_stimulus_batches(
+                materialize_frames(stimulus_frames(x)),
+                materialize_frames(stimulus_frames(x_spontaneous)), input_dtype,
+            )
 
         if summarize:
             (_z_evoked, _z_spont), voltage_source_full = run_extractor_summaries(
@@ -1579,6 +1622,21 @@ def main(_):
     # results hands every replica's output back on GPU:0, which sent each
     # replica's 139 MB batch to GPU:0 and back every step; and a mirrored
     # variable read outside replica context resolves to GPU:0's copy.
+    def generate_grating_input(grating_lgn, theta, phase, spike_seeds):
+        """A replica's grating input in --lgn_input_mode's form."""
+        if flags.lgn_input_mode != "packed":
+            return grating_lgn.batch_spikes(theta, phase, spike_seeds)
+        # 16 samples at a time, each group packed before the next is sampled.
+        words = []
+        for begin in range(0, theta.shape[0], 16):
+            with tf.control_dependencies(words[-1:]):
+                spikes = grating_lgn.batch_spikes(
+                    theta[begin:begin + 16], phase[begin:begin + 16],
+                    spike_seeds[begin:begin + 16],
+                )
+            words.append(lgn_input_source.pack_frames(spikes))
+        return tf.concat(words, axis=0)
+
     grating_generators = []
     for device in strategy.extended.worker_devices:
         with tf.device(device):
@@ -1593,7 +1651,9 @@ def main(_):
                 dtype=dtype,
                 lgn_backend=flags.lgn_backend,
             )
-        grating_generators.append((device, tf.function(grating_lgn.batch_spikes)))
+        grating_generators.append((device, tf.function(
+            functools.partial(generate_grating_input, grating_lgn)
+        )))
 
     def distributed_generate_gratings(orientation, phase, spike_seeds):
         """LGN spikes for every replica, each generated and left on its own GPU."""
@@ -1638,7 +1698,14 @@ def main(_):
     else:
         train_data_set = strategy.distribute_datasets_from_function(get_gratings_dataset_fn())
 
-    def sample_probability_batch(probability, batch_size, current_input=False):
+    def sample_gray_input(probability, batch_size, current_input=False):
+        """A replica's gray-screen training input in --lgn_input_mode's form
+        (packed: the sampler's chunks of trials, each packed as it is drawn)."""
+        pack = lgn_input_source.pack_frames if flags.lgn_input_mode == "packed" else None
+        return sample_probability_batch(probability, batch_size, current_input, pack)
+
+    def sample_probability_batch(probability, batch_size, current_input=False,
+                                 chunk_transform=None):
         """Spikes of a replica's batch (current input: the scaled probability).
 
         A [n_phases, time, n_input] probability holds the validation grating
@@ -1660,13 +1727,14 @@ def main(_):
             int(batch_size),
             seed=seed_helper.next_spontaneous_seed(),
             trial_index=phase_index,
+            chunk_transform=chunk_transform,
         )
 
-    def make_distributed_probability_sampler(batch_size):
+    def make_distributed_probability_sampler(batch_size, sample=sample_probability_batch):
         @tf.function
         def distributed_sampler(probability, current_input=False):
             def replica_sample(replica_probability):
-                return sample_probability_batch(
+                return sample(
                     replica_probability,
                     batch_size,
                     current_input=current_input,
@@ -1680,8 +1748,10 @@ def main(_):
         per_replica_batch_size: make_distributed_probability_sampler(
             per_replica_batch_size
         ),
-        gray_batch_size: make_distributed_probability_sampler(gray_batch_size),
     }
+    distributed_sample_gray_input = make_distributed_probability_sampler(
+        gray_batch_size, sample_gray_input
+    )
 
     def distributed_sample_probability_batch(
         probability, batch_size, current_input=False
@@ -2316,10 +2386,7 @@ def main(_):
             # LGN spikes for this step; y is the grating orientation
             x, y = next_batch.result()
             next_batch = grating_generator.submit(next_gratings)
-            x_spontaneous = distributed_sample_probability_batch(
-                spontaneous_prob_base,
-                gray_batch_size,
-            )
+            x_spontaneous = distributed_sample_gray_input(spontaneous_prob_base)
             profile_this_step = (
                 flags.profile_train_step
                 and not profiler_finished
@@ -2701,6 +2768,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', True, '')
     absl.app.flags.DEFINE_boolean('compute_lgn_activity_gradient', False, '')
+    absl.app.flags.DEFINE_enum(
+        'lgn_input_mode', 'packed', ['packed', 'halves'],
+        'Training LGN input form (see stimulus_frames).')
     absl.app.flags.DEFINE_boolean('compute_bkg_activity_gradient', False, '')
     absl.app.flags.DEFINE_boolean('train_recurrent', True, '')
     absl.app.flags.DEFINE_boolean('train_recurrent_per_type', False, '')

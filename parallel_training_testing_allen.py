@@ -130,6 +130,8 @@ parser.add_argument('--random_weights', default=False, action='store_true')
 parser.add_argument('--uniform_weights', default=False, action='store_true')
 parser.add_argument('--backward_mode', default='recorded', choices=['recorded', 'checkpointing', 'autodiff'],
                     help='Training backward mode (see multi_training.py)')
+parser.add_argument('--lgn_input_mode', default='packed', choices=['packed', 'halves'],
+                    help='Training LGN input form (see multi_training.py)')
 parser.add_argument(
     '--voltage_offload', nargs='?', const='adaptive', default='none',
     choices=VOLTAGE_OFFLOAD_MODES,
@@ -242,9 +244,10 @@ def main():
             if name != 'segmented_rollout':
                 training_script += argument
             # osi_dsi_estimator.py does not define the training batch splits or
-            # the backward options.
+            # the backward and LGN input options.
             if name not in ('grating_batch_size', 'gray_batch_size', 'backward_mode',
-                            'pack_spike_checkpoints', 'voltage_offload', 'history_offload'):
+                            'pack_spike_checkpoints', 'voltage_offload', 'history_offload',
+                            'lgn_input_mode'):
                 evaluation_script += argument
 
     job_ids = []

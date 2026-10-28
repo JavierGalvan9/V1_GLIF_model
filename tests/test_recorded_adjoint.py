@@ -6,6 +6,7 @@ RecordedAdjointRunner's adjoint, fed the same forward's records, must match it
 bit for bit - weights, every floating initial state, all statistics.
 """
 
+import functools
 import os
 import unittest
 from unittest import mock
@@ -14,7 +15,7 @@ import numpy as np
 import tensorflow as tf
 
 from tests.network_fixtures import load_network
-from v1_model_utils import cuda_csr_recurrent, models, spatial_layout
+from v1_model_utils import cuda_csr_recurrent, lgn_input_source, models, spatial_layout
 from v1_model_utils import loss_functions as losses
 from v1_model_utils.recorded_adjoint import (
     RecordedAdjointRunner,
@@ -32,9 +33,12 @@ class RecordedAdjointTest(unittest.TestCase):
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
         self.addCleanup(tf.keras.mixed_precision.set_global_policy, "float32")
 
-    def _model(self, **model_options):
-        """The 1000-neuron test model, built; its RNN layer and input width."""
+    def _model(self, lgn_delay=None, **model_options):
+        """The 1000-neuron test model, built; its RNN layer and input width.
+        ``lgn_delay``: every LGN edge's delay in ms (a delay buffer from 2)."""
         network, lgn, bkg = load_network(1000)
+        if lgn_delay is not None:
+            lgn = {**lgn, "delays": np.full(len(lgn["weights"]), lgn_delay, np.float32)}
         edge_orders = None
         if cuda_csr_recurrent.DIRECT_CSR:
             network, lgn, bkg, edge_orders = spatial_layout.apply_csr_edge_order(
@@ -52,16 +56,20 @@ class RecordedAdjointTest(unittest.TestCase):
         model.build((self.BATCH, self.SEQ_LEN, n_input))
         return model, model.get_layer("rsnn"), n_input
 
-    def _runner(self, model, layer, chunk_size, voltage_offload="none", history_offload="none"):
+    def _runner(self, model, layer, chunk_size, voltage_offload="none", history_offload="none",
+                differentiate_inputs=False):
         return RecordedAdjointRunner(
             models.build_sequence_and_state_model(model, layer), layer.cell,
-            sequence_length=self.SEQ_LEN, chunk_size=chunk_size, differentiate_inputs=False,
+            sequence_length=self.SEQ_LEN, chunk_size=chunk_size,
+            differentiate_inputs=differentiate_inputs,
             accumulated_variable=layer.cell.accumulated_weight_gradient_variable,
             voltage_offload=voltage_offload, history_offload=history_offload,
         )
 
     def _case(self, chunk_size, count_window, trace_window, paired_samples=False,
-              offload=None, **model_options):
+              offload=None, differentiate_inputs=False, **model_options):
+        """``differentiate_inputs``: also the LGN input's gradient (the cell
+        built with compute_lgn_activity_gradient, float input frames)."""
         model, layer, n_input = self._model(**model_options)
         batch, length = self.BATCH, self.SEQ_LEN
         cell = layer.cell
@@ -72,7 +80,11 @@ class RecordedAdjointTest(unittest.TestCase):
         state = list(cell.zero_state(batch, tf.float32))
         state[0] = tf.constant((rng.random((batch, 3 * n)) < 0.02).astype(spike_dtype))
         state[1] = tf.constant(rng.normal(0.3, 0.3, (batch, n)).astype(np.float32))
+        if cell._lgn_delay_buffer_width:
+            state[cell._lgn_delay_state_index] = tf.constant(
+                (rng.random((batch, cell._lgn_delay_buffer_width)) < 0.02).astype(spike_dtype))
         state = tuple(state)
+        source = lgn_input_source.DenseFrames(inputs)
         sample_ids = rng.integers(0, n, (2, 2, 15))
         if paired_samples:
             # Every row samples eight neurons, seven of them twice.
@@ -93,7 +105,7 @@ class RecordedAdjointTest(unittest.TestCase):
         offload = dict(offload or {})
         runner = self._runner(
             model, layer, chunk_size, offload.pop("voltage_offload", "none"),
-            offload.pop("history_offload", "none"),
+            offload.pop("history_offload", "none"), differentiate_inputs,
         )
         for name, value in offload.items():  # store settings, small enough for this sequence
             setattr(runner, name, value)
@@ -112,14 +124,16 @@ class RecordedAdjointTest(unittest.TestCase):
 
         variables = model.trainable_variables
         floating = [i for i, value in enumerate(state) if value.dtype.is_floating]
+        differentiated_inputs = [inputs] if differentiate_inputs else []
         recurrent = [v.name for v in variables].index("sparse_recurrent_weights")
 
         @tf.function
         def compare():
             with tf.GradientTape() as tape:
-                tape.watch([state[i] for i in floating])
+                tape.watch([state[i] for i in floating] + differentiated_inputs)
                 outputs, final_state, records = runner._forward_records(
-                    inputs, state, statistics
+                    functools.partial(source.advance, source.tensors), source.initial_buffer(),
+                    state, statistics,
                 )
                 stores.append(records[-1])
                 history_stores.append(records[-2])
@@ -131,22 +145,24 @@ class RecordedAdjointTest(unittest.TestCase):
             cotangents = output_tape.gradient(detached_loss, detached)
             with runner._accumulation(True):
                 reference = tape.gradient(
-                    loss, list(variables) + [state[i] for i in floating],
+                    loss, list(variables) + [state[i] for i in floating] + differentiated_inputs,
                     unconnected_gradients=tf.UnconnectedGradients.ZERO,
                 )
             reference[recurrent] = runner._accumulated_gradient(reference, tf.float32)
-            state_gradients, candidate = runner._adjoint(
-                inputs, state, final_state, records, statistics,
+            input_gradients, state_gradients, candidate = runner._adjoint(
+                source, source.tensors, state, final_state, records, statistics,
                 cotangents[:len(outputs)], cotangents[len(outputs):],
                 tuple(v.value for v in variables),
             )
-            return reference, list(candidate) + [state_gradients[i] for i in floating]
+            return reference, (list(candidate) + [state_gradients[i] for i in floating]
+                               + list(input_gradients[:len(differentiated_inputs)]))
 
         # Autodiff sums the BKG/LGN weight gradients over the whole loop; the
         # adjoint sums them per chunk, then over chunks (the segmented runner's
         # order), so with several chunks only those two differ, by fp32 rounding.
         summed = {"rest_of_brain_weights", "sparse_input_weights"}
-        names = [v.name for v in variables] + [f"state_{i}" for i in floating]
+        names = ([v.name for v in variables] + [f"state_{i}" for i in floating]
+                 + ["inputs"] * len(differentiated_inputs))
         gradients = compare()
         if runner.history_offload != "none":
             # Reuse the traced graph and its stores on the next training step.
@@ -176,6 +192,21 @@ class RecordedAdjointTest(unittest.TestCase):
         # reference here hands the recurrent backward its bound and addends.
         tf.keras.mixed_precision.set_global_policy("float32")
         self._case(self.SEQ_LEN, (0, self.SEQ_LEN), (3, self.SEQ_LEN), dtype=tf.float32)
+
+    def test_matches_with_lgn_activity_gradients(self):
+        # The input frames' gradient, and with a delay buffer (3 ms: two
+        # frames held, so the sequence's last two end in the final buffer)
+        # the initial buffer's, over one and several chunks.
+        for chunk_size, lgn_delay in ((self.SEQ_LEN, None), (4, None), (4, 3.0)):
+            with self.subTest(chunk_size=chunk_size, lgn_delay=lgn_delay):
+                self._case(chunk_size, (0, self.SEQ_LEN), (3, self.SEQ_LEN),
+                           differentiate_inputs=True, compute_lgn_activity_gradient=True,
+                           train_input=True, lgn_delay=lgn_delay)
+
+    def test_matches_with_a_delay_buffer_and_undifferentiated_inputs(self):
+        # The activity gradient reaches the initial buffer, not the inputs.
+        self._case(4, (0, self.SEQ_LEN), (3, self.SEQ_LEN),
+                   compute_lgn_activity_gradient=True, lgn_delay=3.0)
 
     def test_matches_with_neurons_sampled_twice(self):
         # The dense gradient sums a neuron's two trace cotangents before adding
@@ -238,6 +269,13 @@ class RecordedAdjointTest(unittest.TestCase):
         self.assertFalse(runner.records)
         with self.assertRaisesRegex(ValueError, "no voltage sequences"):
             runner(tf.zeros((self.BATCH, self.SEQ_LEN, 1)), (), SpikeStatistics((0, 1), ()))
+
+    def test_checks_the_length_of_a_dense_frame_source(self):
+        model, layer, n_input = self._model()
+        runner = self._runner(model, layer, self.SEQ_LEN)
+        short = lgn_input_source.DenseFrames(tf.zeros((self.BATCH, self.SEQ_LEN - 1, n_input), tf.bool))
+        with self.assertRaisesRegex(tf.errors.InvalidArgumentError, "sequence_length"):
+            runner(short, layer.cell.zero_state(self.BATCH, tf.float32), SpikeStatistics((0, 1), ()))
 
     def test_rejects_an_unknown_voltage_offload(self):
         model, layer, _ = self._model()

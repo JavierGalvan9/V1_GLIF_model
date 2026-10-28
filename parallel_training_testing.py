@@ -136,7 +136,7 @@ parser.add_argument(
 )
 parser.add_argument('--qos', default='normal', help='Slurm QoS for TalaIA jobs.')
 parser.add_argument('--walltime', default='48:00', help='Scheduler wall time as hours:minutes.')
-parser.add_argument('--memory_gb', default=80, type=int, help='Host memory (GB) requested for training jobs.')
+parser.add_argument('--memory_gb', default=96, type=int, help='Host memory (GB) requested for training jobs.')
 parser.add_argument('--n_runs', default=1, type=int) # number of runs with n_epochs each, with an osi/dsi evaluation after each
 parser.add_argument('--n_epochs', default=75, type=int)
 parser.add_argument('--batch_size', default=2, type=int)
@@ -217,6 +217,8 @@ parser.add_argument('--random_weights', default=False, action='store_true')
 parser.add_argument('--uniform_weights', default=False, action='store_true')
 parser.add_argument('--backward_mode', default='recorded', choices=['recorded', 'checkpointing', 'autodiff'],
                     help='Training backward mode (see multi_training.py)')
+parser.add_argument('--lgn_input_mode', default='packed', choices=['packed', 'halves'],
+                    help='Training LGN input form (see multi_training.py)')
 parser.add_argument(
     '--voltage_offload', nargs='?', const='adaptive', default='none',
     choices=VOLTAGE_OFFLOAD_MODES,
@@ -363,12 +365,14 @@ def main():
                 training_script += f"--{name} {shlex.quote(str(value))} "
 
             # osi_dsi_estimator.py does not define training-only batch splits,
-            # rolling-loss flags, training debug flags, or the backward options.
+            # rolling-loss flags, training debug flags, the backward options or the
+            # LGN input mode.
             if name in {
                 'n_gpus', 'grating_batch_size', 'gray_batch_size', 'stratified_grating_angles',
                 'debug_gradients', 'global_clipnorm',
                 'detach_reset', 'detach_asc_reset',
                 'pack_spike_checkpoints', 'backward_mode', 'voltage_offload', 'history_offload',
+                'lgn_input_mode',
             } or name.startswith(('rolling_', 'batch_emd_')):
                 continue
 

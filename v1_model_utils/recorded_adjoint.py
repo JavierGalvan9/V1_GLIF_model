@@ -15,12 +15,13 @@ traces (SpikeStatistics), which the forward loop streams and whose cotangents
 the reverse loop turns back into each timestep's spike gradient.
 """
 
+import functools
 from typing import NamedTuple
 
 import numpy as np
 import tensorflow as tf
 
-from . import models
+from . import lgn_input_source, models
 from .offload_options import HISTORY_OFFLOAD_MODES, VOLTAGE_OFFLOAD_MODES
 from .cuda_csr_external.wrapper import (
     external_backward,
@@ -406,9 +407,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             "no voltage sequences": not cell._return_voltage_sequences,
             "no output_neuron_ids": cell._output_neuron_ids is None,
             "spike dtype = compute dtype": cell._output_spike_dtype == cell.compute_dtype,
-            "no LGN/BKG activity gradients": not (cell._compute_lgn_activity_gradient
-                                                  or cell._compute_bkg_activity_gradient),
-            "differentiate_inputs off": not self.differentiate_inputs,
+            "no BKG activity gradients": not cell._compute_bkg_activity_gradient,
             "only rec/BKG/LGN trainable":
                 trainable <= {id(value) for value in self._weight_roles.values()},
             "accumulator present": (self._accumulated_variable is not None
@@ -418,44 +417,56 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
 
     def __call__(self, inputs, initial_state, statistics=None):
         if statistics is None:
+            if isinstance(inputs, lgn_input_source.FrameSource):
+                inputs = inputs.materialize(inputs.tensors, self.sequence_length)
             return super().__call__(inputs, initial_state)
         if not self.records:
             raise ValueError(
                 "This cell's rollout has derivatives the recorded adjoint lacks: "
                 + ", ".join(self.unsupported)
             )
-        time_check = tf.debugging.assert_equal(
-            tf.shape(inputs)[1],
-            self.sequence_length,
-            message="Recorded input length does not match sequence_length.",
-        )
+        # Any lgn_input_source.FrameSource: the rollout reads one frame per
+        # step, so no [batch, time, n_input] input needs to exist.
+        source = lgn_input_source.as_source(inputs)
+        checks = []
+        if isinstance(source, lgn_input_source.DenseFrames):
+            checks.append(tf.debugging.assert_equal(
+                tf.shape(source.tensors[0])[1],
+                self.sequence_length,
+                message="Recorded input length does not match sequence_length.",
+            ))
+        n_inputs = len(source.tensors)
 
         @tf.custom_gradient
-        def recorded_rollout(inputs, *initial_state):
-            with tf.control_dependencies([time_check]):
+        def recorded_rollout(*arguments):
+            tensors, initial_state = arguments[:n_inputs], arguments[n_inputs:]
+            with tf.control_dependencies(checks):
                 outputs, final_state, records = self._forward_records(
-                    inputs, initial_state, statistics
+                    functools.partial(source.advance, tensors), source.initial_buffer(),
+                    initial_state, statistics,
                 )
 
             def grad(*output_gradients, variables=None):
                 n_outputs = len(outputs)
-                state_gradients, variable_gradients = self._adjoint(
-                    inputs, initial_state, final_state, records, statistics,
+                input_gradients, state_gradients, variable_gradients = self._adjoint(
+                    source, tensors, initial_state, final_state, records, statistics,
                     output_gradients[:n_outputs], output_gradients[n_outputs:],
                     tuple(variables or ()),
                 )
-                argument_gradients = (None,) + state_gradients
+                argument_gradients = input_gradients + state_gradients
                 if variables:
                     return argument_gradients, list(variable_gradients)
                 return argument_gradients
 
             return outputs + final_state, grad
 
-        return recorded_rollout(inputs, *tuple(initial_state))
+        return recorded_rollout(*source.tensors, *tuple(initial_state))
 
     # Forward -------------------------------------------------------------
 
-    def _forward_records(self, inputs, initial_state, statistics):
+    def _forward_records(self, advance, lgn_buffer, initial_state, statistics):
+        """``advance(time, lgn_buffer)``: the LGN frame of step ``time`` and
+        the source's buffer for the next step (lgn_input_source.FrameSource)."""
         cell, length = self.cell, self.sequence_length
         states = cell.to_loop_state(initial_state)
         history = states[0].slots
@@ -538,8 +549,9 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             [float(count_start <= time < count_stop) for time in range(length)], count_dtype
         )
 
-        def step(time, states, counts, frames, voltages, blocked, traces, pending):
+        def step(time, states, counts, frames, voltages, blocked, traces, pending, lgn_buffer):
             frames, voltages, blocked = hand_over(pending, time - 1, frames, voltages, blocked)
+            lgn_frame, lgn_buffer = advance(time, lgn_buffer)
             # The statistics read the exposed spikes, as the losses read the
             # sequence, so their gradient arrives as the exposed spikes' one.
             # `call`, not Keras' `__call__`: called directly (outside the RNN
@@ -547,7 +559,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             # weights to float16, which the RNN layer's rollout does not.
             # The GLIF op writes the packed spikes and blocked mask itself.
             with record_packed_masks(_WORD_BITS) as record:
-                spikes, new_states = cell.call(inputs[:, time], states)
+                spikes, new_states = cell.call(lgn_frame, states)
             new_states = tf.nest.pack_sequence_as(states, tf.nest.flatten(new_states))
             voltage, refractory = new_states[1], new_states[2]
             packed_spikes, packed_blocked = (
@@ -567,15 +579,17 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 tf.bitcast(packed_spikes, tf.uint32) if spike_store else pending[1],
                 tf.bitcast(packed_blocked, tf.uint32) if blocked_store else pending[2],
             )
-            return time + 1, new_states, counts, frames, voltages, blocked, traces, pending
+            return (time + 1, new_states, counts, frames, voltages, blocked, traces, pending,
+                    lgn_buffer)
 
         # The LGN weights are constant over the rollout: their per-pair sums for
         # the coalesced current sweep are computed once, here, not every step.
         with cell.lgn_pair_weights_scope():
-            _, states, counts, frames, voltages, blocked, traces, pending = tf.while_loop(
+            _, states, counts, frames, voltages, blocked, traces, pending, _ = tf.while_loop(
                 lambda time, *_: time < length,
                 step,
-                (tf.constant(0), states, counts, frames, voltages, blocked, traces, pending),
+                (tf.constant(0), states, counts, frames, voltages, blocked, traces, pending,
+                 lgn_buffer),
                 parallel_iterations=32,
             )
         frames, voltages, blocked = hand_over(pending, length - 1, frames, voltages, blocked)
@@ -660,8 +674,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
 
         return count_gradient, spike_cotangent
 
-    def _adjoint(self, inputs, initial_state, final_state, records, statistics,
+    def _adjoint(self, source, tensors, initial_state, final_state, records, statistics,
                  statistic_gradients, state_gradients, variables):
+        """``(input_gradients, state_gradients, variable_gradients)``; the
+        input gradients are the ``source``'s, one per tensor of ``tensors``."""
         cell, length, delay = self.cell, self.sequence_length, self.cell.max_delay
         frames, voltages, blocked, bkg_activity, history_stores, store = records
         spike_store, blocked_store = history_stores
@@ -698,17 +714,23 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         spike_carry, spike_cotangent_at = self._spike_cotangents(
             statistic_gradients, statistics, final_slots[0]
         )
-        lgn_frames = None
-        if "lgn" in summed:
-            # The LGN frame acting at step t: the delay buffer's frames, oldest
-            # first, then the input sequence.
-            lgn_frames = inputs
-            if cell._lgn_delay_buffer_width:
-                buffered = tf.reshape(
-                    initial_state[cell._lgn_delay_state_index],
-                    [inputs.shape[0], -1, cell.input_dim],
-                )
-                lgn_frames = tf.concat([buffered[:, ::-1], inputs], axis=1)
+        # The LGN frames acting on the steps: the delay buffer's, oldest first,
+        # then the source's (read again from its tensors).
+        held = cell._lgn_delay_buffer_width // cell.input_dim
+        acting, acting_tensors = source, tuple(tensors)
+        if held:
+            buffered = tf.reshape(
+                initial_state[cell._lgn_delay_state_index],
+                [final_slots[0].shape[0], held, cell.input_dim],
+            )[:, ::-1]
+            acting = lgn_input_source.DelayedFrames(buffered, source, self.differentiate_inputs)
+            acting_tensors = (buffered,) + acting_tensors
+        lgn_frame = functools.partial(acting.frame, acting_tensors)
+        # The LGN activity gradients reach the delay buffer's frames and, when
+        # the inputs are differentiated, the source's float frames.
+        activity = cell._compute_lgn_activity_gradient and bool(
+            held or self.differentiate_inputs and source.differentiable
+        )
 
         external = {
             "bkg": (cell.bkg_input_csr,
@@ -726,7 +748,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                     values = bkg_activity[time]
                 else:
                     values, _ = models._lgn_activity(
-                        cell, cell._permute_lgn_input(lgn_frames[:, time, :cell.input_dim])
+                        cell, cell._permute_lgn_input(lgn_frame(time)[:, :cell.input_dim])
                     )
                 # The dense BKG gradient's one-pass form (tensor or resource
                 # connectivity, FP16 or FP32), bitwise the fallback's.
@@ -747,6 +769,25 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                     )
                 gradients.append(gradient)
             return tuple(gradients)
+
+        def frame_gradient(upstream):
+            """The cotangent of the LGN frame acting on this step."""
+            connectivity, weights = external["lgn"]
+            if connectivity.resource_name is not None:
+                gradient, _ = resource_external_backward(
+                    connectivity, None, upstream, weights, basis,
+                    compute_activity_gradient=True, compute_weight_gradient=False,
+                )
+            else:
+                gradient, _ = external_backward(
+                    connectivity, None, upstream, weights, basis,
+                    connectivity.post_ids, connectivity.synapse_types,
+                    connectivity.row_splits, connectivity.edge_ids,
+                    connectivity.nonempty_rows, connectivity.pair_ids,
+                    connectivity.pair_posts, connectivity.pair_types,
+                    compute_activity_gradient=True, compute_weight_gradient=False,
+                )
+            return cell._unpermute_lgn_gradient(gradient)
 
         # The recurrent backward (tensor or resource connectivity) takes the
         # GLIF backward's abs-max of the upstream and the slots' activity masks,
@@ -794,9 +835,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 element_shape=frames_like.shape, element_dtype=tf.int32,
             )
 
-        def reverse_step(time, voltages, blocked, window, cotangents, partial):
+        def reverse_step(time, voltages, blocked, window, cotangents, partial, inputs):
             """Step ``time``'s backward; ``window`` holds z[time - 1 .. time - delay],
-            when carried their activity masks, and the spike cotangent's carry."""
+            when carried their activity masks, and the spike cotangent's carry;
+            ``inputs`` the acting frames' gradient buffer."""
             slots, masks, spike_carry, packed_slots = window
             history, voltage_g, asc_g, rise_g, psc_g = cotangents
             if store:
@@ -861,6 +903,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 total + gradient
                 for total, gradient in zip(partial, weight_gradients(time, upstream))
             )
+            if activity:
+                inputs = acting.add_gradient(
+                    acting_tensors, time, lambda: frame_gradient(upstream), inputs
+                )
             if masks:
                 masks = masks[1:] + (spike_activity_masks(oldest),)
             if spike_carry is spike_cotangent:
@@ -872,7 +918,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 packed_slots = packed_slots[1:] + (oldest_words,)
             return (time - 1, voltages, blocked,
                     (slots[1:] + (oldest,), masks, spike_carry, packed_slots),
-                    (history, voltage_g, asc_g, rise_g, psc_g), partial)
+                    (history, voltage_g, asc_g, rise_g, psc_g), partial, inputs)
 
         frames_like = tf.zeros([final_slots[0].shape[0], -(-width // _WORD_BITS)], tf.int32)
         cotangents = (
@@ -899,26 +945,27 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         masks = tuple(spike_activity_masks(slot) for slot in slots)
         window = (slots, masks, spike_carry, packed_slots)
         totals = tuple(tf.zeros_like(roles[role]) for role in summed)
+        inputs = acting.gradient_buffer(acting_tensors, length + held) if activity else ()
 
-        def reverse_chunk(chunk, voltages, blocked, window, cotangents, totals):
+        def reverse_chunk(chunk, voltages, blocked, window, cotangents, totals, inputs):
             start = chunk * self.chunk_size
             stop = tf.minimum(start + self.chunk_size, length)
-            time, voltages, blocked, window, cotangents, partial = tf.while_loop(
+            time, voltages, blocked, window, cotangents, partial, inputs = tf.while_loop(
                 lambda time, *_: time >= start,
                 reverse_step,
                 (stop - 1, voltages, blocked, window, cotangents,
-                 tuple(tf.zeros_like(total) for total in totals)),
+                 tuple(tf.zeros_like(total) for total in totals), inputs),
                 parallel_iterations=4,
             )
             totals = tuple(total + chunk_total for total, chunk_total in zip(totals, partial))
-            return chunk - 1, voltages, blocked, window, cotangents, totals
+            return chunk - 1, voltages, blocked, window, cotangents, totals, inputs
 
         with self._accumulation("recurrent" in roles):
-            _, _, _, _, cotangents, totals = tf.while_loop(
+            _, _, _, _, cotangents, totals, inputs = tf.while_loop(
                 lambda chunk, *_: chunk >= 0,
                 reverse_chunk,
                 (tf.constant(self.n_chunks - 1), voltages, blocked, window, cotangents,
-                 totals),
+                 totals, inputs),
                 parallel_iterations=1,
             )
         gradients = dict(zip(summed, totals))
@@ -935,22 +982,40 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         state_gradient = {
             0: tf.concat(history, axis=1), 1: voltage_g, 3: asc_g, 4: rise_g, 5: psc_g,
         }
-        if cell._lgn_delay_buffer_width:
-            # Shifted frame by frame and never read back as a differentiable
-            # input, the final buffer's gradient reaches only the initial
-            # buffer frames that survive the rollout.
+        input_gradients = (None,) * len(tensors)
+        if held:
             buffer_gradient = self._gradient_or_zeros(
                 state_gradients[cell._lgn_delay_state_index],
                 final_state[cell._lgn_delay_state_index],
             )
-            shift = min(length * cell.input_dim, cell._lgn_delay_buffer_width)
-            state_gradient[cell._lgn_delay_state_index] = tf.concat(
-                [buffer_gradient[:, shift:], tf.zeros_like(buffer_gradient[:, :shift])],
-                axis=1,
-            )
+            if activity:
+                # The final buffer holds the acting frames length .. length +
+                # held - 1, newest first: their gradient completes the buffer's.
+                blocks = tf.split(buffer_gradient, held, axis=1)
+                for index in range(length, length + held):
+                    inputs = acting.add_gradient(
+                        acting_tensors, index,
+                        lambda block=blocks[length + held - 1 - index]: block, inputs,
+                    )
+                buffered_gradient, *input_gradients = acting.gradients(acting_tensors, inputs)
+                state_gradient[cell._lgn_delay_state_index] = tf.reshape(
+                    buffered_gradient[:, ::-1], buffer_gradient.shape
+                )
+            else:
+                # Shifted frame by frame and never read back as a differentiable
+                # input, the final buffer's gradient reaches only the initial
+                # buffer frames that survive the rollout.
+                shift = min(length * cell.input_dim, cell._lgn_delay_buffer_width)
+                state_gradient[cell._lgn_delay_state_index] = tf.concat(
+                    [buffer_gradient[:, shift:], tf.zeros_like(buffer_gradient[:, :shift])],
+                    axis=1,
+                )
+        elif activity:
+            input_gradients = acting.gradients(acting_tensors, inputs)
         if cell._track_voltage_penalty:
             state_gradient[len(final_state) - 1] = penalty_gradient
         return (
+            tuple(input_gradients),
             tuple(state_gradient.get(index) for index in range(len(final_state))),
             variable_gradients,
         )
