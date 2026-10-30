@@ -15,6 +15,8 @@ from v1_model_utils.cuda_caches import configure_cuda_caches
 configure_cuda_caches()  # before CUDA and XLA initialize
 
 import absl
+import concurrent.futures
+import threading
 import numpy as np
 import tensorflow as tf
 from time import time
@@ -407,9 +409,26 @@ def main(_):
             f"{voltages.nbytes / (1024**3):.2f} GiB for the first trial."
         )
 
+    # The spike array is written on a few threads, off the simulation's path.
+    # These writes first-touch its pages, so the kernel zeroes them on the way:
+    # one thread writes ~7 GB/s, at 66k neurons x 100 trials no faster than the
+    # GPU produces spikes, and each --seq_len call would wait for its last write.
+    # A sink's array keeps TF's host copy of the chunk alive until written; the
+    # slots cap the chunks held by pending writes.
+    spike_writer = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    write_slots = threading.BoundedSemaphore(4)
+    pending_writes = []
+
+    def write_spikes(chunk_spikes, angle_id, start):
+        try:
+            spikes[:, angle_id, start:start + chunk_spikes.shape[1]] = chunk_spikes
+        finally:
+            write_slots.release()
+
     def store_spikes(chunk_spikes, angle_id, start):
-        """Host sink: one rollout chunk's spikes into the spike array."""
-        spikes[:, angle_id, start:start + chunk_spikes.shape[1]] = chunk_spikes
+        """Host sink: queues one rollout chunk's spikes for the spike array."""
+        write_slots.acquire()
+        pending_writes.append(spike_writer.submit(write_spikes, chunk_spikes, angle_id, start))
         return np.int32(0)
 
     def store_voltage(chunk_voltage, start):
@@ -470,6 +489,10 @@ def main(_):
             chunk_counts.append(count)
             if angle_id == 0:
                 first_trial_chunks.append(first_trial)
+        # The angle's spikes are all in the array (and any write error raised).
+        for write in pending_writes:
+            write.result()
+        pending_writes.clear()
 
         # Track GPU memory and inference time
         average_rate = int(tf.add_n(chunk_counts)) / spikes[:, angle_id].size
@@ -499,6 +522,8 @@ def main(_):
                 print(f"Voltage traces saved to {voltage_path}")
         if not flags.calculate_osi_dsi:
             break
+
+    spike_writer.shutdown()
 
     # Save the performance metrics
     callbacks.save_inference_metrics()
