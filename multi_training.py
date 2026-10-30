@@ -297,6 +297,11 @@ def sample_stateless_bernoulli_batch(
     per-sample probabilities on its first axis and sample b draws from
     ``probability[trial_index[b]]``.
 
+    Batches above ``batch_chunk_size`` samples are drawn chunk by chunk: one
+    chunk's float32 uniforms (4 bytes per spike) are alive at a time, and every
+    chunk continues the Philox stream of a single full draw, so the spikes do
+    not depend on the chunking.
+
     ``chunk_transform`` (e.g. bit-packing) maps each chunk's spikes before the
     next chunk is drawn, so only one chunk is ever held as spikes; the draws
     are those of the untransformed sample.
@@ -317,21 +322,22 @@ def sample_stateless_bernoulli_batch(
     batch_size = int(batch_size)
     elements_per_sample = sample_shape.num_elements()
     full_tensor_element_limit = min(int(full_tensor_element_limit), 2**31 - 1)
-    if batch_size * elements_per_sample <= full_tensor_element_limit:
-        random_uniform = tf.random.stateless_uniform(
-            (batch_size, *sample_shape), seed=seed, dtype=tf.float32
-        )
-        return chunk_transform(random_uniform < trial_probability(0, batch_size))
-
-    if elements_per_sample % 4:
-        raise ValueError(
-            "Chunked Philox sampling requires a per-sample size divisible by four."
-        )
     if batch_chunk_size <= 0:
         raise ValueError("batch_chunk_size must be positive.")
     batch_chunk_size = min(batch_chunk_size, full_tensor_element_limit // elements_per_sample)
     if batch_chunk_size < 1:
         raise ValueError("A single probability sample exceeds the element limit.")
+    if batch_size <= batch_chunk_size:
+        random_uniform = tf.random.stateless_uniform(
+            (batch_size, *sample_shape), seed=seed, dtype=tf.float32
+        )
+        return chunk_transform(random_uniform < trial_probability(0, batch_size))
+
+    # Philox emits four uniforms per counter step: a chunk starts on a step.
+    if batch_chunk_size * elements_per_sample % 4:
+        raise ValueError(
+            "Chunked Philox sampling requires chunks of a multiple of four elements."
+        )
     key, counter = tf.raw_ops.StatelessRandomGetKeyCounter(seed=seed)
     algorithm = tf.raw_ops.StatelessRandomGetAlg()
     sampled_chunks = []
