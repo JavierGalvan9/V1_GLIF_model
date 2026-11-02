@@ -287,6 +287,19 @@ otherwise uses TensorFlow. Use `acceleration="cuda"` to require CUDA or
 kernel supports `surrogate_gradient="triangular"`, `"gaussian"`, and
 `"slayer"`; the legacy `pseudo_gauss=True` option selects Gaussian.
 
+Simulations with CUDA acceleration are reproducible statistically, not
+bitwise. The synaptic-current operator (`cuda_csr_recurrent`) sums each
+target's LGN and recurrent inputs with fp32 atomics, so the order of the
+additions varies between runs. Occasionally a current then differs by one
+fp16 rounding step, which can flip a spike and change the rest of that trial.
+At 5,000 neurons and 10 trials per angle, the two outcomes of repeated runs
+differed by 10 spikes in one trial, and population OSI and firing-rate means
+moved by at most 0.3 SEM. `tf.config.experimental.enable_op_determinism()`
+does not change this. Compare runs through their statistics, or, for a bitwise
+reference, use `acceleration="tensorflow"` with op determinism enabled (about
+7x slower at 5,000 neurons). Details:
+`Experiments/test_determinism_20261030/REPORT.md`.
+
 Compiled CUDA operators are stored outside the repository in an ABI- and
 architecture-keyed cache. They are built with `nvcc` and the C++ compiler from
 the active Conda environment. Set `V1_CUDA_CACHE_DIR` to override the default

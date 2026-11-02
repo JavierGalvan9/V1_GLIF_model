@@ -1525,6 +1525,9 @@ class V1Column(tf.keras.layers.Layer):
             return
         if pair_weights is None:
             pair_weights = self.lgn_pair_weights()
+        if pair_weights is None:
+            yield
+            return
         # Not a tracked attribute; MirroredStrategy traces replicas one at a time.
         object.__setattr__(self, "_lgn_pair_weights", pair_weights)
         try:
