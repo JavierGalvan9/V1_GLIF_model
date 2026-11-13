@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from v1_model_utils import models, recorded_adjoint as adjoint
+from v1_model_utils import lgn_input_source, models, recorded_adjoint as adjoint
 
 
 BATCH, WIDTH, DELAY = 2, 35, 3
@@ -39,6 +39,7 @@ class _Cell:
     _compute_bkg_activity_gradient = False
     _track_voltage_penalty = False
     _lgn_delay_buffer_width = 0
+    input_dim = WIDTH
     _scales_recurrent_inputs = False
     _recurrent_dampening = 1.0
     _dt = 1.0
@@ -95,13 +96,22 @@ class _FrameStore:
                     tf.Variable(tf.zeros((capacity,), tf.int32)),
                 ))
 
-    def offload_frame(self, value, index, key, capacity, *args, codec):
+    def offload_frame(self, value, index, key, capacity, *args, codec, drop_outside=False, order=None):
         assert codec == "raw"
         assert value.dtype == tf.int32
         if key not in self.stores:
             self.stores[key] = self.resources[key.split("_")[0]].pop()
         data, written, taken = self.stores[key]
         assert data.shape == (capacity, *value.shape)
+        if drop_outside:  # the op records nothing outside [0, capacity)
+            index = tf.convert_to_tensor(index)
+            return tf.cond((index >= 0) & (index < capacity),
+                           lambda: self._write(value, index, data, written, taken),
+                           lambda: tf.zeros([0]))
+        return self._write(value, index, data, written, taken)
+
+    @staticmethod
+    def _write(value, index, data, written, taken):
         reset = tf.cond(
             tf.equal(index, 0),
             lambda: (written.assign(tf.zeros_like(written)), taken.assign(tf.zeros_like(taken))),
@@ -115,7 +125,11 @@ class _FrameStore:
         with tf.control_dependencies(updates):
             return tf.zeros([0])
 
-    def take_frame(self, index, key, like, **kwargs):
+    def take_frame(self, index, key, like, zero_before_start=False, order=None, **kwargs):
+        if zero_before_start:  # the op returns zeros before frame 0
+            return tf.cond(tf.convert_to_tensor(index) >= 0,
+                           lambda: self.take_frame(index, key, like),
+                           lambda: tf.zeros(like.shape, like.dtype))
         data, written, taken = self.stores[key]
         checks = (tf.debugging.assert_equal(written[index], 1),
                   tf.debugging.assert_equal(taken[index], 0))
@@ -187,9 +201,10 @@ def _runner(length, mode=None):
 
 @pytest.mark.parametrize("length", [1, 2, 3, 7, 11])
 @pytest.mark.parametrize("rollouts", [1, 2])
-def test_history_offload_matches_resident_adjoint(portable_backend, length, rollouts):
+@pytest.mark.parametrize("mode", ["raw", "adaptive"])
+def test_history_offload_matches_resident_adjoint(portable_backend, length, rollouts, mode):
     portable_backend.prepare(length, rollouts)
-    resident, offloaded = _runner(length, "none"), _runner(length, "raw")
+    resident, offloaded = _runner(length, "none"), _runner(length, mode)
     # Short sequences ordinarily stay resident; exercise transport even at L < delay.
     offloaded._PREFETCH = 0 if length <= offloaded._PREFETCH else offloaded._PREFETCH
     rng = np.random.default_rng(13)
@@ -208,10 +223,14 @@ def test_history_offload_matches_resident_adjoint(portable_backend, length, roll
         results = []
         for runner in (resident, offloaded):
             for rollout in range(rollouts):
-                outputs, final, records = runner._forward_records(inputs + rollout, state, statistics)
+                source = lgn_input_source.DenseFrames(inputs + rollout)
+                outputs, final, records = runner._forward_records(
+                    lambda time, buffer: source.advance(source.tensors, time, buffer),
+                    source.initial_buffer(), state, statistics,
+                )
                 state_gradients = tuple(tf.ones_like(value) for value in final)
-                gradients, _ = runner._adjoint(
-                    inputs, state, final, records, statistics,
+                _, gradients, _ = runner._adjoint(
+                    source, source.tensors, state, final, records, statistics,
                     (tf.ones_like(outputs[0]),), state_gradients, (),
                 )
                 results.append((outputs, final, tuple(value for value in gradients if value is not None)))
@@ -229,6 +248,7 @@ def test_history_offload_matches_resident_adjoint(portable_backend, length, roll
 
 def test_history_offload_configuration_and_fallbacks(portable_backend, monkeypatch):
     assert _runner(11).history_offload == "none"
+    assert _runner(11).voltage_offload == "none"
     with pytest.raises(ValueError, match="history_offload"):
         _runner(11, "compressed")
     runner = _runner(11, "raw")
@@ -241,3 +261,40 @@ def test_history_offload_configuration_and_fallbacks(portable_backend, monkeypat
         return tf.constant(1)
 
     assert fallback().numpy() == 1
+
+
+@pytest.mark.parametrize("mode,codec", [("raw", "raw"), ("adaptive", "tq"),
+                                       ("compressed", "tq")])
+def test_voltage_offload_selects_codec(portable_backend, monkeypatch, mode, codec):
+    length = 11
+    runner = adjoint.RecordedAdjointRunner(
+        SimpleNamespace(_v1_sequence_output_count=1), _Cell(), length, 4,
+        differentiate_inputs=False, voltage_offload=mode,
+    )
+    monkeypatch.setattr(runner, "_frame_store",
+                        lambda name, enabled, *args: name if enabled else None)
+    codecs = []
+
+    def offload(value, index, key, *args, codec, drop_outside=False, order=None):
+        assert key == "voltages" and value.dtype == tf.float32
+        codecs.append(codec)
+        return tf.zeros([0])
+
+    monkeypatch.setattr(adjoint.frame_store, "offload_frame", offload)
+    state = tuple(tf.zeros((BATCH, size), dtype) for size, dtype in (
+        (WIDTH * DELAY, tf.float32), (WIDTH, tf.float32), (WIDTH, tf.int32),
+        (WIDTH * 2, tf.float32), (WIDTH * 4, tf.float32), (WIDTH * 4, tf.float32),
+        (1, tf.int32),
+    ))
+
+    @tf.function(autograph=False)
+    def run():
+        source = lgn_input_source.DenseFrames(tf.zeros((BATCH, length, WIDTH)))
+        outputs, _, _ = runner._forward_records(
+            lambda time, buffer: source.advance(source.tensors, time, buffer),
+            source.initial_buffer(), state, adjoint.SpikeStatistics((0, length)),
+        )
+        return outputs
+
+    run()
+    assert codecs and set(codecs) == {codec}

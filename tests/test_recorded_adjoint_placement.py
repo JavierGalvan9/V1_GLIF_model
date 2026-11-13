@@ -65,6 +65,18 @@ def test_one_gpu_fix_is_a_no_op():
     assert "NOOP_BITWISE True" in out, out[-3000:]
 
 
+def test_two_replicas_roll_out_concurrently_with_offload():
+    """No frame-store op joins the global chain into which TensorFlow's automatic
+    control dependencies put every stateful op without a resource input, across
+    replicas: there, replica 1's rollout (gated on its length check) would wait
+    for replica 0's whole forward."""
+    if len(_gpus()) < 2:
+        pytest.skip("needs two GPUs")
+    out, _ = _run_child("chain", 2)
+    chain = next(line for line in out.splitlines() if line.startswith("CHAIN"))
+    assert chain.split()[1:] == ["Assert", "Assert"], chain
+
+
 def _child(mode):
     from tests.network_fixtures import load_network
     from v1_model_utils import cuda_csr_recurrent, models, recorded_adjoint, spatial_layout
@@ -96,6 +108,7 @@ def _child(mode):
             models.build_sequence_and_state_model(model, model.get_layer("rsnn")), cell,
             sequence_length=LENGTH, chunk_size=LENGTH, differentiate_inputs=False,
             accumulated_variable=cell.accumulated_weight_gradient_variable,
+            **(dict(voltage_offload="raw", history_offload="adaptive") if mode == "chain" else {}),
         )
     rng = np.random.default_rng(0)
     spikes = (rng.random((BATCH, LENGTH, n_input)) < 0.02).astype(np.float16)
@@ -113,7 +126,15 @@ def _child(mode):
                         + tf.reduce_sum(outputs[2]))
             return tape.gradient(loss, model.trainable_variables)
 
-        results = tf.function(lambda: strategy.run(replica_step))()
+        step = tf.function(lambda: strategy.run(replica_step))
+        if mode == "chain":
+            from tensorflow.python.framework import auto_control_deps
+            graph = step.get_concrete_function().graph
+            print("CHAIN", *(op.type for op in graph.get_operations()
+                             if auto_control_deps.op_is_stateful(op)
+                             and not any(t.dtype == tf.resource for t in op.inputs)))
+            return []
+        results = step()
         return [np.asarray(strategy.experimental_local_results(g)[0]) for g in results]
 
     fixed = recorded_adjoint._on_replica_device

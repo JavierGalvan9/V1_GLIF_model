@@ -9,6 +9,10 @@ using namespace tensorflow;
 // compute stream made with CUDA events (no host synchronization).
 // One store per (GPU, key) lives for the process; the host buffer is
 // allocated by the first offload and reused by every later rollout.
+// Both ops take an unread `order` resource, one per replica: TensorFlow's
+// automatic control dependencies then order a replica's store ops among
+// themselves only. Stateful ops without a resource input join one global
+// chain, which would hold each replica's rollout behind the previous one's.
 // Copies run in groups of `group` frames: one compute-stream event starts a
 // group and one copy event ends it, so the compute stream sees one event
 // record (and, coming back, one wait) per group rather than per frame.
@@ -35,6 +39,10 @@ using namespace tensorflow;
 // length and decoded when taken. Other dtypes, and "raw", store the exact
 // bits. The forward never waits for the copies or the encoder: a frame the
 // ring cannot take stays raw.
+// With `drop_outside`, an index outside [0, capacity) records nothing, so a
+// loop can hand over frames before the record's start or past its end without
+// a conditional (whose host predicate TensorFlow copies to the GPU, and waits
+// for, every step).
 // Returns an empty token (a data edge for ordering).
 REGISTER_OP("V1FrameStoreOffload")
     .Attr("T: {float, half, int32}")
@@ -43,8 +51,10 @@ REGISTER_OP("V1FrameStoreOffload")
     .Attr("resident_from: int >= 0")
     .Attr("group: int >= 1 = 1")
     .Attr("codec: {'raw', 'tq'} = 'raw'")
+    .Attr("drop_outside: bool = false")
     .Input("frame: T")
     .Input("index: int32")
+    .Input("order: resource")
     .Output("token: float")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -64,14 +74,17 @@ REGISTER_OP("V1FrameStoreOffload")
 // frame decodes from the reconstructions of the frames after it: those a
 // take handed out are kept while a stored frame below still needs them (until
 // the next rollout for frames not on the host); others are rebuilt from the
-// stored chain.
+// stored chain. With `zero_before_start`, a negative index returns a zero
+// frame (without a conditional, as above) and leaves the store untouched.
 REGISTER_OP("V1FrameStoreTake")
     .Attr("T: {float, half, int32}")
     .Attr("key: string")
     .Attr("shape: shape")
     .Attr("prefetch: int >= 0 = 0")
     .Attr("group: int >= 1 = 1")
+    .Attr("zero_before_start: bool = false")
     .Input("index: int32")
+    .Input("order: resource")
     .Output("frame: T")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
 import tensorflow as tf
@@ -131,3 +132,13 @@ def test_state_only_rollout_preserves_compact_integer_states(tmp_path, request):
     assert initial_state[2].dtype in (tf.int8, tf.int16)
     assert state[2].dtype == initial_state[2].dtype
     assert state[6].dtype == tf.int32
+
+
+def test_lgn_pair_weights_scope_nests_without_cuda_currents():
+    """Without CUDA currents there are no pair weights: nested scopes (the
+    estimator's around the rollout's) must neither set nor delete them."""
+    cell = SimpleNamespace(lgn_pair_weights=lambda: None)
+    with models.V1Column.lgn_pair_weights_scope(cell):
+        with models.V1Column.lgn_pair_weights_scope(cell):
+            pass
+    assert not hasattr(cell, "_lgn_pair_weights")

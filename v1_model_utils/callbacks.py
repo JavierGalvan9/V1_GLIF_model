@@ -1233,7 +1233,7 @@ class OsiDsiCallbacks:
 class Callbacks:
     def __init__(self, network, lgn_input, bkg_input, model, optimizer, flags, logdir, strategy,
                  metrics_keys, pre_delay=50, post_delay=50, checkpoint=None, model_variables_init=None,
-                 save_optimizer=True, spontaneous_training=False, write_outputs=True):
+                 save_optimizer=True, spontaneous_training=False, write_outputs=True, neuron_state=None):
 
         self.n_neurons = int(network.get('n_nodes', flags.neurons))
         self.n_edges = network['n_edges'] + len(lgn_input['weights'])
@@ -1246,6 +1246,8 @@ class Callbacks:
             self.neuropixels_feature = 'Evoked rate (Hz)'
         self.model = model
         self.optimizer = optimizer
+        # Callable returning the running statistics saved with every checkpoint.
+        self.neuron_state = neuron_state
         self.flags = flags
         self.logdir = logdir
         self.write_outputs = bool(write_outputs)
@@ -1320,7 +1322,7 @@ class Callbacks:
         self.train_start_time = time()
         self.epoch = self.flags.run_session * self.flags.n_epochs
 
-    def on_train_end(self, metric_values, normalizers=None):
+    def on_train_end(self, metric_values):
         self._finish_validation_plot()
         self.train_end_time = time()
         print("\n ---------- Training ended at ",
@@ -1351,13 +1353,6 @@ class Callbacks:
             'min_val_loss': self.min_val_loss,
             'no_improve_epochs': self.no_improve_epochs
         }
-        if normalizers is not None:
-            data_to_save.update(normalizers)
-
-        # Persist per-neuron statistics in canonical order, as for checkpoints.
-        data_to_save = spatial_layout.translate_neuron_state(
-            tf_utils.neuron_layout(self.model), data_to_save, to_runtime=False
-        )
         with open(os.path.join(self.logdir, 'train_end_data.pkl'), 'wb') as f:
             pkl.dump(data_to_save, f)
 
@@ -1659,6 +1654,11 @@ class Callbacks:
         canonical = time()
         try:
             path = manager.save(checkpoint_number=self.epoch)
+            if self.neuron_state is not None:
+                # Canonical neuron order, as for the checkpoint itself.
+                tf_utils.save_checkpoint_neuron_state(manager, path, spatial_layout.translate_neuron_state(
+                    tf_utils.neuron_layout(self.model), self.neuron_state(), to_runtime=False
+                ))
             written = time()
             return path
         finally:

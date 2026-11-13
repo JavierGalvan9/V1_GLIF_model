@@ -214,7 +214,7 @@ def test_neuron_state_translation_round_trips_nested_payloads():
         "v1_ema": np.linspace(0, 1, N_NODES),
         "min_val_loss": 0.5,
         "epoch_metric_values": {"rate": [1.0, 2.0, 3.0]},
-        "adaptative_crowd_osi_state": {
+        "rolling_osi_emd_state": {
             "core": {
                 "ori_real": np.arange(N_NODES, dtype=np.float32),
                 "weight_sum": 12.0,
@@ -226,22 +226,36 @@ def test_neuron_state_translation_round_trips_nested_payloads():
         runtime["v1_ema"], payload["v1_ema"][layout.new_to_old]
     )
     assert np.array_equal(
-        runtime["adaptative_crowd_osi_state"]["core"]["ori_real"],
-        payload["adaptative_crowd_osi_state"]["core"]["ori_real"][layout.new_to_old],
+        runtime["rolling_osi_emd_state"]["core"]["ori_real"],
+        payload["rolling_osi_emd_state"]["core"]["ori_real"][layout.new_to_old],
     )
     # Non neuron-aligned entries pass through untouched.
     assert runtime["min_val_loss"] == 0.5
     assert runtime["epoch_metric_values"]["rate"] == [1.0, 2.0, 3.0]
-    assert runtime["adaptative_crowd_osi_state"]["core"]["weight_sum"] == 12.0
+    assert runtime["rolling_osi_emd_state"]["core"]["weight_sum"] == 12.0
 
     canonical = spatial_layout.translate_neuron_state(
         layout, runtime, to_runtime=False
     )
     assert np.allclose(canonical["v1_ema"], payload["v1_ema"])
     assert np.allclose(
-        canonical["adaptative_crowd_osi_state"]["core"]["ori_real"],
-        payload["adaptative_crowd_osi_state"]["core"]["ori_real"],
+        canonical["rolling_osi_emd_state"]["core"]["ori_real"],
+        payload["rolling_osi_emd_state"]["core"]["ori_real"],
     )
+
+
+def test_neuron_state_translation_reorders_rows_of_replica_copies():
+    network, _, _ = _network()
+    layout = spatial_layout.build_layout(network, spatial_layout.MORTON)
+    # Rolling OSI state: one row per replica copy, neurons on the last axis.
+    rows = np.stack([np.linspace(0, 1, N_NODES), np.linspace(1, 2, N_NODES)]).astype(np.float32)
+    payload = {"rolling_osi_emd_state": {"core": {"ori_real": rows, "weight_sum": np.ones(2, np.float32)}}}
+    runtime = spatial_layout.translate_neuron_state(layout, payload, to_runtime=True)
+    state = runtime["rolling_osi_emd_state"]["core"]
+    assert np.array_equal(state["ori_real"], rows[:, layout.new_to_old])
+    assert np.array_equal(state["weight_sum"], np.ones(2, np.float32))
+    canonical = spatial_layout.translate_neuron_state(layout, runtime, to_runtime=False)
+    assert np.array_equal(canonical["rolling_osi_emd_state"]["core"]["ori_real"], rows)
 
 
 def test_delayed_presynaptic_relabelling_keeps_delay_blocks():

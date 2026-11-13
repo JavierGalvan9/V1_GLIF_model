@@ -1414,11 +1414,12 @@ Status LookupStore(const std::string& key, FrameStore** store) {
   return absl::OkStatus();
 }
 
-Status ScalarIndex(const Tensor& index, int64_t* value) {
+Status ScalarIndex(const Tensor& index, int64_t* value, bool negative_allowed = false) {
   if (!TensorShapeUtils::IsScalar(index.shape()))
     return errors::InvalidArgument("index must be a scalar");
   *value = index.scalar<int32_t>()();
-  if (*value < 0) return errors::InvalidArgument("index must be non-negative");
+  if (*value < 0 && !negative_allowed)
+    return errors::InvalidArgument("index must be non-negative");
   return absl::OkStatus();
 }
 
@@ -1432,10 +1433,14 @@ class OffloadOp : public OpKernel {
     std::string codec;
     OP_REQUIRES_OK(c, c->GetAttr("codec", &codec));
     codec_ = codec == "tq" ? Codec::kTq : Codec::kRaw;
+    OP_REQUIRES_OK(c, c->GetAttr("drop_outside", &drop_outside_));
   }
   void Compute(OpKernelContext* c) override {
     int64_t i;
-    OP_REQUIRES_OK(c, ScalarIndex(c->input(1), &i));
+    OP_REQUIRES_OK(c, ScalarIndex(c->input(1), &i, drop_outside_));
+    Tensor* token;
+    OP_REQUIRES_OK(c, c->allocate_output(0, TensorShape({0}), &token));
+    if (drop_outside_ && (i < 0 || i >= capacity_)) return;
     OP_REQUIRES(c, i < capacity_,
                 errors::InvalidArgument("index ", i, " is outside [0, ", capacity_, ")"));
     OP_REQUIRES(c, c->input(0).NumElements() > 0,
@@ -1444,14 +1449,13 @@ class OffloadOp : public OpKernel {
     OP_REQUIRES_OK(c, LookupStore(key_, &store));
     OP_REQUIRES_OK(c,
                    store->Offload(c, i, capacity_, resident_from_, group_, codec_, c->input(0)));
-    Tensor* token;
-    OP_REQUIRES_OK(c, c->allocate_output(0, TensorShape({0}), &token));
   }
 
  private:
   std::string key_;
   int64_t capacity_, resident_from_, group_;
   Codec codec_;
+  bool drop_outside_;
 };
 
 class TakeOp : public OpKernel {
@@ -1465,10 +1469,21 @@ class TakeOp : public OpKernel {
     OP_REQUIRES_OK(c, c->GetAttr("shape", &shape));
     OP_REQUIRES(c, shape.AsTensorShape(&shape_),
                 errors::InvalidArgument("shape must be fully defined"));
+    OP_REQUIRES_OK(c, c->GetAttr("zero_before_start", &zero_before_start_));
   }
   void Compute(OpKernelContext* c) override {
     int64_t i;
-    OP_REQUIRES_OK(c, ScalarIndex(c->input(0), &i));
+    OP_REQUIRES_OK(c, ScalarIndex(c->input(0), &i, zero_before_start_));
+    if (i < 0) {  // before the record's start: a zero frame, on the compute stream
+      Tensor* frame;
+      OP_REQUIRES_OK(c, c->allocate_output(0, shape_, &frame));
+      const cudaError_t status =
+          cudaMemsetAsync(const_cast<char*>(frame->tensor_data().data()), 0,
+                          frame->TotalBytes(), c->eigen_device<GPUDevice>().stream());
+      OP_REQUIRES(c, status == cudaSuccess,
+                  errors::Internal("cudaMemsetAsync failed: ", cudaGetErrorString(status)));
+      return;
+    }
     FrameStore* store;
     OP_REQUIRES_OK(c, LookupStore(key_, &store));
     OP_REQUIRES_OK(c, store->Take(c, i, prefetch_, group_, dtype_, shape_));
@@ -1479,6 +1494,7 @@ class TakeOp : public OpKernel {
   DataType dtype_;
   int64_t prefetch_, group_;
   TensorShape shape_;
+  bool zero_before_start_;
 };
 
 }  // namespace

@@ -15,8 +15,10 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 from v1_model_utils import gpu_selection
+from v1_model_utils.offload_options import normalize_offload_args
 
 _WORKER_FLAG = "distributed_worker_index"
 _MODE_FLAG = "distributed_mode"
@@ -26,12 +28,6 @@ DISTRIBUTED_MODES = ("mirrored", "multi_worker")
 # cannot actually service, and NCCL then stalls instead of falling back. Only
 # those architectures need the transport forced down to shared memory/host.
 _NO_PEER_ACCESS_ARCHITECTURES = {"86"}
-
-# Directory holding the non-chief worker logs, relative to the working
-# directory, so one process per GPU does not interleave its output on the
-# console.
-WORKER_LOG_DIRECTORY = "Distributed_worker_logs"
-
 
 @dataclass(frozen=True)
 class TrainingLaunchPlan:
@@ -75,15 +71,17 @@ class WorkerProcess:
 
 
 def _option(argv, name, default=None):
+    """Value of ``--name`` in ``argv``; the last occurrence wins, as in absl."""
     option = f"--{name}"
+    found = default
     for index, value in enumerate(argv[1:], start=1):
         if value.startswith(option + "="):
-            return value.split("=", 1)[1]
-        if value == option:
+            found = value.split("=", 1)[1]
+        elif value == option:
             if index + 1 >= len(argv):
                 raise ValueError(f"{option} requires a value")
-            return argv[index + 1]
-    return default
+            found = argv[index + 1]
+    return found
 
 
 def _replace_options(argv, replacements, removals=()):
@@ -186,7 +184,7 @@ def plan_training_launch(
     argv, *, environ=None, worker_addresses=None, compute_capabilities=None
 ):
     """Validate CLI distribution settings and return an immutable launch plan."""
-    argv = tuple(argv)
+    argv = normalize_offload_args(argv)
     environ = os.environ if environ is None else environ
     n_gpus = int(_option(argv, "n_gpus", 1))
     if n_gpus < 1:
@@ -311,35 +309,40 @@ def build_worker_processes(plan, *, base_environ=None, enabled=False):
     return tuple(workers)
 
 
-def worker_log_path(worker_index, directory=None):
-    """Return the log file a non-chief worker writes its output to."""
-    directory = WORKER_LOG_DIRECTORY if directory is None else directory
-    return os.path.join(directory, f"worker_{worker_index}.log")
+def worker_log_path(worker_index, directory, *, stderr=False):
+    """Return a worker's stdout or stderr file in its run directory."""
+    suffix = "err" if stderr else "out"
+    return os.path.join(directory, f"worker_{worker_index}.{suffix}")
 
 
 def launch_worker_processes(plan, *, enabled=False, log_directory=None):
     """Run all workers, propagate failures, and forward termination signals.
 
-    The chief writes to the console. Every other worker gets its own log file
-    so a two-GPU run reads like a one-GPU run, and a failure in a non-chief
-    worker is still recoverable afterwards.
+    The chief keeps the wrapper's console logging. Other workers write separate
+    stdout/stderr files under Out/<run_id> and Error/<run_id>. ``log_directory``
+    optionally selects a parent for both trees (default: working directory).
     """
     specs = build_worker_processes(plan, enabled=enabled)
-    log_directory = WORKER_LOG_DIRECTORY if log_directory is None else log_directory
+    log_directory = "." if log_directory is None else log_directory
+    run_id = f"run_{uuid.uuid4().hex}"
     processes = []
     handles = []
     for index, spec in enumerate(specs):
         if index == 0:
             processes.append(subprocess.Popen(spec.argv, env=spec.environ))
             continue
-        path = worker_log_path(index, log_directory)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        handle = open(path, "w", encoding="utf-8")
-        handles.append(handle)
-        print(f"Worker {index} output: {path}", flush=True)
+        out_path = worker_log_path(index, os.path.join(log_directory, "Out", run_id))
+        err_path = worker_log_path(index, os.path.join(log_directory, "Error", run_id), stderr=True)
+        for path in (out_path, err_path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        out_handle = open(out_path, "x", encoding="utf-8")
+        handles.append(out_handle)
+        err_handle = open(err_path, "x", encoding="utf-8")
+        handles.append(err_handle)
+        print(f"Worker {index} stdout: {out_path}; stderr: {err_path}", flush=True)
         processes.append(
             subprocess.Popen(
-                spec.argv, env=spec.environ, stdout=handle, stderr=handle
+                spec.argv, env=spec.environ, stdout=out_handle, stderr=err_handle
             )
         )
     previous_handlers = {}

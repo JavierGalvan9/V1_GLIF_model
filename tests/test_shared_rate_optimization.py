@@ -5,6 +5,7 @@ import tensorflow as tf
 
 from multi_training import (
     annulus_mask_from_core,
+    run_chunked_gray_state_rollout,
     run_gray_state_rollout,
     update_rate_emas,
 )
@@ -91,6 +92,30 @@ class SharedRateTargetTests(unittest.TestCase):
         np.testing.assert_array_equal(fallback_state[1].numpy(), [5.0])
         with self.assertRaisesRegex(ValueError, "final-state tensor"):
             run_gray_state_rollout(None, lambda _: (tf.constant([1.0]),), ())
+
+    def test_chunked_gray_state_rollout_matches_one_full_rollout(self):
+        x = tf.keras.layers.Input(shape=(None, 3))
+        h0 = tf.keras.layers.Input(shape=(4,))
+        c0 = tf.keras.layers.Input(shape=(4,))
+        _, h, c = tf.keras.layers.LSTM(4, return_state=True)(x, initial_state=[h0, c0])
+        state_model = tf.keras.Model([x, h0, c0], [h, c])
+        inputs = tf.random.stateless_normal((2, 23, 3), seed=(1, 2))
+        initial_state = (tf.zeros((2, 4)), tf.zeros((2, 4)))
+
+        full = run_gray_state_rollout(state_model, None, (inputs, *initial_state))
+        sampled_chunks = []
+
+        def sample_chunk(start, end):
+            sampled_chunks.append((start, end))
+            return inputs[:, start:end]
+
+        chunked = run_chunked_gray_state_rollout(
+            state_model, None, sample_chunk, initial_state, seq_len=23, chunk_size=5
+        )
+
+        self.assertEqual(sampled_chunks, [(0, 5), (5, 10), (10, 15), (15, 20), (20, 23)])
+        for full_state, chunked_state in zip(full, chunked):
+            np.testing.assert_allclose(chunked_state.numpy(), full_state.numpy(), rtol=1e-5, atol=1e-6)
 
     def test_quantile_midpoints_preserve_equal_sized_distribution(self):
         firing_rates = np.array([0.1, 0.2, 0.6, 0.9], dtype=np.float32)

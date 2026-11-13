@@ -30,9 +30,15 @@ def network_path(n_neurons):
     from v1_model_utils import load_sparse
 
     path = load_sparse.v1_cache_path(_flags(), n_neurons, f"v1_{n_neurons}")
-    # Fixtures cached before the configuration key was added to the name.
-    legacy = os.path.join(DATA_DIR, "tf_data", f"V1_network_v1_{n_neurons}.pkl")
-    return legacy if not os.path.exists(path) and os.path.exists(legacy) else path
+    key = os.path.basename(path).removesuffix(".pkl").rsplit("_", 1)[1]
+    directory = os.path.join(DATA_DIR, "tf_data")
+    candidates = (
+        path,
+        os.path.join(directory, f"V1_network_v1_{n_neurons}_{key}.pkl"),
+        os.path.join(directory, f"v1_network_{n_neurons}neurons_legacy.pkl"),
+        os.path.join(directory, f"V1_network_v1_{n_neurons}.pkl"),
+    )
+    return next((candidate for candidate in candidates if os.path.exists(candidate)), path)
 
 
 def load_network(n_neurons):
@@ -49,7 +55,11 @@ def load_network(n_neurons):
         )
     with open(path, "rb") as handle:
         cached = pickle.load(handle)
-    return cached["payload"] if isinstance(cached, dict) else cached
+    network, lgn_input, bkg_input = cached["payload"] if isinstance(cached, dict) else cached
+    # Like load_sparse.cached_load_v1: a cache built under another path or host
+    # must read its companion files from this checkout's data directory.
+    network["data_dir"] = DATA_DIR
+    return network, lgn_input, bkg_input
 
 
 def build_network(n_neurons):

@@ -421,9 +421,9 @@ def tracked_to_canonical(layout, values, tracked_ids=None, axis=-1):
 def translate_neuron_state(layout, payload, to_runtime):
     """Translate the per-neuron arrays of a persisted state payload.
 
-    ``train_end_data.pkl`` stores neuron-aligned running statistics (firing-rate
-    EMAs, rolling orientation-selectivity accumulators) that are written and
-    read across runs. They follow the same canonical-on-disk rule as
+    The neuron state saved beside each checkpoint holds neuron-aligned running
+    statistics (firing-rate EMAs, rolling orientation-selectivity accumulators) that are
+    written and read across runs. They follow the same canonical-on-disk rule as
     checkpoints, so they are translated on the way in and out.
     """
     if layout.is_identity:
@@ -435,10 +435,12 @@ def translate_neuron_state(layout, payload, to_runtime):
             for key, value in payload.items()
         }
     array = np.asarray(payload) if not np.isscalar(payload) else None
-    if array is not None and array.shape == (layout.n_nodes,) and (
+    # The last axis is the neuron axis; leading axes (e.g. one row per
+    # replica copy of the rolling state) are kept.
+    if array is not None and array.ndim in (1, 2) and array.shape[-1] == layout.n_nodes and (
         np.issubdtype(array.dtype, np.floating)
     ):
-        return reorder(array)
+        return reorder(array, axis=-1)
     return payload
 
 

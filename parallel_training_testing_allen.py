@@ -9,6 +9,7 @@ import shlex
 # import tensorflow as tf
 from v1_model_utils import toolkit
 from v1_model_utils import spatial_layout
+from v1_model_utils.offload_options import HISTORY_OFFLOAD_MODES, VOLTAGE_OFFLOAD_MODES
 # # script_path = "bash d
 
 # Create argument parser
@@ -91,6 +92,10 @@ parser.add_argument('--fano_samples', default=512, type=int)
 parser.add_argument('--caching', dest='caching', action='store_true')
 parser.add_argument('--nocaching', dest='caching', action='store_false')
 parser.set_defaults(caching=True)
+parser.add_argument(
+    '--compress_model_cache', default=False, action='store_true',
+    help='Store constructed V1 model caches with LZ4 compression (.pkl.lz4).',
+)
 
 parser.add_argument('--core_only', default=False, action='store_true')
 parser.add_argument('--core_loss', default=False, action='store_true')
@@ -125,8 +130,18 @@ parser.add_argument('--random_weights', default=False, action='store_true')
 parser.add_argument('--uniform_weights', default=False, action='store_true')
 parser.add_argument('--backward_mode', default='recorded', choices=['recorded', 'checkpointing', 'autodiff'],
                     help='Training backward mode (see multi_training.py)')
-parser.add_argument('--voltage_offload', default='none', choices=['none', 'raw', 'compressed'],
-                    help='Training membrane-record offload with --backward_mode recorded (see multi_training.py)')
+parser.add_argument('--lgn_input_mode', default='packed', choices=['packed', 'halves'],
+                    help='Training LGN input form (see multi_training.py)')
+parser.add_argument(
+    '--voltage_offload', nargs='?', const='adaptive', default='none',
+    choices=VOLTAGE_OFFLOAD_MODES,
+    help='Recorded membrane offload: bare flag enables adaptive; compressed is its legacy alias.',
+)
+parser.add_argument(
+    '--history_offload', nargs='?', const='adaptive', default='none',
+    choices=HISTORY_OFFLOAD_MODES,
+    help='Recorded packed-history offload: bare flag enables adaptive; raw is its legacy alias.',
+)
 parser.add_argument('--segmented_rollout', dest='segmented_rollout', action='store_true',
                     help='Evaluation rollout in int32-safe chunks (see osi_dsi_estimator.py)')
 parser.add_argument('--nosegmented_rollout', dest='segmented_rollout', action='store_false')
@@ -229,9 +244,10 @@ def main():
             if name != 'segmented_rollout':
                 training_script += argument
             # osi_dsi_estimator.py does not define the training batch splits or
-            # the backward options.
+            # the backward and LGN input options.
             if name not in ('grating_batch_size', 'gray_batch_size', 'backward_mode',
-                            'voltage_offload'):
+                            'pack_spike_checkpoints', 'voltage_offload', 'history_offload',
+                            'lgn_input_mode'):
                 evaluation_script += argument
 
     job_ids = []

@@ -1161,6 +1161,9 @@ class V1Column(tf.keras.layers.Layer):
             self._bind_constant(
                 "_lgn_row_gather", self._lgn_row_order.new_to_old, tf.int64
             )
+            self._bind_constant(
+                "_lgn_row_scatter", self._lgn_row_order.old_to_new, tf.int64
+            )
         self.lgn_input_dense_shape = (self._n_neurons, self.input_dim,)
         input_indices = np.array(lgn_input["indices"])
         input_weights = np.array(lgn_input["weights"])
@@ -1522,6 +1525,9 @@ class V1Column(tf.keras.layers.Layer):
             return
         if pair_weights is None:
             pair_weights = self.lgn_pair_weights()
+        if pair_weights is None:
+            yield
+            return
         # Not a tracked attribute; MirroredStrategy traces replicas one at a time.
         object.__setattr__(self, "_lgn_pair_weights", pair_weights)
         try:
@@ -1962,6 +1968,13 @@ class V1Column(tf.keras.layers.Layer):
             return lgn_input
         return tf.gather(lgn_input, self._lgn_row_gather, axis=1)
 
+    def _unpermute_lgn_gradient(self, gradient):
+        """A runtime-order LGN activity gradient in canonical row order (the
+        gradient of _permute_lgn_input)."""
+        if self._lgn_row_gather is None:
+            return gradient
+        return tf.gather(gradient, self._lgn_row_scatter, axis=1)
+
     def call(self, inputs, state, constants=None):
 
         # Get all the model inputs
@@ -1984,10 +1997,12 @@ class V1Column(tf.keras.layers.Layer):
         )
         # Afferent delay: the LGN frame that acts on this timestep was emitted
         # `_lgn_delay_steps - 1` steps ago. Newest frame first, as for z_buf.
+        # Bool spike frames (multi_training.model_input_dtype) take the buffer's
+        # dtype as they enter it.
         if self._lgn_delay_buffer_width:
             lgn_buf = state[self._lgn_delay_state_index]
             new_lgn_buf = tf.concat(
-                [lgn_input, lgn_buf[:, :-self.input_dim]], axis=1
+                [tf.cast(lgn_input, lgn_buf.dtype), lgn_buf[:, :-self.input_dim]], axis=1
             )
             lgn_input = lgn_buf[:, -self.input_dim:]
         lgn_input = self._permute_lgn_input(lgn_input)
@@ -2668,21 +2683,22 @@ def _normalize_v1_rnn_outputs(rsnn_layer, outputs):
 # decorating the methods would recompile once per runner and keep each instance
 # alive for as long as its trace is cached.
 @tf.function(jit_compile=True)
-def _pack_spike_words(spikes, word_bits):
-    """Pack a [batch, width] binary state into positive int32 words."""
+def _pack_spike_words(spikes, word_bits, word_dtype=tf.int32):
+    """Pack a [batch, width] binary state into ``word_dtype`` words (positive
+    for int32: 31 bits)."""
     padding = (-spikes.shape[-1]) % word_bits
-    bits = tf.cast(spikes, tf.int32)
+    bits = tf.cast(spikes, word_dtype)
     if padding:
         bits = tf.pad(bits, ((0, 0), (0, padding)))
     bits = tf.reshape(bits, (tf.shape(bits)[0], -1, word_bits))
-    shifts = tf.range(word_bits, dtype=tf.int32)
+    shifts = tf.cast(tf.range(word_bits), word_dtype)  # no uint32 Range kernel
     return tf.reduce_sum(tf.bitwise.left_shift(bits, shifts), axis=-1)
 
 
 @tf.function(jit_compile=True)
 def _unpack_spike_words(packed, width, dtype, word_bits):
-    """Restore the first ``width`` binary values from positive int32 words."""
-    shifts = tf.range(word_bits, dtype=tf.int32)
+    """Restore the first ``width`` binary values from _pack_spike_words' words."""
+    shifts = tf.cast(tf.range(word_bits), packed.dtype)
     bits = tf.bitwise.bitwise_and(
         tf.bitwise.right_shift(packed[..., tf.newaxis], shifts), 1
     )

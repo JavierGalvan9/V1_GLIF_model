@@ -61,6 +61,21 @@ conda env create -f environment.yml
 conda activate neuro_tf221
 ```
 
+To update an existing environment:
+
+```bash
+conda env update -n neuro_tf221 -f environment.yml
+conda activate neuro_tf221
+python3 -m pip check
+```
+
+The environment includes the Python kernel for analysis notebooks. Register it
+with your notebook editor and select **Python (neuro_tf221)**:
+
+```bash
+python3 -m ipykernel install --user --name neuro_tf221 --display-name "Python (neuro_tf221)"
+```
+
 `environment.yml` is the single source of truth for the environment name and
 the pinned direct dependencies. `neuro_tf221` (TensorFlow 2.21.0 / Keras 3.15.1
 / NumPy 2.5.3 / Python 3.12) is the only supported environment; the older
@@ -76,9 +91,23 @@ Python package versions with:
 ```bash
 python runtime_diagnostics.py
 ```
-The lock records all
-resolved Conda and pip dependencies for exact Linux reproduction; use the
-portable `environment.yml` when resolving for a different platform.
+The lock records all resolved Conda and pip dependencies, including build
+identifiers, for Linux x86_64 reproduction. It has no machine-specific install
+path. To recreate that resolved environment instead of resolving the direct
+dependencies again, use `conda env create -f environment.lock.yml`. Both files
+target the supported Linux/NVIDIA setup.
+
+On hosts without a system CUDA toolkit (including TalaIA), TensorFlow 2.21 may
+fail to find its pip-installed `libcusolver.so.11`. After activating the
+environment, expose that library directory before importing TensorFlow:
+
+```bash
+export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/nvidia/cusolver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Repeat this after activation in a new shell; submitted jobs inherit it. For
+persistent activation/deactivation hooks, see the TalaIA setup in
+[AGENTS.md](AGENTS.md#talaia-cluster-bsai).
 
 Confirm the active TensorFlow and CUDA toolchain before submitting GPU jobs:
 
@@ -113,7 +142,7 @@ To run a short smoke test against the full V1 network, use the network you built
 python osi_dsi_estimator.py --data_dir GLIF_network \
     --results_dir Simulation_results/smoke_osi --neurons 0 --n_trials_per_angle 1 \
     --seq_len 50 --spont_duration 50 --evoked_duration 50 --n_runs 1 --n_epochs 1 \
-    --batch_size 1 --nocalculate_osi_dsi --restore_from ''
+    --batch_size 1 --nocalculate_osi_dsi --restore_from '' --evaluate_untrained
 ```
 
 Parameters:
@@ -164,8 +193,13 @@ GPUs at 32 per replica the 66,652-neuron model reaches 34.3 samples/s against
 `--distributed_mode` selects how `--n_gpus > 1` executes: `mirrored` (default)
 uses one process, and `multi_worker` forks one process per GPU with
 `MultiWorkerMirroredStrategy`. Multi-worker measured a few percent faster per
-step but builds the network once per GPU in host memory; its non-chief workers
-write to `Distributed_worker_logs/worker_<n>.log`. See
+step but builds the network once per GPU in host memory. Non-chief workers
+write stdout to `Out/run_<unique_id>/worker_<n>.out` and stderr to
+`Error/run_<unique_id>/worker_<n>.err`, relative to the working directory.
+Each launch gets a unique ID shared by its matching `Out` and `Error`
+directories, so separate launches do not overwrite each other's logs. The
+chief keeps the wrapper's existing console logging. The launcher prints each
+worker's log paths. See
 [the distributed-training investigation](docs/distributed-training.md) for the
 findings behind these choices.
 
@@ -253,11 +287,71 @@ otherwise uses TensorFlow. Use `acceleration="cuda"` to require CUDA or
 kernel supports `surrogate_gradient="triangular"`, `"gaussian"`, and
 `"slayer"`; the legacy `pseudo_gauss=True` option selects Gaussian.
 
+Simulations with CUDA acceleration are reproducible statistically, not
+bitwise. The synaptic-current operator (`cuda_csr_recurrent`) sums each
+target's LGN and recurrent inputs with fp32 atomics, so the order of the
+additions varies between runs. Occasionally a current then differs by one
+fp16 rounding step, which can flip a spike and change the rest of that trial.
+At 5,000 neurons and 10 trials per angle, the two outcomes of repeated runs
+differed by 10 spikes in one trial, and population OSI and firing-rate means
+moved by at most 0.3 SEM. `tf.config.experimental.enable_op_determinism()`
+does not change this. Compare runs through their statistics, or, for a bitwise
+reference, use `acceleration="tensorflow"` with op determinism enabled (about
+7x slower at 5,000 neurons). Details:
+`Experiments/test_determinism_20261030/REPORT.md`.
+
 Compiled CUDA operators are stored outside the repository in an ABI- and
 architecture-keyed cache. They are built with `nvcc` and the C++ compiler from
 the active Conda environment. Set `V1_CUDA_CACHE_DIR` to override the default
 `~/.cache/v1_glif/cuda` location. Missing or stale operators rebuild
 automatically; intermediate object files are discarded after linking.
+
+### Network and LGN Data Caches
+
+Prepared network data and LGN spike probabilities are cached under
+`<data_dir>/tf_data/`. These caches are separate from trained checkpoints:
+
+```text
+tf_data/
+    v1_network_203816neurons_<hash>.pkl
+    lgn_probabilities/
+        eval_osi_dsi_4s_seed3000_<hash>.pkl
+        validation_8phases_500ms_<hash>.pkl
+        spontaneous_500ms_<hash>.pkl
+```
+
+Network filenames include the neuron count and a configuration hash; runs
+with the same model configuration share a cache regardless of their run
+label. `--compress_model_cache` selects `.pkl.lz4` encoding. Switching encoding
+reuses a valid existing cache and retains the original file.
+
+LGN filenames identify the protocol and sequence duration. For the examples
+above, OSI/DSI evaluation uses 2 seconds of gray screen followed by 2 seconds
+of grating, with one seeded starting phase per direction. Training validation
+uses eight fixed starting phases per direction, each lasting 500 ms. Its
+sequence length follows `--seq_len`; the gray-screen initial state is generated
+separately. Both caches store probabilities rather than sampled spikes.
+
+Each LGN pickle has an adjacent `.json` file containing the settings encoded
+by its configuration hash and the previous filename. Older single-phase
+validation caches use the prefix `validation_single` to distinguish them from
+the current validation protocol.
+
+The loaders still recognize previous cache filenames and migrate them when
+reused. To migrate existing caches across the repository's data directories
+without loading or rewriting their payloads, run:
+
+```bash
+python3 -m v1_model_utils.cache_files GLIF_network_nll_*
+```
+
+Migration preserves distinct configurations and refuses to overwrite an
+existing destination. Network caches without a recoverable configuration hash
+use `v1_network_<count>neurons_legacy.pkl` until a loader validates and reuses
+them. Missing network and LGN probability caches are rebuilt when the relevant
+training or evaluation path needs them; deleting them increases the next run's
+startup work. Preserve the source network data, supporting files, and trained
+checkpoints.
 
 ## Visual Stimuli
 

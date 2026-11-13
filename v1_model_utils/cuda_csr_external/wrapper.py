@@ -1,17 +1,13 @@
 """TensorFlow interface for fused LGN/background synaptic currents."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
 
 from v1_model_utils import csr_order
-from v1_model_utils.cuda_operator_cache import ensure_artifact
-from v1_model_utils.cuda_csr_external.build import build_flags_for, DIRECT_CSR
-from v1_model_utils.cuda_csr_recurrent.build import (
-    build_flags_for as recurrent_build_flags_for,
-)
+from v1_model_utils.cuda_csr_external.build import DIRECT_CSR, LIBRARY
+from v1_model_utils.cuda_csr_recurrent.build import LIBRARY as RECURRENT_LIBRARY
 from v1_model_utils.cuda_csr_recurrent.wrapper import (
     MAX_SPIKE_SLOTS,
     calculate_recurrent_csr_currents,
@@ -253,35 +249,8 @@ def build_csr_connectivity(
 def _load_ops():
     global _OPS, _RECURRENT_OPS
     if _OPS is None:
-        recurrent_directory = Path(__file__).parents[1] / "cuda_csr_recurrent"
-        recurrent_library = ensure_artifact(
-            recurrent_directory,
-            "csr_recurrent_ops",
-            sources=(
-                recurrent_directory / "build.py",
-                recurrent_directory / "csr_recurrent_ops.cc",
-                recurrent_directory / "csr_recurrent_ops.cu.cc",
-                recurrent_directory / "event_weight_grad.cuh",
-            ),
-            build_module="v1_model_utils.cuda_csr_recurrent.build",
-            build_flags=recurrent_build_flags_for,
-        )
-        directory = Path(__file__).parent
-        library = ensure_artifact(
-            directory,
-            "csr_external_grad_ops",
-            sources=(
-                directory / "build.py",
-                directory / "csr_external_grad_ops.cc",
-                directory / "csr_external_grad_ops.cu.cc",
-                directory / "generic_backward_kernels.cuh",
-                recurrent_directory / "event_weight_grad.cuh",
-            ),
-            build_module="v1_model_utils.cuda_csr_external.build",
-            build_flags=build_flags_for,
-        )
-        _RECURRENT_OPS = tf.load_op_library(str(recurrent_library))
-        _OPS = tf.load_op_library(str(library))
+        _RECURRENT_OPS = tf.load_op_library(str(RECURRENT_LIBRARY.ensure()))
+        _OPS = tf.load_op_library(str(LIBRARY.ensure()))
     return _RECURRENT_OPS, _OPS
 
 

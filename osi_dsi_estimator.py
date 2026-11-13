@@ -15,7 +15,8 @@ from v1_model_utils.cuda_caches import configure_cuda_caches
 configure_cuda_caches()  # before CUDA and XLA initialize
 
 import absl
-import copy
+import concurrent.futures
+import threading
 import numpy as np
 import tensorflow as tf
 from time import time
@@ -23,6 +24,12 @@ import logging
 from v1_model_utils import tf_utils
 from v1_model_utils import cuda_csr_recurrent, spatial_layout, training_utils
 tf.get_logger().setLevel(logging.INFO)
+
+
+@tf.function(jit_compile=True)
+def count_spikes(spikes):
+    """Total spike count; XLA fuses the cast, so no int64 copy of the spikes exists."""
+    return tf.reduce_sum(tf.cast(spikes, tf.int64))
 
 
 def main(_):
@@ -37,10 +44,17 @@ def main(_):
     from v1_model_utils import load_sparse, models
     from v1_model_utils.callbacks import OsiDsiCallbacks, printgpu
     import stim_dataset
+    from v1_model_utils.cuda_prebuild import prebuild_for_run
+
+    # Build the missing CUDA operator libraries together rather than one by one on first use.
+    prebuild_for_run()
 
     tf_utils.configure_reproducibility(flags.seed)
     # Configure TensorFlow optimization options that have proven to be beneficial for our model and training setup. These options can improve the performance of the model by optimizing the computational graph and memory usage.
-    tf_utils.enable_tensorflow_optimizations(enabled=True)
+    # Grappler's memory optimizer is off: on large networks (~1M neurons) it overestimates the peak of the
+    # per-chunk graph and swaps tensors to host memory every timestep (13.3 vs 8.9 s per angle). Inference
+    # keeps no gradient tape, so those swaps never save memory.
+    tf_utils.enable_tensorflow_optimizations(enabled=True, memory_optimizer=False)
 
     # Create the tensorflow datafile for the network
     os.makedirs(os.path.join(flags.data_dir, 'tf_data'), exist_ok=True)
@@ -77,17 +91,7 @@ def main(_):
     else:
         load_fn = load_sparse.load_v1
 
-    # Create a deep copy of flags and override uniform_weights to False
-    # This ensures initial weight distribution is preserved for visualization
-    if flags.uniform_weights:
-        modified_flags = copy.deepcopy(flags)
-        modified_flags.uniform_weights = False
-        load_fn = load_sparse.load_v1  # revert to original load function
-    else:
-        modified_flags = flags
-
-    # Use modified flags for loading network
-    network, lgn_input, bkg_input = load_fn(modified_flags, flags.neurons, flag_str=flag_str)
+    network, lgn_input, bkg_input = load_fn(flags, flags.neurons, flag_str=flag_str)
     print(f"Model files loading: {time()-t0:.2f} seconds\n")
 
     # Renumber neurons for CSR cache locality, then reorder the edges into the
@@ -209,10 +213,11 @@ def main(_):
             current_epoch=current_epoch,
             result_name="OSI/DSI",
             evaluate_untrained=flags.evaluate_untrained,
+            # The core-only output narrows the (unused) readout to the core.
             runtime_cast_ignored_variables={
                 "projection_v1/kernel",
                 "projection_v1/bias",
-            } if flags.track_core_only else (),
+            } if flags.track_core_only and len(output_neuron_ids) < network["n_nodes"] else (),
         )
 
         # model_variables_dict['Best'] =  {var.name: var.numpy().astype(np.float16) for var in model.trainable_variables}
@@ -225,31 +230,25 @@ def main(_):
             model, rsnn_layer, name="osi_dsi_sequence_and_state_extractor"
         )
         n_sequence_outputs = sequence_and_state_model._v1_sequence_output_count
-        # The per-replica batch here is --n_trials_per_angle, which is exactly the
+        # Each --seq_len chunk is simulated in rollout chunks of
+        # --gradient_checkpoint_chunk_size steps, one model call each, and every
+        # rollout chunk's spikes leave the GPU as soon as they exist. The
+        # per-replica batch here is --n_trials_per_angle, which is exactly the
         # knob raised to tighten the OSI/DSI statistics. Above 2**31 elements the
-        # stock Keras RNN output assembly (TensorArray.stack) returns the wrong
-        # spikes with no error at all, so route it through the segmented runner --
-        # which rejoins along axis 1 and is int32-safe -- or refuse outright.
-        segmented_extractor = None
-        if flags.segmented_rollout:
-            segmented_extractor = models.SegmentedRecomputeRunner(
-                sequence_and_state_model,
-                sequence_length=flags.seq_len,
-                chunk_size=flags.gradient_checkpoint_chunk_size,
-                differentiate_inputs=False,
-                pack_spike_checkpoints=flags.pack_spike_checkpoints,
-                cell=rsnn_layer.cell,
-            )
-            print(
-                "Segmented RNN rollout: "
-                f"{segmented_extractor.n_chunks} chunks, "
-                f"chunk_size={segmented_extractor.chunk_size}."
-            )
-        else:
-            training_utils.require_int32_safe_rnn_output(
-                per_replica_batch_size, flags.seq_len, network["n_nodes"]
-            )
-            print("Segmented RNN rollout disabled.")
+        # stock Keras RNN output assembly (TensorArray.stack) of one model call
+        # returns the wrong spikes with no error at all, so refuse it outright.
+        # The call stacks the tracked neurons' spikes, and their voltages after
+        # them with --track_voltage.
+        rollout_chunk_size = (
+            min(flags.gradient_checkpoint_chunk_size, flags.seq_len)
+            if flags.segmented_rollout else flags.seq_len
+        )
+        output_width = network["n_nodes"] if output_neuron_ids is None else len(output_neuron_ids)
+        training_utils.require_int32_safe_rnn_output(
+            per_replica_batch_size, rollout_chunk_size,
+            output_width * (2 if flags.track_voltage else 1),
+        )
+        print(f"RNN rollout in chunks of {rollout_chunk_size} steps.")
 
         # The gray-screen warm-up only needs the final state, so the state-only
         # model keeps it from building a [batch, seq_len, n_neurons] sequence
@@ -306,62 +305,71 @@ def main(_):
             lgn_backend=flags.lgn_backend,
         )
 
-    # Both paths return one flat tuple: the sequence outputs followed by the
-    # final state, so roll_out splits them the same way either way.
-    if segmented_extractor is not None:
-        def extractor_forward(_x, _state_variables):
-            return tuple(segmented_extractor(_x, _state_variables))
-    else:
-        def extractor_forward(_x, _state_variables):
-            return tuple(
-                tf.nest.flatten(sequence_and_state_model((_x, _state_variables)))
-            )
+    def rollout_pieces(probability):
+        """``probability`` [steps, n_input] split into its rollout chunks."""
+        return [probability[start:start + rollout_chunk_size]
+                for start in range(0, probability.shape[0], rollout_chunk_size)]
 
-    def roll_out(_x, _state_variables):
-        if _x.dtype == tf.bool:
-            _x = tf.cast(_x, dtype)
+    def roll_out(pieces, state, first_draw, on_chunk=None):
+        """Final state of a rollout driven by the LGN spike probabilities
+        ``pieces`` (rollout_pieces), in rollout chunks whose inputs are the spontaneous
+        draws ``first_draw``, ``first_draw + 1``, ... Each chunk's input is drawn and cast
+        only after the previous chunk's state exists: the draws do not depend on
+        the state, so in a graph they would otherwise all run, and hold their
+        memory, up front. ``on_chunk(start, x, sequences)`` receives every
+        chunk's bool input and sequence outputs; without it only the final state
+        is computed."""
         seed_helper.advance_noise_seed()
-        _out = extractor_forward(_x, _state_variables)
-        sequences = _out[:n_sequence_outputs]
-        voltage = sequences[1] if flags.track_voltage else ()
-        return sequences[0], voltage, tuple(_out[n_sequence_outputs:])
-
-    @tf.function
-    def distributed_roll_out(x, state_variables):
-        return strategy.run(roll_out, args=(x, state_variables))
+        state = tuple(state)
+        # One computation of the LGN pair sums for all the chunks.
+        with rsnn_layer.cell.lgn_pair_weights_scope():
+            for draw, piece in enumerate(pieces):
+                start = draw * rollout_chunk_size
+                with tf.control_dependencies(state[:1]):
+                    x = generate_spontaneous_spikes(piece, per_replica_batch_size, first_draw + draw)
+                inputs = (tf.cast(x, dtype), state)
+                if on_chunk is None and state_model is not None:
+                    state = tuple(tf.nest.flatten(state_model(inputs)))
+                    continue
+                outputs = tf.nest.flatten(sequence_and_state_model(inputs))
+                state = tuple(outputs[n_sequence_outputs:])
+                if on_chunk is not None:
+                    on_chunk(start, x, outputs[:n_sequence_outputs])
+        return state
 
     # Generate spontaneous spikes efficiently
     @tf.function
-    def generate_spontaneous_spikes(probability, batch_size):
+    def generate_spontaneous_spikes(probability, batch_size, draw):
         """Spikes [batch_size, *probability.shape]. The probabilities and uniforms are
         float32 whatever `dtype` is: float16 uniforms take only 1024 values, so
         P(u < p) would be ceil(1024 p) / 1024 (+14% spikes at spontaneous rates).
         """
+        # On the GPU, the seed's fold-ins would each end in a device-to-host
+        # read (int32 results live in host memory) that waits for the GPU.
+        with tf.device('/CPU:0'):
+            seed = seed_helper.spontaneous_seed(draw)
         random_uniform = tf.random.stateless_uniform(
             tf.concat([[batch_size], tf.shape(probability)], axis=0),
-            seed=seed_helper.next_spontaneous_seed(),
+            seed=seed,
             dtype=tf.float32,
         )
         return tf.less(random_uniform, tf.cast(probability, tf.float32))
 
-    def generate_gray_state(batch_size):
-        batch_size = tf.cast(batch_size, tf.int32)
-        gray_spikes = tf.cast(generate_spontaneous_spikes(spontaneous_prob, batch_size), dtype)
-        zero_state = rsnn_layer.cell.zero_state(batch_size, dtype=dtype)
-        if state_model is None:
-            return roll_out(gray_spikes, zero_state)[2]
-        # Keep the noise stream advancing exactly once per gray rollout, as the
-        # roll_out path above does, so the two branches stay seed-compatible.
-        seed_helper.advance_noise_seed()
-        return tuple(tf.nest.flatten(state_model((gray_spikes, zero_state))))
+    def generate_gray_state(first_draw):
+        zero_state = rsnn_layer.cell.zero_state(per_replica_batch_size, dtype=dtype)
+        return roll_out(rollout_pieces(spontaneous_prob), zero_state, first_draw)
 
     @tf.function
-    def distributed_generate_gray_state(batch_size):
-        return strategy.run(generate_gray_state, args=(batch_size,))
+    def distributed_generate_gray_state(first_draw):
+        return strategy.run(generate_gray_state, args=(first_draw,))
+
+    # The LGN draws are numbered on the host (DistributedSeedHelper.spontaneous_seed).
+    draws_per_chunk = len(range(0, flags.seq_len, rollout_chunk_size))
 
     # Match the original estimator semantics: initialize the gray-screen state
     # once, outside per-angle timing, and reuse it as an immutable starting state.
-    gray_state = distributed_generate_gray_state(per_replica_batch_size)
+    gray_state = distributed_generate_gray_state(tf.constant(1))
+    next_draw = 1 + draws_per_chunk
 
     # Define the callbacks for the OSI/DSI analysis
     stim_duration = flags.spont_duration + flags.evoked_duration
@@ -377,9 +385,7 @@ def main(_):
                                 pre_delay=flags.spont_duration, post_delay=post_delay, model_variables_init=model_variables_dict,
                                 neuron_ids=canonical_neuron_ids)
 
-    n_iterations = int(np.ceil(flags.n_trials_per_angle / per_replica_batch_size))
     chunk_size = flags.seq_len
-    num_chunks = int(np.ceil(sim_duration / chunk_size))
     # Determine which neurons to track based on track_core_only flag
     if flags.track_core_only:
         n_tracked_neurons = np.sum(core_mask)
@@ -403,42 +409,93 @@ def main(_):
             f"{voltages.nbytes / (1024**3):.2f} GiB for the first trial."
         )
 
+    # The spike array is written on a few threads, off the simulation's path.
+    # These writes first-touch its pages, so the kernel zeroes them on the way:
+    # one thread writes ~7 GB/s, at 66k neurons x 100 trials no faster than the
+    # GPU produces spikes, and each --seq_len call would wait for its last write.
+    # A sink's array keeps TF's host copy of the chunk alive until written; the
+    # slots cap the chunks held by pending writes.
+    spike_writer = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    write_slots = threading.BoundedSemaphore(4)
+    pending_writes = []
+
+    def write_spikes(chunk_spikes, angle_id, start):
+        try:
+            spikes[:, angle_id, start:start + chunk_spikes.shape[1]] = chunk_spikes
+        finally:
+            write_slots.release()
+
+    def store_spikes(chunk_spikes, angle_id, start):
+        """Host sink: queues one rollout chunk's spikes for the spike array."""
+        write_slots.acquire()
+        pending_writes.append(spike_writer.submit(write_spikes, chunk_spikes, angle_id, start))
+        return np.int32(0)
+
+    def store_voltage(chunk_voltage, start):
+        """Host sink: the first trial's voltage of one rollout chunk."""
+        voltages[start:start + chunk_voltage.shape[0]] = chunk_voltage
+        return np.int32(0)
+
+    def to_host(sink, *args):
+        # Stateless, so that no later stateful op waits for the host; the
+        # caller returns the token so the sink is not pruned.
+        return tf.numpy_function(sink, args, tf.int32, stateful=False)
+
+    def simulate_chunk(pieces, state, first_draw, angle_id, start, store_voltages):
+        """One --seq_len chunk of every trial. Each rollout chunk's spikes (and,
+        with ``store_voltages``, the first trial's voltage) go to
+        the host sinks as soon as the model produces them: the copies and host
+        writes overlap the next rollout chunks, and only the spike count and the
+        first trial's input stay on the GPU."""
+        counts, stored, first_trial = [], [], []
+
+        def on_chunk(chunk_start, x, sequences):
+            first_trial.append(x[0])
+            chunk_spikes = tf.cast(sequences[0], tf.uint8)
+            counts.append(count_spikes(chunk_spikes))
+            stored.append(to_host(store_spikes, chunk_spikes, angle_id, start + chunk_start))
+            if store_voltages:
+                stored.append(to_host(store_voltage, sequences[1][0], start + chunk_start))
+
+        state = roll_out(pieces, state, first_draw, on_chunk)
+        return state, tf.add_n(counts), tf.concat(first_trial, axis=0), tf.stack(stored)
+
+    @tf.function
+    def distributed_simulate_chunk(pieces, state, first_draw, angle_id, start, store_voltages):
+        return strategy.run(
+            simulate_chunk, args=(pieces, state, first_draw, angle_id, start, store_voltages)
+        )
+
     for angle_id, angle in enumerate(DG_angles):
         print(f'Running angle {angle}...')
         # load LGN firing rates for the given angle and calculate spiking probability
         lgn_prob = lgn_firing_probabilities_dict[angle]
 
         t0 = time()
-        angle_spike_count = 0
-
-        for iter_id in range(n_iterations):
-            start_idx = iter_id * per_replica_batch_size
-            end_idx = min((iter_id + 1) * per_replica_batch_size, flags.n_trials_per_angle)
-            iteration_length = end_idx - start_idx
-
-            lgn_spikes = generate_spontaneous_spikes(lgn_prob, tf.constant(per_replica_batch_size, tf.int32))
-            continuing_state = gray_state
-
-            for chunk_id in range(num_chunks):
-                start = chunk_id * chunk_size
-                stop = (chunk_id + 1) * chunk_size
-                chunk = lgn_spikes[:, start:stop, :]
-                v1_z_chunk, v1_v_chunk, continuing_state = distributed_roll_out(
-                    chunk, continuing_state
-                )
-                tracked_spikes = tf.cast(v1_z_chunk, tf.uint8).numpy()[
-                    :iteration_length
-                ]
-                angle_spike_count += np.sum(tracked_spikes, dtype=np.uint64)
-                spikes[start_idx:end_idx, angle_id, start:stop, :] = tracked_spikes
-                if voltages is not None and angle_id == 0 and iter_id == 0:
-                    voltages[start:stop] = v1_v_chunk.numpy()[0].astype(
-                        np.float16
-                    )
+        continuing_state = gray_state
+        chunk_counts, first_trial_chunks = [], []
+        for start in range(0, sim_duration, chunk_size):
+            # Host tensors: the call copies each piece to the GPU while the
+            # previous one is simulated.
+            with tf.device('/CPU:0'):
+                pieces = [tf.constant(piece)
+                          for piece in rollout_pieces(lgn_prob[start:start + chunk_size])]
+            continuing_state, count, first_trial, _ = distributed_simulate_chunk(
+                pieces, continuing_state, tf.constant(next_draw),
+                tf.constant(angle_id), tf.constant(start),
+                voltages is not None and angle_id == 0,
+            )
+            next_draw += draws_per_chunk
+            chunk_counts.append(count)
+            if angle_id == 0:
+                first_trial_chunks.append(first_trial)
+        # The angle's spikes are all in the array (and any write error raised).
+        for write in pending_writes:
+            write.result()
+        pending_writes.clear()
 
         # Track GPU memory and inference time
-        # average_rate = np.mean(spikes[start_idx:end_idx, angle_id, :, :].astype(np.float32))
-        average_rate = angle_spike_count / spikes[:, angle_id].size
+        average_rate = int(tf.add_n(chunk_counts)) / spikes[:, angle_id].size
         callbacks.track_performance(t0, average_rate=average_rate, gpu_id=0)
 
         print(f'    Angle processing time: {time() - t0:.2f}s')
@@ -448,7 +505,7 @@ def main(_):
         if angle_id == 0:
             # Raster plot for 0 degree orientation
             callbacks.single_trial_callbacks(
-                lgn_row_order.to_runtime(lgn_spikes.numpy()),
+                lgn_row_order.to_runtime(tf.concat(first_trial_chunks, axis=0).numpy()[np.newaxis]),
                 spikes[:, 0, :, :],
                 y=angle,
             )
@@ -465,6 +522,8 @@ def main(_):
                 print(f"Voltage traces saved to {voltage_path}")
         if not flags.calculate_osi_dsi:
             break
+
+    spike_writer.shutdown()
 
     # Save the performance metrics
     callbacks.save_inference_metrics()
@@ -568,13 +627,17 @@ if __name__ == '__main__':
 
     # absl.app.flags.DEFINE_boolean('float16', False, '')
     absl.app.flags.DEFINE_boolean('caching', True, '')
+    absl.app.flags.DEFINE_boolean(
+        'compress_model_cache', False,
+        'Store constructed V1 model caches with LZ4 compression (.pkl.lz4).',
+    )
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     absl.app.flags.DEFINE_boolean('core_loss', False, '')
     absl.app.flags.DEFINE_boolean('all_neuron_rate_loss', False, '')  # whethre you want to enforce rate loss to all neurons
     absl.app.flags.DEFINE_float('loss_core_radius', 400.0, '') # 0 is not using core loss
     absl.app.flags.DEFINE_float('plot_core_radius', 400.0, '') # 0 is not using core plot
 
-    absl.app.flags.DEFINE_boolean('hard_reset', False, '')
+    absl.app.flags.DEFINE_boolean('hard_reset', True, 'Clamp voltage to reset during refractoriness; must match training.')
     absl.app.flags.DEFINE_enum(
         "integration_scheme", "exact", ["exact", "euler"],
         "Membrane step integrator; must match the value used for training.")
@@ -618,19 +681,14 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean(
         "segmented_rollout",
         True,
-        "Run the rollout in --gradient_checkpoint_chunk_size chunks (the int32-safe "
-        "SegmentedRecomputeRunner forward); off runs the stock Keras RNN, refused when "
-        "its output passes 2**31 elements.",
+        "Simulate each --seq_len chunk in model calls of --gradient_checkpoint_chunk_size "
+        "steps, whose spikes go to the host as each call ends; off makes one call per "
+        "--seq_len chunk. A call whose stacked output passes 2**31 elements is refused.",
     )
     absl.app.flags.DEFINE_integer(
         "gradient_checkpoint_chunk_size",
         25,
-        "Temporal chunk size for the segmented RNN rollout.",
-    )
-    absl.app.flags.DEFINE_boolean(
-        "pack_spike_checkpoints",
-        True,
-        "Bit-pack binary recurrent spike state stored at temporal chunk boundaries.",
+        "Steps per model call of the segmented rollout.",
     )
     absl.app.flags.DEFINE_boolean("track_core_only", False, "Track spikes only from core neurons to reduce memory usage")
     absl.app.flags.DEFINE_boolean("track_voltage", False, "Track and save membrane voltage traces during simulation")

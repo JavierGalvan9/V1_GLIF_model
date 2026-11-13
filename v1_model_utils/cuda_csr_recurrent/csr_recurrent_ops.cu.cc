@@ -2399,11 +2399,27 @@ __device__ __forceinline__ void LoadProjection(const P* source, float* out) {
 // Edgeless rows are written as zeros, which is what lets the op skip clearing
 // its output. The odd row stride kSlice + 1 keeps the transposed read
 // conflict-free.
-constexpr int kTileRows = 32;
-constexpr int kTileWarps = 8;
+//
+// The block shape is set per architecture (cuda_csr_config); it decides only
+// which warp computes a row, never the order of a row's sums.
+#ifndef V1_ROWTILE_ROWS
+#define V1_ROWTILE_ROWS 32
+#endif
+#ifndef V1_ROWTILE_WARPS
+#define V1_ROWTILE_WARPS 8
+#endif
+constexpr int kTileRows = V1_ROWTILE_ROWS;
+constexpr int kTileWarps = V1_ROWTILE_WARPS;
+// A minimum of resident blocks only where one is set: even an explicit 1
+// changes ptxas' register allocation.
+#ifdef V1_ROWTILE_MIN_BLOCKS
+#define V1_ROWTILE_BOUNDS __launch_bounds__(32 * kTileWarps, V1_ROWTILE_MIN_BLOCKS)
+#else
+#define V1_ROWTILE_BOUNDS __launch_bounds__(32 * kTileWarps)
+#endif
 
 template <typename T, typename W, typename P, int kSlice, int kPack, bool kMultiSlice>
-__global__ __launch_bounds__(32 * kTileWarps) void BackwardRowTileKernel(
+__global__ V1_ROWTILE_BOUNDS void BackwardRowTileKernel(
     const P* projected, int64_t runtime_stride, const W* weights, const uint32* pair_ids,
     const uint32* edge_ids, const uint32* row_splits, int64_t n_pre, int64_t batch,
     const T* dampening, SpikeSlots<T*> spike_grad, const float* inverse_scale,

@@ -15,6 +15,7 @@ import unittest
 import numpy as np
 import tensorflow as tf
 
+from stim_dataset import stratify_angles
 from v1_model_utils.loss_functions import OrientationSelectivityLoss
 
 WINDOW_MS = 500.0
@@ -44,14 +45,12 @@ def _single_type_loss(tuning_angle, osi_target=0.4, dsi_target=0.0):
     loss = _estimator([tuning_angle], _osi_cost=1.0)
     loss._emd_group_indices = tf.ragged.constant([[0]], dtype=tf.int32)
     loss._n_node_types = tf.constant(1, dtype=tf.int32)
-    loss._osi_target_distributions = tf.ragged.constant(
+    loss._osi_empirical_distributions = tf.ragged.constant(
         [[osi_target]], dtype=tf.float32
     )
-    loss._dsi_target_distributions = tf.ragged.constant(
+    loss._dsi_empirical_distributions = tf.ragged.constant(
         [[dsi_target]], dtype=tf.float32
     )
-    loss._osi_empirical_distributions = loss._osi_target_distributions
-    loss._dsi_empirical_distributions = loss._dsi_target_distributions
     loss.cell_type_count = tf.constant([1.0], dtype=tf.float32)
     return loss
 
@@ -326,6 +325,70 @@ class BatchOsiEstimatorTest(unittest.TestCase):
 
         self.assertLess(float(value.numpy()), 1e-5)
 
+    def test_emd_term_alone_drives_selectivity_toward_target(self):
+        """Without the alignment term the EMD must still carry a gradient.
+
+        A gradient-free shuffle before the sort once zeroed it, leaving only
+        the |Im| penalty, which lowers selectivity.
+        """
+        angles = np.arange(0, 360, 5, dtype=np.float32)
+        loss = _single_type_loss(0.0, osi_target=0.4, dsi_target=0.3)
+        loss._batch_emd_alignment_weight = 0.0
+        rates = tf.Variable(
+            (1.0 + 0.1 * np.cos(2.0 * np.deg2rad(angles)))[:, None] / 1000.0
+        )
+        with tf.GradientTape() as tape:
+            value = loss.batch_osi_emd_loss_from_rates(rates, tf.constant(angles))
+        gradient = tape.gradient(value, rates)
+        self.assertIsNotNone(gradient)
+        stepped = rates - 1e-4 * gradient / tf.reduce_max(tf.abs(gradient))
+        osi_before, _, dsi_before, _ = _estimator([0.0])._batch_signed_osi_dsi_components(
+            rates, tf.constant(angles)
+        )
+        osi_after, _, dsi_after, _ = _estimator([0.0])._batch_signed_osi_dsi_components(
+            stepped, tf.constant(angles)
+        )
+        self.assertGreater(float(osi_after[0]), float(osi_before[0]))
+        self.assertGreater(float(dsi_after[0]), float(dsi_before[0]))
+
+    def test_loss_excludes_neurons_below_half_hertz(self):
+        """Neurons under the 0.5 Hz responsiveness cutoff are left out, too."""
+        angles = np.arange(360, dtype=np.float32)
+        tuned = 1.0 + 0.8 * np.cos(2.0 * np.deg2rad(angles))
+        loss = _single_type_loss(0.0)
+        loss._tuning_angles = tf.constant([0.0, 0.0], dtype=tf.float32)
+        loss._emd_group_indices = tf.ragged.constant([[0, 1]], dtype=tf.int32)
+        loss.cell_type_count = tf.constant([2.0], dtype=tf.float32)
+
+        for mean_rate_hz, expected in ((0.4, 0.0), (0.6, 0.4)):
+            untuned = np.full_like(tuned, mean_rate_hz / 1000.0)
+            value = loss.batch_osi_emd_loss_from_rates(
+                tf.constant(np.stack([tuned, untuned], axis=1)), tf.constant(angles)
+            )
+            # An included untuned neuron misses the 0.4 OSI target by 0.4,
+            # which the two-neuron mean halves, and the DSI target is 0.
+            self.assertAlmostEqual(
+                float(value.numpy()), expected / 2.0, places=5,
+                msg=f"{mean_rate_hz} Hz",
+            )
+
+    def test_mask_uses_preferred_direction_rate(self):
+        """Mean rate below 0.5 Hz but preferred-direction rate above it: included.
+
+        The 8 protocol-direction bins of the batch decide, as for the
+        Neuropixels targets and validation, not the batch-mean rate.
+        """
+        angles = np.arange(0, 360, 5, dtype=np.float32)
+        loss = _estimator([0.0, 0.0])
+        # 0.9 Hz in the 0-degree bin only: a 0.11 Hz batch mean.
+        bin_zero = np.abs(((angles + 22.5) % 360.0) - 22.5) < 22.5
+        selective = np.where(bin_zero, 0.9, 0.0) / 1000.0
+        weak = np.where(bin_zero, 0.4, 0.0) / 1000.0
+        rates = tf.constant(np.stack([selective, weak], axis=1).astype(np.float32))
+        self.assertLess(float(tf.reduce_mean(rates[:, 0])), 0.0005)
+        active = loss._preferred_direction_active(rates, tf.constant(angles))
+        self.assertEqual(active.numpy().tolist(), [True, False])
+
     def test_loss_weights_valid_cell_types_by_model_population_size(self):
         """Cell-type EMDs are averaged using their model population sizes."""
         angles = np.arange(360, dtype=np.float32)
@@ -373,6 +436,24 @@ class BatchOsiEstimatorTest(unittest.TestCase):
 
         self.assertLess(float(compiled_loss(one_active).numpy()), 1e-5)
         self.assertLess(float(compiled_loss(two_active).numpy()), 1e-5)
+
+
+class StratifiedAnglesTest(unittest.TestCase):
+    def test_one_angle_per_equal_width_bin(self):
+        """Every bin of width 360 / batch holds exactly one grating angle."""
+        for dtype, batch in ((tf.float32, 248), (tf.float16, 248), (tf.float32, 7)):
+            uniform = tf.random.stateless_uniform(
+                (batch, 1), seed=(3, 4), maxval=360.0, dtype=tf.float32
+            )
+            angles = stratify_angles(tf.cast(uniform, dtype))
+            self.assertEqual(angles.dtype, dtype)
+            values = angles.numpy().astype(np.float64)[:, 0]
+            self.assertTrue(np.all(np.isfinite(values)))
+            bins = np.floor(values * batch / 360.0).astype(int)
+            # float16 rounds angles near a bin edge (spacing 0.25 deg near 360).
+            tolerance = 1 if dtype == tf.float16 else 0
+            self.assertLessEqual(np.abs(bins - np.arange(batch)).max(), tolerance)
+            self.assertTrue(np.all((values >= 0.0) & (values <= 360.0)))
 
 
 if __name__ == "__main__":

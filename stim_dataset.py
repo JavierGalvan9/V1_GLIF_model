@@ -7,6 +7,7 @@ from time import time
 import tensorflow as tf
 import lgn_model.lgn as lgn_module
 from v1_model_utils import cuda_lgn
+from v1_model_utils.cache_files import lgn_cache_path
 from v1_model_utils.callbacks import printgpu
 # from memory_profiler import profile
 # from pympler.asizeof import asizeof, asized
@@ -361,6 +362,19 @@ def generate_drifting_grating_parameters(seed, dtype=tf.float32):
             .with_options(data_options))
 
 
+def stratify_angles(orientation):
+    """Spread a batch of uniform [0, 360) angles one per equal-width bin.
+
+    Each draw becomes the jitter inside its own bin of width 360 / batch, so
+    every batch covers the circle evenly while the angles stay continuous.
+    Computed in float32: 360 * batch overflows float16.
+    """
+    n_bins = tf.shape(orientation)[0]
+    bins = tf.cast(tf.range(n_bins), tf.float32)[:, tf.newaxis]
+    stratified = (tf.cast(orientation, tf.float32) + 360.0 * bins) / tf.cast(n_bins, tf.float32)
+    return tf.cast(stratified, orientation.dtype)
+
+
 def generate_drifting_grating_tuning(orientation=None, temporal_f=2, cpd=0.04, contrast=0.8,
                                      row_size=80, col_size=120,
                                      seq_len=600, pre_delay=50, post_delay=50,
@@ -530,8 +544,8 @@ def load_or_compute_spontaneous_lgn_probabilities(
 ):
     """Load cached gray-screen LGN spike probabilities or compute and cache them."""
     cache_dir = os.path.join(data_dir, "tf_data")
-    cache_file = os.path.join(
-        cache_dir,
+    cache_file = lgn_cache_path(
+        data_dir,
         f"spontaneous_lgn_probabilities_n_input_{n_input}_seqlen_{seq_len}.pkl",
     )
 
@@ -582,7 +596,12 @@ def load_or_compute_osi_dsi_lgn_probabilities(
     cache_prefix="osi_dsi_lgn_probabilities",
     lgn_backend='grating',
 ):
-    """Load cached OSI/DSI LGN spike probabilities or compute and cache them."""
+    """Load cached OSI/DSI LGN spike probabilities or compute and cache them.
+
+    Returns {angle: array [osi_seq_len, n_input]} of ``output_dtype``, on the host:
+    the eight angles take 2 GiB at 4000 ms, so each slice goes to the GPU only
+    when it is simulated.
+    """
     if angles is None:
         angles = np.arange(0, 360, 45)
 
@@ -599,8 +618,8 @@ def load_or_compute_osi_dsi_lgn_probabilities(
         post_delay = int(post_delay or 0)
     angle_key = "-".join(str(int(angle)) for angle in angles)
     current_key = "current" if current_input else "spikes"
-    cache_file = os.path.join(
-        cache_dir,
+    cache_file = lgn_cache_path(
+        data_dir,
         f"{cache_prefix}_{GRATING_LGN_VERSION}_n_input_{n_input}_seqlen_{osi_seq_len}_"
         f"pre_{pre_delay}_post_{post_delay}_rotation_{rotation}_"
         f"seed_{seed}_{current_key}_angles_{angle_key}.pkl",
@@ -649,9 +668,64 @@ def load_or_compute_osi_dsi_lgn_probabilities(
         print("OSI/DSI dataset created and cached successfully!")
 
     return {
-        angle: tf.convert_to_tensor(probs, dtype=output_dtype)
+        angle: np.asarray(probs, dtype=tf.as_dtype(output_dtype).as_numpy_dtype)
         for angle, probs in lgn_firing_probabilities_dict.items()
     }
+
+
+def load_or_compute_protocol_phase_lgn_probabilities(
+    seq_len,
+    pre_delay,
+    post_delay,
+    n_input=17400,
+    data_dir='GLIF_network_nll',
+    rotation='cw',
+    angles=None,
+    n_phases=8,
+    bmtk_compat=True,
+    lgn_backend='grating',
+):
+    """LGN spike probabilities of the validation gratings, ``n_phases`` per direction.
+
+    Returns {angle: float32 array [n_phases, seq_len, n_input]}, on the host,
+    for the phases 360 k / n_phases (k = 0 .. n_phases - 1). The phases are
+    fixed, so every validation sees the same stimuli; together they cover
+    the 2 Hz drift cycle that one phase per direction would see a single
+    part of through the response window. Cached in ``tf_data/lgn_probabilities``.
+    """
+    if angles is None:
+        angles = np.arange(0, 360, 45)
+    angle_key = "-".join(str(int(angle)) for angle in angles)
+    cache_file = lgn_cache_path(
+        data_dir,
+        f"protocol_phase_lgn_probabilities_{GRATING_LGN_VERSION}_n_input_{n_input}_"
+        f"seqlen_{int(seq_len)}_pre_{int(pre_delay)}_post_{int(post_delay)}_"
+        f"rotation_{rotation}_phases_{int(n_phases)}_angles_{angle_key}.pkl",
+    )
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            probabilities = pkl.load(f)
+        print("Loaded cached validation grating LGN probabilities.")
+        return probabilities
+
+    grating = DriftingGratingLGN(
+        int(seq_len), int(pre_delay), int(post_delay), n_input=n_input, data_dir=data_dir,
+        rotation=rotation, bmtk_compat=bmtk_compat, dtype=tf.float32, lgn_backend=lgn_backend,
+    )
+    phases = 360.0 * np.arange(n_phases) / n_phases
+    probabilities = {}
+    for angle in angles:
+        t0 = time()
+        probabilities[int(angle)] = np.stack([
+            (-tf.math.expm1(-grating.firing_rates(float(angle), float(phase)) / 1000.0)).numpy()
+            for phase in phases
+        ]).astype(np.float32)
+        print(f"Validation gratings at {int(angle)} deg: {time() - t0:.2f}s")
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    with open(cache_file, "wb") as f:
+        pkl.dump(probabilities, f, protocol=pkl.HIGHEST_PROTOCOL)
+    print("Validation grating LGN probabilities created and cached.")
+    return probabilities
 
 
 ### NATURAL SCENES STIMULUS GENERATION ###

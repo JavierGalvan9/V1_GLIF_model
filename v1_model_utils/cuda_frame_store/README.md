@@ -1,22 +1,31 @@
 # CUDA host frame store
 
 `RecordedAdjointRunner` (`--backward_mode recorded`) keeps the float32 membrane
-voltage of every step for its reverse pass. With `--voltage_offload raw` or
-`compressed`, this package parks that record in pinned host memory: the
+voltage of every step for its reverse pass. Bare `--voltage_offload` enables
+adaptive voltage offload; omitting it keeps the record on the GPU (`none`).
+This package parks the enabled record in pinned host memory: the
 forward hands each frame to `offload_frame`, and the reverse loop gets it back
 with `take_frame`, which also prefetches the next frames. The copies run on the
 store's own streams and are ordered against the compute stream with CUDA events
 only, so the host never synchronizes.
 
-`--history_offload raw` independently offloads both bit-packed spike and
-refractory histories as exact int32 words. Its default is `none`, which keeps
-both histories on the GPU. It works with any `--voltage_offload` mode, including
-`none`, and is available through both training entry points:
+Bare `--history_offload` independently enables adaptive offload of both
+bit-packed spike and refractory histories as exact int32 words. Its omitted
+default is also `none`. History admission adapts to the link without lossy
+compression. It works with any voltage mode, including `none`, through the
+training script and both submission wrappers:
 
 ```bash
-python multi_training.py --backward_mode recorded --history_offload raw ...
-python parallel_training_testing.py --history_offload raw ...
+python multi_training.py --backward_mode recorded --voltage_offload --history_offload ...
+python parallel_training_testing.py --voltage_offload --history_offload ...
+python parallel_training_testing_allen.py --voltage_offload --history_offload ...
 ```
+
+Explicit `--voltage_offload adaptive` and `--history_offload adaptive` select
+the same behavior. Explicit `none` disables either independently. Existing
+`--voltage_offload compressed` and `--history_offload raw` remain accepted
+with their original adaptive behavior. Use `--voltage_offload raw` when stored
+voltages must remain exact.
 
 The backward pass retains a small spike-delay window on the GPU so each
 offloaded spike frame is fetched once. History copies use the same adaptive
@@ -27,12 +36,33 @@ inside the prefetch window, or when the CUDA store is unavailable, the records
 remain on the GPU. Training warns and ignores the option in other backward
 modes; evaluation commands do not receive it.
 
+Packed spike histories use `uint32` bit views while crossing the backward
+delay-window loop. TensorFlow's GPU control-flow kernels keep `int32` tensors in
+host memory, which would introduce extra, synchronous frame transfers. The store
+and spike kernels still receive the original `int32` bits; these views do not
+change the packed format or gradients.
+
+The rollout loops call the ops without `tf.cond`. Frames outside the record
+(the spike frames of the forward's last `max_delay` steps) are dropped by the
+offload itself (`drop_outside`), and the reverse loop's read before frame 0
+returns zeros (`zero_before_start`). A `tf.cond` inside a GPU loop copies its
+host predicate to the GPU every step, and TensorFlow releases that copy only
+once the compute stream has reached it, so the host ran in lockstep with the GPU.
+
+The forward hands each step's frames to the stores at the start of the next
+step (the last step's after the loop). TensorFlow's automatic control
+dependencies make every loop variable of the next iteration wait for the
+stateful ops of the loop body; offloading the step's own GLIF outputs held the
+next step until this step's GLIF op had run on the host, so the host could not
+queue steps ahead of the GPU. The frames, their order and the stores' memory
+are unchanged.
+
 ## Modes
 
 - `raw`: frames are copied exactly, so the gradients are bitwise those of the
   GPU-resident record.
-- `compressed`: frames go out raw while the PCIe link keeps up. The frames the
-  link could not take by the end of the forward are encoded with TQ-pack
+- `adaptive` (legacy alias `compressed`): frames go out raw while the PCIe
+  link keeps up. Frames the link could not take by the end of the forward are encoded with TQ-pack
   (`tq_codec.cu.h`). TQ-pack quantizes to the grid 2^-16 (|error| <= 2^-17,
   about 7.6e-6, on the stored voltages only; the live forward voltage stays
   exact) and predicts each frame from the two later ones (about 0.4 of the raw

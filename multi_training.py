@@ -13,6 +13,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'  # before import tensorflow
 
 # The launch plan picks the visible GPUs first, so the cache key names them.
 from v1_model_utils import training_orchestration
+from v1_model_utils.offload_options import HISTORY_OFFLOAD_MODES, VOLTAGE_OFFLOAD_MODES
 from v1_model_utils.training_bootstrap import TRAINING_LAUNCH_PLAN
 
 from v1_model_utils.cuda_caches import configure_cuda_caches
@@ -23,12 +24,12 @@ import socket
 # import re
 import concurrent.futures
 import copy
+import functools
 import json
 import numpy as np
 import pandas as pd
 import statistics
 import tensorflow as tf
-import pickle as pkl
 from time import strftime, time
 import logging
 from v1_model_utils import tf_utils
@@ -65,6 +66,11 @@ def update_rate_emas(v1_ema, v1_rates, decay, update_state=True):
         )
 
 
+# Grating phases per protocol direction in validation (fixed, evenly spaced).
+VALIDATION_PHASES = 8
+
+
+
 def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
     """Return warm-up final state, using the full sequence model as fallback."""
     if state_model is not None:
@@ -76,6 +82,27 @@ def run_gray_state_rollout(state_model, sequence_and_state_model, inputs):
             "by at least one final-state tensor."
         )
     return tuple(full_outputs[1:])
+
+
+def run_chunked_gray_state_rollout(state_model, sequence_and_state_model, sample_chunk,
+                                   initial_state, seq_len, chunk_size):
+    """Final state of a gray-screen rollout fed one time chunk at a time.
+
+    ``sample_chunk(start, end)`` returns the model input for ``[start, end)``, so the
+    full [batch, seq_len, n_input] input and its time-major copy never exist at once.
+    Each chunk is sampled and rolled out after the previous one's state: the
+    samples and the rollout's weight-derived tensors (about six weight-sized
+    copies per chunk) do not depend on the state, so in a graph every chunk's
+    would otherwise be made up front and stay alive until its chunk runs.
+    """
+    state = tuple(initial_state)
+    for start in range(0, seq_len, chunk_size):
+        with tf.control_dependencies(state[:1]):
+            x = sample_chunk(start, min(start + chunk_size, seq_len))
+            state = tuple(run_gray_state_rollout(
+                state_model, sequence_and_state_model, (x, *state)
+            ))
+    return state
 
 
 def resolve_stimulus_batch_sizes(batch_size, grating_batch_size, gray_batch_size):
@@ -158,9 +185,20 @@ def int32_safe_cast(values, dtype, chunk_size=25,
 require_int32_safe_rnn_output = training_utils.require_int32_safe_rnn_output
 
 
+def model_input_dtype(dtype, compute_lgn_activity_gradient):
+    """The dtype LGN spikes are handed to the model in.
+
+    Bool by default: each time chunk is cast where it enters the model (Keras at
+    the model input, the cell per time step), so no full [batch, seq_len, n_input]
+    copy in the model dtype exists. The LGN activity gradient flows through
+    floating inputs only (models._lgn_activity), so requesting it keeps ``dtype``.
+    """
+    return dtype if compute_lgn_activity_gradient else tf.bool
+
+
 @tf.function(autograph=False, jit_compile=True)
 def concatenate_stimulus_batches(grating, spontaneous, dtype):
-    """Fuse input casts and concatenation without full cast intermediates.
+    """Fuse input casts (if any) and concatenation without full cast intermediates.
 
     Mandatory XLA compilation also avoids the stock GPU Cast kernel's int32
     indexing limit: either sub-batch can exceed 2**31 elements.
@@ -188,6 +226,34 @@ def sample_weighted_mean(values, sample_counts):
 def combine_replica_rates(rates_hz, sample_counts):
     """Combine per-neuron mean rates from replicas of possibly unequal size."""
     return np.average(rates_hz, axis=0, weights=sample_counts).astype(np.float32)
+
+
+def validation_phase_index(replica_id, batch_size, n_phases):
+    """Grating phase of each of a replica's validation trials.
+
+    Trial i of replica r is trial g = r * batch_size + i of the global batch
+    and takes phase g mod n_phases, so the phases are spread evenly over the
+    global batch whatever the replica count.
+    """
+    trial = tf.cast(replica_id, tf.int32) * batch_size + tf.range(batch_size, dtype=tf.int32)
+    return tf.math.floormod(trial, n_phases)
+
+
+def direction_averaged_validation_losses(rates_by_direction, fano_curves_by_direction,
+                                         rate_loss, sync_loss):
+    """Evoked validation rate and sync losses of the direction-averaged statistics.
+
+    The Neuropixels evoked targets average over all grating trials: each
+    unit's rate over every direction, the Fano curve over every trial. So
+    one rate loss is taken on each neuron's rate averaged over the
+    directions, and one sync loss on the directions' mean Fano curve, not
+    the mean of per-direction losses. ``fano_curves_by_direction`` is None
+    when the sync loss is off.
+    """
+    rate_value = float(rate_loss(np.mean(rates_by_direction, axis=0)))
+    if fano_curves_by_direction is None:
+        return rate_value, 0.0
+    return rate_value, float(sync_loss(np.mean(fano_curves_by_direction, axis=0)))
 
 
 def protocol_selectivity_from_rates(rates_hz, angles):
@@ -218,36 +284,60 @@ def sample_stateless_bernoulli_batch(
     seed,
     batch_chunk_size=64,
     full_tensor_element_limit=np.iinfo(np.int32).max,
+    trial_index=None,
+    chunk_transform=None,
 ):
     """Sample Boolean spikes without launching kernels above int32 size.
 
     The probabilities and uniforms are float32: float16
     uniforms take only 1024 values, so P(u < p) would be ceil(1024 p) / 1024
     (+14% spikes at spontaneous LGN rates). Cast only at the model boundary.
+
+    With ``trial_index`` [batch_size], ``probability`` stacks several
+    per-sample probabilities on its first axis and sample b draws from
+    ``probability[trial_index[b]]``.
+
+    Batches above ``batch_chunk_size`` samples are drawn chunk by chunk: one
+    chunk's float32 uniforms (4 bytes per spike) are alive at a time, and every
+    chunk continues the Philox stream of a single full draw, so the spikes do
+    not depend on the chunking.
+
+    ``chunk_transform`` (e.g. bit-packing) maps each chunk's spikes before the
+    next chunk is drawn, so only one chunk is ever held as spikes; the draws
+    are those of the untransformed sample.
     """
     probability = tf.cast(probability, tf.float32)
-    sample_shape = probability.shape
+    if chunk_transform is None:
+        chunk_transform = tf.identity
+    sample_shape = probability.shape if trial_index is None else probability.shape[1:]
+
+    def trial_probability(start, stop):
+        if trial_index is None:
+            return probability
+        return tf.gather(probability, trial_index[start:stop])
+
     if sample_shape.rank is None or not sample_shape.is_fully_defined():
         raise ValueError("Bernoulli sampling requires a static per-sample shape.")
 
     batch_size = int(batch_size)
     elements_per_sample = sample_shape.num_elements()
     full_tensor_element_limit = min(int(full_tensor_element_limit), 2**31 - 1)
-    if batch_size * elements_per_sample <= full_tensor_element_limit:
-        random_uniform = tf.random.stateless_uniform(
-            (batch_size, *sample_shape), seed=seed, dtype=tf.float32
-        )
-        return random_uniform < probability
-
-    if elements_per_sample % 4:
-        raise ValueError(
-            "Chunked Philox sampling requires a per-sample size divisible by four."
-        )
     if batch_chunk_size <= 0:
         raise ValueError("batch_chunk_size must be positive.")
     batch_chunk_size = min(batch_chunk_size, full_tensor_element_limit // elements_per_sample)
     if batch_chunk_size < 1:
         raise ValueError("A single probability sample exceeds the element limit.")
+    if batch_size <= batch_chunk_size:
+        random_uniform = tf.random.stateless_uniform(
+            (batch_size, *sample_shape), seed=seed, dtype=tf.float32
+        )
+        return chunk_transform(random_uniform < trial_probability(0, batch_size))
+
+    # Philox emits four uniforms per counter step: a chunk starts on a step.
+    if batch_chunk_size * elements_per_sample % 4:
+        raise ValueError(
+            "Chunked Philox sampling requires chunks of a multiple of four elements."
+        )
     key, counter = tf.raw_ops.StatelessRandomGetKeyCounter(seed=seed)
     algorithm = tf.raw_ops.StatelessRandomGetAlg()
     sampled_chunks = []
@@ -256,14 +346,20 @@ def sample_stateless_bernoulli_batch(
         chunk_counter = counter + tf.constant(
             [start * elements_per_sample // 4, 0], dtype=tf.uint64
         )
-        random_uniform = tf.raw_ops.StatelessRandomUniformV2(
-            shape=tf.constant([chunk_batch_size, *sample_shape]),
-            key=key,
-            counter=chunk_counter,
-            alg=algorithm,
-            dtype=tf.float32,
-        )
-        sampled_chunks.append(random_uniform < probability)
+        # Each chunk's float32 uniforms (4 bytes per output spike) are drawn
+        # only once the previous chunk is sampled: unordered, every chunk's
+        # were alive at once, 4x the output (34 GiB at 1024 x 500 ms).
+        with tf.control_dependencies(sampled_chunks[-1:]):
+            random_uniform = tf.raw_ops.StatelessRandomUniformV2(
+                shape=tf.constant([chunk_batch_size, *sample_shape]),
+                key=key,
+                counter=chunk_counter,
+                alg=algorithm,
+                dtype=tf.float32,
+            )
+        sampled_chunks.append(chunk_transform(
+            random_uniform < trial_probability(start, start + chunk_batch_size)
+        ))
     # Axis-0 concat with 16+ inputs takes a GPU kernel with unsafe offsets
     # above int32 size. Bound the fan-in so every join uses the slice kernel.
     while len(sampled_chunks) > 8:
@@ -297,8 +393,14 @@ def main(_):
     import stim_dataset
     from v1_model_utils.callbacks import Callbacks
     import v1_model_utils.loss_functions as losses
-    from v1_model_utils import load_sparse, models, other_v1_utils, recorded_adjoint
+    from v1_model_utils import (
+        lgn_input_source, load_sparse, models, other_v1_utils, recorded_adjoint
+    )
     from v1_model_utils import optimizers as optimizer_utils
+    from v1_model_utils.cuda_prebuild import prebuild_for_run
+
+    # Build the missing CUDA operator libraries together rather than one by one on first use.
+    prebuild_for_run()
 
     # Configure seed for reproducibility
     tf_utils.configure_reproducibility(flags.seed)
@@ -315,6 +417,7 @@ def main(_):
 
     # Configure the dtype policy
     mixed_precision, dtype = tf_utils.configure_policy_and_dtype(flags.dtype)
+    input_dtype = model_input_dtype(dtype, flags.compute_lgn_activity_gradient)
 
     # On one multi-GPU node (including Nuredduna), prefer MirroredStrategy:
     # one process builds the model once and runs a replica on each GPU.
@@ -584,19 +687,16 @@ def main(_):
         # Define the decay factor for the exponential moving average
         ema_decay = 0.95
         # Initialize exponential moving averages for V1 and LM firing rates
-        train_end_data = {}
-        if os.path.exists(os.path.join(logdir, 'train_end_data.pkl')):
-            with open(os.path.join(logdir, 'train_end_data.pkl'), 'rb') as f:
-                train_end_data = pkl.load(f)
-            # Stored canonical, like checkpoints; move it into the runtime layout.
-            train_end_data = spatial_layout.translate_neuron_state(
-                neuron_layout, train_end_data, to_runtime=True
-            )
+        # Stored canonical, like checkpoints; move it into the runtime layout.
+        restored_neuron_state = spatial_layout.translate_neuron_state(
+            neuron_layout, tf_utils.load_checkpoint_neuron_state(_checkpoint_directory),
+            to_runtime=True,
+        )
         # 3 Hz is near the average FR of cortex.
         default_v1_ema = tf.constant(
             0.003, shape=(network["n_nodes"],), dtype=tf.float32
         )
-        restored_v1_ema = train_end_data.get("v1_ema")
+        restored_v1_ema = restored_neuron_state.get("v1_ema")
         if restored_v1_ema is None:
             v1_ema_value = default_v1_ema
         else:
@@ -634,8 +734,7 @@ def main(_):
                                                          data_dir=flags.data_dir,
                                                          rolling_decay=flags.rolling_decay,
                                                          rolling_target_sample_ess=flags.rolling_target_sample_ess,
-                                                         rolling_batch_size=grating_batch_size,
-                                                         rolling_gradient_correction=flags.rolling_gradient_correction,
+                                                         rolling_batch_size=global_grating_batch_size,
                                                          rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                          rolling_warmup=flags.rolling_warmup,
                                                          batch_emd_alignment_weight=flags.batch_emd_alignment_weight)
@@ -661,8 +760,7 @@ def main(_):
                                                                      data_dir=flags.data_dir,
                                                                      rolling_decay=flags.rolling_decay,
                                                                      rolling_target_sample_ess=flags.rolling_target_sample_ess,
-                                                                     rolling_batch_size=grating_batch_size,
-                                                                     rolling_gradient_correction=flags.rolling_gradient_correction,
+                                                                     rolling_batch_size=global_grating_batch_size,
                                                                      rolling_max_gradient_scale=flags.rolling_max_gradient_scale,
                                                                      rolling_warmup=flags.rolling_warmup,
                                                                      batch_emd_alignment_weight=flags.batch_emd_alignment_weight)
@@ -670,31 +768,21 @@ def main(_):
             # model.add_loss(lambda: annulus_OSI_DSI_Loss(rsnn_layer.output[0][0], placeholder_angle, trim=True, normalizer=v1_ema))
 
         def _restore_rolling_state(loss_obj, state, label):
-            if flags.osi_loss_method not in (
-                "rolling_osi_emd",
-                "adaptative_crowd_osi",
-            ) or not state:
+            if flags.osi_loss_method != "rolling_osi_emd" or not state:
                 return
             try:
                 if loss_obj.set_rolling_state(state):
-                    print(f"Restored {flags.osi_loss_method} state for {label}.")
+                    weight_sum = loss_obj.get_rolling_state()["weight_sum"]
+                    print(
+                        f"Restored {flags.osi_loss_method} state for {label} "
+                        f"(EMA weight sum per replica: {weight_sum})."
+                    )
             except ValueError as exc:
                 print(f"Warning: could not restore {flags.osi_loss_method} state for {label}: {exc}")
 
-        rolling_state_key = None
-        if flags.osi_loss_method == "rolling_osi_emd":
-            rolling_state_key = "rolling_osi_emd_state"
-        elif flags.osi_loss_method == "adaptative_crowd_osi":
-            rolling_state_key = "adaptative_crowd_osi_state"
-
-        rolling_state_payload = (
-            train_end_data.get(rolling_state_key, {}) if rolling_state_key else {}
-        )
+        rolling_state_payload = restored_neuron_state.get("rolling_osi_emd_state", {})
         if isinstance(rolling_state_payload, dict):
-            core_state = rolling_state_payload.get("core")
-            if core_state is None and "ori_real" in rolling_state_payload:
-                core_state = rolling_state_payload
-            _restore_rolling_state(OSI_DSI_Loss, core_state, "core")
+            _restore_rolling_state(OSI_DSI_Loss, rolling_state_payload.get("core"), "core")
             if annulus_mask is not None:
                 _restore_rolling_state(
                     annulus_OSI_DSI_Loss,
@@ -948,7 +1036,7 @@ def main(_):
             return extractor_model((x, state_vars))
 
     def run_extractor(_x, _state_variables):
-        _x = int32_safe_cast(_x, dtype)
+        _x = int32_safe_cast(_x, input_dtype)
         seed_helper.advance_noise_seed()
         _state_variables = models.reset_voltage_penalty_state(
             rsnn_layer.cell, _state_variables
@@ -962,7 +1050,8 @@ def main(_):
         Returns one losses.SpikeSummary per group in place of its spike
         sequence, and the voltage-penalty accumulator.
         """
-        _x = int32_safe_cast(_x, dtype)
+        if not isinstance(_x, lgn_input_source.FrameSource):
+            _x = int32_safe_cast(_x, input_dtype)
         seed_helper.advance_noise_seed()
         _state_variables = models.reset_voltage_penalty_state(
             rsnn_layer.cell, _state_variables
@@ -1167,14 +1256,31 @@ def main(_):
 
         return _loss, _aux
 
+    # --lgn_input_mode: what a step's LGN input is. "halves": the
+    # [batch, seq_len, n_input] bool grating and gray halves; "packed": the
+    # halves bit-packed. The recorded adjoint reads them a frame at a time,
+    # so the full-batch input never exists; any other rollout gets it whole.
+    def stimulus_frames(x):
+        if flags.lgn_input_mode == "packed":
+            return lgn_input_source.PackedFrames(x, flags.n_input)
+        return lgn_input_source.DenseFrames(x)
+
+    def materialize_frames(source):
+        return source.materialize(source.tensors, flags.seq_len)
+
+    def reads_frames(summarize):
+        return summarize and isinstance(segmented_extractor, recorded_adjoint.RecordedAdjointRunner)
+
     def roll_out(x, y, initial_state, spontaneous=False, trim=True, update_loss_state=True,
                  summarize=False):
 
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), initial_state)
+        source = stimulus_frames(x)
+        x = source if reads_frames(summarize) else materialize_frames(source)
         if summarize:
             sync_loss = spont_sync_loss if spontaneous else evoked_sync_loss
             (_z,), voltage_source = run_extractor_summaries(
-                x, initial_state, ((x.shape[0], sync_loss),), trim
+                x, initial_state, ((source.batch, sync_loss),), trim
             )
             _out = None
         else:
@@ -1206,7 +1312,16 @@ def main(_):
     def roll_out_combined(x, y, x_spontaneous, initial_state, trim=True, update_loss_state=True,
                           summarize=False):
 
-        x_concat = concatenate_stimulus_batches(x, x_spontaneous, dtype)
+        if reads_frames(summarize):
+            # The recorded rollout reads each step's frame from the two halves.
+            x_concat = lgn_input_source.ConcatFrames(
+                stimulus_frames(x), stimulus_frames(x_spontaneous)
+            )
+        else:
+            x_concat = concatenate_stimulus_batches(
+                materialize_frames(stimulus_frames(x)),
+                materialize_frames(stimulus_frames(x_spontaneous)), input_dtype,
+            )
 
         if summarize:
             (_z_evoked, _z_spont), voltage_source_full = run_extractor_summaries(
@@ -1496,11 +1611,16 @@ def main(_):
                 global_grating_batch_size
             )
             pipeline_seed = flags.seed + flags.run_session + 10000 + int(input_context.input_pipeline_id)
-            return (
-                stim_dataset.generate_drifting_grating_parameters(pipeline_seed, dtype=dtype)
-                .batch(batch_size)
-                .prefetch(tf.data.AUTOTUNE)
-            )
+            dataset = stim_dataset.generate_drifting_grating_parameters(
+                pipeline_seed, dtype=dtype
+            ).batch(batch_size)
+            if flags.stratified_grating_angles:
+                dataset = dataset.map(
+                    lambda orientation, phase, spike_seed: (
+                        stim_dataset.stratify_angles(orientation), phase, spike_seed
+                    )
+                )
+            return dataset.prefetch(tf.data.AUTOTUNE)
         return _f
 
     # One generator per replica GPU, with its LGN filters on that GPU, called
@@ -1508,6 +1628,21 @@ def main(_):
     # results hands every replica's output back on GPU:0, which sent each
     # replica's 139 MB batch to GPU:0 and back every step; and a mirrored
     # variable read outside replica context resolves to GPU:0's copy.
+    def generate_grating_input(grating_lgn, theta, phase, spike_seeds):
+        """A replica's grating input in --lgn_input_mode's form."""
+        if flags.lgn_input_mode != "packed":
+            return grating_lgn.batch_spikes(theta, phase, spike_seeds)
+        # 16 samples at a time, each group packed before the next is sampled.
+        words = []
+        for begin in range(0, theta.shape[0], 16):
+            with tf.control_dependencies(words[-1:]):
+                spikes = grating_lgn.batch_spikes(
+                    theta[begin:begin + 16], phase[begin:begin + 16],
+                    spike_seeds[begin:begin + 16],
+                )
+            words.append(lgn_input_source.pack_frames(spikes))
+        return tf.concat(words, axis=0)
+
     grating_generators = []
     for device in strategy.extended.worker_devices:
         with tf.device(device):
@@ -1522,7 +1657,9 @@ def main(_):
                 dtype=dtype,
                 lgn_backend=flags.lgn_backend,
             )
-        grating_generators.append((device, tf.function(grating_lgn.batch_spikes)))
+        grating_generators.append((device, tf.function(
+            functools.partial(generate_grating_input, grating_lgn)
+        )))
 
     def distributed_generate_gratings(orientation, phase, spike_seeds):
         """LGN spikes for every replica, each generated and left on its own GPU."""
@@ -1567,31 +1704,43 @@ def main(_):
     else:
         train_data_set = strategy.distribute_datasets_from_function(get_gratings_dataset_fn())
 
-    def sample_probability_batch(probability, batch_size, current_input=False):
-        if current_input:
-            probability = tf.cast(probability, dtype)
-            return tf.broadcast_to(
-                probability * tf.cast(1.3, dtype),
-                (int(batch_size), *probability.shape),
+    def sample_gray_input(probability, batch_size, current_input=False):
+        """A replica's gray-screen training input in --lgn_input_mode's form
+        (packed: the sampler's chunks of trials, each packed as it is drawn)."""
+        pack = lgn_input_source.pack_frames if flags.lgn_input_mode == "packed" else None
+        return sample_probability_batch(probability, batch_size, current_input, pack)
+
+    def sample_probability_batch(probability, batch_size, current_input=False,
+                                 chunk_transform=None):
+        """Spikes of a replica's batch (current input: the scaled probability).
+
+        A [n_phases, time, n_input] probability holds the validation grating
+        phases; each trial draws from its own (validation_phase_index).
+        """
+        phase_index = None
+        if probability.shape.rank == 3:
+            phase_index = validation_phase_index(
+                tf.distribute.get_replica_context().replica_id_in_sync_group,
+                int(batch_size), probability.shape[0],
             )
+        if current_input:
+            probability = tf.cast(probability, dtype) * tf.cast(1.3, dtype)
+            if phase_index is not None:
+                return tf.gather(probability, phase_index)
+            return tf.broadcast_to(probability, (int(batch_size), *probability.shape))
         return sample_stateless_bernoulli_batch(
             probability,
             int(batch_size),
             seed=seed_helper.next_spontaneous_seed(),
+            trial_index=phase_index,
+            chunk_transform=chunk_transform,
         )
 
-    def generate_spontaneous_spikes(batch_size):
-        return sample_stateless_bernoulli_batch(
-            spontaneous_prob_base,
-            int(batch_size),
-            seed=seed_helper.next_spontaneous_seed(),
-        )
-
-    def make_distributed_probability_sampler(batch_size):
+    def make_distributed_probability_sampler(batch_size, sample=sample_probability_batch):
         @tf.function
         def distributed_sampler(probability, current_input=False):
             def replica_sample(replica_probability):
-                return sample_probability_batch(
+                return sample(
                     replica_probability,
                     batch_size,
                     current_input=current_input,
@@ -1605,24 +1754,47 @@ def main(_):
         per_replica_batch_size: make_distributed_probability_sampler(
             per_replica_batch_size
         ),
-        gray_batch_size: make_distributed_probability_sampler(gray_batch_size),
     }
+    distributed_sample_gray_input = make_distributed_probability_sampler(
+        gray_batch_size, sample_gray_input
+    )
 
     def distributed_sample_probability_batch(
         probability, batch_size, current_input=False
     ):
         return probability_samplers[batch_size](probability, current_input)
 
-    def generate_gray_state():
-        x = generate_spontaneous_spikes(real_batch_size)
-        x = int32_safe_cast(x, dtype)
-        init_state = rsnn_layer.cell.zero_state(real_batch_size, dtype=dtype)
-        seed_helper.advance_noise_seed()
-        inputs = [x]
-        inputs.extend(list(init_state))
-        return run_gray_state_rollout(
-            state_model, sequence_and_state_model, tuple(inputs)
+    def sample_input_chunk(probability, start, end):
+        """Spikes for one time chunk of a full-batch input (see ``input_dtype``).
+
+        Sampling chunk by chunk keeps the gray-state rollout and the validation
+        steps below the training peak at large per-replica batches.
+        """
+        return int32_safe_cast(
+            sample_probability_batch(probability[..., start:end, :], real_batch_size),
+            input_dtype,
         )
+
+    def distribute_to_replicas(value):
+        """A copy of a host array on every replica's device, as a per-replica value."""
+        copies = []
+        for device in strategy.extended.worker_devices:
+            with tf.device(device):
+                copies.append(tf.identity(value))
+        return strategy.experimental_distribute_values_from_function(
+            lambda context: copies[context.replica_id_in_sync_group]
+        )
+
+    def generate_gray_state():
+        initial_state = rsnn_layer.cell.zero_state(real_batch_size, dtype=dtype)
+        seed_helper.advance_noise_seed()
+        # One computation of the LGN pair sums for all the chunks.
+        with rsnn_layer.cell.lgn_pair_weights_scope():
+            return run_chunked_gray_state_rollout(
+                state_model, sequence_and_state_model,
+                lambda start, end: sample_input_chunk(spontaneous_prob_base, start, end),
+                initial_state, flags.seq_len, flags.gradient_checkpoint_chunk_size,
+            )
 
     @tf.function
     def distributed_generate_gray_state():
@@ -1643,18 +1815,22 @@ def main(_):
         chunk_size = flags.gradient_checkpoint_chunk_size
         sync_enabled = hasattr(sync_loss, "gather_sampled_traces")
 
-        def replica_step(x, state, sample_plan):
-            x = int32_safe_cast(x, dtype)
+        def replica_step(probability, state, sample_plan):
             seed_helper.advance_noise_seed()
             state = models.reset_voltage_penalty_state(rsnn_layer.cell, state)
             counts = tf.zeros((network["n_nodes"],), tf.float32)
             sampled_chunks = []
             packed_chunks = []
+            first_trial_chunks = []
             # One computation of the LGN pair sums for all the chunks.
             with rsnn_layer.cell.lgn_pair_weights_scope():
                 for start in range(0, flags.seq_len, chunk_size):
                     end = min(start + chunk_size, flags.seq_len)
-                    outputs = tf.nest.flatten(sequence_and_state_model((x[:, start:end], state)))
+                    # After the previous chunk (see run_chunked_gray_state_rollout).
+                    with tf.control_dependencies(state[:1]):
+                        x = sample_input_chunk(probability, start, end)
+                    first_trial_chunks.append(x[0])
+                    outputs = tf.nest.flatten(sequence_and_state_model((x, state)))
                     spikes = outputs[0]
                     state = tuple(outputs[n_sequences:])
                     rate_start = max(start, delays[0]) - start
@@ -1681,11 +1857,12 @@ def main(_):
                 tf.concat(sampled_chunks, axis=1) if sync_enabled
                 else tf.zeros((0, 0), tf.float32)
             )
-            return rates, state[-1], sampled, tf.concat(packed_chunks, axis=0)
+            return (rates, state[-1], sampled, tf.concat(packed_chunks, axis=0),
+                    tf.concat(first_trial_chunks, axis=0)[tf.newaxis])
 
         @tf.function
-        def distributed_step(x, state, sample_plan):
-            return strategy.run(replica_step, args=(x, state, sample_plan))
+        def distributed_step(probability, state, sample_plan):
+            return strategy.run(replica_step, args=(probability, state, sample_plan))
 
         return distributed_step
 
@@ -1814,18 +1991,19 @@ def main(_):
                 )
             completed += count
 
-        sync_value = 0.0
+        fano_curve = None
         if sync_enabled:
             traces = tf.convert_to_tensor(np.concatenate(sampled_traces, axis=0))
-            sync_value = float(sync_loss.loss_from_sampled_traces(traces).numpy())
+            fano_curve = sync_loss.pop_fano_tf(traces).numpy()
         return (combine_replica_rates(rates, counts),
-                sample_weighted_mean(voltage_losses, counts), sync_value, representative)
+                sample_weighted_mean(voltage_losses, counts), fano_curve, representative)
 
-    def collect_compact_validation_summaries(distributed_x, outputs, keep, sync_loss):
+    def collect_compact_validation_summaries(outputs, keep, sync_loss):
         """Copy only small statistics and packed raster data from each replica."""
         if keep != global_batch_size:
             raise ValueError("Compact validation requires a full distributed batch.")
-        distributed_rates, distributed_voltage, distributed_traces, distributed_packed = outputs
+        (distributed_rates, distributed_voltage, distributed_traces, distributed_packed,
+         distributed_x) = outputs
         sync_enabled = hasattr(sync_loss, "loss_from_sampled_traces")
         per_trial = sync_loss._plan(keep)["per_trial"] if sync_enabled else 0
         rates, voltage_losses, counts, sampled_traces = [], [], [], []
@@ -1855,27 +2033,33 @@ def main(_):
                     bits.reshape(1, flags.seq_len, -1)[:, :, :network["n_nodes"]].astype(np.float32),
                 )
             completed += count
-        sync_value = 0.0
+        fano_curve = None
         if sync_enabled:
             traces = tf.convert_to_tensor(np.concatenate(sampled_traces, axis=0))
-            sync_value = float(sync_loss.loss_from_sampled_traces(traces).numpy())
+            fano_curve = sync_loss.pop_fano_tf(traces).numpy()
         return (combine_replica_rates(rates, counts),
-                sample_weighted_mean(voltage_losses, counts), sync_value, representative)
+                sample_weighted_mean(voltage_losses, counts), fano_curve, representative)
+
+    def sync_loss_from_curve(sync_loss, fano_curve):
+        """Sync loss of a population Fano curve; 0 when the sync loss is off."""
+        if fano_curve is None:
+            return 0.0
+        duration = sync_loss._t_end_seconds - sync_loss._t_start_seconds
+        return float(sync_loss.loss_from_fano_curve(fano_curve, duration).numpy())
 
     def run_gray_validation(initial_state):
-        x = distributed_sample_probability_batch(
-            spontaneous_prob_base, per_replica_batch_size
-        )
         if flags.use_online_voltage_loss:
             outputs = compact_gray_step(
-                x, initial_state, validation_sample_plan(spont_sync_loss, global_batch_size)
+                spontaneous_prob_base, initial_state,
+                validation_sample_plan(spont_sync_loss, global_batch_size),
             )
-            rates, voltage, sync, representative = collect_compact_validation_summaries(
-                x, outputs, global_batch_size, spont_sync_loss
+            rates, voltage, fano_curve, representative = collect_compact_validation_summaries(
+                outputs, global_batch_size, spont_sync_loss
             )
         else:
+            x = distributed_sample_probability_batch(spontaneous_prob_base, per_replica_batch_size)
             z, v = distributed_validation_step(x, initial_state)
-            rates, voltage, sync, representative = collect_validation_summaries(
+            rates, voltage, fano_curve, representative = collect_validation_summaries(
                 x, z, v, global_batch_size, spont_sync_loss
             )
         return {
@@ -1889,22 +2073,24 @@ def main(_):
                 ).numpy()
             ),
             "spont_voltage_loss": voltage,
-            "spont_sync_loss": sync,
+            "spont_fano_curve": fano_curve,
+            "spont_sync_loss": sync_loss_from_curve(spont_sync_loss, fano_curve),
             "representative": representative,
         }
 
     def run_osi_dsi_validation(probability, angle, initial_state):
-        x = distributed_sample_probability_batch(probability, per_replica_batch_size)
         if flags.use_online_voltage_loss:
             outputs = compact_evoked_step(
-                x, initial_state, validation_sample_plan(evoked_sync_loss, global_batch_size)
+                probability, initial_state,
+                validation_sample_plan(evoked_sync_loss, global_batch_size),
             )
-            rates, voltage, sync, representative = collect_compact_validation_summaries(
-                x, outputs, global_batch_size, evoked_sync_loss
+            rates, voltage, fano_curve, representative = collect_compact_validation_summaries(
+                outputs, global_batch_size, evoked_sync_loss
             )
         else:
+            x = distributed_sample_probability_batch(probability, per_replica_batch_size)
             z, v = distributed_validation_step(x, initial_state)
-            rates, voltage, sync, representative = collect_validation_summaries(
+            rates, voltage, fano_curve, representative = collect_validation_summaries(
                 x, z, v, global_batch_size, evoked_sync_loss
             )
         representative = (
@@ -1912,16 +2098,8 @@ def main(_):
         )
         return {
             "evoked_rates": rates,
-            "evoked_rate_loss": float(
-                validation_rate_loss_from_rates(
-                    rates,
-                    evoked_rate_regularizer,
-                    annulus_evoked_rate_regularizer
-                    if annulus_mask is not None else None,
-                ).numpy()
-            ),
             "evoked_voltage_loss": voltage,
-            "evoked_sync_loss": sync,
+            "evoked_fano_curve": fano_curve,
             "representative": representative,
         }
 
@@ -1946,34 +2124,67 @@ def main(_):
             *tuple(tf.constant(value, dtype=tf.float32) for value in metric_values)
         )
 
-    def run_protocol_validation():
+    def run_protocol_validation(epoch):
         initial_state = distributed_generate_gray_state()
         spont_result = run_gray_validation(initial_state)
         evoked_rates_by_angle = []
-        evoked_rate_losses = []
         evoked_voltage_losses = []
-        evoked_sync_losses = []
+        evoked_fano_curves = []
         representative_evoked = None
 
         for angle in protocol_angles:
+            # Trial g of the global batch shows phase g mod VALIDATION_PHASES.
             result = run_osi_dsi_validation(
-                osi_dsi_lgn_probabilities[int(angle)],
+                distribute_to_replicas(protocol_lgn_probabilities[int(angle)]),
                 float(angle),
                 initial_state,
             )
             evoked_rates_by_angle.append(result["evoked_rates"])
-            evoked_rate_losses.append(result["evoked_rate_loss"])
             evoked_voltage_losses.append(result["evoked_voltage_loss"])
-            evoked_sync_losses.append(result["evoked_sync_loss"])
+            evoked_fano_curves.append(result["evoked_fano_curve"])
             if representative_evoked is None:
                 x_rep, z_rep, y_rep = result["representative"]
                 representative_evoked = (x_rep, z_rep, y_rep)
 
         evoked_rates = np.stack(evoked_rates_by_angle, axis=0)
+        evoked_fano_curves = (
+            None if evoked_fano_curves[0] is None else np.stack(evoked_fano_curves, axis=0)
+        )
         # `core_mask` is None when every neuron already lies inside the core.
         osi_mask = None if core_mask is None else np.asarray(core_mask, dtype=bool)
-        osi_rates = evoked_rates if osi_mask is None else evoked_rates[:, osi_mask]
+        neuron_slice = slice(None) if osi_mask is None else osi_mask
+        osi_rates = evoked_rates[:, neuron_slice]
         osi, dsi = protocol_selectivity_from_rates(osi_rates, protocol_angles)
+        # Responsiveness cutoff of the Neuropixels targets, osi_dsi_estimator and
+        # the training loss: no OSI/DSI below 0.5 Hz at the preferred direction
+        # (here the best of the 8 protocol directions; in training, the best of
+        # the batch's gratings binned into those directions).
+        preferred_rates = osi_rates.max(axis=0)
+        osi[preferred_rates < 0.5] = np.nan
+        dsi[preferred_rates < 0.5] = np.nan
+        if _TRAINING_LAUNCH_PLAN.is_chief:
+            directory = os.path.join(logdir, "Validation_osi_dsi")
+            os.makedirs(directory, exist_ok=True)
+            fano_arrays = {} if evoked_fano_curves is None else dict(
+                evoked_fano_curves=evoked_fano_curves,
+                spont_fano_curve=spont_result["spont_fano_curve"],
+                fano_bin_sizes_ms=np.asarray(evoked_sync_loss._bin_sizes_ms),
+                evoked_fano_target=evoked_sync_loss.experimental_fanos_mean.numpy(),
+                spont_fano_target=spont_sync_loss.experimental_fanos_mean.numpy(),
+            )
+            # Arrays are in runtime neuron order; node_ids holds each entry's
+            # canonical (network file) id.
+            np.savez(
+                os.path.join(directory, f"Epoch_{epoch}.npz"),
+                osi=osi, dsi=dsi, preferred_rates=preferred_rates,
+                evoked_rates=osi_rates.mean(axis=0),
+                rates_by_angle=osi_rates.astype(np.float32),
+                tuning_angle=np.asarray(network["tuning_angle"])[neuron_slice],
+                spont_rates=np.asarray(spont_result["spont_rates"])[neuron_slice],
+                node_ids=neuron_layout.new_to_old[neuron_slice],
+                pop_names=other_v1_utils.pop_names(network, data_dir=flags.data_dir)[neuron_slice],
+                **fano_arrays,
+            )
 
         cell_type_populations_ids = losses.get_population_neuron_ids(
             network,
@@ -1981,9 +2192,17 @@ def main(_):
             core_mask=core_mask,
             reindex_selected=False,
         )
-        rate_loss = (
-            float(np.mean(evoked_rate_losses)) + float(spont_result["spont_rate_loss"])
+        evoked_rate_loss, evoked_sync_loss_value = direction_averaged_validation_losses(
+            evoked_rates,
+            evoked_fano_curves,
+            lambda rates: validation_rate_loss_from_rates(
+                rates,
+                evoked_rate_regularizer,
+                annulus_evoked_rate_regularizer if annulus_mask is not None else None,
+            ).numpy(),
+            lambda curve: sync_loss_from_curve(evoked_sync_loss, curve),
         )
+        rate_loss = evoked_rate_loss + float(spont_result["spont_rate_loss"])
 
         osi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
         dsi_values = np.full(network["n_nodes"], np.nan, dtype=np.float32)
@@ -2011,9 +2230,7 @@ def main(_):
         voltage_loss = (
             float(np.mean(evoked_voltage_losses)) + float(spont_result["spont_voltage_loss"])
         )
-        sync_loss = (
-            float(np.mean(evoked_sync_losses)) + float(spont_result["spont_sync_loss"])
-        )
+        sync_loss = evoked_sync_loss_value + float(spont_result["spont_sync_loss"])
 
         regularizer_loss = 0.
         if flags.train_recurrent and flags.recurrent_weight_regularization > 0:
@@ -2056,28 +2273,37 @@ def main(_):
                    'train_regularizer_loss', 'train_osi_dsi_loss', 'train_sync_loss', 'val_loss',
                    'val_firing_rate', 'val_rate_loss', 'val_voltage_loss', 'val_regularizer_loss', 'val_osi_dsi_loss', 'val_sync_loss']
 
+    def current_neuron_state():
+        """Running statistics of the current weights, saved with every checkpoint."""
+        state = {'v1_ema': np.asarray(v1_ema.read_value())}
+        if flags.osi_loss_method == "rolling_osi_emd":
+            rolling_state = {"core": OSI_DSI_Loss.get_rolling_state()}
+            if annulus_mask is not None:
+                rolling_state["annulus"] = annulus_OSI_DSI_Loss.get_rolling_state()
+            state["rolling_osi_emd_state"] = rolling_state
+        return state
+
     callbacks = Callbacks(network, lgn_input, bkg_input, model, optimizer, flags, logdir, strategy,
                           metric_keys, pre_delay=delays[0], post_delay=delays[1], model_variables_init=model_variables_dict,
-                          checkpoint=checkpoint, spontaneous_training=flags.spontaneous_training,
+                          checkpoint=checkpoint, neuron_state=current_neuron_state,
+                          spontaneous_training=flags.spontaneous_training,
                           write_outputs=_TRAINING_LAUNCH_PLAN.is_chief)
 
     protocol_angles = np.asarray(tuple(range(0, 360, 45)), dtype=np.int32)
     protocol_target_df = load_neuropixels_targets(flags.neuropixels_df)
 
-    osi_dsi_lgn_probabilities = stim_dataset.load_or_compute_osi_dsi_lgn_probabilities(
+    # Host arrays [VALIDATION_PHASES, seq_len, n_input] float32 per direction;
+    # each direction goes to the GPUs only while it is validated.
+    protocol_lgn_probabilities = stim_dataset.load_or_compute_protocol_phase_lgn_probabilities(
         seq_len=flags.seq_len,
         pre_delay=delays[0],
         post_delay=delays[1],
         n_input=flags.n_input,
         data_dir=flags.data_dir,
         rotation=flags.rotation,
-        seed=flags.seed,
-        output_dtype=tf.float32,  # sampled in float32 (sample_stateless_bernoulli_batch)
         angles=protocol_angles,
-        strategy=strategy,
+        n_phases=VALIDATION_PHASES,
         bmtk_compat=flags.bmtk_compat_lgn,
-        current_input=flags.current_input,
-        cache_prefix="protocol_validation_lgn_probabilities",
         lgn_backend=flags.lgn_backend,
     )
 
@@ -2166,10 +2392,7 @@ def main(_):
             # LGN spikes for this step; y is the grating orientation
             x, y = next_batch.result()
             next_batch = grating_generator.submit(next_gratings)
-            x_spontaneous = distributed_sample_probability_batch(
-                spontaneous_prob_base,
-                gray_batch_size,
-            )
+            x_spontaneous = distributed_sample_gray_input(spontaneous_prob_base)
             profile_this_step = (
                 flags.profile_train_step
                 and not profiler_finished
@@ -2292,7 +2515,7 @@ def main(_):
             v1_spikes_spont_val,
             protocol_selectivity,
             protocol_rates,
-        ) = run_protocol_validation()
+        ) = run_protocol_validation(epoch + 1)
         print(f"Validation protocol wall time: {time() - validation_started:.2f}s", flush=True)
 
         epoch_values = list(read_train_metrics().numpy())
@@ -2338,16 +2561,7 @@ def main(_):
         reset_train_metrics()
         distributed_reset_validation_metrics()
 
-    normalizers = {'v1_ema': np.asarray(v1_ema.read_value())}
-    if flags.osi_loss_method in ("rolling_osi_emd", "adaptative_crowd_osi"):
-        rolling_state = {"core": OSI_DSI_Loss.get_rolling_state()}
-        if annulus_mask is not None:
-            rolling_state["annulus"] = annulus_OSI_DSI_Loss.get_rolling_state()
-        if flags.osi_loss_method == "rolling_osi_emd":
-            normalizers["rolling_osi_emd_state"] = rolling_state
-        else:
-            normalizers["adaptative_crowd_osi_state"] = rolling_state
-    callbacks.on_train_end(metric_values, normalizers=normalizers)
+    callbacks.on_train_end(metric_values)
 
 
 if __name__ == '__main__':
@@ -2389,7 +2603,7 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
-    absl.app.flags.DEFINE_string('osi_loss_method', 'crowd_osi', '')
+    absl.app.flags.DEFINE_string('osi_loss_method', 'rolling_osi_emd', '')
     absl.app.flags.DEFINE_string('optimizer', 'exp_adam', '')
     absl.app.flags.DEFINE_string('neuropixels_df', 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv',
                                  'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
@@ -2416,7 +2630,7 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_float('rate_cost', 10000., '')
     absl.app.flags.DEFINE_float('sync_cost', 1.5, '')
     absl.app.flags.DEFINE_float('voltage_cost', 1., '')
-    absl.app.flags.DEFINE_float('osi_cost', 20., '')
+    absl.app.flags.DEFINE_float('osi_cost', 2., '')
     absl.app.flags.DEFINE_float('annulus_loss_weight', 0.1, '')
     absl.app.flags.DEFINE_float('osi_loss_subtraction_ratio', 0., '')
     absl.app.flags.DEFINE_float(
@@ -2426,18 +2640,13 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_float(
         'rolling_target_sample_ess',
-        80.0,
+        248.0,
         'Target effective sample size in samples used when rolling_decay < 0 (auto mode).',
-    )
-    absl.app.flags.DEFINE_boolean(
-        'rolling_gradient_correction',
-        False,
-        'Scale current-batch gradients through the rolling OSI/DSI EMA without changing forward values.',
     )
     absl.app.flags.DEFINE_float(
         'rolling_max_gradient_scale',
         20.0,
-        'Maximum gradient scale used by rolling_gradient_correction.',
+        'Cap on the 1/(1-decay) gradient scale through the rolling OSI/DSI EMA.',
     )
     absl.app.flags.DEFINE_boolean(
         'rolling_warmup',
@@ -2490,6 +2699,10 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_integer(
         'gray_batch_size', 1, 'Gray/spontaneous samples per replica.'
+    )
+    absl.app.flags.DEFINE_boolean(
+        'stratified_grating_angles', True,
+        'Draw each replica batch of grating angles one per equal-width bin of 360 / batch.'
     )
     absl.app.flags.DEFINE_integer(
         'n_gpus', 1, 'Number of visible GPUs to use.'
@@ -2547,6 +2760,10 @@ if __name__ == '__main__':
     # absl.app.flags.DEFINE_boolean('use_dale_law', True, '')
     # if one wants to use caching, remember to update the caching function
     absl.app.flags.DEFINE_boolean('caching', True, '')
+    absl.app.flags.DEFINE_boolean(
+        'compress_model_cache', False,
+        'Store constructed V1 model caches with LZ4 compression (.pkl.lz4).',
+    )
     # a little confusing.
     absl.app.flags.DEFINE_boolean('core_only', False, '')
     # not used. should be retired.
@@ -2557,6 +2774,9 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_boolean('train_input', False, '')
     absl.app.flags.DEFINE_boolean('train_noise', True, '')
     absl.app.flags.DEFINE_boolean('compute_lgn_activity_gradient', False, '')
+    absl.app.flags.DEFINE_enum(
+        'lgn_input_mode', 'packed', ['packed', 'halves'],
+        'Training LGN input form (see stimulus_frames).')
     absl.app.flags.DEFINE_boolean('compute_bkg_activity_gradient', False, '')
     absl.app.flags.DEFINE_boolean('train_recurrent', True, '')
     absl.app.flags.DEFINE_boolean('train_recurrent_per_type', False, '')
@@ -2601,11 +2821,13 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_enum(
         "voltage_offload",
         "none",
-        ["none", "raw", "compressed"],
+        VOLTAGE_OFFLOAD_MODES,
+        "Bare --voltage_offload enables adaptive mode; omission defaults to none. "
         "With --backward_mode recorded, where its float32 membrane record lives: none "
         "(GPU memory), raw (copied to pinned host memory during the forward, exact, and "
         "prefetched back in the backward; the frames the copy engine cannot take stay on "
-        "the GPU) or compressed (as raw, but frames the PCIe link could not otherwise take "
+        "the GPU) or adaptive (legacy alias: compressed; as raw, but frames the PCIe "
+        "link could not otherwise take "
         "are TQ-pack encoded: LOSSY on the grid 2^-16, |error| <= 7.6e-6 on the stored "
         "voltages only, so gradients are no longer bitwise). Needs the CUDA frame store "
         "op and pinned host RAM per GPU for the whole record (52 MB per step at batch 64 "
@@ -2615,9 +2837,11 @@ if __name__ == '__main__':
     absl.app.flags.DEFINE_enum(
         "history_offload",
         "none",
-        ["none", "raw"],
+        HISTORY_OFFLOAD_MODES,
+        "Bare --history_offload enables adaptive mode; omission defaults to none. "
         "With --backward_mode recorded, where the bit-packed spike and refractory "
-        "histories live: none (GPU memory) or raw (exact copies to pinned host RAM "
+        "histories live: none (GPU memory) or adaptive (legacy alias: raw; exact copies "
+        "to pinned host RAM "
         "during the forward, prefetched back during the backward). Independent of "
         "--voltage_offload. Uses the CUDA frame store; recent frames and frames the "
         "copy engine cannot take stay on the GPU. Requires pinned host RAM for both "
