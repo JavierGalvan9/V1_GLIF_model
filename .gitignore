@@ -174,3 +174,4 @@ Neuropixels_data/rf_refit/
 Neuropixels_data/cortical_metrics_1.5.csv
 Neuropixels_data/rf_monitor_positions.ipynb
 .gitignore
+synaptic_data/tau_basis_old.npy
