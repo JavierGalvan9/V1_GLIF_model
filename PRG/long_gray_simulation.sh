@@ -2,7 +2,7 @@
 # Submit from Nuredduna: bash PRG/long_gray_simulation.sh --restore_from /path/to/Best_model
 set -euo pipefail
 
-if [[ $# -eq 0 || ${1-} == --help || ${1-} == -h ]]; then
+if [[ ${1-} == --help || ${1-} == -h ]]; then
     cat <<'USAGE'
 Usage: bash PRG/long_gray_simulation.sh [--restore_from /path/to/Best_model] [flags...]
 
