@@ -21,8 +21,13 @@ This model simulates a cortical column in mouse V1, processing LGN input togethe
 - `v1_model_utils/`: Utility modules for V1 model implementation
   - `load_sparse.py`: Functions for loading network connectivity
   - `models.py`: Core model implementation with GLIF neurons
+  - `recorded_adjoint.py`: Recorded-adjoint and checkpointed-statistics backward runners
+  - `lgn_input_source.py`: Frame-by-frame LGN input sources (bool halves, bit-packed words)
   - `loss_functions.py`: Custom loss functions for biorealistic training
   - `callbacks.py`: Custom callbacks for TensorFlow training
+  - `cuda_*/`: Custom CUDA operators (GLIF state, CSR recurrent/external/resource currents, background noise, LGN, host frame store)
+  - `cuda_prebuild.py`: Parallel build of every missing CUDA operator library
+  - `offload_options.py`, `gpu_selection.py`, `cache_files.py`: Offload modes, automatic GPU selection, and cache naming/migration
   - `optimizers.py`: Custom optimizers for training
   - `plotting_utils.py`: Visualization tools
   - `model_metrics_analysis.py`: Analysis functions for model output
@@ -32,6 +37,7 @@ This model simulates a cortical column in mouse V1, processing LGN input togethe
 - `osi_dsi_estimator.py`: Tool for evaluating orientation and direction selectivity after training or as a smoke test
 - `osi_dsi_analysis.ipynb`: Notebook for exploring OSI/DSI analysis and tuning-angle statistics
 - `Neuropixels_data/`: Reference data from Neuropixels recordings for comparison
+- `PRG/`: Long gray-screen recording workflow (see `PRG/README.md`)
 
 ## Getting Started
 
@@ -81,9 +87,8 @@ the pinned direct dependencies. `neuro_tf221` (TensorFlow 2.21.0 / Keras 3.15.1
 / NumPy 2.5.3 / Python 3.12) is the only supported environment; the older
 `neuro_tf2151` environment (TF 2.15 / Keras 2.15 / NumPy 1.x) is retired and
 must not be used for tests, checks, or jobs. After a validated environment
-update, bump the pins in `environment.yml`, mirror the name and versions in
-`AGENTS.md`, and regenerate the complete platform-specific lock with
-`conda env export -n neuro_tf221 | sed '/^prefix: /d' > environment.lock.yml`.
+update, bump the pins in `environment.yml` and mirror the name and versions in
+`AGENTS.md`. There is no separate lock file.
 
 Record the active driver, GPUs, TensorFlow CUDA/cuDNN build, compiler, and core
 Python package versions with:
@@ -91,11 +96,6 @@ Python package versions with:
 ```bash
 python runtime_diagnostics.py
 ```
-The lock records all resolved Conda and pip dependencies, including build
-identifiers, for Linux x86_64 reproduction. It has no machine-specific install
-path. To recreate that resolved environment instead of resolving the direct
-dependencies again, use `conda env create -f environment.lock.yml`. Both files
-target the supported Linux/NVIDIA setup.
 
 On hosts without a system CUDA toolkit (including TalaIA), TensorFlow 2.21 may
 fail to find its pip-installed `libcusolver.so.11`. After activating the
@@ -162,7 +162,7 @@ To train the model to match experimental V1 tuning properties:
 python multi_training.py --data_dir GLIF_network \
     --neurons 0 --seq_len 500 --n_epochs 75 --steps_per_epoch 25 \
     --batch_size 5 --optimizer exp_adam --learning_rate 0.005 \
-    --rate_cost 10000 --voltage_cost 1 --sync_cost 1.5 --osi_cost 20 \
+    --rate_cost 10000 --voltage_cost 1 --sync_cost 1.5 --osi_cost 2 \
     --train_recurrent
 ```
 
@@ -199,14 +199,16 @@ write stdout to `Out/run_<unique_id>/worker_<n>.out` and stderr to
 Each launch gets a unique ID shared by its matching `Out` and `Error`
 directories, so separate launches do not overwrite each other's logs. The
 chief keeps the wrapper's existing console logging. The launcher prints each
-worker's log paths. See
-[the distributed-training investigation](docs/distributed-training.md) for the
-findings behind these choices.
+worker's log paths.
 
 The CUDA operators are built automatically when the architecture-specific
-cache is missing or stale. Caches for A100 (`sm80`), RTX 3090 (`sm86`), L40S /
-RTX 6000 Ada (`sm89`), and RTX Pro 6000 Blackwell (`sm120`) coexist; building
-for one architecture does not replace the others.
+cache is missing or stale. `multi_training.py` and `osi_dsi_estimator.py` build
+every missing library in parallel at startup; to build them ahead of a job, run
+`python -m v1_model_utils.cuda_prebuild`. Caches for A100 (`sm80`), RTX 3090
+(`sm86`), L40S / RTX 6000 Ada (`sm89`), B200 (`sm100`), and RTX Pro 6000
+Blackwell (`sm120`) coexist; building for one architecture does not replace the
+others. B200 builds use their own kernel launch shapes, which give bitwise the
+same results.
 
 Note: Running with batch size 5 requires ~40 GB of VRAM. If you have less VRAM, reduce the batch size.
 
@@ -214,7 +216,17 @@ Parameters:
 - `--rate_cost`: Cost weight for firing-rate regularization
 - `--voltage_cost`: Cost weight for voltage dynamics
 - `--sync_cost`: Cost weight for synchronization regularization
-- `--osi_cost`: Cost weight for matching orientation/direction selectivity to experimental data
+- `--osi_cost`: Cost weight for matching orientation/direction selectivity to experimental data (default: `2`)
+- `--osi_loss_method`: OSI/DSI loss (default: `rolling_osi_emd`; also
+  `batch_osi_emd`, `crowd_osi`, `crowd_spikes`, `neuropixels_fr`). The two EMD
+  losses match each cell type's signed selectivity distribution to the
+  Neuropixels targets for neurons whose preferred-direction rate reaches
+  0.5 Hz, pooled across replicas. `rolling_osi_emd` uses exponential moving
+  averages whose decay follows `--rolling_target_sample_ess` (default: `248`
+  samples) and the global grating batch; a global batch at or above the target
+  ESS makes it equal to `batch_osi_emd`.
+- `--stratified_grating_angles`: Draw one grating angle per equal-width bin of
+  360 / batch in each replica batch (default: on).
 - `--train_recurrent`: Enable training of recurrent connections
 - `--optimizer`: Optimizer used for the paper-aligned runs (`exp_adam`)
 - `--learning_rate`: Learning rate used in the reported configuration (`0.005`)
@@ -229,17 +241,28 @@ Parameters:
   - `autodiff`: plain TensorFlow backprop (refused when the spike sequence
     passes 2**31 elements).
 - `--voltage_offload`: With `--backward_mode recorded`, where its float32
-  membrane record lives: `none` (default, GPU memory), `raw` (pinned host
-  memory, exact) or `compressed` (as `raw`, with the frames the PCIe link
-  cannot take encoded on the 2^-16 grid: lossy, |error| <= 7.6e-6 on the
-  stored voltages only). Ignored with a warning in the other modes. See
+  membrane record lives: omitted or `none` (GPU memory); bare flag or
+  `adaptive` (pinned host memory, with the frames the PCIe link cannot take
+  encoded on the 2^-16 grid: lossy, |error| <= 7.6e-6 on the stored voltages
+  only; `compressed` is a legacy alias); `raw` (pinned host memory, exact).
+  Ignored with a warning in the other modes. See
   [the frame store README](v1_model_utils/cuda_frame_store/README.md).
+- `--history_offload`: With `--backward_mode recorded`, keeps the bit-packed
+  spike and refractory histories in pinned host memory, exactly: omitted or
+  `none` (GPU memory); bare flag or `adaptive` (legacy alias `raw`).
+  Independent of `--voltage_offload`.
+- `--lgn_input_mode`: How the recorded adjoint reads the LGN input, frame by
+  frame: `packed` (default, 32 spikes per `uint32` word on the GPU) or
+  `halves` (the grating and gray halves as bool). Both draw the same spikes.
+- `--compute_lgn_activity_gradient`: Backpropagate to the LGN activity
+  (default: off); supported by every backward mode.
 - `--gradient_checkpoint_chunk_size`: Timesteps per chunk (default: `25`): the
   replay chunk of `checkpointing` (smaller chunks reduce peak VRAM at the cost
-  of additional loop overhead) and the gradient-summation chunk of `recorded`.
+  of additional loop overhead), the gradient-summation chunk of `recorded`, and
+  the input-sampling chunk of validation.
 - `--pack_spike_checkpoints`: Store the binary recurrent spike-delay state at
-  temporal checkpoint boundaries in a bit-packed `int32` representation. This
-  is opt-in while its end-to-end memory and runtime trade-off is evaluated.
+  temporal checkpoint boundaries of the `checkpointing` replay in a bit-packed
+  `int32` representation (default: on).
 - `--n_gpus`: Number of GPUs to use (default: `1`).
 - `--auto_select_gpus`: Expose `--n_gpus` idle GPUs spread across PCIe root
   ports (default: on). It never acts inside a Slurm job or when
@@ -254,6 +277,17 @@ For the 203,816-neuron model at sequence length 500 and batch size 1, the
 TensorFlow allocation, respectively, with similar steady-state step times.
 Whole-sequence recomputation and chunk size 250 exceeded 96 GiB. These figures
 depend on the connectivity, losses, TensorFlow build, and GPU architecture.
+
+Validation shows each direction at eight evenly spaced grating phases (global
+validation trial `g` uses phase `g mod 8`), and the evoked rate and
+synchronization losses average over directions before the loss, as the
+Neuropixels targets do. OSI/DSI are undefined (NaN) for neurons whose
+preferred-direction rate is below 0.5 Hz. Each epoch the chief writes
+`Validation_osi_dsi/Epoch_<k>.npz` in the run directory (OSI, DSI, rates by
+angle, spontaneous rates, node ids, and Fano curves when the sync loss is on).
+Every checkpoint is saved with a `ckpt-<N>.neuron_state.pkl` holding the running
+firing-rate EMA and the rolling OSI/DSI state, and restoring a checkpoint
+restores that state with it.
 
 #### Evaluating Orientation and Direction Selectivity
 

@@ -386,13 +386,16 @@ def main():
     job_ids = []
     eval_job_ids = []
 
-    # initial_evaluation_command = evaluation_commands + ["-o", f"Out/{sim_name}_{v1_neurons}_initial_test.out", "-e", f"Error/{sim_name}_{v1_neurons}_initial_test.err", "-j", f"{sim_name}_initial_test"]
-    # if initial_benchmark_model:
-    #     initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from {initial_benchmark_model}"
-    # else:
-    #     initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from '' --evaluate_untrained"
-    # eval_job_id = submit_job(initial_evaluation_command + [initial_evaluation_script], print_only=flags.print_only)
-    # eval_job_ids.append(eval_job_id)
+    if initial_benchmark_model:
+        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from {initial_benchmark_model}"
+    else:
+        initial_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 500 --seed {flags.seed} --ckpt_dir {logdir} --run_session {-1} --restore_from '' --evaluate_untrained"
+    initial_evaluation_command = scheduler_command(
+            flags, initial_evaluation_script, f"{sim_name}_initial_test", f"{sim_name}_{v1_neurons}_initial_test",
+            **evaluation_resources,
+        )
+    eval_job_id = submit_job(initial_evaluation_command, print_only=flags.print_only)
+    eval_job_ids.append(eval_job_id)
 
     for i in range(flags.n_runs):
         # Submit the training and evaluation jobs with dependencies: train0 - train1 & eval0 - rtrain2 & eval1 - ...
@@ -428,19 +431,23 @@ def main():
             eval_job_id = submit_job(new_evaluation_command, print_only=flags.print_only)
             eval_job_ids.append(eval_job_id)
 
-    # # Final evaluation with the best model
-    # final_evaluation_command = evaluation_commands + ['-d', job_id, "-o", f"Out/{sim_name}_{v1_neurons}_test_final.out", "-e", f"Error/{sim_name}_{v1_neurons}_test_final.err", "-j", f"{sim_name}_test_final"]
-    # final_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
-    # final_evaluation_command = final_evaluation_command + [final_evaluation_script]
-    # eval_job_id = submit_job(final_evaluation_command)
-    # eval_job_ids.append(eval_job_id)
+    # Final evaluation with the best model
+    dependency = job_ids[-1]
+    if flags.print_only:
+        dependency = f"<{sim_name}_train_{i}_JOBID>"
+    final_evaluation_script = evaluation_script + f"--dtype 'float32' --track_core_only --seq_len 200 --seed {flags.seed} --ckpt_dir {logdir} --restore_from 'Best_model' --run_session {i}"
+    final_evaluation_command = scheduler_command(
+        flags, final_evaluation_script, f"{sim_name}_final_test", f"{sim_name}_{v1_neurons}_final_test",
+        dependency=dependency, **evaluation_resources,
+    )
+    eval_job_id = submit_job(final_evaluation_command, print_only=flags.print_only)
+    eval_job_ids.append(eval_job_id)
 
     if flags.print_only:
         print("Print-only mode: no jobs submitted.")
     else:
         print("Submitted training jobs with the following JOBIDs:", job_ids)
         print("Submitted evaluation jobs with the following JOBIDs:", eval_job_ids)
-
 
 if __name__ == '__main__':
     main()

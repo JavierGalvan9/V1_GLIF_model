@@ -23,10 +23,10 @@ def test_single_run_submits_training_for_fresh_and_restored_runs(
     wrapper.main()
 
     commands = [line for line in capsys.readouterr().out.splitlines() if line.startswith("run ")]
-    assert len(commands) == 1
-    assert "python multi_training.py " in commands[0]
-    assert "initial_test" not in commands[0]
-    training_args = shlex.split(shlex.split(commands[0])[-1])
+    assert len(commands) == 3
+    training = [command for command in commands if "python multi_training.py " in command]
+    assert len(training) == 1
+    training_args = shlex.split(shlex.split(training[0])[-1])
     assert training_args[training_args.index("--restore_from") + 1] == (
         str(checkpoint_dir) if restored else ""
     )
@@ -42,7 +42,8 @@ def test_history_offload_reaches_training_only(mode, tmp_path, monkeypatch, caps
     commands = [line for line in capsys.readouterr().out.splitlines() if line.startswith("run ")]
     training = [command for command in commands if "python multi_training.py " in command]
     evaluation = [command for command in commands if "python osi_dsi_estimator.py " in command]
-    assert len(training) == len(evaluation) == 2
+    assert len(training) == 2
+    assert len(evaluation) == 4
     assert all(f"--history_offload {mode}" in command for command in training)
     assert all("--history_offload" not in command for command in evaluation)
 
@@ -84,7 +85,8 @@ def test_talaia_jobs_are_sbatch_commands_with_dependencies(tmp_path, monkeypatch
     ]
     training = [command for command in commands if "python multi_training.py " in command[-1]]
     evaluation = [command for command in commands if "python osi_dsi_estimator.py " in command[-1]]
-    assert len(training) == len(evaluation) == 2
+    assert len(training) == 2
+    assert len(evaluation) == 4
     for command in commands:
         assert command[-2] == "--wrap"
         assert command[command.index("-A") + 1] == "uib_focosineu_acc"
@@ -100,7 +102,47 @@ def test_talaia_jobs_are_sbatch_commands_with_dependencies(tmp_path, monkeypatch
     assert not any(arg.startswith("--dependency") for arg in training[0])
     assert any(arg.startswith("--dependency=afterok:<") for arg in training[1])
     assert "--gres=gpu:1" in evaluation[0]
-    assert any(arg.startswith("--dependency=afterok:<") for arg in evaluation[0])
+    assert any(arg.startswith("--dependency=afterok:<") for arg in evaluation[1])
+
+
+@pytest.mark.parametrize("cluster", ["nuredduna", "talaia"])
+@pytest.mark.parametrize("n_runs", [1, 2])
+@pytest.mark.parametrize("print_only", [False, True])
+def test_final_evaluation_waits_for_last_training_job(
+    cluster, n_runs, print_only, tmp_path, monkeypatch
+):
+    arguments = [
+        "parallel_training_testing.py", "--cluster", cluster, "--n_runs", str(n_runs),
+        "--results_dir", str(tmp_path),
+    ]
+    if print_only:
+        arguments.append("--print_only")
+    monkeypatch.setattr(sys, "argv", arguments)
+    submissions = []
+
+    def submit_job(command, print_only=False):
+        submissions.append(command)
+        return None if print_only else str(len(submissions))
+
+    monkeypatch.setattr(wrapper, "submit_job", submit_job)
+    wrapper.main()
+
+    last_training_index = next(
+        index for index in reversed(range(len(submissions)))
+        if "python multi_training.py " in submissions[index][-1]
+    )
+    last_training = submissions[last_training_index]
+    name_option = "-j" if cluster == "nuredduna" else "-J"
+    last_training_name = last_training[last_training.index(name_option) + 1]
+    dependency = (
+        f"<{last_training_name}_JOBID>" if print_only else str(last_training_index + 1)
+    )
+    final = submissions[-1]
+    assert "_final_test" in final[final.index(name_option) + 1]
+    if cluster == "nuredduna":
+        assert final[final.index("-d") + 1] == dependency
+    else:
+        assert f"--dependency=afterok:{dependency}" in final
 
 
 @pytest.mark.parametrize("arguments", [
@@ -122,5 +164,8 @@ def test_nuredduna_defaults_to_rtxpro6000(tmp_path, monkeypatch, capsys):
         "--results_dir", str(tmp_path), "--print_only",
     ])
     wrapper.main()
-    command = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("run "))
+    command = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("run ") and "python multi_training.py " in line
+    )
     assert shlex.split(command)[:7] == ["run", "-g", "1", "-G", "rtxpro6000", "-c", "8"]
