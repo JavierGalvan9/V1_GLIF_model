@@ -61,7 +61,7 @@ parser.add_argument('--annulus_loss_weight', default=0.1, type=float)
 parser.add_argument('--osi_loss_subtraction_ratio', default=0., type=float)
 parser.add_argument(
     '--osi_loss_method',
-    default='batch_osi_emd',
+    default='rolling_osi_emd',
     type=str,
     choices=[
         'crowd_osi',
@@ -79,7 +79,7 @@ parser.add_argument(
 )
 parser.add_argument(
     '--rolling_target_sample_ess',
-    default=80.0,
+    default=248.0,
     type=float,
     help='Target effective sample size in samples used when rolling_decay < 0 (auto mode).',
 )

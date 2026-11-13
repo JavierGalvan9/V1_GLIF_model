@@ -64,7 +64,7 @@ def test_osi_defaults_and_stratification_switch(arguments, training_flag, tmp_pa
     assert training and evaluation
     for command in training:
         assert training_flag in command
-        assert command[command.index("--osi_loss_method") + 1] == "batch_osi_emd"
+        assert command[command.index("--osi_loss_method") + 1] == "rolling_osi_emd"
         assert float(command[command.index("--osi_cost") + 1]) == 2.0
     assert all("stratified_grating_angles" not in " ".join(command) for command in evaluation)
 

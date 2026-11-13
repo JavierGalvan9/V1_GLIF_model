@@ -2603,7 +2603,7 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_string('rotation', 'ccw', '')
     absl.app.flags.DEFINE_string('ckpt_dir', '', '')
-    absl.app.flags.DEFINE_string('osi_loss_method', 'batch_osi_emd', '')
+    absl.app.flags.DEFINE_string('osi_loss_method', 'rolling_osi_emd', '')
     absl.app.flags.DEFINE_string('optimizer', 'exp_adam', '')
     absl.app.flags.DEFINE_string('neuropixels_df', 'Neuropixels_data/OSI_DSI_neuropixels_v4.csv',
                                  'File name of the Neuropixels DataFrame for OSI/DSI analysis.')
@@ -2640,7 +2640,7 @@ if __name__ == '__main__':
     )
     absl.app.flags.DEFINE_float(
         'rolling_target_sample_ess',
-        80.0,
+        248.0,
         'Target effective sample size in samples used when rolling_decay < 0 (auto mode).',
     )
     absl.app.flags.DEFINE_float(

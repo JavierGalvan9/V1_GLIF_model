@@ -1795,7 +1795,7 @@ class OrientationSelectivityLoss:
                  core_mask=None, method="crowd_osi", subtraction_ratio=1.0,
                  neuropixels_df="Neuropixels_data/v1_OSI_DSI_DF.csv", data_dir='',
                  rolling_decay=0.5, rolling_epsilon=1e-6,
-                 rolling_target_sample_ess=80.0, rolling_batch_size=None,
+                 rolling_target_sample_ess=248.0, rolling_batch_size=None,
                  rolling_max_decay=0.9999,
                  rolling_max_gradient_scale=20.0,
                  rolling_warmup=True,
@@ -1895,6 +1895,13 @@ class OrientationSelectivityLoss:
                 f"batch_size={int(rolling_batch_size)}, "
                 f"resolved_decay={resolved_decay:.6f}"
             )
+            if resolved_decay == 0.0:
+                print(
+                    f"Warning: [{self._method}] the global grating batch "
+                    f"({int(rolling_batch_size)}) reaches the target sample ESS "
+                    f"({float(rolling_target_sample_ess):g}); the EMA keeps no "
+                    "memory and each step uses only the current batch."
+                )
             return resolved_decay
 
         if not 0.0 <= rolling_decay < 1.0:
