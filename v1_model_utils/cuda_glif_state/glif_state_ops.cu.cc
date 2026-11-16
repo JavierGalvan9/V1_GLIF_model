@@ -3,6 +3,7 @@
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/util/gpu_kernel_helper.h"
+#include <cuda_fp16.h>
 #include <type_traits>
 #include <algorithm>
 #include <atomic>
@@ -569,7 +570,8 @@ __global__ __launch_bounds__(kTileThreads, ForwardMinBlocks<T, Pack>()) void For
     bool emit_voltage, T* spikes, float* new_v, R* new_r,
     float* new_asc, T* new_rise, T* new_psc,
     bool* refractory_out, T* voltage_out, int penalty,
-    float* penalty_partials, Bkg bkg, PackedMasks pack, bool transposed) {
+    float* penalty_partials, Bkg bkg, PackedMasks pack, bool transposed,
+    __half* voltage_record) {
   const float step = *dt; const float rest = *v_reset;
   const float threshold = *v_th;
   const int64_t batch = count / neurons;
@@ -673,6 +675,7 @@ __global__ __launch_bounds__(kTileThreads, ForwardMinBlocks<T, Pack>()) void For
     spikes[i] = spike;
     if (refractory_out) refractory_out[i] = blocked;
     if (emit_voltage) voltage_out[i] = V<T>(voltage);
+    if (voltage_record) voltage_record[i] = __float2half_rn(voltage);
     if (penalty) penalty_sum[sample - tile_first] += PenaltyValue(penalty, voltage);
     if constexpr (Pack) { fired = F(spike) != 0.0f; blocked_bit = blocked; }
     }
@@ -688,10 +691,11 @@ __global__ __launch_bounds__(kTileThreads, ForwardMinBlocks<T, Pack>()) void For
 // forward, the backward measured faster without sharing the neuron constants
 // across samples. Launched with kBackwardThreads threads (at most 94 registers
 // up to kMaxTiledBasis bases on sm_120; a launch bound would change the
-// four-basis register allocation).
-template <typename T, int Basis, bool Vec, int WordBits>
+// four-basis register allocation). M is the recorded membrane's type: float,
+// or __half for FusedGlifStep's voltage_record, widened on load.
+template <typename T, int Basis, bool Vec, int WordBits, typename M>
 __global__ void BackwardKernelTiled(int64_t count, int neurons, int n_basis,
-    SpikeMasks<T, WordBits> masks, const float* __restrict__ new_v, Constants k,
+    SpikeMasks<T, WordBits> masks, const M* __restrict__ new_v, Constants k,
     const float* dt, const float* v_th, const float* sigma,
     const float* amplitude, int surrogate, const T* __restrict__ gspikes,
     const T* __restrict__ gnew_z, const T* __restrict__ gprev_z, const float* __restrict__ gv,
@@ -716,7 +720,7 @@ __global__ void BackwardKernelTiled(int64_t count, int neurons, int n_basis,
     // The surrogate of the threshold. Both consumers of a spike read it in T,
     // so the upstream gradient is summed in T before it meets the float32
     // surrogate of the float32 membrane.
-    const float membrane = new_v[i];
+    const float membrane = F(new_v[i]);
     const float vs = membrane - threshold;
     float shape;
     if (surrogate == 1) {
@@ -846,6 +850,7 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
     string penalty;
     OP_REQUIRES_OK(c, c->GetAttr("penalty", &penalty));
     penalty_ = penalty == "range" ? 1 : penalty == "threshold" ? 2 : 0;
+    OP_REQUIRES_OK(c, c->GetAttr("emit_voltage_record", &emit_voltage_record_));
   }
   void Compute(OpKernelContext* c) override {
     const Tensor& prev_z = c->input(0); const Tensor& v = c->input(1);
@@ -898,6 +903,11 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
     if (pack_masks_)
       pack = PackedMasks{spike_words->flat<int32>().data(), blocked_words->flat<int32>().data(),
                          static_cast<int>(words), mask_word_bits_};
+    Tensor* voltage_record;
+    OP_REQUIRES_OK(c, c->allocate_output(
+        11, emit_voltage_record_ ? v.shape() : TensorShape({0}), &voltage_record));
+    __half* record = emit_voltage_record_
+        ? reinterpret_cast<__half*>(voltage_record->flat<Eigen::half>().data()) : nullptr;
     const Tensor& bkg_activity = c->input(20);
     Bkg bkg{nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr};
     if (bkg_activity.NumElements()) {
@@ -919,6 +929,10 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
     auto& d = c->eigen_device<GPUDevice>();
     auto launch_masks = [&](auto tag, auto vec, auto pack_tag) {
       constexpr int B = decltype(tag)::value;
+      if (B == 0 && record)
+        return absl::InvalidArgumentError(absl::StrCat(
+            "emit_voltage_record needs the tiled forward (1 to ", kMaxTiledBasis,
+            " synaptic bases)"));
       auto kernel = [] {
         if constexpr (B > 0)
           return ForwardKernelTiled<T, R, B, decltype(vec)::value, decltype(pack_tag)::value>;
@@ -976,7 +990,7 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
       auto launch_kernel = [&](auto... tail) {
         if constexpr (B > 0)
           return GpuLaunchKernel(kernel, blocks, threads, 0, d.stream(), tail..., bkg, stage,
-                                 transposed);
+                                 transposed, record);
         else return GpuLaunchKernel(kernel, blocks, threads, 0, d.stream(), tail...);
       };
       TF_RETURN_IF_ERROR(launch_kernel(
@@ -1028,13 +1042,17 @@ template <typename T, typename R> class ForwardOp : public OpKernel {
   }
  private:
   bool hard_; bool emit_voltage_; bool emit_refractory_; bool pack_masks_;
-  int mask_word_bits_; int penalty_;
+  int mask_word_bits_; int penalty_; bool emit_voltage_record_;
 };
 
 // FusedGlifStepBackward (Packed = false) and FusedGlifStepBackwardPacked,
 // which reads the previous spikes and the refractory mask as packed 32-bit
-// words (`word_bits` per word) instead of the dense T and bool tensors.
-template <typename T, bool Packed> class BackwardOp : public OpKernel {
+// words (`word_bits` per word) instead of the dense T and bool tensors. M is
+// new_v's type: float, or Eigen::half (the forward's voltage_record, tiled
+// kernels only).
+template <typename T, bool Packed, typename M> class BackwardOp : public OpKernel {
+  using DeviceM = std::conditional_t<std::is_same<M, float>::value, float, __half>;
+
  public:
   explicit BackwardOp(OpKernelConstruction* c) : OpKernel(c) {
     string surrogate;
@@ -1118,7 +1136,7 @@ template <typename T, bool Packed> class BackwardOp : public OpKernel {
       return GpuLaunchKernel(kernel,
         blocks, threads, 0, d.stream(),
         new_v.NumElements(), neurons, grise.dim_size(1) / neurons, masks,
-        new_v.flat<float>().data(), ReadConstants(c, 3),
+        reinterpret_cast<const DeviceM*>(new_v.flat<M>().data()), ReadConstants(c, 3),
         c->input(10).flat<float>().data(), c->input(11).flat<float>().data(),
         c->input(12).flat<float>().data(), c->input(13).flat<float>().data(),
         surrogate_, c->input(14).flat<T>().data(), c->input(15).flat<T>().data(),
@@ -1139,13 +1157,16 @@ template <typename T, bool Packed> class BackwardOp : public OpKernel {
       constexpr int B = decltype(tag)::value, Bits = decltype(word_bits)::value;
       const SpikeMasks<T, Bits> masks{prev_z.data(), c->input(2).data(), static_cast<int>(words)};
       if constexpr (B > 0) {
-        auto kernel = BackwardKernelTiled<T, B, decltype(vec)::value, Bits>;
+        auto kernel = BackwardKernelTiled<T, B, decltype(vec)::value, Bits, DeviceM>;
         auto cfg = GetGpuLaunchConfigFixedBlockSize(neurons, d, kernel, 0, kBackwardThreads);
         const int64_t rows = std::min<int64_t>(new_v.dim_size(0), 65535);
         const bool transposed = TransposedTileGrid(neurons, rows);
         return launch_with(kernel,
                            transposed ? dim3(rows, cfg.block_count) : dim3(cfg.block_count, rows),
                            cfg.thread_per_block, masks, transposed);
+      } else if constexpr (!std::is_same<M, float>::value) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "a half new_v needs the tiled backward (1 to ", kMaxTiledBasis, " synaptic bases)"));
       } else {
         auto cfg = GetGpuLaunchConfig(new_v.NumElements(), d);
         return launch_with(BackwardKernel<T, 0, Bits>, dim3(cfg.block_count),
@@ -1178,10 +1199,10 @@ template <typename T, bool Packed> class BackwardOp : public OpKernel {
 #define REG(T,R) REGISTER_KERNEL_BUILDER(Name("FusedGlifStep").Device(DEVICE_GPU).TypeConstraint<T>("T").TypeConstraint<R>("R"),ForwardOp<T,R>);
 REG(float,int8); REG(float,int16); REG(Eigen::half,int8); REG(Eigen::half,int16);
 #undef REG
-#define REG(T) \
-  REGISTER_KERNEL_BUILDER(Name("FusedGlifStepBackward").Device(DEVICE_GPU).TypeConstraint<T>("T"),BackwardOp<T, false>); \
-  REGISTER_KERNEL_BUILDER(Name("FusedGlifStepBackwardPacked").Device(DEVICE_GPU).TypeConstraint<T>("T").TypeConstraint<int32>("W"),BackwardOp<T, true>); \
-  REGISTER_KERNEL_BUILDER(Name("FusedGlifStepBackwardPacked").Device(DEVICE_GPU).TypeConstraint<T>("T").TypeConstraint<uint32>("W"),BackwardOp<T, true>);
-REG(float); REG(Eigen::half);
+#define REG(T, M) \
+  REGISTER_KERNEL_BUILDER(Name("FusedGlifStepBackward").Device(DEVICE_GPU).TypeConstraint<T>("T").TypeConstraint<M>("V"),BackwardOp<T, false, M>); \
+  REGISTER_KERNEL_BUILDER(Name("FusedGlifStepBackwardPacked").Device(DEVICE_GPU).TypeConstraint<T>("T").TypeConstraint<M>("V").TypeConstraint<int32>("W"),BackwardOp<T, true, M>); \
+  REGISTER_KERNEL_BUILDER(Name("FusedGlifStepBackwardPacked").Device(DEVICE_GPU).TypeConstraint<T>("T").TypeConstraint<M>("V").TypeConstraint<uint32>("W"),BackwardOp<T, true, M>);
+REG(float, float); REG(Eigen::half, float); REG(float, Eigen::half); REG(Eigen::half, Eigen::half);
 #undef REG
 #endif

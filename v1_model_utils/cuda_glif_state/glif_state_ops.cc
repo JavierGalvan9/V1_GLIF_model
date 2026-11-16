@@ -66,12 +66,20 @@ using namespace tensorflow;
 // computed exactly as BkgCsrForward computes it and rounded to T once, so the
 // step sees the same input bit for bit, without a separate pass over the
 // [batch, neurons * 4] current. Empty bkg_* inputs disable it.
+//
+// With emit_voltage_record, voltage_record ([batch, neurons] half) holds the
+// membrane rounded once to half (__float2half_rn(new_v)): the compact record
+// a recorded adjoint keeps on the GPU and the backward ops read as V = half.
+// Only the tiled forward (1 to 8 synaptic bases) writes it; the runtime-basis
+// forward rejects the attribute. Without it voltage_record is empty. The other
+// outputs do not depend on it.
 REGISTER_OP("FusedGlifStep")
     .Attr("T: {half, float}").Attr("R: {int8, int16}")
     .Attr("hard_reset: bool = false").Attr("emit_voltage: bool = false")
     .Attr("emit_refractory: bool = true")
     .Attr("pack_masks: bool = false").Attr("mask_word_bits: int = 31")
     .Attr("penalty: {'none', 'range', 'threshold'} = 'none'")
+    .Attr("emit_voltage_record: bool = false")
     .Input("prev_z: T").Input("v: float").Input("r: R").Input("asc: float")
     .Input("psc_rise: T").Input("psc: T").Input("rec_inputs: T")
     .Input("syn_coeffs: float").Input("asc_decay: float")
@@ -89,6 +97,7 @@ REGISTER_OP("FusedGlifStep")
     .Output("refractory: bool").Output("voltage: T")
     .Output("new_penalty_acc: float")
     .Output("spike_words: int32").Output("blocked_words: int32")
+    .Output("voltage_record: half")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       bool emit_voltage;
       TF_RETURN_IF_ERROR(c->GetAttr("emit_voltage", &emit_voltage));
@@ -113,6 +122,9 @@ REGISTER_OP("FusedGlifStep")
                               : c->UnknownDim());
       }
       c->set_output(9, words); c->set_output(10, words);
+      bool emit_voltage_record;
+      TF_RETURN_IF_ERROR(c->GetAttr("emit_voltage_record", &emit_voltage_record));
+      c->set_output(11, emit_voltage_record ? c->input(1) : c->Vector(0));
       return absl::OkStatus();
     });
 
@@ -133,6 +145,11 @@ REGISTER_OP("FusedGlifStep")
 // With emit_abs_max, rec_inputs_grad_abs_max ([1] uint32) holds the float bits
 // of the largest finite |rec_inputs_grad| (0 if none), exactly the bound the
 // recurrent backward's AbsMaxFiniteKernel measures; otherwise it is empty.
+//
+// new_v is the float32 membrane (V = float) or FusedGlifStep's half
+// voltage_record (V = half), which the kernel widens to float32 on load: the
+// results are then those of V = float on the widened record, bit for bit. A
+// half new_v needs the tiled kernels (1 to 8 synaptic bases).
 REGISTER_OP("FusedGlifStepBackward")
     .Attr("T: {half, float}")
     .Attr("surrogate: {'triangular', 'gaussian', 'slayer'} = 'triangular'")
@@ -142,7 +159,8 @@ REGISTER_OP("FusedGlifStepBackward")
     .Attr("emit_voltage: bool = false")
     .Attr("penalty: {'none', 'range', 'threshold'} = 'none'")
     .Attr("emit_abs_max: bool = false")
-    .Input("prev_z: T").Input("new_v: float").Input("refractory: bool")
+    .Attr("V: {half, float} = DT_FLOAT")
+    .Input("prev_z: T").Input("new_v: V").Input("refractory: bool")
     .Input("syn_coeffs: float").Input("asc_decay: float")
     .Input("asc_amps: float").Input("decay: float").Input("asc_factor: float")
     .Input("reset_coeff: float").Input("asc_spike_factor: float")
@@ -184,7 +202,8 @@ REGISTER_OP("FusedGlifStepBackwardPacked")
     .Attr("penalty: {'none', 'range', 'threshold'} = 'none'")
     .Attr("emit_abs_max: bool = false")
     .Attr("word_bits: int = 31").Attr("W: {int32, uint32} = DT_INT32")
-    .Input("prev_z_bits: W").Input("new_v: float").Input("refractory_bits: W")
+    .Attr("V: {half, float} = DT_FLOAT")
+    .Input("prev_z_bits: W").Input("new_v: V").Input("refractory_bits: W")
     .Input("syn_coeffs: float").Input("asc_decay: float")
     .Input("asc_amps: float").Input("decay: float").Input("asc_factor: float")
     .Input("reset_coeff: float").Input("asc_spike_factor: float")

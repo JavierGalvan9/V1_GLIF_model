@@ -298,3 +298,47 @@ def test_voltage_offload_selects_codec(portable_backend, monkeypatch, mode, code
 
     run()
     assert codecs and set(codecs) == {codec}
+
+
+def test_voltage_record_dtype_follows_precision_placement_and_basis(portable_backend, capsys):
+    """A mixed-precision cell keeps the float16 record on the GPU only; one
+    whose basis count the tiled GLIF kernels do not take keeps float32 (one
+    line says so), and so does its forward's record."""
+    class MixedCell(_Cell):
+        compute_dtype = "float16"
+
+    class WideCell(MixedCell):
+        _n_syn_basis = 9
+
+    def runner(cell, mode="none"):
+        return adjoint.RecordedAdjointRunner(
+            SimpleNamespace(_v1_sequence_output_count=1), cell, 11, 4,
+            differentiate_inputs=False, voltage_offload=mode,
+        )
+
+    assert runner(_Cell()).voltage_record == "fp32 (GPU)"
+    assert runner(MixedCell()).voltage_record == "fp16 (GPU)"
+    assert runner(MixedCell(), "raw").voltage_record == "fp32 (offload raw)"
+    assert capsys.readouterr().out == ""
+    wide = runner(WideCell())
+    assert wide.voltage_record == "fp32 (GPU)"
+    assert "stays float32" in capsys.readouterr().out
+    state = tuple(tf.zeros((BATCH, size), dtype) for size, dtype in (
+        (WIDTH * DELAY, tf.float32), (WIDTH, tf.float32), (WIDTH, tf.int32),
+        (WIDTH * 2, tf.float32), (WIDTH * 4, tf.float32), (WIDTH * 4, tf.float32),
+        (1, tf.int32),
+    ))
+    voltage_dtypes = []
+
+    @tf.function(autograph=False)
+    def run():
+        source = lgn_input_source.DenseFrames(tf.zeros((BATCH, 11, WIDTH)))
+        outputs, _, records = wide._forward_records(
+            lambda time, buffer: source.advance(source.tensors, time, buffer),
+            source.initial_buffer(), state, adjoint.SpikeStatistics((0, 11)),
+        )
+        voltage_dtypes.append(records[2])
+        return outputs
+
+    run()
+    assert voltage_dtypes == [tf.float32]

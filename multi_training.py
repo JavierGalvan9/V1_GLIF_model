@@ -847,7 +847,8 @@ def main(_):
         else:
             print(
                 f"Backward mode: {backward_mode}"
-                + (f", voltage offload {voltage_offload}" if backward_mode == "recorded" else "")
+                + (f", voltage offload {voltage_offload}, voltage record "
+                   f"{segmented_extractor.voltage_record}" if backward_mode == "recorded" else "")
                 + (f", history offload {history_offload}" if backward_mode == "recorded" else "")
                 + f" ({segmented_extractor.n_chunks} chunks, "
                 f"chunk_size={segmented_extractor.chunk_size})."
@@ -2823,16 +2824,18 @@ if __name__ == '__main__':
         "none",
         VOLTAGE_OFFLOAD_MODES,
         "Bare --voltage_offload enables adaptive mode; omission defaults to none. "
-        "With --backward_mode recorded, where its float32 membrane record lives: none "
-        "(GPU memory), raw (copied to pinned host memory during the forward, exact, and "
-        "prefetched back in the backward; the frames the copy engine cannot take stay on "
-        "the GPU) or adaptive (legacy alias: compressed; as raw, but frames the PCIe "
-        "link could not otherwise take "
-        "are TQ-pack encoded: LOSSY on the grid 2^-16, |error| <= 7.6e-6 on the stored "
-        "voltages only, so gradients are no longer bitwise). Needs the CUDA frame store "
-        "op and pinned host RAM per GPU for the whole record (52 MB per step at batch 64 "
-        "and 203,816 neurons: ~26 GB at seq_len 500); ignored with a warning in the "
-        "other backward modes.",
+        "With --backward_mode recorded, where its membrane record lives: none "
+        "(GPU memory; float16 under mixed precision, the membrane rounded once to nearest, "
+        "half the memory of float32), raw (float32, copied to pinned host memory during "
+        "the forward, exact, and prefetched back in the backward; the frames the copy "
+        "engine cannot take stay on the GPU) or adaptive (legacy alias: compressed; as "
+        "raw, but frames the PCIe link could not otherwise take are TQ-pack encoded: "
+        "LOSSY on the grid 2^-16, |error| <= 7.6e-6 on the stored voltages only, so "
+        "gradients are no longer bitwise). Where offloading is unavailable (no CUDA frame "
+        "store, seq_len <= 8) the record stays on the GPU, as with none. Needs the CUDA "
+        "frame store op and pinned host RAM per GPU for the whole record (52 MB per step "
+        "at batch 64 and 203,816 neurons: ~26 GB at seq_len 500); ignored with a warning "
+        "in the other backward modes.",
     )
     absl.app.flags.DEFINE_enum(
         "history_offload",

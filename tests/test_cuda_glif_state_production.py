@@ -182,12 +182,77 @@ def test_packed_masks_and_abs_max_match_the_dense_op_at_every_basis(dtype, basis
     assert expected[6].numpy().view(np.float32)[0] == gradient[np.isfinite(gradient)].max()
     for word_bits in (31, 32):
         packed = forward(pack_masks=True, mask_word_bits=word_bits, emit_refractory=False)
-        spike_words, blocked_words = packed[9:]
+        spike_words, blocked_words = packed[9:11]
         np.testing.assert_array_equal(spike_words, models._pack_spike_words(dense[0], word_bits))
         np.testing.assert_array_equal(blocked_words,
                                       models._pack_spike_words(dense[2] > 0, word_bits))
         actual = backward(models._pack_spike_words(slots[0], word_bits), blocked_words, word_bits)
         for got, want in zip(actual, expected):
+            np.testing.assert_array_equal(got.numpy().view(np.uint8), want.numpy().view(np.uint8))
+
+
+@pytest.mark.parametrize("dtype", [tf.float32, tf.float16])
+@pytest.mark.parametrize("basis", [1, 4, 8, 9])
+def test_half_voltage_record_is_the_rounded_membrane_and_backward_widens_it(dtype, basis):
+    """The tiled forward (1 to 8 bases) with emit_voltage_record writes
+    cast(new_v, half) and every other output bitwise as without it; both
+    backward ops on that half record return, bitwise, their float32 results on
+    the widened record. The runtime-basis kernels (9 bases) reject both."""
+    from v1_model_utils.cuda_glif_state.wrapper import (
+        _load_ops,
+        glif_constants,
+        glif_step_backward,
+    )
+
+    ops = _load_ops()
+    cell = SimpleNamespace(**{**vars(_op_cell(10007, basis, dtype)), "_hard_reset": True,
+                              "_return_voltage_sequences": False,
+                              "_surrogate_gradient": "gaussian"})
+    slots, v, r, asc, rise, psc, inputs, acc = _op_state(cell, batch=3)
+    constants = glif_constants(cell)
+    inverse = tf.constant(1.0 / cell._n_neurons)
+    no_bkg = (tf.zeros([0, 0], dtype), tf.zeros([0]), tf.zeros([0], tf.uint32),
+              tf.zeros([0], tf.uint32), tf.zeros([0], tf.uint8), tf.zeros([0, 4]))
+
+    def forward(**flags):
+        return ops.fused_glif_step(
+            slots[0], v, r, asc, rise, psc, inputs, *constants, cell.t_ref_steps, cell._dt,
+            cell.v_reset, cell.v_th, acc, inverse, *no_bkg, hard_reset=True,
+            emit_voltage=False, penalty="range", pack_masks=True, emit_refractory=True,
+            **flags)
+
+    if basis > 8:
+        with pytest.raises(tf.errors.InvalidArgumentError, match="tiled forward"):
+            forward(emit_voltage_record=True)
+    plain = forward()
+    assert plain[11].shape == (0,)
+    half = tf.cast(plain[1], tf.float16)
+    if basis <= 8:
+        recorded = forward(emit_voltage_record=True)
+        for got, want in zip(recorded[:11], plain[:11]):
+            np.testing.assert_array_equal(got.numpy().view(np.uint8), want.numpy().view(np.uint8))
+        assert recorded[11].dtype == tf.float16
+        np.testing.assert_array_equal(recorded[11].numpy().view(np.uint16),
+                                      half.numpy().view(np.uint16))
+    rng = np.random.default_rng(4)
+    upstream = [tf.constant(rng.normal(size=x.shape), x.dtype)
+                for x in (plain[0], plain[0], slots[1], plain[1], plain[3], plain[4], plain[5])]
+    upstream += [tf.zeros([0], dtype), tf.constant(rng.normal(size=(3, 1)), tf.float32)]
+    masks = {None: (slots[0], plain[6]),
+             31: (models._pack_spike_words(slots[0], 31), plain[10])}
+    for word_bits, (prev_z, blocked) in masks.items():
+        def backward(new_v):
+            return glif_step_backward(
+                cell, prev_z, new_v, blocked, constants, cell._dt, cell.v_th, cell._gauss_std,
+                cell._dampening_factor, inverse, *upstream, penalty="range",
+                emit_abs_max=True, word_bits=word_bits)
+
+        if basis > 8:
+            with pytest.raises(tf.errors.InvalidArgumentError, match="tiled backward"):
+                backward(half)
+            continue
+        expected = backward(tf.cast(half, tf.float32))
+        for got, want in zip(backward(half), expected):
             np.testing.assert_array_equal(got.numpy().view(np.uint8), want.numpy().view(np.uint8))
 
 

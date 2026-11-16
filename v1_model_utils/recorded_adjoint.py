@@ -4,8 +4,9 @@ The segmented runner keeps chunk-boundary states and, for the gradient, re-runs
 each chunk's forward under a tape. The cell's backward operators, however, read
 only three things per timestep from the forward pass: the float32 membrane after
 the step, the blocked (refractory) mask and the spike history. The recorded
-adjoint keeps exactly those - the membrane by reference, the binary ones packed
-31 to an int32 word - and runs the timesteps in reverse calling the operators
+adjoint keeps exactly those - the membrane by reference (rounded to float16
+under mixed precision while it stays on the GPU), the binary ones packed 31 to
+an int32 word - and runs the timesteps in reverse calling the operators
 the cell's custom gradients call, with the same arguments, routing the
 cotangents as autodiff does. No forward operator runs in the backward pass.
 
@@ -38,7 +39,12 @@ from .cuda_csr_recurrent.wrapper import (
     spike_slots,
 )
 from .cuda_frame_store import wrapper as frame_store
-from .cuda_glif_state.wrapper import glif_constants, glif_step_backward, record_packed_masks
+from .cuda_glif_state.wrapper import (
+    MAX_TILED_BASIS,
+    glif_constants,
+    glif_step_backward,
+    record_packed_masks,
+)
 
 
 class SampledTraces(NamedTuple):
@@ -359,6 +365,15 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
     loop so every recorded frame is fetched only once. Both options default
     to "none" and keep records resident when the CUDA store is unavailable.
 
+    A membrane record kept on the GPU (``voltage_offload="none"``, or the
+    fallbacks above: eager mode, no CUDA frame store, a sequence no longer
+    than ``_PREFETCH``) is float16 when the cell computes in float16 (mixed
+    precision): the GLIF op rounds each step's float32 membrane to nearest,
+    and the backward op widens it again, which halves the record at about
+    4e-5 relative L2 change in the weight gradients. Offloaded records, float32
+    cells and cells whose basis count the GLIF ops' tiled kernels do not take
+    (1 to MAX_TILED_BASIS) keep the float32 record.
+
     ``__call__(inputs, initial_state, statistics)`` returns the counts (in the
     spike dtype, like the dense sequence they sum), one [rows * per_trial,
     window] trace tensor per SampledTraces and the final state. Without
@@ -395,6 +410,28 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         }
         self.unsupported = self._unsupported(cell)
         self.records = not self.unsupported
+        self._half_voltage_record = self._writes_half_voltage_record(cell)
+
+    @staticmethod
+    def _writes_half_voltage_record(cell):
+        """Whether the cell's membrane record, where it stays on the GPU, is
+        the GLIF op's float16 one: a float16 compute dtype, and a basis count
+        the op's tiled kernels take (else one line says it stays float32)."""
+        if tf.as_dtype(cell.compute_dtype) != tf.float16:
+            return False
+        if 1 <= cell._n_syn_basis <= MAX_TILED_BASIS:
+            return True
+        print(f"Recorded adjoint: {cell._n_syn_basis} synaptic bases (the float16 voltage record "
+              f"needs 1 to {MAX_TILED_BASIS}); the voltage record stays float32.")
+        return False
+
+    @property
+    def voltage_record(self):
+        """The membrane record of a graph-mode training rollout, e.g.
+        "fp16 (GPU)" or "fp32 (offload adaptive)"."""
+        if self._offloads(self.voltage_offload != "none"):
+            return f"fp32 (offload {self.voltage_offload})"
+        return f"{'fp16' if self._half_voltage_record else 'fp32'} (GPU)"
 
     def _unsupported(self, cell):
         """The conditions of this adjoint the cell's rollout fails (empty when
@@ -490,7 +527,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                         order=self._store_order.handle,
                     )
         store = self._frame_store("voltages", self.voltage_offload != "none", batch, width)
-        voltages = tf.zeros([0]) if store else _empty_list(tf.float32, [batch, width])
+        # Only a record kept on the GPU may be the op's float16 one.
+        voltage_dtype = tf.float16 if self._half_voltage_record and not store else tf.float32
+        half_voltage = voltage_dtype == tf.float16
+        voltages = tf.zeros([0]) if store else _empty_list(voltage_dtype, [batch, width])
         # Frames from resident_from on stay on the GPU.
         resident_from = length - self._PREFETCH
         blocked = tf.zeros([0]) if blocked_store else _empty_list(tf.int32, [batch, words])
@@ -558,10 +598,11 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
             # layer) a mixed-precision layer's __call__ would autocast the
             # weights to float16, which the RNN layer's rollout does not.
             # The GLIF op writes the packed spikes and blocked mask itself.
-            with record_packed_masks(_WORD_BITS) as record:
+            with record_packed_masks(_WORD_BITS, half_voltage) as record:
                 spikes, new_states = cell.call(lgn_frame, states)
             new_states = tf.nest.pack_sequence_as(states, tf.nest.flatten(new_states))
-            voltage, refractory = new_states[1], new_states[2]
+            voltage = record.voltage if half_voltage else new_states[1]
+            refractory = new_states[2]
             packed_spikes, packed_blocked = (
                 (record.spike_words, record.blocked_words) if record.spike_words is not None
                 else _pack_step(spikes, refractory)
@@ -606,16 +647,22 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                 cell, batch, initial_state[6], num_steps=length
             ))
         return outputs, final_state, (
-            frames, voltages, blocked, bkg_activity, (spike_store, blocked_store), store
+            frames, voltages, voltage_dtype, blocked, bkg_activity, (spike_store, blocked_store),
+            store,
         )
+
+    def _offloads(self, enabled):
+        """Whether a record with offloading ``enabled`` leaves the GPU in a
+        graph-mode rollout: the CUDA frame store is available and the sequence
+        is longer than the resident tail."""
+        return enabled and self._PREFETCH < self.sequence_length and frame_store.available()
 
     def _frame_store(self, kind, enabled, batch, width):
         """The host store key of this rollout's named record, or None to
         keep the record on the GPU. Keys count the rollouts of the outermost
         graph being traced (so retraces reuse their stores) and name the
         frame shape; the op keeps one store per key and GPU."""
-        if (not enabled or self._PREFETCH >= self.sequence_length
-                or tf.executing_eagerly() or not frame_store.available()):
+        if tf.executing_eagerly() or not self._offloads(enabled):
             return None
         graph = tf.compat.v1.get_default_graph()
         while getattr(graph, "outer_graph", None) is not None:
@@ -679,8 +726,10 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
         """``(input_gradients, state_gradients, variable_gradients)``; the
         input gradients are the ``source``'s, one per tensor of ``tensors``."""
         cell, length, delay = self.cell, self.sequence_length, self.cell.max_delay
-        frames, voltages, blocked, bkg_activity, history_stores, store = records
+        frames, voltages, voltage_dtype, blocked, bkg_activity, history_stores, store = records
         spike_store, blocked_store = history_stores
+        # The resident membrane frames: float32, or the forward's float16 record.
+        voltage_like = tf.TensorSpec(final_state[1].shape, voltage_dtype)
         final_slots = tf.split(final_state[0], delay, axis=1)
         spike_dtype = final_slots[0].dtype
         width = final_slots[0].shape[1]
@@ -852,7 +901,7 @@ class RecordedAdjointRunner(models.SegmentedRecomputeRunner):
                         order=self._store_order.handle,
                     )
             else:
-                voltages, voltage = _pop(voltages, final_state[1])
+                voltages, voltage = _pop(voltages, voltage_like)
             if blocked_store:
                 with tf.control_dependencies([voltage_g, blocked]):
                     packed_blocked = frame_store.take_frame(

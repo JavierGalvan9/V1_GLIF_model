@@ -10,13 +10,16 @@ from v1_model_utils.cuda_glif_state.build import LIBRARY
 
 
 _GLIF_OPS = None
+# glif_state_ops.cu.cc's kMaxTiledBasis: the tiled kernels, the only ones that
+# write and read the float16 membrane record, take 1 to this many synaptic bases.
+MAX_TILED_BASIS = 8
 # Per thread, because MirroredStrategy traces every replica in its own thread:
 # a replica's GLIF step must only ever fill its own record.
 _MASK_RECORD = threading.local()
 
 
 @contextlib.contextmanager
-def record_packed_masks(word_bits):
+def record_packed_masks(word_bits, half_voltage=False):
     """Within the block, each GLIF step also has the op write its spikes and
     refractory mask (new_r > 0) bit-packed ``word_bits`` per int32 word
     ([batch, ceil(neurons / word_bits)], ``models._pack_spike_words``' layout
@@ -24,9 +27,13 @@ def record_packed_masks(word_bits):
     ``blocked_words``. The op then skips the dense mask the step's gradient
     reads; a gradient taken through such a step (a recorded rollout normally
     differentiates its records instead) unpacks it from ``blocked_words``,
-    which is exact. Both stay None if no step ran.
+    which is exact. With ``half_voltage`` the op also writes the membrane
+    rounded to float16 into the record's ``voltage`` (tiled forward only: 1
+    to 8 synaptic bases), and a gradient taken through the step reads that
+    record, as the recorded adjoint does. All stay None if no step ran.
     """
-    record = SimpleNamespace(word_bits=word_bits, spike_words=None, blocked_words=None)
+    record = SimpleNamespace(word_bits=word_bits, half_voltage=half_voltage,
+                             spike_words=None, blocked_words=None, voltage=None)
     previous = getattr(_MASK_RECORD, "record", None)
     _MASK_RECORD.record = record
     try:
@@ -75,7 +82,9 @@ def glif_step_backward(cell, prev_z, new_v, blocked, constants, dt, v_th, sigma,
     asc, rise, psc, exposed voltage, penalty accumulator)``, each in the dtype
     and shape of the forward output it belongs to. With ``word_bits``,
     ``prev_z`` and ``blocked`` are bit-packed words (``models._pack_spike_words``
-    layout) read by FusedGlifStepBackwardPacked, bitwise the same.
+    layout) read by FusedGlifStepBackwardPacked, bitwise the same. ``new_v``
+    is the float32 membrane or FusedGlifStep's float16 record, which the op
+    widens on load (bitwise the float32 op on the widened record).
     """
     ops = _load_ops()
     flags = dict(
@@ -176,6 +185,7 @@ def update_glif_state(
     # inside the segmented-recompute backward pass.
     constants = glif_constants(cell)
     record = getattr(_MASK_RECORD, "record", None)
+    half_voltage = record is not None and record.half_voltage
 
     # The outputs end with the next history: the spikes again (a separate
     # output, so the gradient of the exposed spike sequence and that of the
@@ -198,12 +208,15 @@ def update_glif_state(
             penalty=penalty, emit_refractory=record is None,
             pack_masks=record is not None,
             mask_word_bits=31 if record is None else record.word_bits,
+            emit_voltage_record=half_voltage,
         )
-        outputs, words = tuple(outputs[:9]), outputs[9:]
+        outputs, words, voltage_record = tuple(outputs[:9]), outputs[9:11], outputs[11]
         (spikes, new_v, _, new_asc, new_rise, new_psc, blocked,
          exposed, new_accumulator) = outputs
         if record is not None:
             record.spike_words, record.blocked_words = words
+            if half_voltage:  # a record the backward reads, never differentiated
+                record.voltage = tf.stop_gradient(voltage_record)
 
         def grad(gs, gv, _gr, ga, grise, gpsc, _gb, gvoltage, gacc, gz, *gpass):
             mask = (blocked if record is None
@@ -224,7 +237,8 @@ def update_glif_state(
                          else tf.zeros([0], prev_z.dtype))
             handing_off = link is not None and link.hands_off(history)
             zg, vg, ag, rg, pg, ig, bound = glif_step_backward(
-                cell, prev_z, new_v, mask, constants, dt, v_th, sigma, amplitude,
+                cell, prev_z, voltage_record if half_voltage else new_v, mask, constants,
+                dt, v_th, sigma, amplitude,
                 inverse, _gradient_like(gs, spikes), _gradient_like(gz, spikes),
                 prev_grad, _gradient_like(gv, new_v), _gradient_like(ga, new_asc),
                 _gradient_like(grise, new_rise), _gradient_like(gpsc, new_psc),

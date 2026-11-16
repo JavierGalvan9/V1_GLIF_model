@@ -19,6 +19,15 @@ follow the compute dtype. The four per-(neuron, basis) constants are packed as
 `[syn_decay, psc_initial, psc_factor, psc_rise_factor]` and read with one
 `float4` load.
 
+For the recorded adjoint, `FusedGlifStep(emit_voltage_record=True)` also
+writes the membrane rounded once to float16 (`__float2half_rn`) as a trailing
+`voltage_record` output. Both backward ops read `new_v` as float32 or as that
+float16 record (attribute `V`), widening it on load, so a half record gives
+bitwise the float32 op's results on the widened record. `RecordedAdjointRunner`
+keeps this record instead of the float32 membrane under mixed precision
+whenever the record stays on the GPU. Only the tiled kernels (1 to 8 bases)
+write or read it; the runtime-basis kernels reject it.
+
 The CUDA backward kernel supports the `triangular`, `gaussian`, and `slayer`
 surrogate gradients selected through `surrogate_gradient`. The legacy
 `pseudo_gauss=True` option remains an alias for `surrogate_gradient="gaussian"`.

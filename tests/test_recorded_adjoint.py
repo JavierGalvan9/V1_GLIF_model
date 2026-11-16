@@ -3,7 +3,10 @@
 Each case runs the recorded forward loop once under a tape: TensorFlow's VJP of
 that loop (the CUDA operators' own custom gradients) is the reference, and
 RecordedAdjointRunner's adjoint, fed the same forward's records, must match it
-bit for bit - weights, every floating initial state, all statistics.
+bit for bit - weights, every floating initial state, all statistics. Under mixed
+precision a membrane record kept on the GPU is the GLIF op's float16 one, which
+both differentiate; the adjoint on it must also match, bit for bit, the float32
+adjoint fed the same record widened.
 """
 
 import functools
@@ -22,6 +25,18 @@ from v1_model_utils.recorded_adjoint import (
     SampledTraces,
     SpikeStatistics,
 )
+
+
+def _widened(records, like):
+    """``records`` with the float16 membrane record widened to float32."""
+    frames, voltages, _, *rest = records
+    stacked = tf.raw_ops.TensorListStack(
+        input_handle=voltages, element_dtype=tf.float16, element_shape=like.shape
+    )
+    widened = tf.raw_ops.TensorListFromTensor(
+        tensor=tf.cast(stacked, tf.float32), element_shape=like.shape
+    )
+    return (frames, widened, tf.float32, *rest)
 
 
 class RecordedAdjointTest(unittest.TestCase):
@@ -111,7 +126,7 @@ class RecordedAdjointTest(unittest.TestCase):
             setattr(runner, name, value)
         self.assertEqual(runner.unsupported, ())
         self.assertTrue(runner.records)
-        stores, history_stores = [], []
+        stores, history_stores, voltage_dtypes = [], [], []
 
         def loss_of(outputs, final_state):
             counts = tf.cast(outputs[0], tf.float32)
@@ -137,6 +152,7 @@ class RecordedAdjointTest(unittest.TestCase):
                 )
                 stores.append(records[-1])
                 history_stores.append(records[-2])
+                voltage_dtypes.append(records[2])
                 loss = loss_of(outputs, final_state)
             detached = [tf.stop_gradient(v) for v in list(outputs) + list(final_state)]
             with tf.GradientTape() as output_tape:
@@ -149,13 +165,20 @@ class RecordedAdjointTest(unittest.TestCase):
                     unconnected_gradients=tf.UnconnectedGradients.ZERO,
                 )
             reference[recurrent] = runner._accumulated_gradient(reference, tf.float32)
-            input_gradients, state_gradients, candidate = runner._adjoint(
-                source, source.tensors, state, final_state, records, statistics,
-                cotangents[:len(outputs)], cotangents[len(outputs):],
-                tuple(v.value for v in variables),
-            )
-            return reference, (list(candidate) + [state_gradients[i] for i in floating]
-                               + list(input_gradients[:len(differentiated_inputs)]))
+            def adjoint(records):
+                input_gradients, state_gradients, candidate = runner._adjoint(
+                    source, source.tensors, state, final_state, records, statistics,
+                    cotangents[:len(outputs)], cotangents[len(outputs):],
+                    tuple(v.value for v in variables),
+                )
+                return (list(candidate) + [state_gradients[i] for i in floating]
+                        + list(input_gradients[:len(differentiated_inputs)]))
+
+            # The float32 adjoint on the widened float16 record, same forward
+            # (a second adjoint, so only with no store: its takes consume frames).
+            widened = (adjoint(_widened(records, final_state[1]))
+                       if records[2] == tf.float16 and not any(records[-2]) else [])
+            return reference, adjoint(records), widened
 
         # Autodiff sums the BKG/LGN weight gradients over the whole loop; the
         # adjoint sums them per chunk, then over chunks (the segmented runner's
@@ -168,10 +191,17 @@ class RecordedAdjointTest(unittest.TestCase):
             # Reuse the traced graph and its stores on the next training step.
             gradients = compare()
         self.assertEqual(bool(stores[0]), runner.voltage_offload != "none")
+        resident_half = spike_dtype == "float16" and not stores[0]
+        self.assertEqual(voltage_dtypes[0], tf.float16 if resident_half else tf.float32)
+        self.assertEqual(runner.voltage_record, "fp16 (GPU)" if resident_half else (
+            "fp32 (GPU)" if not stores[0] else f"fp32 (offload {runner.voltage_offload})"))
+        for name, half, widened in zip(names, gradients[1], gradients[2]):
+            np.testing.assert_array_equal(tf.convert_to_tensor(half).numpy(),
+                                          tf.convert_to_tensor(widened).numpy(), name)
         self.assertEqual(tuple(map(bool, history_stores[0])),
                          (runner.history_offload != "none",) * 2)
         lossy = runner.voltage_offload in ("adaptive", "compressed")
-        for name, expected, actual in zip(names, *gradients):
+        for name, expected, actual in zip(names, *gradients[:2]):
             expected = tf.convert_to_tensor(expected).numpy()
             actual = tf.convert_to_tensor(actual).numpy()
             if lossy:  # the reverse pass reads (part of) the record within 2**-17
@@ -231,16 +261,21 @@ class RecordedAdjointTest(unittest.TestCase):
         ))
 
     def test_matches_with_packed_histories_in_host_memory(self):
+        """Mixed precision keeps a float16 record on the GPU ("none") and a
+        float32 one offloaded ("raw"); float32 models keep float32 in both."""
         from v1_model_utils import cuda_frame_store
 
         if not cuda_frame_store.available():
             self.skipTest("CUDA frame store unavailable")
-        for voltage_offload in ("none", "raw"):
-            with self.subTest(voltage_offload=voltage_offload):
-                self._case(4, (2, 9), (4, 8), train_input=True, offload=dict(
-                    voltage_offload=voltage_offload, history_offload="raw",
-                    _PREFETCH=3, _COPY_GROUP=2,
-                ))
+        for dtype in (tf.float16, tf.float32):
+            tf.keras.mixed_precision.set_global_policy(
+                "mixed_float16" if dtype == tf.float16 else "float32")
+            for voltage_offload in ("none", "raw"):
+                with self.subTest(dtype=dtype.name, voltage_offload=voltage_offload):
+                    self._case(4, (2, 9), (4, 8), train_input=True, dtype=dtype, offload=dict(
+                        voltage_offload=voltage_offload, history_offload="raw",
+                        _PREFETCH=3, _COPY_GROUP=2,
+                    ))
 
     def test_rejects_an_unknown_history_offload(self):
         model, layer, _ = self._model()
